@@ -1,0 +1,53 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local dependency installs
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Logs and runtime output
+*.log
+logs/
+*.pid
+
+# Local upload/artifact directories
+single_ra_isi/
+uploads/
+artifacts/
+
+# Generated batch/export files
+*.jsonl
+*.ndjson
+~$*.xlsx
+
+# Root-level data inputs and exports used by local scripts
+/*.csv
+/*.xlsx
+/input.json
+/output.json
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

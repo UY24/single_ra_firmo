@@ -73,6 +73,7 @@ upload_summaries_cache: dict[str, dict[str, Any]] = {}
 gemini_batch_list_cache: list[dict[str, Any]] = []
 gemini_batch_list_cache_fetched_at: float = 0.0
 gemini_batch_list_error_cooldown_until: float = 0.0
+ai_mode_tasks: set[asyncio.Task] = set()
 
 s3_client = None
 
@@ -4104,6 +4105,7 @@ def build_upload_output_xlsx_bytes(output_data: dict[str, Any]) -> bytes:
         "output_serpwow_cost_usd",
         "output_gemini_cost_usd",
         "output_total_cost_usd",
+        "output_processing_seconds",
         "output_json",
     ]
 
@@ -4189,6 +4191,7 @@ def build_upload_output_xlsx_bytes(output_data: dict[str, Any]) -> bytes:
                 result_obj.get("serpwow_cost_usd"),
                 result_obj.get("gemini_cost_usd"),
                 result_obj.get("total_cost_usd"),
+                (context_obj.get("timing") or {}).get("total_seconds"),
                 json.dumps(result_obj, ensure_ascii=True),
             ]
         )
@@ -6008,6 +6011,12 @@ async def process_upload_job(job: dict[str, Any]) -> None:
         # Backward compatibility for clients still reading old keys.
         result["s3_html_key"] = s3_serpwow_json_key
         result["s3_html_error"] = s3_error
+        # Record total per-row processing time so each pipeline's flow duration is visible
+        # in the output/XLSX (parallels the AI-mode per-batch timing).
+        if isinstance(result.get("context"), dict):
+            result["context"]["timing"] = {
+                "total_seconds": round(asyncio.get_event_loop().time() - started_monotonic, 3)
+            }
 
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
@@ -7460,6 +7469,59 @@ async def gsearch_discover(
         "candidates": candidates,
         "results": formatted_results,
     }
+
+
+@app.post("/uploads/ai-mode")
+async def create_ai_mode_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    import ai_mode_service
+    raw = await file.read()
+    try:
+        info = ai_mode_service.prepare_ai_mode_run(raw, file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
+    ai_mode_tasks.add(task)
+    task.add_done_callback(ai_mode_tasks.discard)
+    return info
+
+
+@app.get("/uploads/ai-mode")
+async def list_ai_mode_uploads() -> dict[str, Any]:
+    import ai_mode_service
+    runs = await asyncio.to_thread(ai_mode_service.list_ai_mode_runs)
+    return {"count": len(runs), "runs": runs}
+
+
+@app.get("/uploads/ai-mode/{run_id}/status")
+async def ai_mode_status(run_id: str) -> dict[str, Any]:
+    import ai_mode_service
+    try:
+        return await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="AI mode run not found") from exc
+
+
+@app.get("/uploads/ai-mode/{run_id}/result")
+async def ai_mode_result(
+    run_id: str,
+    file: str = Query("final_report.json"),
+    download: bool = Query(False),
+) -> Response:
+    import ai_mode_service
+    try:
+        path = await asyncio.to_thread(ai_mode_service.get_ai_mode_result_path, run_id, file)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="AI mode run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Requested file is not available yet") from exc
+    body = await asyncio.to_thread(path.read_bytes)
+    media_type = "application/json" if file.endswith(".json") else ("text/csv" if file.endswith(".csv") else "text/plain")
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{run_id}_{file}"'
+    return Response(content=body, media_type=media_type, headers=headers)
 
 
 if __name__ == "__main__":

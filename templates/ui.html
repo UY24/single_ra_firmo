@@ -535,6 +535,7 @@
       <button id="tabGmapsSearch" class="tab-btn" type="button">Google Maps Lookup</button>
       <button id="tabGsearchPhases" class="tab-btn" type="button">Google Search Phases</button>
       <button id="tabRetryOps" class="tab-btn" type="button">Retry Operations</button>
+      <button id="tabAiMode" class="tab-btn" type="button">AI Mode</button>
     </div>
 
     <div id="consoleView" class="view">
@@ -929,6 +930,43 @@
       </div>
     </div>
 
+    <div id="aiModeView" class="view hidden">
+      <div class="card">
+        <div class="card-label">AI Mode (scrape.do + LLM)</div>
+        <div class="controls">
+          <input id="aiModeCsvFile" type="file" accept=".csv" />
+          <button id="aiModeUploadBtn">Upload &amp; Run</button>
+        </div>
+        <div class="meta" id="aiModeMeta">No AI-mode run yet.</div>
+        <div class="muted">Input mode is auto-detected (company vs address). LLM provider is set by the <code>AI_MODE_LLM_PROVIDER</code> env var (<code>gemini</code> or <code>openai</code>). Results are saved under <code>ai_mode_result/&lt;run_id&gt;/</code>. Expected columns: <code>company_name</code>/<code>entity_name</code>, <code>country</code>, optional <code>input_full_address</code> (address mode), or <code>Company Name ENG</code>, <code>Country Code</code>, <code>Company Name Local</code> (company mode).</div>
+      </div>
+
+      <div class="card">
+        <div class="status-head">
+          <h3>AI Mode Runs</h3>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Run ID</th>
+                <th>Status</th>
+                <th>Mode</th>
+                <th>Rows</th>
+                <th>Batches</th>
+                <th>Scrape.do Time (s)</th>
+                <th>LLM Time (s)</th>
+                <th>Updated</th>
+                <th>Downloads</th>
+              </tr>
+            </thead>
+            <tbody id="aiModeRunsBody"></tbody>
+          </table>
+          <div id="aiModeRunsEmpty" class="table-empty" style="display:none;">No AI-mode runs yet.</div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -974,6 +1012,14 @@
     const triggerRetryBtn = document.getElementById('triggerRetryBtn');
     const retryMeta = document.getElementById('retryMeta');
 
+    const tabAiMode = document.getElementById('tabAiMode');
+    const aiModeView = document.getElementById('aiModeView');
+    const aiModeCsvFile = document.getElementById('aiModeCsvFile');
+    const aiModeUploadBtn = document.getElementById('aiModeUploadBtn');
+    const aiModeMeta = document.getElementById('aiModeMeta');
+    const aiModeRunsBody = document.getElementById('aiModeRunsBody');
+    const aiModeRunsEmpty = document.getElementById('aiModeRunsEmpty');
+
     // Google Maps Lookup Selectors
     const gmapsQuery = document.getElementById('gmapsQuery');
     const gmapsCountry = document.getElementById('gmapsCountry');
@@ -992,6 +1038,7 @@
     let pollTimer = null;
     let firmographicsPollTimer = null;
     let uploadsTimer = null;
+    let aiModePollTimer = null;
     let activeTab = 'console';
 
     function setActiveTab(tab) {
@@ -1001,21 +1048,24 @@
       const isGmaps = tab === 'gmaps';
       const isGsearch = tab === 'gsearch';
       const isRetry = tab === 'retry';
-      const isConsole = !isBatch && !isFirmographics && !isGmaps && !isGsearch && !isRetry;
-      
+      const isAiMode = tab === 'aimode';
+      const isConsole = !isBatch && !isFirmographics && !isGmaps && !isGsearch && !isRetry && !isAiMode;
+
       tabConsole.classList.toggle('active', isConsole);
       tabFirmographics.classList.toggle('active', isFirmographics);
       tabBatchManager.classList.toggle('active', isBatch);
       tabGmapsSearch.classList.toggle('active', isGmaps);
       tabGsearchPhases.classList.toggle('active', isGsearch);
       tabRetryOps.classList.toggle('active', isRetry);
-      
+      tabAiMode.classList.toggle('active', isAiMode);
+
       consoleView.classList.toggle('hidden', !isConsole);
       firmographicsView.classList.toggle('hidden', !isFirmographics);
       batchManagerView.classList.toggle('hidden', !isBatch);
       gmapsSearchView.classList.toggle('hidden', !isGmaps);
       gsearchView.classList.toggle('hidden', !isGsearch);
       retryOpsView.classList.toggle('hidden', !isRetry);
+      aiModeView.classList.toggle('hidden', !isAiMode);
     }
 
     function setStatusChip(status) {
@@ -2010,16 +2060,122 @@
     const gsearchRunBtn = document.getElementById('gsearchRunBtn');
     gsearchRunBtn.addEventListener('click', handleGsearchAction);
 
+    function aiModeStatusClass(s) {
+      if (s === 'completed') return 'done';
+      if (s === 'failed') return 'error';
+      return 'running';
+    }
+
+    async function refreshAiModeRuns() {
+      try {
+        const res = await fetch('/uploads/ai-mode');
+        if (!res.ok) return;
+        const data = await res.json();
+        const runs = Array.isArray(data.runs) ? data.runs : [];
+        aiModeRunsBody.innerHTML = '';
+        if (runs.length === 0) {
+          aiModeRunsEmpty.style.display = 'block';
+          return;
+        }
+        aiModeRunsEmpty.style.display = 'none';
+        for (const run of runs) {
+          const rid = String(run.run_id || '');
+          const shortId = rid.length > 20 ? `${rid.slice(0, 8)}...${rid.slice(-8)}` : rid;
+          const status = String(run.status || '');
+          const downloads = status === 'completed'
+            ? `
+              <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=final_report.json&download=true">↓ JSON</a>
+              <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=found.csv&download=true">↓ found</a>
+              <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=notFound.csv&download=true">↓ notFound</a>
+            `
+            : '<span class="muted">Processing</span>';
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td class="mono" title="${escapeHtml(rid)}">${escapeHtml(shortId)}</td>
+            <td><span class="pill ${aiModeStatusClass(status)}">${escapeHtml(status || '-')}</span></td>
+            <td>${escapeHtml(String(run.input_type || '-'))}</td>
+            <td>${escapeHtml(String(run.total_rows || 0))}</td>
+            <td>${escapeHtml(String(run.batches_done || 0))}/${escapeHtml(String(run.batches_total || 0))}</td>
+            <td>${escapeHtml(Number(run.scrapedo_seconds_total || 0).toFixed(1))}</td>
+            <td>${escapeHtml(Number(run.llm_seconds_total || 0).toFixed(1))}</td>
+            <td>${escapeHtml(shortTs(run.updated_at))}</td>
+            <td>${downloads}</td>
+          `;
+          aiModeRunsBody.appendChild(tr);
+        }
+      } catch (_) {}
+    }
+
+    async function pollAiMode(runId) {
+      try {
+        const res = await fetch(`/uploads/ai-mode/${encodeURIComponent(runId)}/status`);
+        if (!res.ok) return;
+        const s = await res.json();
+        const status = String(s.status || '');
+        const scrapedo = Number(s.scrapedo_seconds_total || 0).toFixed(1);
+        const llm = Number(s.llm_seconds_total || 0).toFixed(1);
+        let text = `Run ${runId} | ${status} | ${s.batches_done || 0}/${s.batches_total || 0} batches | scrape.do ${scrapedo}s | llm ${llm}s`;
+        if (status === 'failed' && s.error) {
+          text += ` | error: ${s.error}`;
+        }
+        aiModeMeta.textContent = text;
+        await refreshAiModeRuns();
+        if (status === 'completed' || status === 'failed') {
+          if (aiModePollTimer) clearInterval(aiModePollTimer);
+          aiModePollTimer = null;
+        }
+      } catch (_) {}
+    }
+
+    aiModeUploadBtn.addEventListener('click', async () => {
+      if (!aiModeCsvFile.files.length) {
+        alert('Please choose a CSV file first.');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', aiModeCsvFile.files[0]);
+      aiModeUploadBtn.disabled = true;
+      aiModeUploadBtn.textContent = 'Uploading...';
+
+      let res;
+      let data;
+      try {
+        res = await fetch('/uploads/ai-mode', { method: 'POST', body: formData });
+        data = await res.json();
+      } finally {
+        aiModeUploadBtn.disabled = false;
+        aiModeUploadBtn.textContent = 'Upload & Run';
+      }
+
+      if (!res.ok) {
+        aiModeMeta.textContent = data.detail;
+        return;
+      }
+
+      const runId = data.run_id;
+      if (aiModePollTimer) clearInterval(aiModePollTimer);
+      aiModePollTimer = setInterval(() => pollAiMode(runId), 2000);
+      await pollAiMode(runId);
+    });
+
+    tabAiMode.addEventListener('click', async () => {
+      setActiveTab('aimode');
+      await refreshAiModeRuns();
+    });
+
     refreshUploadsList();
     refreshFirmographicsUploadsList();
     refreshGmapsUploadsList();
     refreshGsearchUploadsList();
     refreshBatchJobs();
+    refreshAiModeRuns();
     uploadsTimer = setInterval(async () => {
       await refreshUploadsList();
       await refreshFirmographicsUploadsList();
       await refreshGmapsUploadsList();
       await refreshGsearchUploadsList();
+      await refreshAiModeRuns();
       if (activeTab === 'batch') {
         await refreshBatchJobs();
       }

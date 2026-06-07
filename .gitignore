@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 
+docs/
 # Virtual environments and local dependency installs
 .venv/
 venv/
@@ -32,6 +33,7 @@ logs/
 single_ra_isi/
 uploads/
 artifacts/
+ai_mode_result/
 
 # Generated batch/export files
 *.jsonl

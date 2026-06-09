@@ -462,6 +462,21 @@
       color: var(--muted);
       font-family: "JetBrains Mono", monospace;
     }
+    .json-viewer {
+      margin-top: 14px;
+      border: 1px solid var(--stroke);
+      border-radius: 12px;
+      background: rgba(13,15,20,.72);
+      padding: 14px;
+      max-height: 520px;
+      overflow: auto;
+      color: #a5b4fc;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
 
     /* ── PILLS ── */
     .pill {
@@ -702,6 +717,8 @@
                 <th>Processed</th>
                 <th>Success</th>
                 <th>Failed</th>
+                <th>Time Total</th>
+                <th>Avg/row</th>
                 <th>Updated</th>
                 <th>Output JSON</th>
                 <th>Output XLSX</th>
@@ -826,6 +843,8 @@
                 <th>Processed</th>
                 <th>Success</th>
                 <th>Failed</th>
+                <th>Time Total</th>
+                <th>Avg/row</th>
                 <th>Updated</th>
                 <th>Output JSON</th>
                 <th>Output XLSX</th>
@@ -965,6 +984,14 @@
           <div id="aiModeRunsEmpty" class="table-empty" style="display:none;">No AI-mode runs yet.</div>
         </div>
       </div>
+
+      <div id="aiModeReportCard" class="card hidden">
+        <div class="status-head">
+          <h3>report.json</h3>
+          <span id="aiModeReportRun" class="status-chip">No run selected</span>
+        </div>
+        <pre id="aiModeReportJson" class="json-viewer"></pre>
+      </div>
     </div>
 
   </div>
@@ -1019,6 +1046,9 @@
     const aiModeMeta = document.getElementById('aiModeMeta');
     const aiModeRunsBody = document.getElementById('aiModeRunsBody');
     const aiModeRunsEmpty = document.getElementById('aiModeRunsEmpty');
+    const aiModeReportCard = document.getElementById('aiModeReportCard');
+    const aiModeReportRun = document.getElementById('aiModeReportRun');
+    const aiModeReportJson = document.getElementById('aiModeReportJson');
 
     // Google Maps Lookup Selectors
     const gmapsQuery = document.getElementById('gmapsQuery');
@@ -1123,11 +1153,27 @@
         .replaceAll("'", '&#039;');
     }
 
+    function apiErrorMessage(data, fallback = 'Request failed') {
+      if (data && typeof data.detail === 'string') return data.detail;
+      if (data && data.detail) return JSON.stringify(data.detail);
+      if (data && typeof data.error === 'string') return data.error;
+      return fallback;
+    }
+
     function shortTs(value) {
       if (!value) return '-';
       const dt = new Date(value);
       if (Number.isNaN(dt.getTime())) return String(value);
       return dt.toLocaleString();
+    }
+
+    function formatSeconds(value) {
+      if (value === null || value === undefined || value === '') return '-';
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds < 0) return '-';
+      if (seconds >= 100) return `${seconds.toFixed(0)}s`;
+      if (seconds >= 10) return `${seconds.toFixed(1)}s`;
+      return `${seconds.toFixed(2)}s`;
     }
 
     function statusLabel(status) {
@@ -1192,6 +1238,7 @@
 
     function renderUploadsTable(items, targetBody, targetEmpty, options = {}) {
       const useBatchGate = Boolean(options.useBatchGate);
+      const showTiming = Boolean(options.showTiming);
       targetBody.innerHTML = '';
       if (!Array.isArray(items) || items.length === 0) {
         targetEmpty.style.display = 'block';
@@ -1217,6 +1264,9 @@
         const outputXlsxCell = readyForDownload
           ? `<a class="table-link" href="${outputXlsxLink}">↓ XLSX</a>`
           : `<span class="muted">${useBatchGate ? 'Pending batch' : 'Processing'}</span>`;
+        const timingCells = showTiming
+          ? `<td>${escapeHtml(formatSeconds(item.processing_seconds_total))}</td><td>${escapeHtml(formatSeconds(item.processing_seconds_avg))}</td>`
+          : '';
         const tr = document.createElement('tr');
         if (useBatchGate) {
           tr.innerHTML = `
@@ -1228,6 +1278,7 @@
             <td>${Number(item.processed_rows || 0)}</td>
             <td>${Number(item.success_rows || 0)}</td>
             <td>${Number(item.failed_rows || 0)}</td>
+            ${timingCells}
             <td>${escapeHtml(shortTs(item.updated_at))}</td>
             <td>${outputJsonCell}</td>
             <td>${outputXlsxCell}</td>
@@ -1241,6 +1292,7 @@
             <td>${Number(item.processed_rows || 0)}</td>
             <td>${Number(item.success_rows || 0)}</td>
             <td>${Number(item.failed_rows || 0)}</td>
+            ${timingCells}
             <td>${escapeHtml(shortTs(item.updated_at))}</td>
             <td>${outputJsonCell}</td>
             <td>${outputXlsxCell}</td>
@@ -1284,7 +1336,7 @@
           data.uploads || [],
           document.getElementById('gsearchUploadsTableBody'),
           document.getElementById('gsearchUploadsTableEmpty'),
-          { useBatchGate: false },
+          { useBatchGate: false, showTiming: true },
         );
       } catch (_) {}
     }
@@ -1299,7 +1351,7 @@
         const gsearchDownloadLink = document.getElementById('gsearchDownloadLink');
         const gsearchDownloadXlsxLink = document.getElementById('gsearchDownloadXlsxLink');
         
-        gsearchBatchMeta.textContent = `Upload ID: ${uploadId} | Status: ${data.status} | Processed: ${data.processed_rows}/${data.total_rows} | Success: ${data.success_count} | Failed: ${data.failure_count}`;
+        gsearchBatchMeta.textContent = `Upload ID: ${uploadId} | Status: ${data.status} | Processed: ${data.processed_rows}/${data.total_rows} | Success: ${Number(data.success_rows || 0)} | Failed: ${Number(data.failed_rows || 0)} | Time: ${formatSeconds(data.processing_seconds_total)} | Avg: ${formatSeconds(data.processing_seconds_avg)}`;
         await refreshGsearchUploadsList();
 
         const rowsDone = (data.status === 'completed' || data.status === 'completed_with_errors' || data.status === 'failed');
@@ -1328,7 +1380,7 @@
           data.uploads || [],
           document.getElementById('gmapsUploadsTableBody'),
           document.getElementById('gmapsUploadsTableEmpty'),
-          { useBatchGate: false },
+          { useBatchGate: false, showTiming: true },
         );
       } catch (_) {}
     }
@@ -1343,7 +1395,7 @@
         const gmapsDownloadLink = document.getElementById('gmapsDownloadLink');
         const gmapsDownloadXlsxLink = document.getElementById('gmapsDownloadXlsxLink');
         
-        gmapsBatchMeta.textContent = `Upload ID: ${uploadId} | Status: ${data.status} | Processed: ${data.processed_rows}/${data.total_rows} | Success: ${data.success_count} | Failed: ${data.failure_count}`;
+        gmapsBatchMeta.textContent = `Upload ID: ${uploadId} | Status: ${data.status} | Processed: ${data.processed_rows}/${data.total_rows} | Success: ${Number(data.success_rows || 0)} | Failed: ${Number(data.failed_rows || 0)} | Time: ${formatSeconds(data.processing_seconds_total)} | Avg: ${formatSeconds(data.processing_seconds_avg)}`;
         await refreshGmapsUploadsList();
 
         const rowsDone = (data.status === 'completed' || data.status === 'completed_with_errors' || data.status === 'failed');
@@ -1509,13 +1561,16 @@
       let data;
       try {
         res = await fetch('/uploads', { method: 'POST', body: formData });
-        data = await res.json();
+        data = await res.json().catch(() => ({}));
       } finally {
         uploadBtn.disabled = false;
         uploadBtn.textContent = 'Upload & Start';
       }
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        meta.textContent = `Upload failed: ${apiErrorMessage(data)}`;
+        return;
+      }
 
       const uploadId = data.upload_id;
       if (pollTimer) clearInterval(pollTimer);
@@ -1540,13 +1595,16 @@
       let data;
       try {
         res = await fetch('/uploads/firmographics', { method: 'POST', body: formData });
-        data = await res.json();
+        data = await res.json().catch(() => ({}));
       } finally {
         firmographicsUploadBtn.disabled = false;
         firmographicsUploadBtn.textContent = 'Upload Firmographics';
       }
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        firmographicsMeta.textContent = `Upload failed: ${apiErrorMessage(data)}`;
+        return;
+      }
 
       const uploadId = data.upload_id;
       if (firmographicsPollTimer) clearInterval(firmographicsPollTimer);
@@ -1579,13 +1637,16 @@
       let data;
       try {
         res = await fetch('/uploads/gsearch', { method: 'POST', body: formData });
-        data = await res.json();
+        data = await res.json().catch(() => ({}));
       } finally {
         gsearchUploadBtn.disabled = false;
         gsearchUploadBtn.textContent = 'Upload & Start Batch';
       }
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        document.getElementById('gsearchBatchMeta').textContent = `Upload failed: ${apiErrorMessage(data)}`;
+        return;
+      }
 
       const uploadId = data.upload_id;
       if (gsearchPollTimer) clearInterval(gsearchPollTimer);
@@ -1615,13 +1676,16 @@
       let data;
       try {
         res = await fetch('/uploads/gmaps', { method: 'POST', body: formData });
-        data = await res.json();
+        data = await res.json().catch(() => ({}));
       } finally {
         gmapsUploadBtn.disabled = false;
         gmapsUploadBtn.textContent = 'Upload Google Maps CSV';
       }
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        document.getElementById('gmapsBatchMeta').textContent = `Upload failed: ${apiErrorMessage(data)}`;
+        return;
+      }
 
       const uploadId = data.upload_id;
       if (gmapsPollTimer) clearInterval(gmapsPollTimer);
@@ -1760,6 +1824,7 @@
           throw new Error(data.detail || 'Request failed');
         }
 
+        const elapsed = formatSeconds(data.processing_seconds);
         gmapsRawJson.textContent = JSON.stringify(data, null, 2);
         gmapsResultsWrapper.style.display = 'block';
 
@@ -1776,7 +1841,7 @@
               gmapsPlacesList.appendChild(renderGmapsCidCard(cid, queryVal));
             });
           }
-          gmapsMeta.textContent = `Completed discovery for "${queryVal}".`;
+          gmapsMeta.textContent = `Completed discovery for "${queryVal}" in ${elapsed}.`;
         } else if (actionType === 'search') {
           const results = data.results || [];
           gmapsResultsTitle.textContent = `Place Details Search`;
@@ -1790,7 +1855,7 @@
               gmapsPlacesList.appendChild(renderGmapsPlaceCard(place));
             });
           }
-          gmapsMeta.textContent = `Completed search for "${queryVal}".`;
+          gmapsMeta.textContent = `Completed search for "${queryVal}" in ${elapsed}.`;
         } else {
           // Details lookup
           gmapsResultsTitle.textContent = `Place Detail Result`;
@@ -1803,7 +1868,7 @@
             gmapsResultsCount.className = 'status-chip done';
             gmapsPlacesList.appendChild(renderGmapsPlaceCard(data));
           }
-          gmapsMeta.textContent = `Completed details lookup for CID: "${cidVal}".`;
+          gmapsMeta.textContent = `Completed details lookup for CID: "${cidVal}" in ${elapsed}.`;
         }
       } catch (err) {
         gmapsMeta.textContent = `❌ Error: ${err.message || String(err)}`;
@@ -1861,6 +1926,7 @@
         }
 
         const data = await res.json();
+        const elapsed = formatSeconds(data.processing_seconds);
         
         // Render discovered candidates
         const candidates = data.candidates || [];
@@ -1981,7 +2047,7 @@
           gsearchResultsWrapper.style.display = 'block';
         }
 
-        gsearchMeta.textContent = `Completed discovery for phase "${phaseVal}".`;
+        gsearchMeta.textContent = `Completed discovery for phase "${phaseVal}" in ${elapsed}.`;
       } catch (err) {
         gsearchMeta.innerHTML = `<span style="color:var(--bad)">❌ Error: ${escapeHtml(err.message || String(err))}</span>`;
       } finally {
@@ -2062,8 +2128,31 @@
 
     function aiModeStatusClass(s) {
       if (s === 'completed') return 'done';
+      if (s === 'completed_with_errors') return 'error';
       if (s === 'failed') return 'error';
       return 'running';
+    }
+
+    function aiModeTerminal(status) {
+      return ['completed', 'completed_with_errors', 'failed'].includes(String(status || ''));
+    }
+
+    async function showAiModeReport(runId) {
+      aiModeReportCard.classList.remove('hidden');
+      aiModeReportRun.textContent = runId.length > 20 ? `${runId.slice(0, 8)}...${runId.slice(-8)}` : runId;
+      aiModeReportJson.textContent = 'Loading report.json...';
+      try {
+        const res = await fetch(`/uploads/ai-mode/${encodeURIComponent(runId)}/result?file=report.json`);
+        if (!res.ok) {
+          const text = await res.text();
+          aiModeReportJson.textContent = `Unable to load report.json (${res.status}): ${text}`;
+          return;
+        }
+        const data = await res.json();
+        aiModeReportJson.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        aiModeReportJson.textContent = `Unable to load report.json: ${err.message || err}`;
+      }
     }
 
     async function refreshAiModeRuns() {
@@ -2082,20 +2171,30 @@
           const rid = String(run.run_id || '');
           const shortId = rid.length > 20 ? `${rid.slice(0, 8)}...${rid.slice(-8)}` : rid;
           const status = String(run.status || '');
-          const downloads = status === 'completed'
+          const failedRequests = Number(run.failed_request_count || run.scrapedo_failed_requests || 0);
+          const availableFiles = Array.isArray(run.available_files) ? run.available_files : [];
+          const debugLogLink = availableFiles.includes('ai_mode_debug.log')
+            ? `<a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=ai_mode_debug.log&download=true">↓ debug log</a>`
+            : '';
+          const downloads = aiModeTerminal(status)
             ? `
-              <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=final_report.json&download=true">↓ JSON</a>
+              <button class="action-btn" type="button" data-ai-report="${escapeHtml(rid)}">Report</button>
+              ${debugLogLink}
+              <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=final_report.json&download=true">↓ final</a>
               <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=found.csv&download=true">↓ found</a>
               <a class="table-link" href="/uploads/ai-mode/${encodeURIComponent(rid)}/result?file=notFound.csv&download=true">↓ notFound</a>
             `
             : '<span class="muted">Processing</span>';
           const tr = document.createElement('tr');
           tr.innerHTML = `
-            <td class="mono" title="${escapeHtml(rid)}">${escapeHtml(shortId)}</td>
+            <td class="mono" title="${escapeHtml(rid)}">
+              <span>${escapeHtml(shortId)}</span>
+              <button class="action-btn" type="button" data-ai-copy-run-id="${escapeHtml(rid)}">Copy</button>
+            </td>
             <td><span class="pill ${aiModeStatusClass(status)}">${escapeHtml(status || '-')}</span></td>
             <td>${escapeHtml(String(run.input_type || '-'))}</td>
             <td>${escapeHtml(String(run.total_rows || 0))}</td>
-            <td>${escapeHtml(String(run.batches_done || 0))}/${escapeHtml(String(run.batches_total || 0))}</td>
+            <td>${escapeHtml(String(run.batches_done || 0))}/${escapeHtml(String(run.batches_total || 0))}${failedRequests ? ` (${failedRequests} failed)` : ''}</td>
             <td>${escapeHtml(Number(run.scrapedo_seconds_total || 0).toFixed(1))}</td>
             <td>${escapeHtml(Number(run.llm_seconds_total || 0).toFixed(1))}</td>
             <td>${escapeHtml(shortTs(run.updated_at))}</td>
@@ -2115,12 +2214,12 @@
         const scrapedo = Number(s.scrapedo_seconds_total || 0).toFixed(1);
         const llm = Number(s.llm_seconds_total || 0).toFixed(1);
         let text = `Run ${runId} | ${status} | ${s.batches_done || 0}/${s.batches_total || 0} batches | scrape.do ${scrapedo}s | llm ${llm}s`;
-        if (status === 'failed' && s.error) {
+        if ((status === 'failed' || status === 'completed_with_errors') && s.error) {
           text += ` | error: ${s.error}`;
         }
         aiModeMeta.textContent = text;
         await refreshAiModeRuns();
-        if (status === 'completed' || status === 'failed') {
+        if (aiModeTerminal(status)) {
           if (aiModePollTimer) clearInterval(aiModePollTimer);
           aiModePollTimer = null;
         }
@@ -2157,6 +2256,25 @@
       if (aiModePollTimer) clearInterval(aiModePollTimer);
       aiModePollTimer = setInterval(() => pollAiMode(runId), 2000);
       await pollAiMode(runId);
+    });
+
+    aiModeRunsBody.addEventListener('click', (event) => {
+      const reportTarget = event.target.closest('[data-ai-report]');
+      if (reportTarget) {
+        showAiModeReport(reportTarget.getAttribute('data-ai-report') || '');
+        return;
+      }
+
+      const copyTarget = event.target.closest('[data-ai-copy-run-id]');
+      if (!copyTarget) return;
+      const runId = copyTarget.getAttribute('data-ai-copy-run-id') || '';
+      navigator.clipboard.writeText(runId).then(() => {
+        const previous = copyTarget.textContent;
+        copyTarget.textContent = 'Copied';
+        setTimeout(() => { copyTarget.textContent = previous; }, 1200);
+      }).catch(() => {
+        aiModeMeta.textContent = `Run ID: ${runId}`;
+      });
     });
 
     tabAiMode.addEventListener('click', async () => {

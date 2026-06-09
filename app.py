@@ -4004,6 +4004,7 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name
 
 
 def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
+    timing_summary = build_processing_timing_summary(state.get("rows", []))
     return {
         "upload_id": state["upload_id"],
         "pipeline": state.get("pipeline") or PIPELINE_FULL,
@@ -4015,6 +4016,9 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
         "processed_rows": state["processed_rows"],
         "success_rows": state["success_rows"],
         "failed_rows": state["failed_rows"],
+        "processing_seconds_total": timing_summary["processing_seconds_total"],
+        "processing_seconds_avg": timing_summary["processing_seconds_avg"],
+        "processing_seconds_count": timing_summary["processing_seconds_count"],
         "results": [
             {
                 "row_index": row["row_index"],
@@ -5337,6 +5341,31 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
     return rows
 
 
+def build_processing_timing_summary(rows: Any) -> dict[str, Any]:
+    total_seconds = 0.0
+    count = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        result_obj = row.get("result") if isinstance(row.get("result"), dict) else row.get("output")
+        if not isinstance(result_obj, dict):
+            continue
+        context_obj = result_obj.get("context") if isinstance(result_obj.get("context"), dict) else {}
+        timing_obj = context_obj.get("timing") if isinstance(context_obj.get("timing"), dict) else {}
+        if "total_seconds" not in timing_obj:
+            continue
+        seconds = _as_float(timing_obj.get("total_seconds"), -1.0)
+        if seconds < 0:
+            continue
+        total_seconds += seconds
+        count += 1
+    return {
+        "processing_seconds_total": round(total_seconds, 3),
+        "processing_seconds_avg": round(total_seconds / count, 3) if count else 0.0,
+        "processing_seconds_count": count,
+    }
+
+
 def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     if not state.get("pipeline"):
         state["pipeline"] = PIPELINE_FULL
@@ -5360,6 +5389,7 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     state["processed_rows"] = processed
     state["success_rows"] = success
     state["failed_rows"] = failed
+    state.update(build_processing_timing_summary(rows))
     state["updated_at"] = _now_iso()
     return state
 
@@ -5462,6 +5492,9 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
             "processed_rows": summary.get("processed_rows", 0),
             "success_rows": summary.get("success_rows", 0),
             "failed_rows": summary.get("failed_rows", 0),
+            "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
+            "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
+            "processing_seconds_count": summary.get("processing_seconds_count", 0),
             "status_url": f"/uploads/{upload_id}/status",
             "output_url": f"/uploads/{upload_id}/output",
             "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
@@ -6963,6 +6996,9 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         "processed_rows": summary["processed_rows"],
         "success_rows": summary["success_rows"],
         "failed_rows": summary["failed_rows"],
+        "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
+        "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
+        "processing_seconds_count": summary.get("processing_seconds_count", 0),
         "rows": [
             {
                 "row_index": row["row_index"],
@@ -7031,6 +7067,9 @@ async def upload_output(
         else:
             raise
 
+    if isinstance(output_data, dict):
+        output_data.update(build_processing_timing_summary(output_data.get("results") or []))
+
     if format == "xlsx":
         body = build_upload_output_xlsx_bytes(output_data)
         headers = {}
@@ -7053,6 +7092,7 @@ async def upload_output(
 
 @app.get("/gmaps/discover")
 async def gmaps_discover(q: str, country: Optional[str] = None) -> dict[str, Any]:
+    started_monotonic = asyncio.get_running_loop().time()
     api_key = os.getenv("SERPWOW_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
@@ -7064,13 +7104,19 @@ async def gmaps_discover(q: str, country: Optional[str] = None) -> dict[str, Any
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             cids = await gmaps_module.fetch_data_cids(session, q, gl_override=gl)
-        return {"query": q, "gl": gl, "cids": cids}
+        return {
+            "query": q,
+            "gl": gl,
+            "cids": cids,
+            "processing_seconds": round(asyncio.get_running_loop().time() - started_monotonic, 3),
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/gmaps/details")
 async def gmaps_details(cid: str) -> dict[str, Any]:
+    started_monotonic = asyncio.get_running_loop().time()
     api_key = os.getenv("SERPWOW_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
@@ -7078,18 +7124,20 @@ async def gmaps_details(cid: str) -> dict[str, Any]:
     try:
         import gmaps as gmaps_module
         import aiohttp
-        import asyncio
         timeout = aiohttp.ClientTimeout(total=30)
         sem = asyncio.Semaphore(1)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             detail = await gmaps_module.fetch_place_detail(session, cid, sem)
-        return detail
+        response = dict(detail) if isinstance(detail, dict) else {"detail": detail}
+        response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/gmaps/search")
 async def gmaps_search(q: str, country: Optional[str] = None) -> dict[str, Any]:
+    started_monotonic = asyncio.get_running_loop().time()
     api_key = os.getenv("SERPWOW_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
@@ -7097,7 +7145,9 @@ async def gmaps_search(q: str, country: Optional[str] = None) -> dict[str, Any]:
     try:
         import gmaps as gmaps_module
         res = await gmaps_module.process_gmaps_query(q, country=country)
-        return res
+        response = dict(res) if isinstance(res, dict) else {"result": res}
+        response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
+        return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -7357,6 +7407,7 @@ async def gsearch_discover(
     people: Optional[list[str]] = Query(None),
     trade_names: Optional[list[str]] = Query(None),
 ) -> dict[str, Any]:
+    started_monotonic = asyncio.get_running_loop().time()
     api_key = os.getenv("SERPWOW_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
@@ -7468,6 +7519,7 @@ async def gsearch_discover(
         "queries_run": len(queries),
         "candidates": candidates,
         "results": formatted_results,
+        "processing_seconds": round(asyncio.get_running_loop().time() - started_monotonic, 3),
     }
 
 
@@ -7521,6 +7573,17 @@ async def ai_mode_result(
     headers = {}
     if download:
         headers["Content-Disposition"] = f'attachment; filename="{run_id}_{file}"'
+    if file.endswith(".json"):
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            pass
+        else:
+            body = json.dumps(
+                ai_mode_service.sanitize_for_response(parsed),
+                indent=2,
+                ensure_ascii=False,
+            ).encode("utf-8")
     return Response(content=body, media_type=media_type, headers=headers)
 
 
@@ -7529,4 +7592,13 @@ if __name__ == "__main__":
 
     host = os.getenv("API_HOST", "0.0.0.0")
     port = _get_int_env("API_PORT", 11500)
-    uvicorn.run("app:app", host=host, port=port, reload=False)
+    reload = os.getenv("API_RELOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+    log_level = os.getenv("UVICORN_LOG_LEVEL", "info").strip().lower() or "info"
+    uvicorn.run(
+        "app:app",
+        host=host,
+        port=port,
+        reload=reload,
+        access_log=True,
+        log_level=log_level,
+    )

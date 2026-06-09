@@ -20,12 +20,15 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from scrapedo_finder.company_csv_loader import load_company_entities
 from scrapedo_finder.company_extraction import build_company_messages, parse_company_results
@@ -54,6 +57,7 @@ ALLOWED_RESULT_FILES = {
     "found.csv",
     "notFound.csv",
     "run.log",
+    "ai_mode_debug.log",
     "input.csv",
 }
 
@@ -71,6 +75,218 @@ _FIRM_ID_HEADERS = {"firm_id", "firmid", "id"}
 
 # In-memory write-through cache of run status dicts.
 _RUNS: dict[str, dict] = {}
+_AI_MODE_LOGGER = logging.getLogger("ai_mode")
+
+COUNTRY_GL_ALIASES: dict[str, str] = {
+    "united states": "us",
+    "usa": "us",
+    "u.s.a": "us",
+    "u.s.": "us",
+    "us": "us",
+    "united kingdom": "gb",
+    "uk": "gb",
+    "great britain": "gb",
+    "england": "gb",
+    "gb": "gb",
+    "india": "in",
+    "bangladesh": "bd",
+    "canada": "ca",
+    "australia": "au",
+    "germany": "de",
+    "france": "fr",
+    "italy": "it",
+    "spain": "es",
+    "netherlands": "nl",
+    "sweden": "se",
+    "norway": "no",
+    "denmark": "dk",
+    "finland": "fi",
+    "japan": "jp",
+    "south korea": "kr",
+    "korea": "kr",
+    "china": "cn",
+    "singapore": "sg",
+    "united arab emirates": "ae",
+    "uae": "ae",
+    "saudi arabia": "sa",
+    "qatar": "qa",
+    "kuwait": "kw",
+    "oman": "om",
+    "bahrain": "bh",
+    "ireland": "ie",
+    "poland": "pl",
+    "switzerland": "ch",
+    "austria": "at",
+    "belgium": "be",
+    "portugal": "pt",
+    "mexico": "mx",
+    "brazil": "br",
+    "argentina": "ar",
+    "south africa": "za",
+    "new zealand": "nz",
+    "turkiye": "tr",
+    "turkey": "tr",
+    "hungary": "hu",
+    "nigeria": "ng",
+    "colombia": "co",
+    "estonia": "ee",
+    "bulgaria": "bg",
+    "latvia": "lv",
+    "czech republic": "cz",
+    "czechia": "cz",
+    "thailand": "th",
+    "serbia": "rs",
+    "bosnia and herzegovina": "ba",
+    "ecuador": "ec",
+    "albania": "al",
+    "egypt": "eg",
+    "uruguay": "uy",
+    "papua new guinea": "pg",
+}
+
+GOOGLE_DOMAIN_BY_GL: dict[str, str] = {
+    "us": "google.com",
+    "gb": "google.co.uk",
+    "kr": "google.co.kr",
+    "br": "google.com.br",
+    "tr": "google.com.tr",
+    "mx": "google.com.mx",
+    "ar": "google.com.ar",
+    "bd": "google.com.bd",
+    "co": "google.com.co",
+    "uy": "google.com.uy",
+    "pg": "google.com.pg",
+}
+
+
+def _ensure_ai_mode_logger() -> logging.Logger:
+    if not _AI_MODE_LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        _AI_MODE_LOGGER.addHandler(handler)
+    level_name = os.getenv("AI_MODE_LOG_LEVEL", "INFO").strip().upper()
+    _AI_MODE_LOGGER.setLevel(getattr(logging, level_name, logging.INFO))
+    _AI_MODE_LOGGER.propagate = False
+    return _AI_MODE_LOGGER
+
+
+def sanitize_secret_text(value: str) -> str:
+    """Redact Scrape.do token query parameters in user-facing output."""
+    return re.sub(r"([?&]token=)[^&'\"\\s]+", r"\1[REDACTED]", value)
+
+
+def sanitize_for_response(value: Any) -> Any:
+    """Recursively redact secrets before returning JSON through the UI API."""
+    if isinstance(value, str):
+        return sanitize_secret_text(value)
+    if isinstance(value, list):
+        return [sanitize_for_response(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_for_response(item) for key, item in value.items()}
+    return value
+
+
+def _debug_log_path(run_dir: Path) -> Path:
+    return run_dir / "ai_mode_debug.log"
+
+
+def _ai_log(run_id: str, run_dir: Path, message: str, level: int = logging.INFO) -> None:
+    safe_message = sanitize_secret_text(message)
+    _ensure_ai_mode_logger().log(level, "[run:%s] %s", run_id, safe_message)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with _debug_log_path(run_dir).open("a", encoding="utf-8") as handle:
+            handle.write(f"{utc_now_iso()} {logging.getLevelName(level)} {safe_message}\n")
+    except OSError:
+        _ensure_ai_mode_logger().warning(
+            "[run:%s] failed to write AI Mode debug log", run_id
+        )
+
+
+def _country_to_gl(country: str | None, fallback: str = "us") -> str:
+    value = str(country or "").strip().lower()
+    fallback_value = str(fallback or "us").strip().lower() or "us"
+    if not value:
+        return fallback_value
+    if value in COUNTRY_GL_ALIASES:
+        return COUNTRY_GL_ALIASES[value]
+    compact = re.sub(r"[^a-z]", "", value)
+    if compact in COUNTRY_GL_ALIASES:
+        return COUNTRY_GL_ALIASES[compact]
+    if len(compact) == 2:
+        return compact
+    return fallback_value
+
+
+def _google_domain_for_gl(gl: str, fallback: str = "google.com") -> str:
+    clean_gl = str(gl or "").strip().lower()
+    if clean_gl in GOOGLE_DOMAIN_BY_GL:
+        return GOOGLE_DOMAIN_BY_GL[clean_gl]
+    return f"google.{clean_gl}" if len(clean_gl) == 2 else (fallback or "google.com")
+
+
+def _entity_country(entity: Any) -> str:
+    return str(getattr(entity, "country_code", "") or getattr(entity, "country", "") or "").strip()
+
+
+def _location_from_entity(entity: Any, country: str) -> str:
+    address = str(getattr(entity, "address", "") or "").replace("\n", ", ").strip(" ,")
+    if not address:
+        return country if len(country.strip()) > 2 else ""
+    parts = [part.strip() for part in address.split(",") if part.strip()]
+    location_parts = [part for part in parts if not re.fullmatch(r"[A-Za-z]{0,3}[- ]?\d{3,8}", part)]
+    if len(location_parts) >= 3:
+        return ",".join(location_parts[-3:-1] + [country])
+    if len(location_parts) >= 2:
+        return ",".join(location_parts[-2:] + [country])
+    return ",".join([location_parts[0] if location_parts else address, country])
+
+
+def _geo_params_for_group(
+    group: list[Any],
+    settings: Settings,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    countries = [_entity_country(entity) for entity in group if _entity_country(entity)]
+    unique_countries = []
+    for country in countries:
+        if country not in unique_countries:
+            unique_countries.append(country)
+
+    selected_country = unique_countries[0] if unique_countries else ""
+    fallback_gl = settings.scrapedo_gl or "us"
+    gl = _country_to_gl(selected_country, fallback=fallback_gl)
+    google_domain = _google_domain_for_gl(gl, fallback=settings.scrapedo_google_domain or "google.com")
+
+    params = {
+        "gl": gl,
+        "google_domain": google_domain,
+    }
+    if settings.scrapedo_hl:
+        params["hl"] = settings.scrapedo_hl
+    location = _location_from_entity(group[0], selected_country) if selected_country and group else ""
+    if location:
+        params["location"] = location
+
+    return params, {
+        "selected_country": selected_country,
+        "countries": unique_countries,
+        "mixed_countries": len(unique_countries) > 1,
+        "gl": gl,
+        "google_domain": google_domain,
+        "location": location,
+    }
+
+
+def _query_debug_stats(client: ScrapeDoClient, query: str, extra_params: dict[str, str] | None = None) -> dict[str, int]:
+    base_url = "https://api.scrape.do/plugin/google/search/ai-mode"
+    params = client.build_params(query, extra_params=extra_params)
+    encoded_url_chars = len(base_url) + 1 + len(urlencode(params))
+    return {
+        "query_chars": len(query),
+        "encoded_url_chars": encoded_url_chars,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -254,10 +470,55 @@ def _available_files(run_dir: Path) -> list[str]:
     return sorted(name for name in ALLOWED_RESULT_FILES if (run_dir / name).exists())
 
 
+def _request_failed(record: dict[str, Any]) -> bool:
+    return bool(record.get("error")) or str(record.get("status") or "").lower() in {
+        "error",
+        "failed",
+    }
+
+
+def _scrapedo_request_failed(record: dict[str, Any]) -> bool:
+    return _request_failed(record) and not record.get("raw_json_file")
+
+
+def _failed_request_count(records: list[dict]) -> int:
+    return sum(1 for record in records if isinstance(record, dict) and _request_failed(record))
+
+
+def _scrapedo_failed_request_count(records: list[dict]) -> int:
+    return sum(1 for record in records if isinstance(record, dict) and _scrapedo_request_failed(record))
+
+
+def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
+    """Reflect request-level failures from report.json in the UI status."""
+    report_path = run_dir / "report.json"
+    if not report_path.exists():
+        return status
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return status
+
+    requests = report.get("requests")
+    if not isinstance(requests, list):
+        return status
+
+    failed_request_count = _failed_request_count(requests)
+    status["scrapedo_request_count"] = len(requests)
+    status["failed_request_count"] = failed_request_count
+    status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(requests)
+
+    if failed_request_count and status.get("status") == "completed":
+        status["status"] = "completed_with_errors"
+        status["error"] = f"{failed_request_count} request(s) failed. See report.json."
+    return status
+
+
 def _persist_status(run_id: str, status: dict) -> None:
     """Write ``status.json`` for the run and update the in-memory cache."""
     run_dir = _run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    status = _reconcile_status_from_report(run_dir, status)
     status["available_files"] = _available_files(run_dir)
     (run_dir / "status.json").write_text(
         json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -289,8 +550,10 @@ def get_ai_mode_status(run_id: str) -> dict:
     if not run_dir.exists():
         raise KeyError(run_id)
     status = _read_status(run_id)
+    status = _reconcile_status_from_report(run_dir, status)
     status["available_files"] = _available_files(run_dir)
     _RUNS[run_id] = status
+    _persist_status(run_id, status)
     return status
 
 
@@ -304,7 +567,10 @@ def list_ai_mode_runs() -> list[dict]:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             continue
+        status = _reconcile_status_from_report(status_path.parent, status)
         status["available_files"] = _available_files(status_path.parent)
+        if status.get("status") == "completed_with_errors":
+            _persist_status(str(status.get("run_id") or status_path.parent.name), status)
         runs.append(status)
     runs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     return runs
@@ -384,6 +650,9 @@ def prepare_ai_mode_run(raw_csv: bytes, filename: str) -> dict:
         "llm_errors": 0,
         "websites_found": 0,
         "websites_not_found": 0,
+        "failed_request_count": 0,
+        "scrapedo_request_count": 0,
+        "scrapedo_failed_requests": 0,
         "scrapedo_seconds_total": 0.0,
         "llm_seconds_total": 0.0,
         "token_usage": asdict(TokenUsage()),
@@ -392,6 +661,13 @@ def prepare_ai_mode_run(raw_csv: bytes, filename: str) -> dict:
         "error": None,
     }
     _persist_status(run_id, status)
+    _ai_log(
+        run_id,
+        run_dir,
+        f"AI Mode run prepared filename={filename or '-'} input_type={input_type} "
+        f"total_rows={total_rows} batch_size={batch_size} llm_provider={llm_config.provider} "
+        f"llm_model={llm_config.model}",
+    )
 
     return {
         "run_id": run_id,
@@ -420,6 +696,13 @@ def run_ai_mode_sync(run_id: str) -> None:
     status = _read_status(run_id)
     started_at = utc_now_iso()
     wall_t0 = time.perf_counter()
+    debug_log = _debug_log_path(run_dir)
+    if debug_log.exists():
+        try:
+            debug_log.unlink()
+        except OSError:
+            pass
+    _ai_log(run_id, run_dir, "AI Mode run starting")
 
     status["status"] = "running"
     status["started_at"] = started_at
@@ -430,6 +713,16 @@ def run_ai_mode_sync(run_id: str) -> None:
     try:
         settings = build_ai_mode_settings()
         cfg = build_ai_mode_llm_config()
+        _ai_log(
+            run_id,
+            run_dir,
+            "Settings loaded "
+            f"batch_size={settings.batch_size} max_query_chars={settings.scrapedo_max_query_chars} "
+            f"timeout={settings.scrapedo_timeout_seconds}s retries={settings.scrapedo_max_retries} "
+            f"device={settings.scrapedo_device or '-'} hl={settings.scrapedo_hl or '-'} "
+            f"gl={settings.scrapedo_gl or '-'} google_domain={settings.scrapedo_google_domain or '-'} "
+            f"include_html={settings.scrapedo_include_html} llm_provider={cfg.provider} llm_model={cfg.model}",
+        )
         llm = make_llm_client(cfg)
         scrapedo_client = ScrapeDoClient(
             token=settings.scrapedo_token,
@@ -441,6 +734,7 @@ def run_ai_mode_sync(run_id: str) -> None:
             google_domain=settings.scrapedo_google_domain,
             safe=settings.scrapedo_safe,
             include_html=settings.scrapedo_include_html,
+            log=lambda message: _ai_log(run_id, run_dir, message),
         )
 
         input_type = status.get("input_type") or _detect_input_type_from_status(run_dir)
@@ -451,8 +745,18 @@ def run_ai_mode_sync(run_id: str) -> None:
             entities = load_company_entities(input_csv)
         else:
             entities = load_address_entities(input_csv)
+        _ai_log(
+            run_id,
+            run_dir,
+            f"Loaded entities input_type={input_type} total_entities={len(entities)} input_csv={input_csv}",
+        )
 
         groups = list(chunked(entities, settings.batch_size))
+        _ai_log(
+            run_id,
+            run_dir,
+            f"Created {len(groups)} Scrape.do batch(es) from batch_size={settings.batch_size}",
+        )
         status["batches_total"] = len(groups)
         status["updated_at"] = utc_now_iso()
         _persist_status(run_id, status)
@@ -483,20 +787,45 @@ def run_ai_mode_sync(run_id: str) -> None:
                 query = build_company_search_query(group, prompt_path=_COMPANY_PROMPT_PATH)
             else:
                 query = build_search_query(group, prompt_path=_ADDR_PROMPT_PATH)
+            geo_params, geo_debug = _geo_params_for_group(group, settings)
+            query_stats = _query_debug_stats(scrapedo_client, query, extra_params=geo_params)
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Request {request_index}/{len(groups)} scrape phase starting "
+                f"entities={len(group)} names={group_names} "
+                f"query_chars={query_stats['query_chars']} "
+                f"encoded_url_chars={query_stats['encoded_url_chars']} "
+                f"max_query_chars={settings.scrapedo_max_query_chars} "
+                f"geo={geo_debug}",
+            )
 
             t0 = time.perf_counter()
             try:
-                payload = scrapedo_client.search_google_ai_mode(query)
+                payload = scrapedo_client.search_google_ai_mode(query, extra_params=geo_params)
                 scrapedo_seconds = time.perf_counter() - t0
                 raw_name = f"request_{request_index:03d}.json"
                 (raw_dir / raw_name).write_text(
                     json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
                 rel_raw_path = f"raw_scrapedo_response/{raw_name}"
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Request {request_index}/{len(groups)} scrape phase succeeded "
+                    f"seconds={scrapedo_seconds:.2f} raw_json_file={rel_raw_path}",
+                )
             except Exception as exc:  # scrape.do failure: skip LLM for this batch
                 scrapedo_seconds = time.perf_counter() - t0
-                req_error = str(exc)
+                req_error = sanitize_secret_text(str(exc))
                 req_status = "error"
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Request {request_index}/{len(groups)} scrape phase failed "
+                    f"seconds={scrapedo_seconds:.2f} error={req_error}",
+                    logging.ERROR,
+                )
                 entities_without_scrape_data += len(group)
                 scrapedo_seconds_total += scrapedo_seconds
                 per_request_records.append(
@@ -510,6 +839,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                         "llm_seconds": round(llm_seconds, 3),
                         "combined_seconds": round(scrapedo_seconds + llm_seconds, 3),
                         "raw_json_file": rel_raw_path,
+                        "scrapedo_params": geo_debug,
                     }
                 )
                 status["batches_done"] = request_index
@@ -517,9 +847,20 @@ def run_ai_mode_sync(run_id: str) -> None:
                 status["llm_seconds_total"] = round(llm_seconds_total, 3)
                 status["entities_without_scrape_data"] = entities_without_scrape_data
                 status["llm_errors"] = llm_errors
+                status["scrapedo_request_count"] = len(per_request_records)
+                status["failed_request_count"] = _failed_request_count(per_request_records)
+                status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
                 status["token_usage"] = asdict(usage_total)
                 status["updated_at"] = utc_now_iso()
                 _persist_status(run_id, status)
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Status persisted after failed scrape request={request_index} "
+                    f"batches_done={status['batches_done']} "
+                    f"failed_request_count={status['failed_request_count']} "
+                    f"entities_without_scrape_data={entities_without_scrape_data}",
+                )
                 continue
 
             scrapedo_seconds_total += scrapedo_seconds
@@ -527,25 +868,55 @@ def run_ai_mode_sync(run_id: str) -> None:
             # PHASE 2 - LLM cleanup
             text_blocks = payload.get("text_blocks") if isinstance(payload, dict) else None
             references = payload.get("references") if isinstance(payload, dict) else None
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Request {request_index}/{len(groups)} LLM phase starting "
+                f"text_blocks={len(text_blocks or [])} references={len(references or [])}",
+            )
 
             if is_company:
                 messages = build_company_messages(group, text_blocks, references)
             else:
                 messages = build_messages(group_names, text_blocks, references)
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Request {request_index}/{len(groups)} LLM messages built count={len(messages)}",
+            )
 
             t0 = time.perf_counter()
             try:
                 parsed, usage = llm.complete_json(messages)
                 llm_seconds = time.perf_counter() - t0
                 usage_total = usage_total + usage
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Request {request_index}/{len(groups)} LLM call succeeded "
+                    f"seconds={llm_seconds:.2f} tokens={usage.total_tokens} "
+                    f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens}",
+                )
                 if is_company:
                     batch_results = parse_company_results(parsed, group)
                 else:
                     batch_results = parse_results(parsed, group_names)
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Request {request_index}/{len(groups)} parsed LLM results count={len(batch_results)}",
+                )
             except Exception as exc:  # LLM failure: emit per-entity error results
                 llm_seconds = time.perf_counter() - t0
-                req_error = f"LLM error: {exc}"
+                req_error = sanitize_secret_text(f"LLM error: {exc}")
                 req_status = "error"
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Request {request_index}/{len(groups)} LLM phase failed "
+                    f"seconds={llm_seconds:.2f} error={req_error}",
+                    logging.ERROR,
+                )
                 llm_errors += len(group)
                 batch_results = []
                 if is_company:
@@ -555,7 +926,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                                 company_name_eng=entity.company_name_eng,
                                 company_name_local=entity.company_name_local,
                                 country_code=entity.country_code,
-                                error=f"LLM error: {exc}",
+                                error=req_error,
                             )
                         )
                 else:
@@ -563,7 +934,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                         batch_results.append(
                             EntityCleanResult(
                                 entity_name=name,
-                                error=f"LLM error: {exc}",
+                                error=req_error,
                             )
                         )
 
@@ -592,6 +963,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "llm_seconds": round(llm_seconds, 3),
                     "combined_seconds": round(scrapedo_seconds + llm_seconds, 3),
                     "raw_json_file": rel_raw_path,
+                    "scrapedo_params": geo_debug,
                 }
             )
 
@@ -599,11 +971,21 @@ def run_ai_mode_sync(run_id: str) -> None:
             status["entities_processed"] = len(results)
             status["entities_without_scrape_data"] = entities_without_scrape_data
             status["llm_errors"] = llm_errors
+            status["scrapedo_request_count"] = len(per_request_records)
+            status["failed_request_count"] = _failed_request_count(per_request_records)
+            status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
             status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
             status["llm_seconds_total"] = round(llm_seconds_total, 3)
             status["token_usage"] = asdict(usage_total)
             status["updated_at"] = utc_now_iso()
             _persist_status(run_id, status)
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Status persisted after request={request_index} "
+                f"batches_done={status['batches_done']} entities_processed={status['entities_processed']} "
+                f"failed_request_count={status['failed_request_count']} llm_errors={llm_errors}",
+            )
 
         # ----------------------------------------------------------------- #
         # Final report
@@ -658,6 +1040,8 @@ def run_ai_mode_sync(run_id: str) -> None:
             "input_type": input_type,
             "batch_size": settings.batch_size,
             "total_entities": len(entities),
+            "failed_request_count": _failed_request_count(per_request_records),
+            "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
             "requests": per_request_records,
             "started_at": started_at,
             "completed_at": completed_at,
@@ -681,13 +1065,23 @@ def run_ai_mode_sync(run_id: str) -> None:
                 line += f" {record['error']}"
             log_lines.append(line)
         (run_dir / "run.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        _ai_log(
+            run_id,
+            run_dir,
+            f"Wrote outputs final_report.json report.json run.log found.csv notFound.csv "
+            f"requests={len(per_request_records)} failed_requests={_failed_request_count(per_request_records)}",
+        )
 
         # Reflect final summary counts in the status.
         summary = report.get("summary", {})
-        status["status"] = "completed"
+        failed_request_count = _failed_request_count(per_request_records)
+        status["status"] = "completed_with_errors" if failed_request_count else "completed"
         status["entities_processed"] = summary.get("entities_processed", len(results))
         status["entities_without_scrape_data"] = entities_without_scrape_data
         status["llm_errors"] = llm_errors
+        status["scrapedo_request_count"] = len(per_request_records)
+        status["failed_request_count"] = failed_request_count
+        status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
         status["websites_found"] = summary.get("websites_found", 0)
         status["websites_not_found"] = summary.get("websites_not_found", 0)
         status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
@@ -696,14 +1090,32 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["token_usage"] = asdict(usage_total)
         status["completed_at"] = completed_at
         status["updated_at"] = utc_now_iso()
-        status["error"] = None
+        status["error"] = (
+            f"{failed_request_count} request(s) failed. See report.json."
+            if failed_request_count
+            else None
+        )
         _persist_status(run_id, status)
+        _ai_log(
+            run_id,
+            run_dir,
+            f"AI Mode run finished status={status['status']} "
+            f"duration={total_wall:.2f}s failed_request_count={failed_request_count} "
+            f"entities_processed={status['entities_processed']} "
+            f"entities_without_scrape_data={entities_without_scrape_data}",
+        )
 
     except Exception as exc:  # never raise to caller
         status["status"] = "failed"
-        status["error"] = str(exc)
+        status["error"] = sanitize_secret_text(str(exc))
         status["updated_at"] = utc_now_iso()
         _persist_status(run_id, status)
+        _ai_log(
+            run_id,
+            run_dir,
+            f"AI Mode run crashed error={status['error']}",
+            logging.ERROR,
+        )
         return
 
 

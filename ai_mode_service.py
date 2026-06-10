@@ -25,6 +25,7 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ from scrapedo_finder.company_extraction import build_company_messages, parse_com
 from scrapedo_finder.company_prompting import build_company_search_query
 from scrapedo_finder.company_reporting import build_company_report_dict, write_company_outputs
 from scrapedo_finder.extraction import build_messages, parse_results
-from scrapedo_finder.llm_client import make_llm_client
+from scrapedo_finder.llm_client import make_llm_client, parse_gemini_usage
 from scrapedo_finder.models import (
     CompanyCleanResult,
     EntityCleanResult,
@@ -47,6 +48,8 @@ from scrapedo_finder.prompting import build_search_query, chunked
 from scrapedo_finder.cleanup_reporting import build_report_dict, write_outputs
 from scrapedo_finder.scrapedo_client import ScrapeDoClient
 from scrapedo_finder.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
+
+import gemini_batch
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -358,7 +361,13 @@ def build_ai_mode_llm_config() -> LLMConfig:
     Defaults to the Gemini provider. Reads process env directly; does NOT load a
     scrape.do .env file.
     """
-    provider = (_str_env("AI_MODE_LLM_PROVIDER", "gemini").lower()) or "gemini"
+    # Batch cleanup is Gemini-only, so AI_MODE_LLM_BATCH forces the Gemini provider
+    # regardless of AI_MODE_LLM_PROVIDER (which governs only the normal/sync path).
+    batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
+    if batch_mode:
+        provider = "gemini"
+    else:
+        provider = (_str_env("AI_MODE_LLM_PROVIDER", "gemini").lower()) or "gemini"
     if provider == "openai":
         api_key = _str_env("OPENAI_API_KEY")
         model = _str_env("OPENAI_MODEL") or "gpt-4o-mini"
@@ -366,7 +375,10 @@ def build_ai_mode_llm_config() -> LLMConfig:
     else:
         provider = "gemini"
         api_key = _str_env("GEMINI_API_KEY")
-        model = _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
+        if batch_mode:
+            model = _str_env("GEMINI_BATCH_MODEL") or _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
+        else:
+            model = _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
         base_url = DEFAULT_LLM_BASE_URLS["gemini"]
 
     config = LLMConfig(
@@ -773,219 +785,322 @@ def run_ai_mode_sync(run_id: str) -> None:
         llm_seconds_total = 0.0
         sno = 0
 
-        for request_index, group in enumerate(groups, start=1):
-            group_names = [e.entity_name for e in group]
-            req_error: str | None = None
-            req_status = "success"
-            rel_raw_path: str | None = None
-            scrapedo_seconds = 0.0
-            llm_seconds = 0.0
-            payload: dict | None = None
+        batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
+        concurrency = max(1, _int_env("SCRAPEDO_CONCURRENCY", 5))
 
-            # PHASE 1 - scrape.do
+        # ------------------------------------------------------------- #
+        # PHASE 1 - scrape every batch (parallel, bounded by concurrency)
+        # ------------------------------------------------------------- #
+        status["phase"] = "scraping"
+        status["updated_at"] = utc_now_iso()
+        _persist_status(run_id, status)
+
+        def _scrape_one(request_index: int, group: list) -> dict:
+            group_names = [e.entity_name for e in group]
             if is_company:
                 query = build_company_search_query(group, prompt_path=_COMPANY_PROMPT_PATH)
             else:
                 query = build_search_query(group, prompt_path=_ADDR_PROMPT_PATH)
             geo_params, geo_debug = _geo_params_for_group(group, settings)
-            query_stats = _query_debug_stats(scrapedo_client, query, extra_params=geo_params)
-            _ai_log(
-                run_id,
-                run_dir,
-                f"Request {request_index}/{len(groups)} scrape phase starting "
-                f"entities={len(group)} names={group_names} "
-                f"query_chars={query_stats['query_chars']} "
-                f"encoded_url_chars={query_stats['encoded_url_chars']} "
-                f"max_query_chars={settings.scrapedo_max_query_chars} "
-                f"geo={geo_debug}",
-            )
-
+            raw_name = f"request_{request_index:03d}.json"
+            raw_path = raw_dir / raw_name
+            rel_raw_path = f"raw_scrapedo_response/{raw_name}"
+            # Resume: reuse an existing, parseable raw response instead of re-scraping.
+            if raw_path.exists():
+                try:
+                    payload = json.loads(raw_path.read_text(encoding="utf-8"))
+                    return {
+                        "request_index": request_index, "group": group, "group_names": group_names,
+                        "payload": payload, "error": None, "scrapedo_seconds": 0.0,
+                        "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
+                    }
+                except (ValueError, OSError):
+                    pass
             t0 = time.perf_counter()
             try:
                 payload = scrapedo_client.search_google_ai_mode(query, extra_params=geo_params)
-                scrapedo_seconds = time.perf_counter() - t0
-                raw_name = f"request_{request_index:03d}.json"
-                (raw_dir / raw_name).write_text(
+                seconds = time.perf_counter() - t0
+                raw_path.write_text(
                     json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
-                rel_raw_path = f"raw_scrapedo_response/{raw_name}"
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Request {request_index}/{len(groups)} scrape phase succeeded "
-                    f"seconds={scrapedo_seconds:.2f} raw_json_file={rel_raw_path}",
-                )
-            except Exception as exc:  # scrape.do failure: skip LLM for this batch
-                scrapedo_seconds = time.perf_counter() - t0
-                req_error = sanitize_secret_text(str(exc))
-                req_status = "error"
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Request {request_index}/{len(groups)} scrape phase failed "
-                    f"seconds={scrapedo_seconds:.2f} error={req_error}",
-                    logging.ERROR,
-                )
-                entities_without_scrape_data += len(group)
-                scrapedo_seconds_total += scrapedo_seconds
-                per_request_records.append(
-                    {
-                        "request_index": request_index,
-                        "entity_count": len(group),
-                        "entity_names": group_names,
-                        "status": req_status,
-                        "error": req_error,
-                        "scrapedo_seconds": round(scrapedo_seconds, 3),
-                        "llm_seconds": round(llm_seconds, 3),
-                        "combined_seconds": round(scrapedo_seconds + llm_seconds, 3),
-                        "raw_json_file": rel_raw_path,
-                        "scrapedo_params": geo_debug,
-                    }
-                )
-                status["batches_done"] = request_index
+                return {
+                    "request_index": request_index, "group": group, "group_names": group_names,
+                    "payload": payload, "error": None, "scrapedo_seconds": seconds,
+                    "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
+                }
+            except Exception as exc:  # scrape.do failure for this batch
+                seconds = time.perf_counter() - t0
+                return {
+                    "request_index": request_index, "group": group, "group_names": group_names,
+                    "payload": None, "error": sanitize_secret_text(str(exc)),
+                    "scrapedo_seconds": seconds, "rel_raw_path": None, "geo_debug": geo_debug,
+                }
+
+        scraped: dict[int, dict] = {}
+        scrape_done = 0
+        _ai_log(
+            run_id, run_dir,
+            f"Phase 1 scrape starting batches={len(groups)} concurrency={concurrency}",
+        )
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(_scrape_one, idx, grp): idx
+                for idx, grp in enumerate(groups, start=1)
+            }
+            for fut in as_completed(futures):
+                rec = fut.result()
+                scraped[rec["request_index"]] = rec
+                scrapedo_seconds_total += rec["scrapedo_seconds"]
+                if rec["error"]:
+                    entities_without_scrape_data += len(rec["group"])
+                scrape_done += 1
+                status["batches_done"] = scrape_done
+                status["scrapedo_request_count"] = scrape_done
                 status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-                status["llm_seconds_total"] = round(llm_seconds_total, 3)
                 status["entities_without_scrape_data"] = entities_without_scrape_data
-                status["llm_errors"] = llm_errors
-                status["scrapedo_request_count"] = len(per_request_records)
-                status["failed_request_count"] = _failed_request_count(per_request_records)
-                status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
-                status["token_usage"] = asdict(usage_total)
+                status["scrapedo_failed_requests"] = sum(
+                    1 for r in scraped.values() if r["error"]
+                )
                 status["updated_at"] = utc_now_iso()
                 _persist_status(run_id, status)
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Status persisted after failed scrape request={request_index} "
-                    f"batches_done={status['batches_done']} "
-                    f"failed_request_count={status['failed_request_count']} "
-                    f"entities_without_scrape_data={entities_without_scrape_data}",
-                )
-                continue
+        ordered = [scraped[i] for i in sorted(scraped)]
+        ok_batches = [r for r in ordered if r["payload"] is not None]
+        _ai_log(
+            run_id, run_dir,
+            f"Phase 1 scrape complete ok={len(ok_batches)} failed={len(ordered) - len(ok_batches)}",
+        )
 
-            scrapedo_seconds_total += scrapedo_seconds
+        # ------------------------------------------------------------- #
+        # PHASE 2 - clean every scraped batch (sync OR Gemini Batch)
+        # ------------------------------------------------------------- #
+        status["phase"] = "cleaning"
+        status["updated_at"] = utc_now_iso()
+        _persist_status(run_id, status)
 
-            # PHASE 2 - LLM cleanup
+        batch_results_by_index: dict[int, list] = {}
+        llm_error_by_index: dict[int, str | None] = {}
+        llm_seconds_by_index: dict[int, float] = {}
+
+        def _error_results(rec: dict, message: str) -> list:
+            out: list = []
+            if is_company:
+                for entity in rec["group"]:
+                    out.append(
+                        CompanyCleanResult(
+                            company_name_eng=entity.company_name_eng,
+                            company_name_local=entity.company_name_local,
+                            country_code=entity.country_code,
+                            error=message,
+                        )
+                    )
+            else:
+                for name in rec["group_names"]:
+                    out.append(EntityCleanResult(entity_name=name, error=message))
+            return out
+
+        def _messages_for(rec: dict):
+            payload = rec["payload"]
             text_blocks = payload.get("text_blocks") if isinstance(payload, dict) else None
             references = payload.get("references") if isinstance(payload, dict) else None
-            _ai_log(
-                run_id,
-                run_dir,
-                f"Request {request_index}/{len(groups)} LLM phase starting "
-                f"text_blocks={len(text_blocks or [])} references={len(references or [])}",
-            )
-
             if is_company:
-                messages = build_company_messages(group, text_blocks, references)
-            else:
-                messages = build_messages(group_names, text_blocks, references)
+                return build_company_messages(rec["group"], text_blocks, references)
+            return build_messages(rec["group_names"], text_blocks, references)
+
+        if batch_mode:
+            if not _str_env("GEMINI_API_KEY"):
+                raise RuntimeError("GEMINI_API_KEY not configured (required for AI_MODE_LLM_BATCH)")
+            shard_size = max(1, _int_env("GEMINI_BATCH_SHARD_SIZE", 5000))
+            max_inflight = max(1, _int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
+            poll_sec = max(5, _int_env("AI_MODE_BATCH_POLL_SEC", 15))
+            timeout_sec = max(60, _int_env("AI_MODE_BATCH_TIMEOUT_SEC", 172800))
+            clean_t0 = time.perf_counter()
+
+            items: list[tuple[str, dict]] = []
+            for rec in ok_batches:
+                key = f"batch-{rec['request_index']:06d}"
+                items.append((key, gemini_batch.messages_to_gemini_request(_messages_for(rec))))
+            shards = [items[i : i + shard_size] for i in range(0, len(items), shard_size)]
             _ai_log(
-                run_id,
-                run_dir,
-                f"Request {request_index}/{len(groups)} LLM messages built count={len(messages)}",
+                run_id, run_dir,
+                f"Phase 2 Gemini batch: {len(items)} requests in {len(shards)} shard(s) "
+                f"shard_size={shard_size} max_inflight={max_inflight} model={cfg.model}",
             )
 
-            t0 = time.perf_counter()
-            try:
-                parsed, usage = llm.complete_json(messages)
-                llm_seconds = time.perf_counter() - t0
-                usage_total = usage_total + usage
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Request {request_index}/{len(groups)} LLM call succeeded "
-                    f"seconds={llm_seconds:.2f} tokens={usage.total_tokens} "
-                    f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens}",
-                )
-                if is_company:
-                    batch_results = parse_company_results(parsed, group)
-                else:
-                    batch_results = parse_results(parsed, group_names)
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Request {request_index}/{len(groups)} parsed LLM results count={len(batch_results)}",
-                )
-            except Exception as exc:  # LLM failure: emit per-entity error results
-                llm_seconds = time.perf_counter() - t0
-                req_error = sanitize_secret_text(f"LLM error: {exc}")
-                req_status = "error"
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Request {request_index}/{len(groups)} LLM phase failed "
-                    f"seconds={llm_seconds:.2f} error={req_error}",
-                    logging.ERROR,
-                )
-                llm_errors += len(group)
-                batch_results = []
-                if is_company:
-                    for entity in group:
-                        batch_results.append(
-                            CompanyCleanResult(
-                                company_name_eng=entity.company_name_eng,
-                                company_name_local=entity.company_name_local,
-                                country_code=entity.country_code,
-                                error=req_error,
-                            )
+            collected_by_key: dict[str, dict] = {}
+            job_names: list[str] = list(status.get("gemini_batch_jobs") or [])
+            next_shard = 0
+            inflight: dict[str, int] = {}  # batch_name -> shard index
+            deadline = time.monotonic() + timeout_sec
+            while next_shard < len(shards) or inflight:
+                while next_shard < len(shards) and len(inflight) < max_inflight:
+                    si = next_shard
+                    next_shard += 1
+                    create_obj = gemini_batch.create_batch(
+                        cfg.model, shards[si], display_name=f"ai-mode-{run_id}-shard-{si + 1}"
+                    )
+                    name = gemini_batch.batch_name_from_create(create_obj)
+                    if not name:
+                        raise RuntimeError(
+                            f"Gemini batch create returned no name for shard {si + 1}: {create_obj}"
                         )
-                else:
-                    for name in group_names:
-                        batch_results.append(
-                            EntityCleanResult(
-                                entity_name=name,
-                                error=req_error,
-                            )
+                    inflight[name] = si
+                    job_names.append(name)
+                    status["gemini_batch_jobs"] = job_names
+                    status["updated_at"] = utc_now_iso()
+                    _persist_status(run_id, status)
+                    _ai_log(
+                        run_id, run_dir,
+                        f"Submitted Gemini batch shard {si + 1}/{len(shards)} job={name}",
+                    )
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Gemini batch timed out after {timeout_sec}s; jobs={job_names}"
+                    )
+                terminal: list[str] = []
+                for name, si in list(inflight.items()):
+                    try:
+                        batch_obj = gemini_batch.get_batch(name)
+                    except Exception as exc:  # tolerate transient poll errors
+                        _ai_log(
+                            run_id, run_dir,
+                            f"poll error job={name}: {sanitize_secret_text(str(exc))}",
+                            logging.WARNING,
                         )
+                        continue
+                    sname = gemini_batch.state_name(batch_obj)
+                    done = bool(batch_obj.get("done"))
+                    if gemini_batch.is_terminal(sname, done):
+                        if gemini_batch.is_success(sname, done, batch_obj):
+                            for c in gemini_batch.collect_results(batch_obj):
+                                if c.get("key"):
+                                    collected_by_key[c["key"]] = c
+                            _ai_log(
+                                run_id, run_dir,
+                                f"Gemini batch shard {si + 1} succeeded job={name} state={sname}",
+                            )
+                        else:
+                            _ai_log(
+                                run_id, run_dir,
+                                f"Gemini batch shard {si + 1} failed job={name} state={sname}",
+                                logging.ERROR,
+                            )
+                        terminal.append(name)
+                for name in terminal:
+                    inflight.pop(name, None)
+                if next_shard < len(shards) or inflight:
+                    time.sleep(poll_sec)
 
-            llm_seconds_total += llm_seconds
+            for rec in ok_batches:
+                idx = rec["request_index"]
+                key = f"batch-{idx:06d}"
+                c = collected_by_key.get(key)
+                if c is None or c.get("error") or not c.get("text"):
+                    msg = sanitize_secret_text(
+                        "missing from LLM batch output"
+                        if c is None
+                        else f"LLM error: {c.get('error')}"
+                    )
+                    llm_error_by_index[idx] = msg
+                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    llm_errors += len(rec["group"])
+                    continue
+                parsed = gemini_batch.parse_json_from_text(c["text"])
+                if parsed is None:
+                    msg = sanitize_secret_text("LLM error: could not parse JSON from batch output")
+                    llm_error_by_index[idx] = msg
+                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    llm_errors += len(rec["group"])
+                    continue
+                usage_total = usage_total + parse_gemini_usage(c.get("usage"))
+                if is_company:
+                    batch_results_by_index[idx] = parse_company_results(parsed, rec["group"])
+                else:
+                    batch_results_by_index[idx] = parse_results(parsed, rec["group_names"])
+            llm_seconds_total = time.perf_counter() - clean_t0
+        else:
+            for rec in ok_batches:
+                idx = rec["request_index"]
+                messages = _messages_for(rec)
+                t0 = time.perf_counter()
+                try:
+                    parsed, usage = llm.complete_json(messages)
+                    secs = time.perf_counter() - t0
+                    usage_total = usage_total + usage
+                    if is_company:
+                        batch_results_by_index[idx] = parse_company_results(parsed, rec["group"])
+                    else:
+                        batch_results_by_index[idx] = parse_results(parsed, rec["group_names"])
+                except Exception as exc:
+                    secs = time.perf_counter() - t0
+                    msg = sanitize_secret_text(f"LLM error: {exc}")
+                    llm_error_by_index[idx] = msg
+                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    llm_errors += len(rec["group"])
+                llm_seconds_by_index[idx] = secs
+                llm_seconds_total += secs
+                status["llm_errors"] = llm_errors
+                status["updated_at"] = utc_now_iso()
+                _persist_status(run_id, status)
 
-            # Address mode: backfill location/country from the input entity (by order).
+        # ------------------------------------------------------------- #
+        # PHASE 3 - assemble results + per-request records (in order)
+        # ------------------------------------------------------------- #
+        for rec in ordered:
+            idx = rec["request_index"]
+            if rec["payload"] is None:
+                per_request_records.append(
+                    {
+                        "request_index": idx,
+                        "entity_count": len(rec["group"]),
+                        "entity_names": rec["group_names"],
+                        "status": "error",
+                        "error": rec["error"],
+                        "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
+                        "llm_seconds": 0.0,
+                        "combined_seconds": round(rec["scrapedo_seconds"], 3),
+                        "raw_json_file": rec["rel_raw_path"],
+                        "scrapedo_params": rec["geo_debug"],
+                    }
+                )
+                continue
+            batch_results = batch_results_by_index.get(idx, [])
             if not is_company:
-                for entity, result in zip(group, batch_results):
+                for entity, result in zip(rec["group"], batch_results):
                     result.location = entity.address
                     result.country = entity.country
-
-            # Stable, incrementing serial numbers across the whole run.
             for result in batch_results:
                 sno += 1
                 result.sno = sno
             results.extend(batch_results)
-
+            rec_error = llm_error_by_index.get(idx)
+            llm_secs = llm_seconds_by_index.get(idx, 0.0)
             per_request_records.append(
                 {
-                    "request_index": request_index,
-                    "entity_count": len(group),
-                    "entity_names": group_names,
-                    "status": req_status,
-                    "error": req_error,
-                    "scrapedo_seconds": round(scrapedo_seconds, 3),
-                    "llm_seconds": round(llm_seconds, 3),
-                    "combined_seconds": round(scrapedo_seconds + llm_seconds, 3),
-                    "raw_json_file": rel_raw_path,
-                    "scrapedo_params": geo_debug,
+                    "request_index": idx,
+                    "entity_count": len(rec["group"]),
+                    "entity_names": rec["group_names"],
+                    "status": "error" if rec_error else "success",
+                    "error": rec_error,
+                    "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
+                    "llm_seconds": round(llm_secs, 3),
+                    "combined_seconds": round(rec["scrapedo_seconds"] + llm_secs, 3),
+                    "raw_json_file": rec["rel_raw_path"],
+                    "scrapedo_params": rec["geo_debug"],
                 }
             )
 
-            status["batches_done"] = request_index
-            status["entities_processed"] = len(results)
-            status["entities_without_scrape_data"] = entities_without_scrape_data
-            status["llm_errors"] = llm_errors
-            status["scrapedo_request_count"] = len(per_request_records)
-            status["failed_request_count"] = _failed_request_count(per_request_records)
-            status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
-            status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-            status["llm_seconds_total"] = round(llm_seconds_total, 3)
-            status["token_usage"] = asdict(usage_total)
-            status["updated_at"] = utc_now_iso()
-            _persist_status(run_id, status)
-            _ai_log(
-                run_id,
-                run_dir,
-                f"Status persisted after request={request_index} "
-                f"batches_done={status['batches_done']} entities_processed={status['entities_processed']} "
-                f"failed_request_count={status['failed_request_count']} llm_errors={llm_errors}",
-            )
+        status["batches_done"] = len(groups)
+        status["entities_processed"] = len(results)
+        status["entities_without_scrape_data"] = entities_without_scrape_data
+        status["llm_errors"] = llm_errors
+        status["scrapedo_request_count"] = len(per_request_records)
+        status["failed_request_count"] = _failed_request_count(per_request_records)
+        status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
+        status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
+        status["llm_seconds_total"] = round(llm_seconds_total, 3)
+        status["token_usage"] = asdict(usage_total)
+        status["updated_at"] = utc_now_iso()
+        _persist_status(run_id, status)
 
         # ----------------------------------------------------------------- #
         # Final report

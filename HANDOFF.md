@@ -1,193 +1,267 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-07. Read this first if you're picking up this repo.
+Last updated: 2026-06-10. Read this first if you're picking up this repo.
 
-This project now contains **two independent website-discovery systems** that share one FastAPI app
-+ one UI:
+This project contains **two independent website-discovery systems** sharing one FastAPI app + one UI:
 
 1. **SerpWow pipelines** (the original) — RabbitMQ + worker + S3, 5 modes (`full`, `url_discovery`,
-   `firmographics`, `gmaps`, `gsearch`). Fully documented in `docs/` (start at
-   [`docs/README.md`](docs/README.md)).
-2. **AI Mode** (added this session) — a standalone scrape.do "Google AI Mode" + LLM-cleanup
-   pipeline, vendored from the sibling `scrapeDo` project. Documented in
-   [`docs/13.ai-mode.md`](docs/13.ai-mode.md).
+   `firmographics`, `gmaps`, `gsearch`). Documented in `docs/` (start at [`docs/README.md`](docs/README.md)).
+2. **AI Mode** — a standalone scrape.do "Google AI Mode" + LLM-cleanup pipeline, vendored from the
+   sibling `scrapeDo` project. Documented in [`docs/13.ai-mode.md`](docs/13.ai-mode.md). **Most recent
+   work has been here** (§1).
 
-There is **no** `requirements.txt`/`Dockerfile`. Deps are inferred from imports — see
-[`docs/09.how-to-run.md`](docs/09.how-to-run.md). Python 3.12.
-
----
-
-## 1. What changed recently (this session)
-
-1. **Full docs set written + codex-reviewed** — `docs/01`…`docs/12` describe the SerpWow service
-   accurately (incl. as-built caveats). Three codex findings were verified true and fixed in the
-   docs (see `docs/01` §7, `docs/02`, `docs/05`, `docs/08`).
-2. **AI Mode v1 built** — new tab + endpoints + vendored package + glue. Sequential (batches of
-   10). See §3.
-3. **Per-flow timing added to the SerpWow modes** — see §4.
-
-Pending decisions/TODOs are in §6. **Read §6 before doing more scrapeDo work.**
+Python 3.12 recommended (the code runs on 3.9+ but 3.9 is EOL). There is now a **`requirements.txt`**
+and a **`.venv/`** — see §0.
 
 ---
 
-## 2. Repo map (key files)
+## 0. Environment & how to run (set up this session)
+
+- **venv:** `.venv/` was created with Homebrew Python 3.12 (`/opt/homebrew/bin/python3.12`).
+  Run: `cd website_url_finder && source .venv/bin/activate && python app.py`
+  (or just `.venv/bin/python app.py`).
+- **`requirements.txt`** (new): 8 pinned runtime deps — `fastapi`, `uvicorn`, `httpx`, `pydantic`,
+  `aio-pika`, `boto3`, `python-dotenv`, `python-multipart`. **NOT needed:** `pandas` (only the
+  standalone `convertjtox.py` uses it) and `openpyxl` (XLSX is hand-built with `zipfile`/`xml`).
+  `aio-pika` + `boto3` ARE required even for AI-Mode-only use because `app.py` imports them at module top.
+- **Python version:** ideal **3.12** (matches the modern type-hint syntax; all deps ship `cp312`
+  wheels). Hard floor is 3.9 (PEP 585 generics), but don't use it — EOL.
+- **UI:** open `http://localhost:<API_PORT>/ui`. `.env` sets **`API_PORT=8080`** (the code default in
+  `app.py.__main__` is still `11500`). RabbitMQ is **not** required — startup wraps `init_rabbitmq()`
+  in try/except, and AI Mode runs fully in-process.
+- **New `__main__` env knobs** (app.py): `API_RELOAD` (uvicorn auto-reload on code change — set this
+  instead of manually restarting), `UVICORN_LOG_LEVEL`.
+- **Common gotcha:** open the UI from the app's own port, **not** VS Code Live Server (`:5500`). The
+  AI Mode upload posts to a relative path; a static server returns **405** on the POST.
+- **Sample CSVs** for quick tests: `sample_company.csv` (company mode, header `Company Name ENG`) and
+  `sample_address.csv` (address mode) — 3 rows each = 1 batch.
+- **Offline checks:** `.venv/bin/python -c "import app"` (needs the venv deps);
+  `python3 -c "import ast; ast.parse(open('app.py').read())"` to syntax-check without deps.
+
+---
+
+## 1. What changed in the latest session (2026-06-10)
+
+**AI Mode is now a TWO-PHASE run with an `AI_MODE_LLM_BATCH` toggle — `plancl.md` is now BUILT (§2).**
+The old interleaved scrape→clean loop in `ai_mode_service.run_ai_mode_sync` is gone, replaced by:
+
+1. **Phase 1 — scrape ALL batches first, in parallel** (`ThreadPoolExecutor`, `SCRAPEDO_CONCURRENCY`,
+   default 5; raise toward scrape.do's ~100 cap). **Resume:** a batch whose `request_NNN.json` already
+   exists & parses is reused, not re-scraped.
+2. **Phase 2 — clean ALL scraped batches**, engine chosen by `AI_MODE_LLM_BATCH`:
+   - **false (normal)** → today's synchronous per-batch LLM (`AI_MODE_LLM_PROVIDER` = gemini *or*
+     openai); same behavior, just run as a second phase.
+   - **true (batch)** → **Gemini Batch API only**. One request per scraped batch, **global key
+     `batch-NNNNNN`**, sharded by `GEMINI_BATCH_SHARD_SIZE` (5000) into File-API JSONL jobs, ≤
+     `GEMINI_BATCH_MAX_INFLIGHT` (5) jobs in flight, poll each to terminal, results mapped **by key**.
+     Missing/failed keys → entities land in notFound (`llm_errors`). Per-batch `llm_seconds` is 0 in
+     batch mode; `llm_seconds_total` = whole-cleanup duration.
+3. **Phase 3 — assemble** (the existing final-report block, unchanged): `found.csv` / `notFound.csv` /
+   `final_report.json` / `report.json` / `run.log`; status `completed` | `completed_with_errors`.
+
+- **NEW `gemini_batch.py`** (repo root, self-contained, stdlib `urllib`, **no `app.py` import**):
+  `messages_to_gemini_request` (mirrors `GeminiClient.complete_json`), `create_batch` (inline if
+  <18 MB else File API), `upload_jsonl_file` (resumable), `get_batch`/`state_name`/`is_terminal`/
+  `is_success`, `collect_results` (inline OR downloaded result file, keyed), `parse_json_from_text`,
+  `calculate_gemini_batch_cost_usd`. HTTP isolated in `_http_post_json`/`_http_get_json`/`_http_get_bytes`.
+- **`build_ai_mode_llm_config`** forces `provider="gemini"` + `GEMINI_BATCH_MODEL`/`GEMINI_MODEL` when
+  `AI_MODE_LLM_BATCH=true` (so `GEMINI_API_KEY` is validated at upload, fail-fast).
+- **Same AI Mode tab, same 4 endpoints, same output files — NO `app.py` / `templates/ui.html` changes.**
+- **New env** (in `.env.example`): `AI_MODE_LLM_BATCH=false`, `SCRAPEDO_CONCURRENCY=5`,
+  `GEMINI_BATCH_SHARD_SIZE=5000`, `GEMINI_BATCH_MAX_INFLIGHT=5`, `AI_MODE_BATCH_POLL_SEC=15`,
+  `AI_MODE_BATCH_TIMEOUT_SEC=172800` (48 h — **deliberately separate** from SerpWow's
+  `GEMINI_BATCH_TIMEOUT_SEC=1800`, which is too short for multi-hour batch jobs). Dead `REDIS_*` removed.
+- **NEW `tests/test_gemini_batch.py`** (12 offline tests). Verified this session: `import app` ✓,
+  full suite **17/17** ✓, end-to-end smoke test (scrape.do + Gemini mocked) in **both** modes ✓.
+- **Architecture decision — NO RabbitMQ / Redis for AI Mode.** Its throughput is gated by scrape.do's
+  ~100-concurrent **vendor cap**, which a single process saturates → a queue's horizontal-scale benefit
+  doesn't apply (1M rows ≈ ~39 h with or without a queue). The on-disk run dir gives the
+  durability/retry a queue would. **SerpWow keeps RabbitMQ, untouched.** Reconsider only if AI Mode ever
+  pushes past one scrape.do account's cap (multiple accounts/vendors → then queue + Redis).
+
+### Earlier session (2026-06-08 → 09) — still-relevant context
+1. **References dropped from the LLM prompt** (`extraction.py`/`company_extraction.py`): builders send
+   only flattened `text_blocks` via `text_blocks_to_text`, not `references` (~40% smaller input).
+2. **Per-batch geo-targeting** (`_geo_params_for_group` → scrape.do `extra_params`; recorded as
+   `scrapedo_params`).
+3. **scrape.do client hardening** (`scrapedo_client.py`: log callback, `extra_params`, per-attempt
+   logging, `>=400`→RuntimeError, `estimated_url_chars()`).
+4. **Per-run debug log + secret redaction** (`ai_mode_debug.log`, `AI_MODE_LOG_LEVEL`;
+   `sanitize_secret_text`/`sanitize_for_response`).
+5. **Failure tracking + `completed_with_errors`** (also wired into SerpWow upload paths in `app.py`).
+6. **Address research prompt rewritten** to an OSINT agent prompt — ⚠️ mismatch with the address
+   cleanup prompt/schema, see §6a.
+7. **SerpWow per-flow timing** (`build_processing_timing_summary`; `tests/test_timing_summary.py`).
+8. **Tooling:** venv + `requirements.txt` + Python 3.12; sample CSVs. Earlier sessions built AI Mode v1
+   and the full `docs/` set (§4/§5).
+
+---
+
+## 2. `plancl.md` — the design, now BUILT (this session, §1)
+
+`plancl.md` (repo root) holds the implemented design. **Note:** it was rewritten this session — the
+original "separate **LLM Cleaner tab** + `scrape_manifest.json`" two-stage idea was **dropped** in favor
+of the simpler **in-AI-Mode two-phase** flow now shipped (scrape-all → clean-all in one run, one tab,
+no new endpoints, no separate manifest file — the per-run dir + `report.json` are the durable record).
+Read `plancl.md` for the file-by-file record; §1 here is the summary.
+
+**Not built / deferred** (kept in `plancl.md`'s "future" notes): `(name,country)` **dedup/cache** (the
+biggest cost lever at millions of rows — skip re-scraping repeated entities), and a **queue/worker
+split** (only needed if you ever exceed one scrape.do account's ~100-concurrent cap).
+
+---
+
+## 3. Repo map (key files)
 
 ```
-app.py                  # the whole SerpWow service (FastAPI, worker, Gemini batch, XLSX) — 7.4k lines
-                        #   + 4 NEW AI-mode endpoints near the end (POST/GET /uploads/ai-mode*)
-ai_mode_service.py      # NEW — AI Mode orchestrator (drives scrapedo_finder, writes ai_mode_result/)
-scrapedo_finder/        # NEW — vendored scrape.do package (see §3 + §6 for the file list)
+app.py                  # the whole SerpWow service (FastAPI + worker + Gemini batch + XLSX), ~7.6k lines
+                        #   + 4 AI-mode endpoints near the end (POST/GET /uploads/ai-mode*); result
+                        #   endpoint now sanitizes JSON; __main__ supports API_RELOAD/UVICORN_LOG_LEVEL
+ai_mode_service.py      # AI Mode orchestrator — TWO-PHASE (parallel scrape-all → clean-all: sync or Gemini batch)
+gemini_batch.py         # NEW — self-contained Gemini Batch API helper (File API + inline); used by AI Mode batch mode
+scrapedo_finder/        # vendored scrape.do package (clients in scrapedo_client.py / llm_client.py)
 worker.py               # SerpWow worker entrypoint (NOT needed for AI Mode)
 gmaps.py, codetails.py  # SerpWow Google-Maps + firmographics clients
-templates/ui.html       # single-page UI; 7 tabs now (7th = "AI Mode")
-docs/                   # numbered documentation set (01..13) + 11.handoff.md (SerpWow handoff)
-ai_mode_result/         # NEW — per-run AI-mode output (gitignored; created on first run)
-.env.example            # all env vars (SerpWow + AI Mode); some legacy keys nothing reads (docs/02 §B)
-plancl.md               # the approved implementation plan for AI Mode
+templates/ui.html       # single-page UI; AI Mode is the 7th tab (handles completed_with_errors, debug log)
+tests/                  # test_timing_summary.py (SerpWow) + test_gemini_batch.py (NEW — Gemini batch helper, offline)
+docs/                   # numbered SerpWow documentation set (01..13)
+ai_mode_result/         # per-run output (gitignored): input.csv, status.json, report.json,
+                        #   final_report.json, found.csv, notFound.csv, run.log, ai_mode_debug.log,
+                        #   raw_scrapedo_response/request_NNN.json
+requirements.txt        # NEW — pinned runtime deps (§0)
+.venv/                  # NEW — Python 3.12 virtualenv
+plancl.md               # design for the AI Mode two-phase / Gemini-batch rework — BUILT this session (§2)
+sample_company.csv,
+sample_address.csv      # 3-row test inputs (company / address mode)
+.env.example            # all env vars (now includes the AI Mode batch keys; dead REDIS_* removed — §1)
 ```
 
 ---
 
-## 3. AI Mode (the new feature)
+## 4. AI Mode reference
 
-**Goal:** upload a CSV → for each batch of 10 companies, send ONE prompt to scrape.do Google AI
-Mode, then clean the response with an LLM (Gemini *or* OpenAI) → save raw responses + cleaned
-results + timings under `ai_mode_result/<run_id>/`. Standalone: **no RabbitMQ/S3/state.json**.
+**Goal:** upload CSV → for each batch of `SCRAPEDO_BATCH_SIZE` (10) entities, send ONE prompt to
+scrape.do Google AI Mode (geo-targeted), then clean the response with an LLM (Gemini *or* OpenAI) →
+save raw responses + cleaned results + timings under `ai_mode_result/<run_id>/`. Standalone:
+**no RabbitMQ/S3/state.json**.
 
-**Flow:** `POST /uploads/ai-mode` → `ai_mode_service.prepare_ai_mode_run` (validate CSV, detect
-mode, register run) → API schedules `asyncio.to_thread(run_ai_mode_sync, run_id)` → orchestrator
-loops batches: Phase 1 scrape.do (timed) → Phase 2 LLM clean (timed) → writes outputs. UI polls
-`/uploads/ai-mode/<run_id>/status` every 2 s.
-
-**Endpoints** (in `app.py`, just before `if __name__ == "__main__":`):
-- `POST /uploads/ai-mode` (multipart `file`) → `{run_id, total_rows, input_type, llm_provider, llm_model, batch_size, status_url, result_url}`
-- `GET /uploads/ai-mode` → `{count, runs:[...]}`
-- `GET /uploads/ai-mode/{run_id}/status` → status dict
-- `GET /uploads/ai-mode/{run_id}/result?file=<name>&download=true` → file (allowlist:
-  `final_report.json, found.csv, notFound.csv, report.json, run.log, input.csv`)
-- Module-level `ai_mode_tasks: set[asyncio.Task]` keeps background tasks alive.
-
-**`ai_mode_service.py` public API** (other code depends on these names):
-`prepare_ai_mode_run(raw_csv, filename)`, `run_ai_mode_sync(run_id)`, `list_ai_mode_runs()`,
-`get_ai_mode_status(run_id)`, `get_ai_mode_result_path(run_id, file_name)`. Plus helpers
-`build_ai_mode_settings()`, `build_ai_mode_llm_config()`, `load_address_entities()`.
+**Flow (now two-phase):** `POST /uploads/ai-mode` → `prepare_ai_mode_run` (validate CSV, detect mode,
+register run) → API schedules `asyncio.to_thread(run_ai_mode_sync, run_id)` → orchestrator runs
+**Phase 1** = scrape ALL batches in parallel (`SCRAPEDO_CONCURRENCY`, geo-targeted, resume-aware) →
+**Phase 2** = clean ALL scraped batches (sync per-batch, OR one+ Gemini Batch jobs when
+`AI_MODE_LLM_BATCH=true`) → **Phase 3** = assemble outputs. `status["phase"]` = `scraping`|`cleaning`.
+UI polls `/uploads/ai-mode/<run_id>/status` every 2 s. (See §1 for the full breakdown.)
 
 **Input auto-detect:** header `Company Name ENG` → **company** mode (`load_company_entities`);
-otherwise **address** mode (flexible mapping: `entity_name|company_name|company|name` + `country`
-+ `address|input_full_address|full_address`). So existing SerpWow CSVs work as address mode.
+otherwise **address** mode (flexible mapping: `entity_name|company_name|company|name|legal_name|entity`
++ `country*` + `address|input_full_address|full_address`). So existing SerpWow CSVs work as address mode.
 
-**LLM provider (env-switchable):** `AI_MODE_LLM_PROVIDER=gemini|openai` (default `gemini`).
-Gemini reuses existing `GEMINI_API_KEY` + `GEMINI_MODEL`; OpenAI uses `OPENAI_API_KEY` +
-`OPENAI_MODEL` (+ optional `OPENAI_BASE_URL`). Provider switching is implemented inside the
-vendored `scrapedo_finder/llm_client.py` (`make_llm_client`); the glue just maps env → `LLMConfig`.
+**LLM provider (env-switchable):** `AI_MODE_LLM_PROVIDER=gemini|openai` (default `gemini`). Gemini reuses
+`GEMINI_API_KEY` + `GEMINI_MODEL`; OpenAI uses `OPENAI_API_KEY` + `OPENAI_MODEL` (+ optional
+`OPENAI_BASE_URL`, e.g. an OpenAI-compatible gateway). Switching is inside `llm_client.make_llm_client`;
+the glue maps env → `LLMConfig`. LLM config is validated at **upload** time (missing key → HTTP 400);
+`SCRAPEDO_TOKEN` is validated at **run** time (missing → run `status=failed`).
 
-**On-disk per run** `ai_mode_result/<run_id>/`: `input.csv`, `status.json`, `report.json`,
-`final_report.json`, `found.csv`, `notFound.csv`, `run.log`, `raw_scrapedo_response/request_NNN.json`.
+**4 endpoints** (`app.py`, before `if __name__=="__main__"`), module-level `ai_mode_tasks` set keeps tasks alive:
+- `POST /uploads/ai-mode` (multipart `file`) → run info dict
+- `GET  /uploads/ai-mode` → `{count, runs:[...]}`
+- `GET  /uploads/ai-mode/{run_id}/status` → status dict
+- `GET  /uploads/ai-mode/{run_id}/result?file=<name>&download=true` → file. **Allowlist:**
+  `final_report.json, report.json, found.csv, notFound.csv, run.log, ai_mode_debug.log, input.csv`.
+  JSON files are passed through `sanitize_for_response` (token redaction).
 
-**Timing (the key requirement):** `final_report.json.requests[]` has per-batch
-`{scrapedo_seconds, llm_seconds, combined_seconds}`; `summary` has `scrapedo_seconds_total`,
-`llm_seconds_total`, `batch_duration_seconds`, `token_usage`. `status.json` carries running
-totals so the UI shows live progress.
+**`ai_mode_service.py` public API:** `prepare_ai_mode_run(raw_csv, filename)`, `run_ai_mode_sync(run_id)`,
+`list_ai_mode_runs()`, `get_ai_mode_status(run_id)`, `get_ai_mode_result_path(run_id, file_name)`.
+Helpers worth knowing: `_geo_params_for_group`, `sanitize_for_response`, `_reconcile_status_from_report`,
+`build_ai_mode_settings`, `build_ai_mode_llm_config`, `load_address_entities`.
 
-**Env vars (AI Mode):** `SCRAPEDO_TOKEN` (required), `SCRAPEDO_BATCH_SIZE` (10), `SCRAPEDO_*`
-timeouts/locale; `AI_MODE_LLM_PROVIDER`, `GEMINI_API_KEY`/`GEMINI_MODEL` or
-`OPENAI_API_KEY`/`OPENAI_MODEL`/`OPENAI_BASE_URL`, `LLM_MAX_RETRIES`, `LLM_TIMEOUT_SECONDS`.
-Full table in `docs/13.ai-mode.md`.
+**Status fields:** `status` (`queued|running|completed|completed_with_errors|failed`), `input_type`,
+`total_rows`, `batch_size`, `llm_provider/model`, `batches_total/done`, `entities_processed`,
+`entities_without_scrape_data`, `llm_errors`, `websites_found/not_found`,
+`failed_request_count`/`scrapedo_request_count`/`scrapedo_failed_requests`,
+`scrapedo_seconds_total`, `llm_seconds_total`, `batch_duration_seconds`, `token_usage`,
+plus (this session) **`phase`** (`scraping`|`cleaning`) and **`gemini_batch_jobs`** (list of batch job
+names, batch mode only — persisted before polling for recovery).
+`report.json` has per-request `{scrapedo_seconds, llm_seconds, combined_seconds, raw_json_file,
+scrapedo_params, status, error}` (in batch mode per-request `llm_seconds`=0).
 
-**How to run AI Mode:** AI Mode needs **no RabbitMQ/worker** (runs in-process).
-```bash
-SCRAPEDO_TOKEN=... GEMINI_API_KEY=...   # or AI_MODE_LLM_PROVIDER=openai + OPENAI_API_KEY=...
-python app.py        # open /ui → "AI Mode" tab → upload a CSV
-```
-
-**Verified (offline, mocked scrape.do + LLM):** both address & company modes run end-to-end →
-`status=completed`, correct `ai_mode_result/<run_id>/` layout, per-batch + summary timing fields,
-bad-input rejection, path allowlist. `app.py` AST-parses; routes + globals wired. (Full `import app`
-needs the project venv: `aio_pika`, `fastapi`, `boto3`, `pydantic`, `httpx`.)
-
----
-
-## 4. Per-flow timing for the SerpWow modes (this session)
-
-`process_upload_job` (the worker) now stamps `result["context"]["timing"]["total_seconds"]` =
-total per-row processing time, for **all 5** upload pipelines. It surfaces in `output.json` and as
-a new XLSX column **`output_processing_seconds`** (`build_upload_output_xlsx_bytes`). The synchronous
-`/crawl*` endpoints don't get it (they bypass the worker). Docs updated: `docs/03` §5 (`timing` key)
-and §7 (column). XLSX header/value columns verified aligned (38 == 38).
-
-> If you want a finer breakdown (SerpWow vs Gemini time) like AI Mode has, you'd instrument inside
-> `execute_company_lookup` — more invasive; not done.
+**Env (AI Mode):** `SCRAPEDO_TOKEN` (required), `SCRAPEDO_BATCH_SIZE` (10), `SCRAPEDO_*` timeouts/locale,
+`SCRAPEDO_GL/HL/GOOGLE_DOMAIN` (geo fallbacks), `AI_MODE_LLM_PROVIDER`, Gemini/OpenAI keys+models,
+`LLM_MAX_RETRIES`, `LLM_TIMEOUT_SECONDS`, `AI_MODE_LOG_LEVEL`.
+**Two-phase / batch env (this session):** `AI_MODE_LLM_BATCH` (toggle; true ⇒ Gemini batch, forces
+Gemini provider), `SCRAPEDO_CONCURRENCY` (parallel scrape, 5), `GEMINI_BATCH_SHARD_SIZE` (5000),
+`GEMINI_BATCH_MAX_INFLIGHT` (5), `AI_MODE_BATCH_POLL_SEC` (15), `AI_MODE_BATCH_TIMEOUT_SEC` (172800 =
+48 h; **separate** from SerpWow's `GEMINI_BATCH_TIMEOUT_SEC`), `GEMINI_BATCH_MODEL` (optional → `GEMINI_MODEL`).
 
 ---
 
-## 5. Documentation index (`docs/`)
+## 5. SerpWow documentation index (`docs/`)
 
 `README.md` (index) · `01` architecture · `02` config (used vs legacy env) · `03` data models ·
 `04` app.py reference · `05` pipelines & flow · `06` API · `07` UI · `08` modules & scripts ·
 `09` how to run · `10` data files · `11` handoff (SerpWow) · `12` per-tab LLM map · `13` AI Mode.
+(These describe the SerpWow service; some predate the latest AI-Mode changes in §1.)
 
 ---
 
-## 6. Outstanding decisions & TODOs (IMPORTANT)
+## 6. Outstanding decisions, TODOs & caveats
 
-### 6a. scrapeDo file reduction — DECISION PENDING (user asked to confirm first)
-The vendored `scrapedo_finder/` has 20 `.py` files, but `ai_mode_service.py` only uses 12. The
-import graph was verified: **these 8 files are imported by nothing the integration uses and are
-safe to delete** (the package still imports and AI Mode still works):
+### 6a. ⚠️ Address template ↔ cleanup-prompt mismatch (NEW — verify)
+The rewritten address `search_query_template.txt` (the **query** sent to Google AI Mode) now asks for a
+`Confidence / Flags / Investigation Summary / **Website:**` format. But the address **cleanup**
+`SYSTEM_PROMPT` in `scrapedo_finder/extraction.py` (and the `EntityCleanResult` schema: `short_details`,
+`official_website`, `found_at_attempt`, `attempt_log`) still expects an **"attempt log" with
+`URL: https://...` lines** and even hints "the last attempt-log line containing 'URL: https://...'".
+The cleanup LLM probably still finds the URL (it reads the whole text), but the richer confidence/flags
+output is partly discarded and the prompt hint is stale. **Decide whether to align the address cleanup
+prompt + schema with the new template** (company mode already uses confidence + flags).
 
+### 6b. `AI_MODE_LLM_BATCH` two-phase / Gemini-batch rework — ✅ BUILT (this session, §1)
+Implemented in `ai_mode_service.run_ai_mode_sync` (Phase 1 parallel scrape → Phase 2 sync/Gemini-batch
+clean → Phase 3 assemble) + new `gemini_batch.py`. Deferred follow-ups (kept in `plancl.md`):
+`(name,country)` dedup/cache, and a worker/queue split (only if you exceed the scrape.do ~100 cap).
+
+### 6c. `.env.example` — partially updated
+This session **added** the AI Mode batch keys (`AI_MODE_LLM_BATCH`, `SCRAPEDO_CONCURRENCY`,
+`GEMINI_BATCH_SHARD_SIZE`, `GEMINI_BATCH_MAX_INFLIGHT`, `AI_MODE_BATCH_POLL_SEC`,
+`AI_MODE_BATCH_TIMEOUT_SEC`) and **removed** dead `REDIS_*`. Still missing: `AI_MODE_LOG_LEVEL`,
+`API_RELOAD`, `UVICORN_LOG_LEVEL`, and `GEMINI_MODEL` (AI Mode falls back to `gemini-2.5-flash-lite`).
+
+### 6d. scrapeDo file reduction — DECISION STILL PENDING
+`scrapedo_finder/` has 20 `.py` files; the AI Mode integration uses 12. These **8 are imported by
+nothing the integration uses and are safe to delete** (package still imports, AI Mode still works):
 `__main__.py`, `cli.py`, `cleanup_cli.py`, `runner.py`, `cleanup_runner.py`,
-`company_cleanup_runner.py`, `reporting.py`, `csv_loader.py`
+`company_cleanup_runner.py`, `reporting.py`, `csv_loader.py` (scrapeDo's standalone-CLI layer).
+**Kept / used:** `__init__.py`, `models.py`, `settings.py`, `scrapedo_client.py`, `llm_client.py`,
+`prompting.py`, `company_prompting.py`, `extraction.py`, `company_extraction.py`,
+`cleanup_reporting.py`, `company_reporting.py`, `company_csv_loader.py` + `prompts/`.
+→ Awaiting user go-ahead before deleting. (And the requested per-file `scrapedo_finder/README.md` is
+still owed.)
 
-They are scrapeDo's standalone-CLI / high-level-orchestration layer, which the glue replaced.
-**Trade-off of deleting:** you lose the ability to run scrapeDo's `scrapedo-finder` /
-`scrapedo-clean` CLIs from the vendored copy (the original sibling repo still has them).
-→ **Awaiting user's go-ahead before deleting.**
-
-**Files KEPT / used by AI Mode** (do NOT remove): `__init__.py`, `models.py`, `settings.py`,
-`scrapedo_client.py`, `llm_client.py`, `prompting.py`, `company_prompting.py`, `extraction.py`,
-`company_extraction.py`, `cleanup_reporting.py`, `company_reporting.py`, `company_csv_loader.py`,
-+ `prompts/` (`search_query_template.txt`, `company_search_template.txt`).
-
-### 6b. TODO: `scrapedo_finder/README.md` (per-file usage) — NOT YET WRITTEN
-User requested a README documenting each file's purpose in the scrapedo_finder folder. Use the
-"used vs removable" split in 6a. (This handoff captures the classification; the dedicated README
-is still owed.)
-
-### 6c. v2 (not built): parallelize AI-mode batches
-The single seam is the per-batch `for` loop in `ai_mode_service.run_ai_mode_sync`. Swap for bounded
-`asyncio.gather` over `asyncio.to_thread` batch jobs (or push batches to RabbitMQ). v1 is sequential
-by design.
-
-### 6d. Minor: `prepare_ai_mode_run` validates the LLM config at upload time
-So uploading AI Mode without an LLM key → HTTP 400 with scrapeDo-worded message
-(`Required: LLM_API_KEY, ...`). `SCRAPEDO_TOKEN` is validated at run time instead (missing →
-run `status=failed`). Acceptable for v1; reword if desired.
-
----
-
-## 7. Carry-over caveats from the SerpWow service (still true)
-
-- **Batch-pending row marking is not pipeline-scoped** (`app.py` `process_upload_job`): with
-  `ENABLE_GEMINI_BATCH_POSTPROCESS=true`, no-URL rows in *any* pipeline are marked `completed`
-  /pending, but the batch only runs for `full`. Enable the flag for `full` only. (`docs/02`, `docs/05` §4.)
-- **Two batch-recovery scripts are broken**: `scripts/push_processed_rows_to_gemini_batch.py` (only
-  with `--force-new-job`) and `scripts/requeue_wait_and_push_remaining_to_gemini_batch.py` (main
-  path) reference `app.upload_lock`, which doesn't exist → `AttributeError`. Fix:
-  `app.get_upload_lock(upload_id)`. (`docs/08`.)
-- **No browser/proxy crawling** in the SerpWow service; `massive_proxy_cost_usd` is always `0.0`;
-  several `.env.example` keys (`MASSIVE_*`, `REDIS_*`, `BROWSER_POOL_SIZE`, …) are read by nothing.
-  (`docs/02` §B.)
+### 6e. Carry-over SerpWow caveats (still true)
+- **Batch-pending row marking is not pipeline-scoped** (`app.py process_upload_job`): with
+  `ENABLE_GEMINI_BATCH_POSTPROCESS=true`, no-URL rows in *any* pipeline are marked completed/pending,
+  but the batch only runs for `full`. Enable the flag for `full` only. (`docs/02`, `docs/05` §4.)
+- **Two batch-recovery scripts are broken:** `scripts/push_processed_rows_to_gemini_batch.py` (only with
+  `--force-new-job`) and `scripts/requeue_wait_and_push_remaining_to_gemini_batch.py` (main path)
+  reference `app.upload_lock`, which doesn't exist → `AttributeError`. Fix: `app.get_upload_lock(upload_id)`.
+- **No browser/proxy crawling** in the SerpWow service; `massive_proxy_cost_usd` is always `0.0`; several
+  `.env.example` keys (`MASSIVE_*`, `BROWSER_POOL_SIZE`, …) are read by nothing (`docs/02` §B).
+  (`REDIS_*` was also dead and was **removed** from `.env.example` this session.)
 - `analyze_with_gemini` (app.py) is dead code; `templates/ui copy.html` is an unused backup.
 
 ---
 
-## 8. Fast orientation for a new agent
+## 7. Fast orientation for a new agent
 
-- **Understand the SerpWow service:** read `docs/README.md` → `docs/01` → `docs/04`/`docs/05`.
+- **Run it:** `cd website_url_finder && .venv/bin/python app.py` → `http://localhost:8080/ui`
+  (port from `.env`). Set `SCRAPEDO_TOKEN` + an LLM key in `.env` first. Don't use Live Server (§0).
 - **Work on AI Mode:** read `docs/13.ai-mode.md` + `ai_mode_service.py` (self-contained) +
-  `scrapedo_finder/` (vendored; clients in `scrapedo_client.py` / `llm_client.py`).
-- **Run/verify offline:** mock `ai_mode_service.ScrapeDoClient` and `ai_mode_service.make_llm_client`,
-  then call `prepare_ai_mode_run` + `run_ai_mode_sync` (no network/keys needed). `python3 -c
-  "import ast; ast.parse(open('app.py').read())"` checks app.py without the heavy deps.
-- **Don't** wire AI Mode into RabbitMQ/state.json — it's intentionally standalone.
-- **Before deleting any scrapeDo file**, re-check the import graph and get user confirmation (§6a).
+  `scrapedo_finder/` (clients in `scrapedo_client.py` / `llm_client.py`; prompts in `prompts/`).
+- **AI Mode two-phase + Gemini batch (BUILT this session):** read §1, `plancl.md`, `gemini_batch.py`,
+  and `run_ai_mode_sync` (Phase 1 parallel scrape → Phase 2 sync/batch clean → Phase 3 assemble).
+- **Understand the SerpWow service:** `docs/README.md` → `docs/01` → `docs/04`/`docs/05`.
+- **Run tests:** `.venv/bin/python -m unittest discover -s tests` (pytest is **not** installed in
+  `.venv`) — `test_timing_summary.py` + `test_gemini_batch.py` (17 tests total).
+- **Don't** wire AI Mode into RabbitMQ/state.json — it's intentionally standalone. **Before deleting any
+  scrapeDo file**, re-check the import graph and get user confirmation (§6d).

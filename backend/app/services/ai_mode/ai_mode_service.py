@@ -31,29 +31,30 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from scrapedo_finder.company_csv_loader import load_company_entities
-from scrapedo_finder.company_extraction import build_company_messages, parse_company_results
-from scrapedo_finder.company_prompting import build_company_search_query
-from scrapedo_finder.company_reporting import build_company_report_dict, write_company_outputs
-from scrapedo_finder.extraction import build_messages, parse_results
-from scrapedo_finder.llm_client import make_llm_client, parse_gemini_usage
-from scrapedo_finder.models import (
+from app.services.ai_mode.scrapedo_finder.company_csv_loader import load_company_entities
+from app.services.ai_mode.scrapedo_finder.company_extraction import build_company_messages, parse_company_results
+from app.services.ai_mode.scrapedo_finder.company_prompting import build_company_search_query
+from app.services.ai_mode.scrapedo_finder.company_reporting import build_company_report_dict, write_company_outputs
+from app.services.ai_mode.scrapedo_finder.extraction import build_messages, parse_results
+from app.services.ai_mode.scrapedo_finder.llm_client import make_llm_client, parse_gemini_usage
+from app.services.ai_mode.scrapedo_finder.models import (
     CompanyCleanResult,
     EntityCleanResult,
     EntityInput,
     TokenUsage,
     utc_now_iso,
 )
-from scrapedo_finder.prompting import build_search_query, chunked
-from scrapedo_finder.cleanup_reporting import build_report_dict, write_outputs
-from scrapedo_finder.scrapedo_client import ScrapeDoClient
-from scrapedo_finder.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
+from app.services.ai_mode.scrapedo_finder.prompting import build_search_query, chunked
+from app.services.ai_mode.scrapedo_finder.cleanup_reporting import build_report_dict, write_outputs
+from app.services.ai_mode.scrapedo_finder.scrapedo_client import ScrapeDoClient
+from app.services.ai_mode.scrapedo_finder.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
 
-import gemini_batch
+from app.services.ai_mode import gemini_batch
+from app.core.config import LEGACY_AI_MODE_RESULT_DIR
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-AI_MODE_RESULT_DIR = REPO_ROOT / "ai_mode_result"
+AI_MODE_RESULT_DIR = LEGACY_AI_MODE_RESULT_DIR
 ALLOWED_RESULT_FILES = {
     "final_report.json",
     "report.json",

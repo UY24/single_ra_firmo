@@ -9,7 +9,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-import gemini_batch
+from app.services.ai_mode import gemini_batch
 
 
 class MessagesToGeminiRequestTests(unittest.TestCase):

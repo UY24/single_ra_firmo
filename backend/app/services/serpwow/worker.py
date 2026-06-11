@@ -1,7 +1,7 @@
 import asyncio
 import signal
 
-import app
+from app.services.serpwow import legacy_app as app
 
 
 async def main() -> None:

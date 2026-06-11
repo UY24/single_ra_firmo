@@ -1,23 +1,45 @@
 # backend/app/routers/ai_mode.py
-"""AI-mode upload endpoints, extracted verbatim from the SerpWow legacy app."""
+"""AI-mode endpoints (ai_bulk / ai_deep unified engine)."""
 import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+
+from app.models.entities import InvalidCSVError
+from app.services.ai_mode.mode_config import MODES
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
 
 
+def get_company(company_id: str) -> dict[str, str]:
+    # STUB for now: Supabase company lookup lands in Task 14. Until then the
+    # company_id doubles as the company name for the on-disk run layout.
+    return {"id": company_id, "name": company_id}
+
+
 @router.post("/uploads/ai-mode")
-async def create_ai_mode_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+async def create_ai_mode_upload(
+    file: UploadFile = File(...),
+    mode: str = Form("ai_bulk"),
+    company_id: str = Form(...),
+) -> dict[str, Any]:
     from app.services.ai_mode import ai_mode_service
+    if mode not in MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(MODES)}")
+    company = get_company(company_id)
     raw = await file.read()
     try:
-        info = ai_mode_service.prepare_ai_mode_run(raw, file.filename or "")
-    except ValueError as exc:
+        info = ai_mode_service.prepare_ai_mode_run(
+            raw,
+            file.filename or "",
+            mode_key=mode,
+            company_name=company["name"],
+            company_id=company_id,
+        )
+    except InvalidCSVError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
     ai_mode_tasks.add(task)

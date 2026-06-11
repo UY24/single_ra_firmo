@@ -106,5 +106,48 @@ class TestParseCleanupResponse(unittest.TestCase):
         self.assertEqual(results[0].error, "missing from LLM response")
 
 
+class TestParseJsonArrayFromText(unittest.TestCase):
+    def test_bare_array(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertEqual(parse_json_array_from_text('[{"sno": 1}]'), [{"sno": 1}])
+
+    def test_markdown_fenced_array(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        text = "```json\n[{\"sno\": 1}, {\"sno\": 2}]\n```"
+        self.assertEqual(parse_json_array_from_text(text), [{"sno": 1}, {"sno": 2}])
+
+    def test_object_wrapped_array(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertEqual(parse_json_array_from_text('{"entities": [{"sno": 1}]}'),
+                         [{"sno": 1}])
+
+    def test_single_object_wrapper_key(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertEqual(parse_json_array_from_text('{"records": [{"sno": 1}]}'),
+                         [{"sno": 1}])
+
+    def test_bare_single_result_object(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertEqual(
+            parse_json_array_from_text('{"sno": 1, "company_name": "Acme", "confidence": 5}'),
+            [{"sno": 1, "company_name": "Acme", "confidence": 5}])
+
+    def test_invalid_json_returns_none(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertIsNone(parse_json_array_from_text("not json"))
+        self.assertIsNone(parse_json_array_from_text(""))
+
+    def test_non_array_object_returns_none(self):
+        from app.services.ai_mode.cleanup import parse_json_array_from_text
+        self.assertIsNone(parse_json_array_from_text('{"foo": "bar", "baz": 1}'))
+
+    def test_coerce_already_parsed(self):
+        from app.services.ai_mode.cleanup import coerce_json_array
+        self.assertEqual(coerce_json_array([{"sno": 1}]), [{"sno": 1}])
+        self.assertEqual(coerce_json_array({"entities": [{"sno": 1}]}), [{"sno": 1}])
+        self.assertIsNone(coerce_json_array("text"))
+        self.assertIsNone(coerce_json_array(None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,14 +1,15 @@
-"""AI Mode orchestrator.
+"""AI Mode orchestrator — one engine, two configs (spec §5).
 
-Drives the AI Mode pipeline modules (scrape.do Google AI Mode ->
-LLM cleanup pipeline) and writes results under ``ai_mode_result/<run_id>/``.
+Drives the AI Mode pipeline (scrape.do Google AI Mode -> LLM cleanup) for both
+``ai_bulk`` and ``ai_deep`` modes and writes results under
+``ai_mode_results/<company_slug>/<run_id>/`` (spec §6).
 
 This module is a pure-sync orchestration layer. ``run_ai_mode_sync`` is intended
 to be invoked from a thread (e.g. ``asyncio.to_thread``); it never raises to the
 caller, instead reflecting any failure in the run's ``status.json``.
 
 Public API (other modules depend on these names/signatures):
-    prepare_ai_mode_run(raw_csv, filename) -> dict
+    prepare_ai_mode_run(raw_csv, filename, *, mode_key, company_name, company_id) -> dict
     run_ai_mode_sync(run_id) -> None
     list_ai_mode_runs() -> list[dict]
     get_ai_mode_status(run_id) -> dict
@@ -17,8 +18,6 @@ Public API (other modules depend on these names/signatures):
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import logging
 import os
@@ -28,57 +27,40 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlencode
+from typing import Any, Iterable, TypeVar
 
-from app.services.ai_mode.company_csv_loader import load_company_entities
-from app.services.ai_mode.company_extraction import build_company_messages, parse_company_results
-from app.services.ai_mode.company_prompting import build_company_search_query
-from app.services.ai_mode.company_reporting import build_company_report_dict, write_company_outputs
-from app.services.ai_mode.extraction import build_messages, parse_results
-from app.services.ai_mode.llm_client import make_llm_client, parse_gemini_usage
-from app.services.ai_mode.models import (
-    CompanyCleanResult,
-    EntityCleanResult,
-    EntityInput,
-    TokenUsage,
-    utc_now_iso,
+from app.core.config import LEGACY_AI_MODE_RESULT_DIR
+from app.models.entities import Entity, InvalidCSVError, format_entities_for_prompt, parse_entities_csv
+from app.models.results import EntityResult
+from app.services.ai_mode import gemini_batch, run_store
+from app.services.ai_mode.cleanup import (
+    build_cleanup_messages,
+    coerce_json_array,
+    parse_cleanup_response,
+    parse_json_array_from_text,
 )
-from app.services.ai_mode.prompting import build_search_query, chunked
-from app.services.ai_mode.cleanup_reporting import build_report_dict, write_outputs
+from app.services.ai_mode.llm_client import make_llm_client, parse_gemini_usage
+from app.services.ai_mode.mode_config import get_mode
+from app.services.ai_mode.models import TokenUsage, utc_now_iso
+from app.services.ai_mode.run_reporting import write_outputs
 from app.services.ai_mode.scrapedo_client import ScrapeDoClient
 from app.services.ai_mode.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
 
-from app.services.ai_mode import gemini_batch
-from app.core.config import LEGACY_AI_MODE_RESULT_DIR, PROMPTS_DIR
-
-
-AI_MODE_RESULT_DIR = LEGACY_AI_MODE_RESULT_DIR
 ALLOWED_RESULT_FILES = {
     "final_report.json",
-    "report.json",
     "found.csv",
     "notFound.csv",
     "run.log",
-    "ai_mode_debug.log",
     "input.csv",
 }
 
-# Prompt templates.
-_ADDR_PROMPT_PATH = PROMPTS_DIR / "search_query_template.txt"
-_COMPANY_PROMPT_PATH = PROMPTS_DIR / "company_search_template.txt"
-
-# Header sets used by the flexible address loader. Entries are matched against
-# headers normalized by ``_normalize_header`` (lowercase, strip, internal
-# whitespace collapsed to underscores), so e.g. "Legal Name" -> "legal_name".
-_NAME_HEADERS = {"entity_name", "company_name", "company", "name", "legal_name", "entity"}
-_COUNTRY_HEADERS = {"country", "country_name", "nation", "country_code"}
-_ADDRESS_HEADERS = {"address", "input_full_address", "full_address", "fulladdress"}
-_FIRM_ID_HEADERS = {"firm_id", "firmid", "id"}
+RAW_RESPONSES_DIRNAME = "raw_responses"
 
 # In-memory write-through cache of run status dicts.
 _RUNS: dict[str, dict] = {}
 _AI_MODE_LOGGER = logging.getLogger("ai_mode")
+
+T = TypeVar("T")
 
 COUNTRY_GL_ALIASES: dict[str, str] = {
     "united states": "us",
@@ -162,6 +144,19 @@ GOOGLE_DOMAIN_BY_GL: dict[str, str] = {
 }
 
 
+def chunked(items: list[T], size: int) -> Iterable[list[T]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+# --------------------------------------------------------------------------- #
+# Logging (ONE run.log per run: leveled, secret-redacted)
+# --------------------------------------------------------------------------- #
+def _log_level() -> int:
+    level_name = os.getenv("AI_MODE_LOG_LEVEL", "INFO").strip().upper()
+    return getattr(logging, level_name, logging.INFO)
+
+
 def _ensure_ai_mode_logger() -> logging.Logger:
     if not _AI_MODE_LOGGER.handlers:
         handler = logging.StreamHandler()
@@ -169,8 +164,7 @@ def _ensure_ai_mode_logger() -> logging.Logger:
             logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
         )
         _AI_MODE_LOGGER.addHandler(handler)
-    level_name = os.getenv("AI_MODE_LOG_LEVEL", "INFO").strip().upper()
-    _AI_MODE_LOGGER.setLevel(getattr(logging, level_name, logging.INFO))
+    _AI_MODE_LOGGER.setLevel(_log_level())
     _AI_MODE_LOGGER.propagate = False
     return _AI_MODE_LOGGER
 
@@ -191,23 +185,28 @@ def sanitize_for_response(value: Any) -> Any:
     return value
 
 
-def _debug_log_path(run_dir: Path) -> Path:
-    return run_dir / "ai_mode_debug.log"
+def _run_log_path(run_dir: Path) -> Path:
+    return run_dir / "run.log"
 
 
 def _ai_log(run_id: str, run_dir: Path, message: str, level: int = logging.INFO) -> None:
     safe_message = sanitize_secret_text(message)
     _ensure_ai_mode_logger().log(level, "[run:%s] %s", run_id, safe_message)
+    if level < _log_level():
+        return
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
-        with _debug_log_path(run_dir).open("a", encoding="utf-8") as handle:
+        with _run_log_path(run_dir).open("a", encoding="utf-8") as handle:
             handle.write(f"{utc_now_iso()} {logging.getLevelName(level)} {safe_message}\n")
     except OSError:
         _ensure_ai_mode_logger().warning(
-            "[run:%s] failed to write AI Mode debug log", run_id
+            "[run:%s] failed to write AI Mode run log", run_id
         )
 
 
+# --------------------------------------------------------------------------- #
+# Geo targeting helpers
+# --------------------------------------------------------------------------- #
 def _country_to_gl(country: str | None, fallback: str = "us") -> str:
     value = str(country or "").strip().lower()
     fallback_value = str(fallback or "us").strip().lower() or "us"
@@ -282,16 +281,6 @@ def _geo_params_for_group(
     }
 
 
-def _query_debug_stats(client: ScrapeDoClient, query: str, extra_params: dict[str, str] | None = None) -> dict[str, int]:
-    base_url = "https://api.scrape.do/plugin/google/search/ai-mode"
-    params = client.build_params(query, extra_params=extra_params)
-    encoded_url_chars = len(base_url) + 1 + len(urlencode(params))
-    return {
-        "query_chars": len(query),
-        "encoded_url_chars": encoded_url_chars,
-    }
-
-
 # --------------------------------------------------------------------------- #
 # Env parsing helpers (tolerate missing / malformed values)
 # --------------------------------------------------------------------------- #
@@ -335,8 +324,9 @@ def _str_env(name: str, default: str = "") -> str:
 def build_ai_mode_settings() -> Settings:
     """Build (and validate) scrape.do Settings from the process environment.
 
-    Reads website_url_finder's own process env (app.py has already loaded .env);
-    does NOT load any scrape.do .env file.
+    Reads website_url_finder's own process env (config.py has already loaded
+    .env); does NOT load any scrape.do .env file. ``batch_size`` here is the
+    legacy env value only; the engine batches by ModeConfig.batch_size().
     """
     settings = Settings(
         scrapedo_token=_str_env("SCRAPEDO_TOKEN"),
@@ -394,88 +384,43 @@ def build_ai_mode_llm_config() -> LLMConfig:
 
 
 # --------------------------------------------------------------------------- #
-# CSV helpers
+# scrape.do payload -> raw text for the cleanup LLM
 # --------------------------------------------------------------------------- #
-def _normalize_header(key: str | None) -> str:
-    """Lowercase, strip, and collapse internal whitespace to single underscores.
-
-    This lets human-friendly headers ("Legal Name", "Country Code") match the
-    underscore-style lookup keys used by the flexible address loader.
-    """
-    normalized = (key or "").strip().lower()
-    return "_".join(normalized.split())
+_LIST_BLOCK_TYPES = {"ordered_list", "unordered_list", "list"}
 
 
-def _normalize_row(row: dict[str, Any]) -> dict[str, str]:
-    """Lowercase/strip keys; coerce values to stripped strings."""
-    normalized: dict[str, str] = {}
-    for key, value in row.items():
-        nkey = _normalize_header(key)
-        if not nkey:
+def _payload_text(payload: Any) -> str:
+    """Flatten a scrape.do AI-Mode payload's text_blocks into plain text."""
+    text_blocks = payload.get("text_blocks") if isinstance(payload, dict) else None
+    lines: list[str] = []
+    for block in text_blocks or []:
+        if not isinstance(block, dict):
             continue
-        if value is None:
-            text = ""
-        elif isinstance(value, list):
-            text = " ".join(str(part) for part in value if part is not None).strip()
+        block_type = block.get("type")
+        if block_type in _LIST_BLOCK_TYPES:
+            for index, item in enumerate(block.get("list", []), start=1):
+                snippet = item.get("snippet", "") if isinstance(item, dict) else str(item)
+                if snippet:
+                    lines.append(f"  {index}. {snippet}")
         else:
-            text = str(value).strip()
-        # Keep the first non-empty mapping for a given normalized key.
-        if nkey not in normalized or (not normalized[nkey] and text):
-            normalized[nkey] = text
-    return normalized
-
-
-def _first_match(row: dict[str, str], headers: set[str]) -> str:
-    for key in headers:
-        value = row.get(key, "")
-        if value:
-            return value
-    return ""
-
-
-def _detect_input_type(fieldnames: list[str] | None) -> str:
-    # "Company Name ENG" normalizes to "company_name_eng".
-    for name in fieldnames or []:
-        if _normalize_header(name) == "company_name_eng":
-            return "company"
-    return "address"
-
-
-def load_address_entities(csv_path: Path) -> list[EntityInput]:
-    """Load address-mode entities from a CSV with flexible header mapping.
-
-    Rows with an empty entity name are skipped. ``row_number`` enumerates from 2
-    (accounting for the header row).
-    """
-    entities: list[EntityInput] = []
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row_number, raw_row in enumerate(reader, start=2):
-            row = _normalize_row(raw_row)
-            entity_name = _first_match(row, _NAME_HEADERS)
-            if not entity_name:
-                continue
-            country = _first_match(row, _COUNTRY_HEADERS)
-            address = _first_match(row, _ADDRESS_HEADERS)
-            firm_id_raw = _first_match(row, _FIRM_ID_HEADERS)
-            firm_id = int(firm_id_raw) if firm_id_raw.isdigit() else None
-            entities.append(
-                EntityInput(
-                    entity_name=entity_name,
-                    country=country,
-                    address=address,
-                    firm_id=firm_id,
-                    row_number=row_number,
-                )
-            )
-    return entities
+            snippet = block.get("snippet", "")
+            if snippet:
+                lines.append(snippet)
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# Status persistence + accessors
+# Run dir resolution (new layout + read-only legacy fallback)
 # --------------------------------------------------------------------------- #
-def _run_dir(run_id: str) -> Path:
-    return AI_MODE_RESULT_DIR / run_id
+def _find_run_dir(run_id: str) -> Path | None:
+    """Resolve a run dir: new ai_mode_results layout first, then the legacy dir."""
+    run_dir = run_store.find_run_dir(run_id)
+    if run_dir is not None:
+        return run_dir
+    legacy = LEGACY_AI_MODE_RESULT_DIR / run_id
+    if legacy.is_dir():
+        return legacy
+    return None
 
 
 def _available_files(run_dir: Path) -> list[str]:
@@ -502,7 +447,11 @@ def _scrapedo_failed_request_count(records: list[dict]) -> int:
 
 
 def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
-    """Reflect request-level failures from report.json in the UI status."""
+    """Reflect request-level failures from a LEGACY report.json in the UI status.
+
+    New-layout runs write request records into final_report.json and set their
+    failure counts directly at completion, so this is a no-op for them.
+    """
     report_path = run_dir / "report.json"
     if not report_path.exists():
         return status
@@ -522,15 +471,16 @@ def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
 
     if failed_request_count and status.get("status") == "completed":
         status["status"] = "completed_with_errors"
-        status["error"] = f"{failed_request_count} request(s) failed. See report.json."
+        status["error"] = f"{failed_request_count} request(s) failed."
     return status
 
 
-def _persist_status(run_id: str, status: dict) -> None:
+# --------------------------------------------------------------------------- #
+# Status persistence + accessors
+# --------------------------------------------------------------------------- #
+def _persist_status(run_id: str, run_dir: Path, status: dict) -> None:
     """Write ``status.json`` for the run and update the in-memory cache."""
-    run_dir = _run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-    status = _reconcile_status_from_report(run_dir, status)
     status["available_files"] = _available_files(run_dir)
     (run_dir / "status.json").write_text(
         json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -538,9 +488,8 @@ def _persist_status(run_id: str, status: dict) -> None:
     _RUNS[run_id] = status
 
 
-def _read_status(run_id: str) -> dict:
+def _read_status(run_id: str, run_dir: Path) -> dict:
     """Load status.json, falling back to the in-memory cache."""
-    run_dir = _run_dir(run_id)
     status_path = run_dir / "status.json"
     if status_path.exists():
         try:
@@ -554,35 +503,37 @@ def _read_status(run_id: str) -> dict:
 
 
 def get_ai_mode_status(run_id: str) -> dict:
-    """Return the current status dict for a run.
+    """Return the current status dict for a run (new layout or legacy, read-only).
 
     Raises KeyError if the run is unknown. Refreshes ``available_files``.
     """
-    run_dir = _run_dir(run_id)
-    if not run_dir.exists():
+    run_dir = _find_run_dir(run_id)
+    if run_dir is None:
         raise KeyError(run_id)
-    status = _read_status(run_id)
+    status = _read_status(run_id, run_dir)
     status = _reconcile_status_from_report(run_dir, status)
     status["available_files"] = _available_files(run_dir)
     _RUNS[run_id] = status
-    _persist_status(run_id, status)
     return status
 
 
 def list_ai_mode_runs() -> list[dict]:
-    """Return all known runs, newest first (by created_at)."""
+    """Return all known runs (new layout + legacy dir), newest first."""
+    run_dirs = list(run_store.list_run_dirs())
+    if LEGACY_AI_MODE_RESULT_DIR.exists():
+        run_dirs.extend(p for p in LEGACY_AI_MODE_RESULT_DIR.iterdir() if p.is_dir())
+
     runs: list[dict] = []
-    if not AI_MODE_RESULT_DIR.exists():
-        return runs
-    for status_path in AI_MODE_RESULT_DIR.glob("*/status.json"):
+    for run_dir in run_dirs:
+        status_path = run_dir / "status.json"
+        if not status_path.exists():
+            continue
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             continue
-        status = _reconcile_status_from_report(status_path.parent, status)
-        status["available_files"] = _available_files(status_path.parent)
-        if status.get("status") == "completed_with_errors":
-            _persist_status(str(status.get("run_id") or status_path.parent.name), status)
+        status = _reconcile_status_from_report(run_dir, status)
+        status["available_files"] = _available_files(run_dir)
         runs.append(status)
     runs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     return runs
@@ -594,8 +545,8 @@ def get_ai_mode_result_path(run_id: str, file_name: str) -> Path:
     Raises KeyError for an unknown run, ValueError for a disallowed file name, and
     FileNotFoundError when the file does not exist.
     """
-    run_dir = _run_dir(run_id)
-    if not run_dir.exists():
+    run_dir = _find_run_dir(run_id)
+    if run_dir is None:
         raise KeyError(run_id)
     if file_name not in ALLOWED_RESULT_FILES:
         raise ValueError(f"File not allowed: {file_name}")
@@ -608,49 +559,45 @@ def get_ai_mode_result_path(run_id: str, file_name: str) -> Path:
 # --------------------------------------------------------------------------- #
 # prepare_ai_mode_run
 # --------------------------------------------------------------------------- #
-def prepare_ai_mode_run(raw_csv: bytes, filename: str) -> dict:
+def prepare_ai_mode_run(
+    raw_csv: bytes,
+    filename: str,
+    *,
+    mode_key: str,
+    company_name: str,
+    company_id: str,
+) -> dict:
     """Validate an uploaded CSV, register a queued run, and persist initial state.
 
-    Detects the input type (company vs address), counts usable rows, stores the
-    raw CSV as input.csv, and writes a ``queued`` status.json. Does NOT call any
-    external API.
+    Parses the canonical CSV format (raising InvalidCSVError for bad files),
+    stores the raw CSV as input.csv under the per-company run dir, and writes a
+    ``queued`` status.json. Does NOT call any external API.
     """
     if not (filename or "").lower().endswith(".csv"):
-        raise ValueError("Only .csv file is supported.")
+        raise InvalidCSVError("Only .csv file is supported.")
 
-    text = raw_csv.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    fieldnames = reader.fieldnames
-    input_type = _detect_input_type(fieldnames)
-
-    total_rows = 0
-    for raw_row in reader:
-        if input_type == "company":
-            name = (raw_row.get("Company Name ENG") or "").strip()
-            if name:
-                total_rows += 1
-        else:
-            row = _normalize_row(raw_row)
-            if _first_match(row, _NAME_HEADERS):
-                total_rows += 1
-
-    if total_rows == 0:
-        raise ValueError("No usable rows found in the CSV.")
+    mode = get_mode(mode_key)
+    parsed = parse_entities_csv(raw_csv)
+    total_rows = len(parsed.entities)
 
     run_id = uuid.uuid4().hex
-    run_dir = _run_dir(run_id)
-    (run_dir / "raw_scrapedo_response").mkdir(parents=True, exist_ok=True)
+    run_dir = run_store.run_dir_for(company_name, run_id)
     (run_dir / "input.csv").write_bytes(raw_csv)
 
     # Build the LLM config only to surface provider/model labels (no API call).
     llm_config = build_ai_mode_llm_config()
-    batch_size = _int_env("SCRAPEDO_BATCH_SIZE", 10)
+    batch_size = mode.batch_size()
 
     now = utc_now_iso()
     status = {
         "run_id": run_id,
         "status": "queued",
-        "input_type": input_type,
+        "mode": mode.key,
+        "mode_label": mode.label,
+        "company_id": company_id,
+        "company_name": company_name,
+        "columns_detected": parsed.columns_detected,
+        "warnings": parsed.warnings,
         "total_rows": total_rows,
         "batch_size": batch_size,
         "llm_provider": llm_config.provider,
@@ -672,19 +619,24 @@ def prepare_ai_mode_run(raw_csv: bytes, filename: str) -> dict:
         "updated_at": now,
         "error": None,
     }
-    _persist_status(run_id, status)
+    _persist_status(run_id, run_dir, status)
     _ai_log(
         run_id,
         run_dir,
-        f"AI Mode run prepared filename={filename or '-'} input_type={input_type} "
-        f"total_rows={total_rows} batch_size={batch_size} llm_provider={llm_config.provider} "
-        f"llm_model={llm_config.model}",
+        f"AI Mode run prepared filename={filename or '-'} mode={mode.key} "
+        f"company={company_name} total_rows={total_rows} batch_size={batch_size} "
+        f"llm_provider={llm_config.provider} llm_model={llm_config.model}",
     )
 
     return {
         "run_id": run_id,
         "total_rows": total_rows,
-        "input_type": input_type,
+        "mode": mode.key,
+        "mode_label": mode.label,
+        "company_id": company_id,
+        "company_name": company_name,
+        "columns_detected": parsed.columns_detected,
+        "warnings": parsed.warnings,
         "llm_provider": llm_config.provider,
         "llm_model": llm_config.model,
         "batch_size": batch_size,
@@ -704,14 +656,17 @@ def run_ai_mode_sync(run_id: str) -> None:
     the caller: any unexpected error is captured in status.json (status="failed").
     Persists status after every batch so a UI can poll progress.
     """
-    run_dir = _run_dir(run_id)
-    status = _read_status(run_id)
+    run_dir = run_store.find_run_dir(run_id)
+    if run_dir is None:
+        _ensure_ai_mode_logger().error("[run:%s] run dir not found; cannot run", run_id)
+        return
+    status = _read_status(run_id, run_dir)
     started_at = utc_now_iso()
     wall_t0 = time.perf_counter()
-    debug_log = _debug_log_path(run_dir)
-    if debug_log.exists():
+    run_log = _run_log_path(run_dir)
+    if run_log.exists():
         try:
-            debug_log.unlink()
+            run_log.unlink()
         except OSError:
             pass
     _ai_log(run_id, run_dir, "AI Mode run starting")
@@ -720,16 +675,20 @@ def run_ai_mode_sync(run_id: str) -> None:
     status["started_at"] = started_at
     status["updated_at"] = utc_now_iso()
     status["error"] = None
-    _persist_status(run_id, status)
+    _persist_status(run_id, run_dir, status)
 
     try:
+        mode = get_mode(str(status.get("mode") or "ai_bulk"))
+        batch_size = mode.batch_size()
+        search_prompt = mode.search_prompt()
+
         settings = build_ai_mode_settings()
         cfg = build_ai_mode_llm_config()
         _ai_log(
             run_id,
             run_dir,
             "Settings loaded "
-            f"batch_size={settings.batch_size} max_query_chars={settings.scrapedo_max_query_chars} "
+            f"mode={mode.key} batch_size={batch_size} max_query_chars={settings.scrapedo_max_query_chars} "
             f"timeout={settings.scrapedo_timeout_seconds}s retries={settings.scrapedo_max_retries} "
             f"device={settings.scrapedo_device or '-'} hl={settings.scrapedo_hl or '-'} "
             f"gl={settings.scrapedo_gl or '-'} google_domain={settings.scrapedo_google_domain or '-'} "
@@ -746,44 +705,37 @@ def run_ai_mode_sync(run_id: str) -> None:
             google_domain=settings.scrapedo_google_domain,
             safe=settings.scrapedo_safe,
             include_html=settings.scrapedo_include_html,
-            log=lambda message: _ai_log(run_id, run_dir, message),
+            log=lambda message: _ai_log(run_id, run_dir, message, logging.DEBUG),
         )
-
-        input_type = status.get("input_type") or _detect_input_type_from_status(run_dir)
-        is_company = input_type == "company"
 
         input_csv = run_dir / "input.csv"
-        if is_company:
-            entities = load_company_entities(input_csv)
-        else:
-            entities = load_address_entities(input_csv)
+        entities: list[Entity] = parse_entities_csv(input_csv.read_bytes()).entities
         _ai_log(
             run_id,
             run_dir,
-            f"Loaded entities input_type={input_type} total_entities={len(entities)} input_csv={input_csv}",
+            f"Loaded entities mode={mode.key} total_entities={len(entities)} input_csv={input_csv}",
         )
 
-        groups = list(chunked(entities, settings.batch_size))
+        groups = list(chunked(entities, batch_size))
         _ai_log(
             run_id,
             run_dir,
-            f"Created {len(groups)} Scrape.do batch(es) from batch_size={settings.batch_size}",
+            f"Created {len(groups)} Scrape.do batch(es) from batch_size={batch_size}",
         )
         status["batches_total"] = len(groups)
         status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, status)
+        _persist_status(run_id, run_dir, status)
 
-        raw_dir = run_dir / "raw_scrapedo_response"
+        raw_dir = run_dir / RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
 
-        results: list = []
+        results: list[EntityResult] = []
         per_request_records: list[dict] = []
         usage_total = TokenUsage()
         entities_without_scrape_data = 0
         llm_errors = 0
         scrapedo_seconds_total = 0.0
         llm_seconds_total = 0.0
-        sno = 0
 
         batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
         concurrency = max(1, _int_env("SCRAPEDO_CONCURRENCY", 5))
@@ -793,18 +745,15 @@ def run_ai_mode_sync(run_id: str) -> None:
         # ------------------------------------------------------------- #
         status["phase"] = "scraping"
         status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, status)
+        _persist_status(run_id, run_dir, status)
 
-        def _scrape_one(request_index: int, group: list) -> dict:
-            group_names = [e.entity_name for e in group]
-            if is_company:
-                query = build_company_search_query(group, prompt_path=_COMPANY_PROMPT_PATH)
-            else:
-                query = build_search_query(group, prompt_path=_ADDR_PROMPT_PATH)
+        def _scrape_one(request_index: int, group: list[Entity]) -> dict:
+            group_names = [e.company_name for e in group]
+            query = search_prompt.replace("{entities}", format_entities_for_prompt(group))
             geo_params, geo_debug = _geo_params_for_group(group, settings)
             raw_name = f"request_{request_index:03d}.json"
             raw_path = raw_dir / raw_name
-            rel_raw_path = f"raw_scrapedo_response/{raw_name}"
+            rel_raw_path = f"{RAW_RESPONSES_DIRNAME}/{raw_name}"
             # Resume: reuse an existing, parseable raw response instead of re-scraping.
             if raw_path.exists():
                 try:
@@ -862,7 +811,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     1 for r in scraped.values() if r["error"]
                 )
                 status["updated_at"] = utc_now_iso()
-                _persist_status(run_id, status)
+                _persist_status(run_id, run_dir, status)
         ordered = [scraped[i] for i in sorted(scraped)]
         ok_batches = [r for r in ordered if r["payload"] is not None]
         _ai_log(
@@ -875,36 +824,26 @@ def run_ai_mode_sync(run_id: str) -> None:
         # ------------------------------------------------------------- #
         status["phase"] = "cleaning"
         status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, status)
+        _persist_status(run_id, run_dir, status)
 
-        batch_results_by_index: dict[int, list] = {}
+        batch_results_by_index: dict[int, list[EntityResult]] = {}
         llm_error_by_index: dict[int, str | None] = {}
         llm_seconds_by_index: dict[int, float] = {}
 
-        def _error_results(rec: dict, message: str) -> list:
-            out: list = []
-            if is_company:
-                for entity in rec["group"]:
-                    out.append(
-                        CompanyCleanResult(
-                            company_name_eng=entity.company_name_eng,
-                            company_name_local=entity.company_name_local,
-                            country_code=entity.country_code,
-                            error=message,
-                        )
-                    )
-            else:
-                for name in rec["group_names"]:
-                    out.append(EntityCleanResult(entity_name=name, error=message))
-            return out
+        def _error_results(rec: dict, message: str) -> list[EntityResult]:
+            return [
+                EntityResult(
+                    company_name=entity.company_name,
+                    country=entity.country,
+                    sno=entity.sno,
+                    company_local_name=entity.company_local_name,
+                    error=message,
+                )
+                for entity in rec["group"]
+            ]
 
-        def _messages_for(rec: dict):
-            payload = rec["payload"]
-            text_blocks = payload.get("text_blocks") if isinstance(payload, dict) else None
-            references = payload.get("references") if isinstance(payload, dict) else None
-            if is_company:
-                return build_company_messages(rec["group"], text_blocks, references)
-            return build_messages(rec["group_names"], text_blocks, references)
+        def _messages_for(rec: dict) -> list[dict]:
+            return build_cleanup_messages(_payload_text(rec["payload"]), rec["group"])
 
         if batch_mode:
             if not _str_env("GEMINI_API_KEY"):
@@ -947,7 +886,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     job_names.append(name)
                     status["gemini_batch_jobs"] = job_names
                     status["updated_at"] = utc_now_iso()
-                    _persist_status(run_id, status)
+                    _persist_status(run_id, run_dir, status)
                     _ai_log(
                         run_id, run_dir,
                         f"Submitted Gemini batch shard {si + 1}/{len(shards)} job={name}",
@@ -1004,18 +943,15 @@ def run_ai_mode_sync(run_id: str) -> None:
                     batch_results_by_index[idx] = _error_results(rec, msg)
                     llm_errors += len(rec["group"])
                     continue
-                parsed = gemini_batch.parse_json_from_text(c["text"])
-                if parsed is None:
-                    msg = sanitize_secret_text("LLM error: could not parse JSON from batch output")
+                parsed_array = parse_json_array_from_text(c["text"])
+                if parsed_array is None:
+                    msg = sanitize_secret_text("LLM error: could not parse JSON array from batch output")
                     llm_error_by_index[idx] = msg
                     batch_results_by_index[idx] = _error_results(rec, msg)
                     llm_errors += len(rec["group"])
                     continue
                 usage_total = usage_total + parse_gemini_usage(c.get("usage"))
-                if is_company:
-                    batch_results_by_index[idx] = parse_company_results(parsed, rec["group"])
-                else:
-                    batch_results_by_index[idx] = parse_results(parsed, rec["group_names"])
+                batch_results_by_index[idx] = parse_cleanup_response(parsed_array, rec["group"])
             llm_seconds_total = time.perf_counter() - clean_t0
         else:
             for rec in ok_batches:
@@ -1026,10 +962,16 @@ def run_ai_mode_sync(run_id: str) -> None:
                     parsed, usage = llm.complete_json(messages)
                     secs = time.perf_counter() - t0
                     usage_total = usage_total + usage
-                    if is_company:
-                        batch_results_by_index[idx] = parse_company_results(parsed, rec["group"])
+                    parsed_array = coerce_json_array(parsed)
+                    if parsed_array is None:
+                        msg = "LLM error: response was not a JSON array"
+                        llm_error_by_index[idx] = msg
+                        batch_results_by_index[idx] = _error_results(rec, msg)
+                        llm_errors += len(rec["group"])
                     else:
-                        batch_results_by_index[idx] = parse_results(parsed, rec["group_names"])
+                        batch_results_by_index[idx] = parse_cleanup_response(
+                            parsed_array, rec["group"]
+                        )
                 except Exception as exc:
                     secs = time.perf_counter() - t0
                     msg = sanitize_secret_text(f"LLM error: {exc}")
@@ -1040,7 +982,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                 llm_seconds_total += secs
                 status["llm_errors"] = llm_errors
                 status["updated_at"] = utc_now_iso()
-                _persist_status(run_id, status)
+                _persist_status(run_id, run_dir, status)
 
         # ------------------------------------------------------------- #
         # PHASE 3 - assemble results + per-request records (in order)
@@ -1048,6 +990,7 @@ def run_ai_mode_sync(run_id: str) -> None:
         for rec in ordered:
             idx = rec["request_index"]
             if rec["payload"] is None:
+                results.extend(_error_results(rec, f"scrape.do error: {rec['error']}"))
                 per_request_records.append(
                     {
                         "request_index": idx,
@@ -1063,15 +1006,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     }
                 )
                 continue
-            batch_results = batch_results_by_index.get(idx, [])
-            if not is_company:
-                for entity, result in zip(rec["group"], batch_results):
-                    result.location = entity.address
-                    result.country = entity.country
-            for result in batch_results:
-                sno += 1
-                result.sno = sno
-            results.extend(batch_results)
+            results.extend(batch_results_by_index.get(idx, []))
             rec_error = llm_error_by_index.get(idx)
             llm_secs = llm_seconds_by_index.get(idx, 0.0)
             per_request_records.append(
@@ -1089,116 +1024,73 @@ def run_ai_mode_sync(run_id: str) -> None:
                 }
             )
 
-        status["batches_done"] = len(groups)
-        status["entities_processed"] = len(results)
-        status["entities_without_scrape_data"] = entities_without_scrape_data
-        status["llm_errors"] = llm_errors
-        status["scrapedo_request_count"] = len(per_request_records)
-        status["failed_request_count"] = _failed_request_count(per_request_records)
-        status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
-        status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-        status["llm_seconds_total"] = round(llm_seconds_total, 3)
-        status["token_usage"] = asdict(usage_total)
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, status)
-
         # ----------------------------------------------------------------- #
-        # Final report
+        # Outputs: found.csv / notFound.csv / ONE final_report.json
         # ----------------------------------------------------------------- #
         total_wall = time.perf_counter() - wall_t0
         completed_at = utc_now_iso()
-        llm_label = {"provider": cfg.provider, "base_url": cfg.base_url, "model": cfg.model}
+        failed_request_count = _failed_request_count(per_request_records)
+        websites_found = sum(1 for r in results if r.website_url)
+        websites_not_found = len(results) - websites_found
+        run_status = "completed_with_errors" if failed_request_count else "completed"
 
-        if is_company:
-            report = build_company_report_dict(
-                source_batch_dir=str(run_dir),
-                generated_at=utc_now_iso(),
-                llm=llm_label,
-                results=results,
-                total_input_entities=len(entities),
-                entities_without_scrape_data=entities_without_scrape_data,
-                llm_errors=llm_errors,
-                token_usage=usage_total,
-                time_taken_seconds=total_wall,
-            )
-        else:
-            report = build_report_dict(
-                source_batch_dir=str(run_dir),
-                generated_at=utc_now_iso(),
-                llm=llm_label,
-                results=results,
-                total_input_entities=len(entities),
-                entities_without_scrape_data=entities_without_scrape_data,
-                llm_errors=llm_errors,
-                token_usage=usage_total,
-                time_taken_seconds=total_wall,
-            )
-
-        # Enrich the report with run-level metadata + timing.
-        report["run_id"] = run_id
-        report["input_type"] = input_type
-        report["requests"] = per_request_records
-        report["summary"]["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-        report["summary"]["llm_seconds_total"] = round(llm_seconds_total, 3)
-        report["summary"]["batch_duration_seconds"] = round(total_wall, 3)
-        report["summary"]["started_at"] = started_at
-        report["summary"]["completed_at"] = completed_at
-
-        if is_company:
-            write_company_outputs(run_dir, report, results)
-        else:
-            write_outputs(run_dir, report, results)
-
-        # Separate per-request timing metadata file.
-        report_meta = {
+        summary = {
             "run_id": run_id,
-            "input_type": input_type,
-            "batch_size": settings.batch_size,
-            "total_entities": len(entities),
-            "failed_request_count": _failed_request_count(per_request_records),
+            "status": run_status,
+            "mode": mode.key,
+            "mode_label": mode.label,
+            "company_id": status.get("company_id"),
+            "company_name": status.get("company_name"),
+            "generated_at": completed_at,
+            "llm": {"provider": cfg.provider, "base_url": cfg.base_url, "model": cfg.model},
+            "batch_size": batch_size,
+            "total_input_entities": len(entities),
+            "entities_processed": len(results),
+            "entities_without_scrape_data": entities_without_scrape_data,
+            "llm_errors": llm_errors,
+            "websites_found": websites_found,
+            "websites_not_found": websites_not_found,
+            "scrapedo_request_count": len(per_request_records),
+            "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
-            "requests": per_request_records,
-            "started_at": started_at,
-            "completed_at": completed_at,
+            "token_usage": asdict(usage_total),
             "scrapedo_seconds_total": round(scrapedo_seconds_total, 3),
             "llm_seconds_total": round(llm_seconds_total, 3),
+            "batch_duration_seconds": round(total_wall, 3),
+            "started_at": started_at,
+            "completed_at": completed_at,
         }
-        (run_dir / "report.json").write_text(
-            json.dumps(report_meta, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        write_outputs(run_dir, results, summary=summary, requests=per_request_records)
 
-        # Human-readable per-request log.
-        log_lines = []
+        # Per-request summary lines into the single run.log.
         for record in per_request_records:
             line = (
-                f"{record['request_index']} status={record['status']} "
+                f"request {record['request_index']} status={record['status']} "
                 f"scrapedo={record['scrapedo_seconds']}s "
                 f"llm={record['llm_seconds']}s "
                 f"entities={record['entity_count']}"
             )
             if record.get("error"):
                 line += f" {record['error']}"
-            log_lines.append(line)
-        (run_dir / "run.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+            _ai_log(run_id, run_dir, line,
+                    logging.ERROR if record.get("error") else logging.INFO)
         _ai_log(
             run_id,
             run_dir,
-            f"Wrote outputs final_report.json report.json run.log found.csv notFound.csv "
-            f"requests={len(per_request_records)} failed_requests={_failed_request_count(per_request_records)}",
+            f"Wrote outputs final_report.json found.csv notFound.csv "
+            f"requests={len(per_request_records)} failed_requests={failed_request_count}",
         )
 
         # Reflect final summary counts in the status.
-        summary = report.get("summary", {})
-        failed_request_count = _failed_request_count(per_request_records)
-        status["status"] = "completed_with_errors" if failed_request_count else "completed"
-        status["entities_processed"] = summary.get("entities_processed", len(results))
+        status["status"] = run_status
+        status["entities_processed"] = len(results)
         status["entities_without_scrape_data"] = entities_without_scrape_data
         status["llm_errors"] = llm_errors
         status["scrapedo_request_count"] = len(per_request_records)
         status["failed_request_count"] = failed_request_count
         status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
-        status["websites_found"] = summary.get("websites_found", 0)
-        status["websites_not_found"] = summary.get("websites_not_found", 0)
+        status["websites_found"] = websites_found
+        status["websites_not_found"] = websites_not_found
         status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
         status["llm_seconds_total"] = round(llm_seconds_total, 3)
         status["batch_duration_seconds"] = round(total_wall, 3)
@@ -1206,11 +1098,11 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["completed_at"] = completed_at
         status["updated_at"] = utc_now_iso()
         status["error"] = (
-            f"{failed_request_count} request(s) failed. See report.json."
+            f"{failed_request_count} request(s) failed. See final_report.json."
             if failed_request_count
             else None
         )
-        _persist_status(run_id, status)
+        _persist_status(run_id, run_dir, status)
         _ai_log(
             run_id,
             run_dir,
@@ -1224,7 +1116,7 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["status"] = "failed"
         status["error"] = sanitize_secret_text(str(exc))
         status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, status)
+        _persist_status(run_id, run_dir, status)
         _ai_log(
             run_id,
             run_dir,
@@ -1232,16 +1124,3 @@ def run_ai_mode_sync(run_id: str) -> None:
             logging.ERROR,
         )
         return
-
-
-def _detect_input_type_from_status(run_dir: Path) -> str:
-    """Fallback input-type detection from the stored input.csv header."""
-    input_csv = run_dir / "input.csv"
-    if not input_csv.exists():
-        return "address"
-    try:
-        with input_csv.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            return _detect_input_type(reader.fieldnames)
-    except (OSError, csv.Error):
-        return "address"

@@ -1,29 +1,14 @@
-# website_url_finder — Python runtime dependencies
-#
-# Target interpreter: Python 3.12  (3.11 also fine; 3.9 is the hard floor but EOL — don't use it)
-#
-# Setup:
-#   python3.12 -m venv .venv
-#   source .venv/bin/activate
-#   pip install -U pip
-#   pip install -r requirements.txt
-#   python app.py            # serves http://localhost:11500/ui
-
-# --- Web service: FastAPI app + ASGI server ---
-fastapi==0.115.0
-uvicorn==0.32.0           # plain ASGI server (app.py uses uvicorn.run); `uvicorn[standard]` adds uvloop/httptools for speed
-python-multipart==0.0.20  # required by FastAPI to accept the CSV file upload (AI Mode tab)
-
-# --- HTTP + data models ---
-httpx==0.27.2             # scrape.do + LLM (Gemini/OpenAI) HTTP calls
-pydantic==2.9.2           # request/response models in app.py
-
-# --- SerpWow pipeline infra (imported unconditionally by app.py, so required even for AI Mode) ---
-aio-pika==9.5.6           # RabbitMQ client (worker queue); pulls in aiormq
-boto3==1.42.97            # S3 uploads/downloads; pulls in botocore
-
-# --- Config ---
-python-dotenv==1.0.1      # .env loading used by scrapedo_finder.settings and gmaps.py
-
-# --- Optional: only the standalone convertjtox.py JSON->XLSX helper needs pandas ---
-# pandas==2.2.3
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+boto3
+pika
+aio-pika
+redis
+aiohttp
+python-dotenv
+pyyaml
+duckdb
+httpx
+msgspec

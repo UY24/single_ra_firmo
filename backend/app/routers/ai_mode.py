@@ -41,6 +41,10 @@ async def create_ai_mode_upload(
         )
     except InvalidCSVError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        # Config errors (e.g. missing LLM API key) are client-visible 400s,
+        # not 500s; prepare_ai_mode_run leaves no run dir behind in this case.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)

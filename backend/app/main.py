@@ -5,6 +5,9 @@ import os
 
 from app.core import config  # noqa: F401  (loads .env first)
 from app.services.serpwow.legacy_app import _get_int_env, app  # the existing FastAPI instance
+from app.routers.ai_mode import router as ai_mode_router
+
+app.include_router(ai_mode_router)
 
 if __name__ == "__main__":
     import uvicorn

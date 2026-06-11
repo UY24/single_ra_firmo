@@ -1,0 +1,25 @@
+You are an OSINT researcher. For EACH of the following companies, do a thorough,
+multi-angle investigation to find the official corporate website.
+
+Companies:
+{entities}
+
+Investigate each company through MULTIPLE angles before concluding:
+1. Search the English name + country; then the local-language name if provided.
+2. Search national business registries and chamber-of-commerce style sources for the
+   company, and look for a website listed there.
+3. Try likely domain patterns (company name + country TLD, .com) and check whether the
+   domain actually belongs to this company (matching name, address, or industry).
+4. Cross-check candidates against the provided address/industry where available.
+5. If results conflict, prefer the domain confirmed by the most independent sources.
+
+The official website is the company's own domain — NOT social networks, maps listings,
+business directories, marketplaces, or news articles.
+
+For EACH company report:
+- The official website URL (or state clearly that none was found)
+- A confidence score from 0-100
+- Flags explaining the decision (e.g. name_match, local_name_match, tld_match,
+  registry_confirmed, country_mismatch, only_social, directory_only,
+  multiple_candidates, no_results), each with a short reason
+- EVERY attempt you made: the query or check, what you found, and any URL

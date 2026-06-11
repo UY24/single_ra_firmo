@@ -1,0 +1,19 @@
+Find the official corporate website for EACH of the following companies. Work through
+the whole list; do not skip any entry.
+
+Companies:
+{entities}
+
+For each company:
+- Search by the English name plus country; if a local-language name is given, search it too.
+- The official website is the company's own domain — NOT social networks, maps listings,
+  business directories, marketplaces, or news articles.
+- Prefer domains whose TLD or content matches the company's country.
+
+For EACH company report:
+- The official website URL (or state clearly that none was found)
+- A confidence score from 0-100
+- Flags explaining the decision (e.g. name_match, local_name_match, tld_match,
+  country_mismatch, only_social, directory_only, multiple_candidates, no_results),
+  each with a short reason
+- Every search attempt you made: the query, what you found, and any URL

@@ -80,7 +80,7 @@ def _http_get_bytes(url: str, headers: dict[str, str], timeout: float = 300.0) -
 def messages_to_gemini_request(messages: list[dict[str, str]], *, temperature: float = 0) -> dict[str, Any]:
     """Convert OpenAI-style ``messages`` into a Gemini ``GenerateContentRequest``.
 
-    Mirrors ``scrapedo_finder.llm_client.GeminiClient.complete_json`` exactly so a
+    Mirrors ``app.services.ai_mode.llm_client.GeminiClient.complete_json`` exactly so a
     batched response is shaped identically to the synchronous path (JSON mode,
     same system instruction handling), and the existing parsers apply unchanged.
     """

@@ -138,3 +138,19 @@ def parse_entities_csv(raw: str | bytes) -> ParsedCSV:
         raise InvalidCSVError("No valid rows found. " + REQUIRED_MESSAGE)
     return ParsedCSV(entities=entities, columns_detected=mapping,
                      warnings=warnings, positional=positional)
+
+
+def format_entities_for_prompt(entities: list[Entity]) -> str:
+    """Builds the {entities} block. Optional fields appear only when present (spec §3)."""
+    lines = []
+    for e in entities:
+        line = e.company_name
+        if e.company_local_name:
+            line += f" (local: {e.company_local_name})"
+        line += f" — {e.country}"
+        if e.address:
+            line += f" — {e.address}"
+        if e.industry:
+            line += f" — industry: {e.industry}"
+        lines.append(f"{e.sno}. {line}")
+    return "\n".join(lines)

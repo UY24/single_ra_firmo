@@ -23,6 +23,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from app.core.config import PROJECT_ROOT, TEMPLATES_DIR
+
 def load_local_env(env_path: str = ".env") -> None:
     if not os.path.exists(env_path):
         return
@@ -43,13 +45,13 @@ def load_local_env(env_path: str = ".env") -> None:
         pass
 
 
-load_local_env()
+load_local_env(str(PROJECT_ROOT / ".env"))
 app = FastAPI(title="Single RA ISI API", version="2.0.0")
 
 UPLOAD_BASE_DIR = Path("/tmp/single_ra_isi")
 UPLOAD_BASE_DIR.mkdir(parents=True, exist_ok=True)
 S3_PREFIX = "single_ra_isi"
-UI_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "ui.html"
+UI_TEMPLATE_PATH = TEMPLATES_DIR / "ui.html"
 
 upload_locks: dict[str, asyncio.Lock] = {}
 
@@ -2237,7 +2239,7 @@ async def run_serpwow_from_codetails(official_website: str, country: Optional[st
         }
 
     try:
-        import codetails as codetails_module
+        from app.services.serpwow import codetails as codetails_module
     except Exception as exc:
         return {
             "provider": "serpwow",
@@ -2317,7 +2319,7 @@ async def run_gmaps_from_module(
     input_full_address: Optional[str] = None,
 ) -> dict[str, Any]:
     try:
-        import gmaps as gmaps_module
+        from app.services.serpwow import gmaps as gmaps_module
     except Exception as exc:
         return {
             "provider": "gmaps",
@@ -7098,7 +7100,7 @@ async def gmaps_discover(q: str, country: Optional[str] = None) -> dict[str, Any
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
     
     try:
-        import gmaps as gmaps_module
+        from app.services.serpwow import gmaps as gmaps_module
         import aiohttp
         gl = gmaps_module.country_to_gl(country) if country else gmaps_module.get_gl_from_query(q)
         timeout = aiohttp.ClientTimeout(total=30)
@@ -7122,7 +7124,7 @@ async def gmaps_details(cid: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
     
     try:
-        import gmaps as gmaps_module
+        from app.services.serpwow import gmaps as gmaps_module
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=30)
         sem = asyncio.Semaphore(1)
@@ -7143,7 +7145,7 @@ async def gmaps_search(q: str, country: Optional[str] = None) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
     
     try:
-        import gmaps as gmaps_module
+        from app.services.serpwow import gmaps as gmaps_module
         res = await gmaps_module.process_gmaps_query(q, country=country)
         response = dict(res) if isinstance(res, dict) else {"result": res}
         response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
@@ -7525,7 +7527,7 @@ async def gsearch_discover(
 
 @app.post("/uploads/ai-mode")
 async def create_ai_mode_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    import ai_mode_service
+    from app.services.ai_mode import ai_mode_service
     raw = await file.read()
     try:
         info = ai_mode_service.prepare_ai_mode_run(raw, file.filename or "")
@@ -7539,14 +7541,14 @@ async def create_ai_mode_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.get("/uploads/ai-mode")
 async def list_ai_mode_uploads() -> dict[str, Any]:
-    import ai_mode_service
+    from app.services.ai_mode import ai_mode_service
     runs = await asyncio.to_thread(ai_mode_service.list_ai_mode_runs)
     return {"count": len(runs), "runs": runs}
 
 
 @app.get("/uploads/ai-mode/{run_id}/status")
 async def ai_mode_status(run_id: str) -> dict[str, Any]:
-    import ai_mode_service
+    from app.services.ai_mode import ai_mode_service
     try:
         return await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
     except KeyError as exc:
@@ -7559,7 +7561,7 @@ async def ai_mode_result(
     file: str = Query("final_report.json"),
     download: bool = Query(False),
 ) -> Response:
-    import ai_mode_service
+    from app.services.ai_mode import ai_mode_service
     try:
         path = await asyncio.to_thread(ai_mode_service.get_ai_mode_result_path, run_id, file)
     except KeyError as exc:
@@ -7585,20 +7587,3 @@ async def ai_mode_result(
                 ensure_ascii=False,
             ).encode("utf-8")
     return Response(content=body, media_type=media_type, headers=headers)
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    host = os.getenv("API_HOST", "0.0.0.0")
-    port = _get_int_env("API_PORT", 11500)
-    reload = os.getenv("API_RELOAD", "").strip().lower() in {"1", "true", "yes", "on"}
-    log_level = os.getenv("UVICORN_LOG_LEVEL", "info").strip().lower() or "info"
-    uvicorn.run(
-        "app:app",
-        host=host,
-        port=port,
-        reload=reload,
-        access_log=True,
-        log_level=log_level,
-    )

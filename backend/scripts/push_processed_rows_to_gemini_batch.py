@@ -23,7 +23,7 @@ async def main() -> int:
     )
     args = parser.parse_args()
     try:
-        import app
+        from app.services.serpwow import legacy_app as app
     except ModuleNotFoundError as exc:
         print(
             f"Missing dependency while importing app: {exc}. "

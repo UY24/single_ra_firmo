@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -171,7 +172,7 @@ def _ensure_ai_mode_logger() -> logging.Logger:
 
 def sanitize_secret_text(value: str) -> str:
     """Redact Scrape.do token query parameters in user-facing output."""
-    return re.sub(r"([?&]token=)[^&'\"\\s]+", r"\1[REDACTED]", value)
+    return re.sub(r"([?&]token=)[^&'\"\s]+", r"\1[REDACTED]", value)
 
 
 def sanitize_for_response(value: Any) -> Any:
@@ -580,46 +581,26 @@ def prepare_ai_mode_run(
     parsed = parse_entities_csv(raw_csv)
     total_rows = len(parsed.entities)
 
-    run_id = uuid.uuid4().hex
-    run_dir = run_store.run_dir_for(company_name, run_id)
-    (run_dir / "input.csv").write_bytes(raw_csv)
-
     # Build the LLM config only to surface provider/model labels (no API call).
+    # Validated BEFORE any files are written so a misconfigured server (e.g.
+    # missing API key -> ValueError) never leaves an orphan run dir behind.
     llm_config = build_ai_mode_llm_config()
     batch_size = mode.batch_size()
 
+    run_id = uuid.uuid4().hex
+    run_dir = run_store.run_dir_for(company_name, run_id)
     now = utc_now_iso()
-    status = {
-        "run_id": run_id,
-        "status": "queued",
-        "mode": mode.key,
-        "mode_label": mode.label,
-        "company_id": company_id,
-        "company_name": company_name,
-        "columns_detected": parsed.columns_detected,
-        "warnings": parsed.warnings,
-        "total_rows": total_rows,
-        "batch_size": batch_size,
-        "llm_provider": llm_config.provider,
-        "llm_model": llm_config.model,
-        "batches_total": 0,
-        "batches_done": 0,
-        "entities_processed": 0,
-        "entities_without_scrape_data": 0,
-        "llm_errors": 0,
-        "websites_found": 0,
-        "websites_not_found": 0,
-        "failed_request_count": 0,
-        "scrapedo_request_count": 0,
-        "scrapedo_failed_requests": 0,
-        "scrapedo_seconds_total": 0.0,
-        "llm_seconds_total": 0.0,
-        "token_usage": asdict(TokenUsage()),
-        "created_at": now,
-        "updated_at": now,
-        "error": None,
-    }
-    _persist_status(run_id, run_dir, status)
+    try:
+        (run_dir / "input.csv").write_bytes(raw_csv)
+        status = _initial_status(
+            run_id, mode, parsed, company_id=company_id, company_name=company_name,
+            batch_size=batch_size, llm_config=llm_config, now=now,
+        )
+        _persist_status(run_id, run_dir, status)
+    except BaseException:
+        # Don't leave a half-written run dir (no/partial status.json) behind.
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
     _ai_log(
         run_id,
         run_dir,
@@ -643,6 +624,49 @@ def prepare_ai_mode_run(
         "created_at": now,
         "status_url": f"/uploads/ai-mode/{run_id}/status",
         "result_url": f"/uploads/ai-mode/{run_id}/result",
+    }
+
+
+def _initial_status(
+    run_id: str,
+    mode,
+    parsed,
+    *,
+    company_id: str,
+    company_name: str,
+    batch_size: int,
+    llm_config,
+    now: str,
+) -> dict:
+    return {
+        "run_id": run_id,
+        "status": "queued",
+        "mode": mode.key,
+        "mode_label": mode.label,
+        "company_id": company_id,
+        "company_name": company_name,
+        "columns_detected": parsed.columns_detected,
+        "warnings": parsed.warnings,
+        "total_rows": len(parsed.entities),
+        "batch_size": batch_size,
+        "llm_provider": llm_config.provider,
+        "llm_model": llm_config.model,
+        "batches_total": 0,
+        "batches_done": 0,
+        "entities_processed": 0,
+        "entities_without_scrape_data": 0,
+        "llm_errors": 0,
+        "websites_found": 0,
+        "websites_not_found": 0,
+        "failed_request_count": 0,
+        "scrapedo_request_count": 0,
+        "scrapedo_failed_requests": 0,
+        "scrapedo_seconds_total": 0.0,
+        "llm_seconds_total": 0.0,
+        "token_usage": asdict(TokenUsage()),
+        "created_at": now,
+        "updated_at": now,
+        "error": None,
     }
 
 

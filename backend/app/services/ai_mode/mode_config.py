@@ -19,8 +19,15 @@ class ModeConfig:
 
     def batch_size(self) -> int:
         for env in (self.batch_size_env, self.legacy_env):
-            if env and os.getenv(env):
-                return max(1, int(os.getenv(env)))
+            if not env:
+                continue
+            value = os.getenv(env)
+            if value is None or not value.strip():
+                continue
+            try:
+                return max(1, int(value.strip()))
+            except ValueError:
+                continue  # malformed value: fall through to next candidate/default
         return self.default_batch_size
 
     def search_prompt(self) -> str:

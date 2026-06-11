@@ -24,5 +24,18 @@ class TestModeConfig(unittest.TestCase):
         with self.assertRaises(KeyError):
             get_mode("ai_turbo")
 
+    def test_malformed_env_falls_back_to_default(self):
+        with mock.patch.dict(os.environ, {"AI_BULK_BATCH_SIZE": "ten"}):
+            os.environ.pop("SCRAPEDO_BATCH_SIZE", None)
+            self.assertEqual(get_mode("ai_bulk").batch_size(), 10)
+
+    def test_malformed_primary_env_falls_through_to_legacy(self):
+        with mock.patch.dict(os.environ, {"AI_BULK_BATCH_SIZE": "  ",
+                                          "SCRAPEDO_BATCH_SIZE": "7"}):
+            self.assertEqual(get_mode("ai_bulk").batch_size(), 7)
+        with mock.patch.dict(os.environ, {"AI_BULK_BATCH_SIZE": "ten",
+                                          "SCRAPEDO_BATCH_SIZE": "garbage"}):
+            self.assertEqual(get_mode("ai_bulk").batch_size(), 10)
+
 if __name__ == "__main__":
     unittest.main()

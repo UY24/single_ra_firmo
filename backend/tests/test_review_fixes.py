@@ -116,7 +116,13 @@ class TestUploadEndpointMapsConfigErrorTo400(_PreparedEnv):
 
         app = FastAPI()
         app.include_router(router)
-        with TestClient(app) as client:
+        # Offline: the upload endpoint now validates company_id against Supabase
+        # (Task 14); stub the service so no network is touched.
+        svc = mock.MagicMock()
+        svc.get_company.return_value = {"id": "acme-id-1", "name": "Acme Corp"}
+        svc.create_run.return_value = None
+        with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
+                TestClient(app) as client:
             return client.post(
                 "/uploads/ai-mode",
                 files={"file": ("input.csv", CSV_OK, "text/csv")},

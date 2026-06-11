@@ -503,6 +503,58 @@ def _read_status(run_id: str, run_dir: Path) -> dict:
     return {"run_id": run_id}
 
 
+def set_run_db_id(run_id: str, run_db_id: str | None) -> None:
+    """Persist the Supabase ``runs`` row id into the run's status.json (Task 14)."""
+    if not run_db_id:
+        return
+    run_dir = run_store.find_run_dir(run_id)
+    if run_dir is None:
+        return
+    status = _read_status(run_id, run_dir)
+    status["run_db_id"] = run_db_id
+    _persist_status(run_id, run_dir, status)
+
+
+def _supabase_update_run(run_db_id: str | None, **fields: Any) -> None:
+    """Best-effort Supabase run update — bookkeeping must NEVER affect the run."""
+    if not run_db_id:
+        return
+    try:
+        from app.services.companies import get_company_service
+
+        svc = get_company_service()
+        if svc is not None:
+            svc.update_run(run_db_id, **fields)
+    except Exception:
+        _ensure_ai_mode_logger().exception(
+            "supabase: run update failed for run_db_id=%s (run unaffected)", run_db_id
+        )
+
+
+def _build_run_update(summary: dict, file_links: dict[str, str]) -> dict:
+    """Map an AI-mode terminal summary onto the Supabase ``runs`` row fields."""
+    websites_found = summary.get("websites_found") or 0
+    websites_not_found = summary.get("websites_not_found") or 0
+    llm_errors = summary.get("llm_errors") or 0
+    failed_request_count = summary.get("failed_request_count") or 0
+    return {
+        "status": summary.get("status"),
+        "success_count": websites_found,
+        "failed_count": websites_not_found + llm_errors,
+        "websites_found": websites_found,
+        "websites_not_found": websites_not_found,
+        "token_usage": summary.get("token_usage"),
+        "duration_seconds": summary.get("batch_duration_seconds"),
+        "file_links": file_links,
+        "finished_at": summary.get("completed_at"),
+        "error": (
+            f"{failed_request_count} request(s) failed. See final_report.json."
+            if failed_request_count
+            else None
+        ),
+    }
+
+
 def get_ai_mode_status(run_id: str) -> dict:
     """Return the current status dict for a run (new layout or legacy, read-only).
 
@@ -700,6 +752,7 @@ def run_ai_mode_sync(run_id: str) -> None:
     status["updated_at"] = utc_now_iso()
     status["error"] = None
     _persist_status(run_id, run_dir, status)
+    _supabase_update_run(status.get("run_db_id"), status="running", started_at=started_at)
 
     try:
         mode = get_mode(str(status.get("mode") or "ai_bulk"))
@@ -1084,7 +1137,7 @@ def run_ai_mode_sync(run_id: str) -> None:
             "started_at": started_at,
             "completed_at": completed_at,
         }
-        write_outputs(run_dir, results, summary=summary, requests=per_request_records)
+        output_paths = write_outputs(run_dir, results, summary=summary, requests=per_request_records)
 
         # Per-request summary lines into the single run.log.
         for record in per_request_records:
@@ -1127,6 +1180,12 @@ def run_ai_mode_sync(run_id: str) -> None:
             else None
         )
         _persist_status(run_id, run_dir, status)
+        file_links = {name: str(path) for name, path in output_paths.items()}
+        file_links["input.csv"] = str(input_csv)
+        file_links["run.log"] = str(run_log)
+        _supabase_update_run(
+            status.get("run_db_id"), **_build_run_update(summary, file_links)
+        )
         _ai_log(
             run_id,
             run_dir,
@@ -1141,6 +1200,13 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["error"] = sanitize_secret_text(str(exc))
         status["updated_at"] = utc_now_iso()
         _persist_status(run_id, run_dir, status)
+        _supabase_update_run(
+            status.get("run_db_id"),
+            status="failed",
+            error=status["error"],
+            duration_seconds=round(time.perf_counter() - wall_t0, 3),
+            finished_at=utc_now_iso(),
+        )
         _ai_log(
             run_id,
             run_dir,

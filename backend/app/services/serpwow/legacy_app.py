@@ -5504,8 +5504,65 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
         pass
 
 
+def _update_supabase_run(state: dict[str, Any]) -> None:
+    """Best-effort Supabase ``runs`` row update at upload terminal status (Task 14).
+
+    Maps only what the upload state actually tracks (row success/failed counters,
+    timing, state/output artifact locations). Wrapped entirely in try/except so
+    Supabase bookkeeping can NEVER break the worker.
+    """
+    try:
+        run_db_id = state.get("run_db_id")
+        if not run_db_id:
+            return
+        from app.services.companies import get_company_service
+
+        svc = get_company_service()
+        if svc is None:
+            return
+        upload_id = str(state.get("upload_id") or "")
+        bucket = os.getenv("S3_BUCKET")
+        if bucket:
+            file_links = {
+                "state.json": f"s3://{bucket}/{_state_s3_key(upload_id)}",
+                "output.json": f"s3://{bucket}/{_output_s3_key(upload_id)}",
+            }
+        else:
+            file_links = {
+                "state.json": str(_state_file(upload_id)),
+                "output.json": str(_output_file(upload_id)),
+            }
+        svc.update_run(
+            run_db_id,
+            status=str(state.get("status") or ""),
+            success_count=state.get("success_rows"),
+            failed_count=state.get("failed_rows"),
+            duration_seconds=state.get("processing_seconds_total"),
+            file_links=file_links,
+            finished_at=_now_iso(),
+        )
+    except Exception as exc:
+        print(
+            f"[supabase] run update failed for upload {state.get('upload_id')} "
+            f"(worker unaffected): {type(exc).__name__}: {exc}"
+        )
+
+
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     state = summarize_upload_state(state)
+    if state.get("run_db_id") and state.get("status") in {
+        "completed",
+        "completed_with_errors",
+        "failed",
+    }:
+        # Sync once per distinct terminal snapshot (retries can re-open an upload
+        # and re-complete it with different counters; resync then).
+        marker = (
+            f"{state.get('status')}:{state.get('success_rows')}:{state.get('failed_rows')}"
+        )
+        if state.get("supabase_sync_marker") != marker:
+            state["supabase_sync_marker"] = marker
+            await asyncio.to_thread(_update_supabase_run, dict(state))
     update_summary_cache(upload_id, state)
     await write_upload_artifact(upload_id, "state", state)
 
@@ -6382,9 +6439,25 @@ async def _create_upload_with_rows(
     parsed_rows: list[dict[str, str]],
     pipeline: str,
     phase: str = "all",
+    *,
+    company_id: str,
 ) -> dict[str, Any]:
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
+
+    from app.services.companies import get_company_service
+
+    company_svc = get_company_service()
+    if company_svc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+        )
+    company = await asyncio.to_thread(company_svc.get_company, company_id)
+    if company is None:
+        raise HTTPException(
+            status_code=400, detail="unknown company_id — create the company first"
+        )
 
     if rabbitmq_exchange is None:
         detail = "RabbitMQ not connected. Try again shortly."
@@ -6405,8 +6478,19 @@ async def _create_upload_with_rows(
         upload_id=upload_id,
         row_index=None,
     )
+    # Best-effort Supabase run tracking: create_run never raises (returns None on
+    # failure) and the upload proceeds untracked if Supabase is unhappy.
+    run_db_id = await asyncio.to_thread(
+        company_svc.create_run,
+        company_id=company_id,
+        pipeline=pipeline,
+        run_ref=upload_id,
+        total_rows=len(parsed_rows),
+    )
     state = {
         "upload_id": upload_id,
+        "company_id": company_id,
+        "run_db_id": run_db_id,
         "pipeline": pipeline,
         "phase": phase,
         "created_at": now_iso,
@@ -6501,56 +6585,79 @@ async def _create_upload_with_rows(
 
 
 @app.post("/uploads")
-async def create_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    raw = await file.read()
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(file, parsed_rows, PIPELINE_FULL)
-
-
-@app.post("/uploads/url-discovery")
-async def create_url_discovery_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    raw = await file.read()
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(file, parsed_rows, PIPELINE_URL_DISCOVERY)
-
-
-@app.post("/uploads/firmographics")
-async def create_firmographics_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    raw = await file.read()
-    try:
-        parsed_rows = parse_firmographics_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(file, parsed_rows, PIPELINE_FIRMOGRAPHICS)
-
-
-@app.post("/uploads/gmaps")
-async def create_gmaps_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    raw = await file.read()
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(file, parsed_rows, PIPELINE_GMAPS)
-
-
-@app.post("/uploads/gsearch")
-async def create_gsearch_upload(
+async def create_upload(
     file: UploadFile = File(...),
-    phase: str = Form("all"),
+    company_id: str = Form(...),
 ) -> dict[str, Any]:
     raw = await file.read()
     try:
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(file, parsed_rows, PIPELINE_GSEARCH, phase=phase)
+    return await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_FULL, company_id=company_id
+    )
+
+
+@app.post("/uploads/url-discovery")
+async def create_url_discovery_upload(
+    file: UploadFile = File(...),
+    company_id: str = Form(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        parsed_rows = parse_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_URL_DISCOVERY, company_id=company_id
+    )
+
+
+@app.post("/uploads/firmographics")
+async def create_firmographics_upload(
+    file: UploadFile = File(...),
+    company_id: str = Form(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        parsed_rows = parse_firmographics_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_FIRMOGRAPHICS, company_id=company_id
+    )
+
+
+@app.post("/uploads/gmaps")
+async def create_gmaps_upload(
+    file: UploadFile = File(...),
+    company_id: str = Form(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        parsed_rows = parse_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_GMAPS, company_id=company_id
+    )
+
+
+@app.post("/uploads/gsearch")
+async def create_gsearch_upload(
+    file: UploadFile = File(...),
+    phase: str = Form("all"),
+    company_id: str = Form(...),
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        parsed_rows = parse_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_GSEARCH, phase=phase, company_id=company_id
+    )
 
 
 @app.post("/uploads/{upload_id}/retry-failed-rows")

@@ -9,15 +9,10 @@ from fastapi.responses import Response
 
 from app.models.entities import InvalidCSVError
 from app.services.ai_mode.mode_config import MODES
+from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
-
-
-def get_company(company_id: str) -> dict[str, str]:
-    # STUB for now: Supabase company lookup lands in Task 14. Until then the
-    # company_id doubles as the company name for the on-disk run layout.
-    return {"id": company_id, "name": company_id}
 
 
 @router.post("/uploads/ai-mode")
@@ -29,7 +24,17 @@ async def create_ai_mode_upload(
     from app.services.ai_mode import ai_mode_service
     if mode not in MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(MODES)}")
-    company = get_company(company_id)
+    svc = get_company_service()
+    if svc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+        )
+    company = await asyncio.to_thread(svc.get_company, company_id)
+    if company is None:
+        raise HTTPException(
+            status_code=400, detail="unknown company_id — create the company first"
+        )
     raw = await file.read()
     try:
         info = ai_mode_service.prepare_ai_mode_run(
@@ -45,6 +50,18 @@ async def create_ai_mode_upload(
         # Config errors (e.g. missing LLM API key) are client-visible 400s,
         # not 500s; prepare_ai_mode_run leaves no run dir behind in this case.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Best-effort Supabase run tracking: create_run never raises (returns None on
+    # failure) and the run proceeds untracked if Supabase is unhappy.
+    run_db_id = await asyncio.to_thread(
+        svc.create_run,
+        company_id=company_id,
+        pipeline=mode,
+        run_ref=info["run_id"],
+        total_rows=info["total_rows"],
+    )
+    if run_db_id:
+        info["run_db_id"] = run_db_id
+        await asyncio.to_thread(ai_mode_service.set_run_db_id, info["run_id"], run_db_id)
     task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)

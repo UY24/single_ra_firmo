@@ -1,5 +1,13 @@
-# Python bytecode and caches
+.venv/
 __pycache__/
+*.pyc
+.env
+ai_mode_result/
+ai_mode_results/
+*.xlsx
+.DS_Store
+
+# Retained from previous .gitignore (compatible with rework plan)
 *.py[cod]
 *$py.class
 .pytest_cache/
@@ -7,47 +15,25 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-
-docs/
-# Virtual environments and local dependency installs
-.venv/
 venv/
 env/
 ENV/
-
-# Local secrets and environment overrides
-.env
 .env.*
 !.env.example
 *.pem
 *.key
 *.crt
 *.p12
-
-# Logs and runtime output
 *.log
 logs/
 *.pid
-
-# Local upload/artifact directories
 single_ra_isi/
 uploads/
 artifacts/
-ai_mode_result/
-
-# Generated batch/export files
 *.jsonl
 *.ndjson
-~$*.xlsx
-
-# Root-level data inputs and exports used by local scripts
-/*.csv
-/*.xlsx
 /input.json
 /output.json
-
-# OS/editor files
-.DS_Store
 Thumbs.db
 .idea/
 .vscode/

@@ -180,7 +180,7 @@ async def _run_partial_gemini_batch(app: Any, upload_id: str, rows_to_batch: lis
     rows_touched = 0
     rows_completed = 0
     rows_failed = 0
-    async with app.upload_lock:
+    async with app.get_upload_lock(upload_id):
         state = await app.read_upload_artifact(upload_id, "state")
         for row in state.get("rows", []):
             if not isinstance(row, dict):

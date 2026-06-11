@@ -76,7 +76,7 @@ async def main() -> int:
         return 0
 
     if args.force_new_job:
-        async with app.upload_lock:
+        async with app.get_upload_lock(upload_id):
             latest = await app.read_upload_artifact(upload_id, "state")
             latest["gemini_batch"] = {
                 "status": "waiting_for_rows",

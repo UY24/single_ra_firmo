@@ -6,8 +6,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.core.config import PROJECT_ROOT
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+# Package directory; used by prompting modules to locate bundled prompt templates.
+BASE_DIR = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -53,7 +55,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 def load_settings(env_file: Path | None = None, batch_size: int | None = None) -> Settings:
-    load_dotenv(env_file or BASE_DIR / ".env")
+    load_dotenv(env_file or PROJECT_ROOT / ".env")
     settings = Settings(
         scrapedo_token=os.getenv("SCRAPEDO_TOKEN", "").strip(),
         batch_size=batch_size or _int_env("SCRAPEDO_BATCH_SIZE", 5),
@@ -105,7 +107,7 @@ class LLMConfig:
 
 
 def load_llm_config(env_file: Path | None = None) -> LLMConfig:
-    load_dotenv(env_file or BASE_DIR / ".env")
+    load_dotenv(env_file or PROJECT_ROOT / ".env")
     provider = (os.getenv("LLM_PROVIDER", "openai").strip().lower()) or "openai"
     base_url = os.getenv("LLM_BASE_URL", "").strip().rstrip("/")
     if not base_url:

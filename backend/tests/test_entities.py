@@ -61,5 +61,19 @@ class TestParseEntitiesCSV(unittest.TestCase):
         self.assertEqual(parsed.columns_detected["company_name"], "Company")
         self.assertEqual(parsed.columns_detected["country"], "Nation")
 
+class TestFormatEntitiesForPrompt(unittest.TestCase):
+    def test_minimal_fields(self):
+        from app.models.entities import Entity, format_entities_for_prompt
+        block = format_entities_for_prompt([Entity("Acme KK", "Japan", 1)])
+        self.assertEqual(block, "1. Acme KK — Japan")
+
+    def test_all_optional_fields_appended_only_when_present(self):
+        from app.models.entities import Entity, format_entities_for_prompt
+        e = Entity("Acme KK", "Japan", 1, company_local_name="アクメ株式会社",
+                   address="1-2-3 Shibuya, Tokyo", industry="manufacturing")
+        block = format_entities_for_prompt([e])
+        self.assertEqual(block, "1. Acme KK (local: アクメ株式会社) — Japan — "
+                                "1-2-3 Shibuya, Tokyo — industry: manufacturing")
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 """AI Mode orchestrator.
 
-Drives the vendored ``scrapedo_finder`` package (scrape.do Google AI Mode ->
+Drives the AI Mode pipeline modules (scrape.do Google AI Mode ->
 LLM cleanup pipeline) and writes results under ``ai_mode_result/<run_id>/``.
 
 This module is a pure-sync orchestration layer. ``run_ai_mode_sync`` is intended
@@ -31,29 +31,28 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from app.services.ai_mode.scrapedo_finder.company_csv_loader import load_company_entities
-from app.services.ai_mode.scrapedo_finder.company_extraction import build_company_messages, parse_company_results
-from app.services.ai_mode.scrapedo_finder.company_prompting import build_company_search_query
-from app.services.ai_mode.scrapedo_finder.company_reporting import build_company_report_dict, write_company_outputs
-from app.services.ai_mode.scrapedo_finder.extraction import build_messages, parse_results
-from app.services.ai_mode.scrapedo_finder.llm_client import make_llm_client, parse_gemini_usage
-from app.services.ai_mode.scrapedo_finder.models import (
+from app.services.ai_mode.company_csv_loader import load_company_entities
+from app.services.ai_mode.company_extraction import build_company_messages, parse_company_results
+from app.services.ai_mode.company_prompting import build_company_search_query
+from app.services.ai_mode.company_reporting import build_company_report_dict, write_company_outputs
+from app.services.ai_mode.extraction import build_messages, parse_results
+from app.services.ai_mode.llm_client import make_llm_client, parse_gemini_usage
+from app.services.ai_mode.models import (
     CompanyCleanResult,
     EntityCleanResult,
     EntityInput,
     TokenUsage,
     utc_now_iso,
 )
-from app.services.ai_mode.scrapedo_finder.prompting import build_search_query, chunked
-from app.services.ai_mode.scrapedo_finder.cleanup_reporting import build_report_dict, write_outputs
-from app.services.ai_mode.scrapedo_finder.scrapedo_client import ScrapeDoClient
-from app.services.ai_mode.scrapedo_finder.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
+from app.services.ai_mode.prompting import build_search_query, chunked
+from app.services.ai_mode.cleanup_reporting import build_report_dict, write_outputs
+from app.services.ai_mode.scrapedo_client import ScrapeDoClient
+from app.services.ai_mode.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
 
 from app.services.ai_mode import gemini_batch
-from app.core.config import LEGACY_AI_MODE_RESULT_DIR
+from app.core.config import LEGACY_AI_MODE_RESULT_DIR, PROMPTS_DIR
 
 
-REPO_ROOT = Path(__file__).resolve().parent
 AI_MODE_RESULT_DIR = LEGACY_AI_MODE_RESULT_DIR
 ALLOWED_RESULT_FILES = {
     "final_report.json",
@@ -65,9 +64,9 @@ ALLOWED_RESULT_FILES = {
     "input.csv",
 }
 
-# Prompt templates that ship with the vendored package.
-_ADDR_PROMPT_PATH = REPO_ROOT / "scrapedo_finder" / "prompts" / "search_query_template.txt"
-_COMPANY_PROMPT_PATH = REPO_ROOT / "scrapedo_finder" / "prompts" / "company_search_template.txt"
+# Prompt templates.
+_ADDR_PROMPT_PATH = PROMPTS_DIR / "search_query_template.txt"
+_COMPANY_PROMPT_PATH = PROMPTS_DIR / "company_search_template.txt"
 
 # Header sets used by the flexible address loader. Entries are matched against
 # headers normalized by ``_normalize_header`` (lowercase, strip, internal

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import CompanyEntityInput
-from .settings import BASE_DIR
+from app.core.config import PROMPTS_DIR
 
-COMPANY_SEARCH_TEMPLATE_PATH = BASE_DIR / "prompts" / "company_search_template.txt"
+from .models import CompanyEntityInput
+
+COMPANY_SEARCH_TEMPLATE_PATH = PROMPTS_DIR / "company_search_template.txt"
 
 
 def build_company_search_query(

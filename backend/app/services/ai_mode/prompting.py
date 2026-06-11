@@ -4,8 +4,9 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TypeVar
 
+from app.core.config import PROMPTS_DIR
+
 from .models import EntityInput
-from .settings import BASE_DIR
 
 T = TypeVar("T")
 
@@ -15,7 +16,7 @@ def chunked(items: list[T], size: int) -> Iterable[list[T]]:
         yield items[start : start + size]
 
 
-SEARCH_QUERY_TEMPLATE_PATH = BASE_DIR / "prompts" / "search_query_template.txt"
+SEARCH_QUERY_TEMPLATE_PATH = PROMPTS_DIR / "search_query_template.txt"
 
 
 def build_search_query(

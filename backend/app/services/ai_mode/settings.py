@@ -8,9 +8,6 @@ from dotenv import load_dotenv
 
 from app.core.config import PROJECT_ROOT
 
-# Package directory; used by prompting modules to locate bundled prompt templates.
-BASE_DIR = Path(__file__).resolve().parent
-
 
 @dataclass
 class Settings:

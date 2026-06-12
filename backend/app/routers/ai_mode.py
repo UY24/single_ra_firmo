@@ -2,17 +2,36 @@
 """AI-mode endpoints (ai_bulk / ai_deep unified engine)."""
 import asyncio
 import json
+from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from app.models.entities import InvalidCSVError
+from app.models.entities import InvalidCSVError, parse_entities_csv
 from app.services.ai_mode.mode_config import MODES
 from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
+
+
+def build_preview(raw: bytes) -> dict:
+    """Parse a CSV and return what the engine would see (no run is created)."""
+    parsed = parse_entities_csv(raw)
+    return {"total_rows": len(parsed.entities),
+            "columns_detected": parsed.columns_detected,
+            "warnings": parsed.warnings,
+            "positional": parsed.positional,
+            "sample_rows": [asdict(e) for e in parsed.entities[:5]]}
+
+
+@router.post("/uploads/preview")
+async def preview_upload(file: UploadFile = File(...)) -> dict:
+    try:
+        return build_preview(await file.read())
+    except InvalidCSVError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/uploads/ai-mode")

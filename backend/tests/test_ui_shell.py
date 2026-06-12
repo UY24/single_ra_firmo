@@ -20,6 +20,7 @@ class TestUiShell(unittest.TestCase):
 
     def test_static_assets_served(self):
         for path in ("/static/js/api.js", "/static/js/main.js",
+                     "/static/js/ui.js",
                      "/static/js/dashboard.js", "/static/js/companies.js",
                      "/static/css/app.css"):
             res = self.client.get(path)

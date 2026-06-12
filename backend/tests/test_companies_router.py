@@ -74,6 +74,29 @@ class TestCompaniesRouter(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["companies"][0]["runs"], 3)
 
+    def test_get_endpoints_unreachable_503(self):
+        """Unexpected service errors (network down) map to 503, not a raw 500."""
+        for path, method_name in (
+            ("/companies", "list_companies"),
+            ("/companies/stats", "company_stats"),
+            ("/companies/runs", "list_runs"),
+        ):
+            svc = mock.MagicMock()
+            getattr(svc, method_name).side_effect = ConnectionError("name resolution failed")
+            with mock.patch("app.routers.companies.get_company_service", return_value=svc):
+                res = self.client.get(path)
+            self.assertEqual(res.status_code, 503, path)
+            self.assertIn("Supabase unreachable", res.json()["detail"])
+
+    def test_create_company_unreachable_503(self):
+        """Non-duplicate create failures map to 503 (duplicates still 409)."""
+        svc = mock.MagicMock()
+        svc.create_company.side_effect = ConnectionError("name resolution failed")
+        with mock.patch("app.routers.companies.get_company_service", return_value=svc):
+            res = self.client.post("/companies", json={"name": "Acme"})
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("Supabase unreachable", res.json()["detail"])
+
     def test_list_runs_passes_filters(self):
         svc = mock.MagicMock()
         svc.list_runs.return_value = [{"id": "r1"}]

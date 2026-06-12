@@ -8,17 +8,9 @@
 // completed/completed_with_errors/failed and is always stopped by the router
 // via the cleanup function this view returns).
 import { api, el, fmtUsd, fmtNum, pollStatus } from "./api.js";
-import { errorCard, loadingCard, statusBadge } from "./ui.js";
+import { errorCard, loadingCard, statusBadge, fmtDuration } from "./ui.js";
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
-
-const fmtDuration = (s) => {
-  if (s == null) return "—";
-  const total = Math.round(Number(s));
-  if (Number.isNaN(total)) return "—";
-  const m = Math.floor(total / 60), sec = total % 60;
-  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-};
 
 function statTile(label, value) {
   return el("div", { class: "rounded-xl border border-gray-200 bg-white p-4 shadow-sm" },

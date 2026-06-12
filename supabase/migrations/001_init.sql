@@ -13,7 +13,7 @@ create table runs (
   total_rows int,
   success_count int, failed_count int,
   websites_found int, websites_not_found int,
-  token_usage jsonb,             -- {input_tokens, output_tokens, total_tokens}
+  token_usage jsonb,             -- {prompt_tokens, completion_tokens, total_tokens}
   cost jsonb,                    -- {llm_usd, scrapedo_usd, total_usd, scrapedo_requests}
   duration_seconds numeric,
   file_links jsonb,              -- {"found.csv": "<local path or S3 url>", ...}

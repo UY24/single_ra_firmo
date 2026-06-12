@@ -5166,6 +5166,24 @@ def _normalize_header(header: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", header.strip().lower()).strip("_")
 
 
+def _validate_canonical_upload_csv(raw: bytes) -> None:
+    """Unified CSV validation gate (spec §3) for the SerpWow upload pipelines.
+
+    Runs the canonical validator purely as a gate: garbage files (e.g. legacy
+    Company-Mode exports whose header row would otherwise be ingested as data
+    by ``parse_csv_rows``) are rejected with a 400 up front. On success the
+    callers still use the legacy ``parse_csv_rows`` to build the row dicts the
+    SerpWow pipelines expect. NOT applied to /uploads/firmographics, which has
+    its own website-column format and parser.
+    """
+    from app.models.entities import InvalidCSVError, parse_entities_csv
+
+    try:
+        parse_entities_csv(raw)
+    except InvalidCSVError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def parse_csv_rows(raw: bytes) -> list[dict[str, str]]:
     text = raw.decode("utf-8-sig", errors="replace")
     stream = io.StringIO(text)
@@ -5549,6 +5567,46 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         return False
 
 
+def _mark_supabase_run_running(state: dict[str, Any]) -> bool:
+    """Best-effort one-shot Supabase ``runs`` sync when rows start processing (spec §4).
+
+    Maps upload state "processing" to runs.status "running" and stamps
+    ``started_at``. Wrapped entirely in try/except so Supabase bookkeeping can
+    NEVER break the worker.
+    """
+    try:
+        run_db_id = state.get("run_db_id")
+        if not run_db_id:
+            return False
+        from app.services.companies import get_company_service
+
+        svc = get_company_service()
+        if svc is None:
+            return False
+        return svc.update_run(run_db_id, status="running", started_at=_now_iso())
+    except Exception as exc:
+        print(
+            f"[supabase] run 'running' update failed for upload {state.get('upload_id')} "
+            f"(worker unaffected): {type(exc).__name__}: {exc}"
+        )
+        return False
+
+
+def _should_sync_running(state: dict[str, Any]) -> bool:
+    """True when this snapshot is the upload's first exit from 'queued'.
+
+    Fires only for tracked uploads (``run_db_id``) whose state just became
+    "processing" and that haven't already synced (``supabase_running_marker``).
+    Terminal states never match — the terminal sync in persist_upload_state
+    handles those.
+    """
+    return (
+        bool(state.get("run_db_id"))
+        and state.get("status") == "processing"
+        and not state.get("supabase_running_marker")
+    )
+
+
 def _should_sync_supabase(state: dict[str, Any], marker: str) -> bool:
     """True when this terminal snapshot still needs a Supabase ``runs`` sync.
 
@@ -5566,6 +5624,12 @@ def _should_sync_supabase(state: dict[str, Any], marker: str) -> bool:
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     state = summarize_upload_state(state)
+    if _should_sync_running(state):
+        # One-shot 'running' sync: the marker is set regardless of outcome so a
+        # down Supabase (update_run retries 3x with sleeps) can't re-stall every
+        # subsequent persist; the terminal sync below has its own retry story.
+        state["supabase_running_marker"] = True
+        await asyncio.to_thread(_mark_supabase_run_running, dict(state))
     if state.get("run_db_id") and state.get("status") in {
         "completed",
         "completed_with_errors",
@@ -6615,6 +6679,7 @@ async def create_upload(
     company_id: str = Form(...),
 ) -> dict[str, Any]:
     raw = await file.read()
+    _validate_canonical_upload_csv(raw)
     try:
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:
@@ -6630,6 +6695,7 @@ async def create_url_discovery_upload(
     company_id: str = Form(...),
 ) -> dict[str, Any]:
     raw = await file.read()
+    _validate_canonical_upload_csv(raw)
     try:
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:
@@ -6660,6 +6726,7 @@ async def create_gmaps_upload(
     company_id: str = Form(...),
 ) -> dict[str, Any]:
     raw = await file.read()
+    _validate_canonical_upload_csv(raw)
     try:
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:
@@ -6676,6 +6743,7 @@ async def create_gsearch_upload(
     company_id: str = Form(...),
 ) -> dict[str, Any]:
     raw = await file.read()
+    _validate_canonical_upload_csv(raw)
     try:
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:

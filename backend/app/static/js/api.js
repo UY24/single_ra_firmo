@@ -1,0 +1,39 @@
+// backend/app/static/js/api.js
+export async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail ?? detail; } catch {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+export function pollStatus(path, onUpdate, intervalMs = 2000) {
+  let stopped = false;
+  async function tick() {
+    if (stopped) return;
+    try {
+      const status = await api(path);
+      onUpdate(status);
+      if (["completed", "completed_with_errors", "failed"].includes(status.status)) return;
+    } catch (e) { console.error(e); }
+    setTimeout(tick, intervalMs);
+  }
+  tick();
+  return () => { stopped = true; };
+}
+
+export function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  node.append(...children);
+  return node;
+}
+
+export const fmtUsd = (n) => n == null ? "—" : `$${Number(n).toFixed(4)}`;
+export const fmtNum = (n) => n == null ? "—" : Number(n).toLocaleString();

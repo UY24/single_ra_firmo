@@ -6529,12 +6529,17 @@ async def _create_upload_with_rows(
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
 
     from app.services.companies import get_company_service
+    from app.core.supabase_client import get_supabase_config_error
 
     company_svc = get_company_service()
     if company_svc is None:
+        detail = "Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+        error = get_supabase_config_error()
+        if error:
+            detail = f"{detail}: {error}"
         raise HTTPException(
             status_code=503,
-            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+            detail=detail,
         )
     try:
         company = await asyncio.to_thread(company_svc.get_company, company_id)

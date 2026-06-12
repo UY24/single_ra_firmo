@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" class="h-full">
+<html lang="en" class="h-full dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,11 +7,11 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/css/app.css" />
 </head>
-<body class="h-full bg-gray-50 text-gray-900 antialiased">
+<body class="h-full bg-slate-950 text-slate-100 antialiased">
   <div class="flex h-screen overflow-hidden">
 
     <!-- Sidebar -->
-    <aside class="flex w-56 shrink-0 flex-col bg-slate-900 text-slate-300">
+    <aside class="flex w-56 shrink-0 flex-col bg-slate-950 text-slate-300">
       <div class="flex items-center gap-2 px-5 py-5 border-b border-slate-800">
         <span class="inline-block h-2.5 w-2.5 rounded-full bg-indigo-500"></span>
         <span class="text-sm font-semibold tracking-wide text-white">Forage Console</span>
@@ -22,14 +22,15 @@
         <a href="#/new-run"    data-nav="new-run"    class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">New Run</a>
         <a href="#/runs"       data-nav="runs"       class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Runs</a>
         <a href="#/operations" data-nav="operations" class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Operations</a>
+        <a href="#/tools"      data-nav="tools"      class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Tools</a>
       </nav>
       <div class="px-5 py-4 text-xs text-slate-500 border-t border-slate-800">Internal tool</div>
     </aside>
 
     <!-- Main area -->
     <div class="flex flex-1 flex-col overflow-hidden">
-      <header class="flex h-14 shrink-0 items-center border-b border-gray-200 bg-white px-8">
-        <h1 id="view-title" class="text-base font-semibold text-gray-900">Dashboard</h1>
+      <header class="flex h-14 shrink-0 items-center border-b border-slate-800 bg-slate-900 px-8">
+        <h1 id="view-title" class="text-base font-semibold text-slate-100">Dashboard</h1>
       </header>
 
       <main class="flex-1 overflow-y-auto px-8 py-6">
@@ -39,6 +40,7 @@
         <section data-view="runs"       class="hidden"></section>
         <section data-view="run-detail" class="hidden"></section>
         <section data-view="operations" class="hidden"></section>
+        <section data-view="tools"      class="hidden"></section>
       </main>
     </div>
   </div>

@@ -24,6 +24,16 @@ const PIPELINES = [
     desc: "Firmographics enrichment for rows that already have a website." },
 ];
 
+const PHASES = [
+  { value: "all",      label: "All Phases Combined" },
+  { value: "phase1",   label: "Phase 1: Initial Hook & Punctuation" },
+  { value: "phase2",   label: "Phase 2: AI NL Prompts" },
+  { value: "phase3",   label: "Phase 3: Address Pivot" },
+  { value: "phase4",   label: "Phase 4: Document Hunting" },
+  { value: "phase5",   label: "Phase 5: Dynamic Expansion" },
+  { value: "fallback", label: "Fallback Searches Only" },
+];
+
 const SAMPLE_COLS = ["company_name", "country", "sno", "company_local_name",
                      "address", "firm_id", "industry"];
 
@@ -109,7 +119,7 @@ function previewTables(preview) {
 }
 
 export async function render(root) {
-  const state = { companyId: "", companyName: "", pipeline: null, file: null, preview: null };
+  const state = { companyId: "", companyName: "", pipeline: null, phase: "all", file: null, preview: null };
 
   // ---- Step 1: company -----------------------------------------------------
   const companySelect = el("select", { class: `${inputCls} w-72` });
@@ -199,8 +209,25 @@ export async function render(root) {
       ),
     );
   });
+
+  const phaseSelect = el("select", { class: inputCls + " w-64" },
+    ...PHASES.map((p) => el("option", { value: p.value }, p.label)));
+  phaseSelect.addEventListener("change", () => { state.phase = phaseSelect.value; });
+
+  const phaseRow = el("div", { class: "hidden mt-4 border-t border-gray-100 pt-4" },
+    el("label", {
+      class: "mb-1.5 block text-xs font-medium uppercase tracking-wide text-gray-400",
+    }, "Search Phase"),
+    phaseSelect,
+    el("p", { class: "mt-1 text-xs text-gray-400" },
+      "Which phase(s) to run across all uploaded rows."),
+  );
+
   const step2 = stepCard(2, "Pipeline",
-    el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-2" }, ...pipelineCards));
+    el("div", {},
+      el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-2" }, ...pipelineCards),
+      phaseRow,
+    ));
 
   // ---- Step 3: file + preview ----------------------------------------------
   const previewArea = el("div", { class: "mt-4" });
@@ -241,6 +268,7 @@ export async function render(root) {
     fd.append("file", state.file);
     fd.append("company_id", state.companyId);
     if (state.pipeline.ai) fd.append("mode", state.pipeline.key);
+    if (state.pipeline.key === "gsearch") fd.append("phase", state.phase || "all");
     try {
       const info = await api(state.pipeline.endpoint, { method: "POST", body: fd });
       startMsg.replaceChildren(
@@ -267,8 +295,11 @@ export async function render(root) {
     step3.setEnabled(hasCompany && hasPipeline);
     step4.setEnabled(hasCompany && hasPipeline && hasPreview);
     startBtn.disabled = !(hasCompany && hasPipeline && hasPreview);
+    phaseRow.classList.toggle("hidden", state.pipeline?.key !== "gsearch");
+    const phaseInfo = state.pipeline?.key === "gsearch" && state.phase && state.phase !== "all"
+      ? ` · ${PHASES.find((p) => p.value === state.phase)?.label ?? state.phase}` : "";
     summary.textContent = hasCompany && hasPipeline && hasPreview
-      ? `${state.companyName} · ${state.pipeline.label} · ${fmtNum(state.preview.total_rows)} rows`
+      ? `${state.companyName} · ${state.pipeline.label}${phaseInfo} · ${fmtNum(state.preview.total_rows)} rows`
       : "Complete the steps above to start.";
   }
 

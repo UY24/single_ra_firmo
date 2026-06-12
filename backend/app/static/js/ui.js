@@ -11,7 +11,7 @@ export function errorCard(message) {
       el("p", { class: "text-sm font-semibold text-amber-900" }, "Supabase not configured / unreachable"),
       el("p", { class: "mt-1 text-sm text-amber-800" }, message),
       el("p", { class: "mt-3 text-xs text-amber-700" },
-        "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the project .env, then restart the server."),
+        "In .env, SUPABASE_URL must be the bare REST URL (https://<project-ref>.supabase.co), not the :5432/postgres connection string. Then restart the server."),
     );
   }
   return el("div", { class: "rounded-xl border border-red-200 bg-red-50 p-6 shadow-sm" },

@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.core.supabase_client import get_supabase_config_error
 from app.services.companies import get_company_service
 
 router = APIRouter(prefix="/companies")
@@ -14,8 +15,11 @@ class CompanyIn(BaseModel):
 def _svc():
     svc = get_company_service()
     if svc is None:
-        raise HTTPException(503, "Supabase not configured (set SUPABASE_URL + "
-                                 "SUPABASE_SERVICE_ROLE_KEY)")
+        error = get_supabase_config_error()
+        detail = "Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+        if error:
+            detail = f"{detail}: {error}"
+        raise HTTPException(503, detail)
     return svc
 
 

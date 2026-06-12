@@ -5,6 +5,7 @@ import { render as renderNewRun } from "./new_run.js";
 import { render as renderRuns } from "./runs.js";
 import { render as renderRunDetail } from "./run_detail.js";
 import { render as renderOperations } from "./operations.js";
+import { render as renderTools } from "./tools.js";
 
 const TITLES = {
   dashboard: "Dashboard",
@@ -13,6 +14,7 @@ const TITLES = {
   runs: "Runs",
   "run-detail": "Run Detail",
   operations: "Operations",
+  tools: "Tools",
 };
 
 const VIEWS = {
@@ -22,6 +24,7 @@ const VIEWS = {
   runs: renderRuns,
   "run-detail": renderRunDetail,
   operations: renderOperations,
+  tools: renderTools,
 };
 
 function parseHash() {

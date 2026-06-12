@@ -8,12 +8,19 @@ from typing import Any
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
+from app.core.supabase_client import get_supabase_config_error
 from app.models.entities import InvalidCSVError, parse_entities_csv
 from app.services.ai_mode.mode_config import MODES
 from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
+
+
+def _supabase_not_configured_detail() -> str:
+    detail = "Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)"
+    error = get_supabase_config_error()
+    return f"{detail}: {error}" if error else detail
 
 
 def build_preview(raw: bytes) -> dict:
@@ -47,7 +54,7 @@ async def create_ai_mode_upload(
     if svc is None:
         raise HTTPException(
             status_code=503,
-            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+            detail=_supabase_not_configured_detail(),
         )
     try:
         company = await asyncio.to_thread(svc.get_company, company_id)
@@ -130,7 +137,7 @@ async def rerun_ai_mode_upload(run_id: str) -> dict[str, Any]:
     if svc is None:
         raise HTTPException(
             status_code=503,
-            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+            detail=_supabase_not_configured_detail(),
         )
     mode = str(prev_status.get("mode") or "ai_bulk")
     company_id = str(prev_status.get("company_id") or "")

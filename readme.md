@@ -45,11 +45,20 @@ served at `/app`.
    `supabase/migrations/001_init.sql`, then paste into `.env`:
 
    - `SUPABASE_URL` — the **bare** project URL (`https://<ref>.supabase.co`), **not** the
-     postgres `:5432` connection string
+     postgres `:5432/postgres` connection string
    - `SUPABASE_SERVICE_ROLE_KEY` — the full **service_role** secret (~200+ chars) from
      Project Settings → API
 
    Upload endpoints return 503 until both are set.
+
+   Quick sanity check without printing secrets:
+
+   ```sh
+   awk -F= '/^SUPABASE_URL=/{print $2}' .env
+   ```
+
+   The value must look like `https://abcxyz.supabase.co` and must not contain `:5432` or
+   `/postgres`.
 
 ## Run
 
@@ -57,7 +66,16 @@ served at `/app`.
 .venv/bin/python run.py    # from the repo root (`python run.py` if the venv is active)
 ```
 
-or equivalently:
+For development with auto-reload, run uvicorn against the root launcher:
+
+```sh
+.venv/bin/uvicorn run:app --reload --host 0.0.0.0 --port 8080
+```
+
+`run:app` is intentional: uvicorn needs the `module:asgi_app` import string. `uvicorn run
+--reload` is incomplete.
+
+You can also run the backend module directly:
 
 ```sh
 cd backend && ../.venv/bin/python -m app.main
@@ -77,7 +95,7 @@ docker compose up -d rabbitmq
 then run the worker in a second terminal:
 
 ```sh
-cd backend && ../.venv/bin/python -m app.services.serpwow.worker
+.venv/bin/python worker.py
 ```
 
 Management UI: `http://localhost:15672`.

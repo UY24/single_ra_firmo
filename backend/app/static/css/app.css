@@ -1,4 +1,140 @@
-/* backend/app/static/css/app.css — minimal custom styles; Tailwind (CDN) does the rest. */
+/* backend/app/static/css/app.css — dark-only console theme; Tailwind (CDN) does the rest. */
+
+:root {
+  color-scheme: dark;
+}
+
+body,
+main {
+  background: #020617 !important; /* slate-950 */
+  color: #e5e7eb !important;
+}
+
+.rounded-xl {
+  border-radius: 0.5rem !important;
+}
+
+.bg-white,
+.bg-gray-50,
+.bg-gray-100 {
+  background-color: #0f172a !important; /* slate-900 */
+}
+
+.bg-indigo-50,
+.bg-indigo-100,
+.bg-indigo-50\/30,
+.hover\:bg-indigo-50\/40:hover,
+.hover\:bg-indigo-50\/30:hover {
+  background-color: rgba(49, 46, 129, 0.32) !important;
+}
+
+.hover\:bg-gray-50:hover,
+.hover\:bg-gray-50\/50:hover {
+  background-color: #111827 !important;
+}
+
+.border-gray-100,
+.border-gray-200,
+.border-gray-300 {
+  border-color: #334155 !important; /* slate-700 */
+}
+
+.divide-gray-100 > :not([hidden]) ~ :not([hidden]),
+.divide-gray-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #1e293b !important;
+}
+
+.text-gray-900 {
+  color: #f8fafc !important;
+}
+
+.text-gray-800,
+.text-gray-700,
+.text-gray-600 {
+  color: #cbd5e1 !important;
+}
+
+.text-gray-500,
+.text-gray-400 {
+  color: #94a3b8 !important;
+}
+
+input,
+select,
+textarea {
+  background-color: #020617 !important;
+  border-color: #475569 !important;
+  color: #e5e7eb !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #64748b !important;
+}
+
+input[type="file"]::file-selector-button {
+  background-color: #1e293b !important;
+  color: #c7d2fe !important;
+}
+
+.shadow,
+.shadow-sm {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35) !important;
+}
+
+.bg-amber-50 {
+  background-color: #422006 !important;
+}
+
+.border-amber-200,
+.border-amber-300 {
+  border-color: #92400e !important;
+}
+
+.text-amber-900,
+.text-amber-800,
+.text-amber-700 {
+  color: #fcd34d !important;
+}
+
+.bg-red-50 {
+  background-color: #450a0a !important;
+}
+
+.border-red-200,
+.border-red-300 {
+  border-color: #991b1b !important;
+}
+
+.text-red-900,
+.text-red-800,
+.text-red-700,
+.text-red-600 {
+  color: #fca5a5 !important;
+}
+
+.text-green-700,
+.text-emerald-600 {
+  color: #86efac !important;
+}
+
+.text-indigo-700,
+.text-indigo-600,
+.text-indigo-800 {
+  color: #a5b4fc !important;
+}
+
+.bg-emerald-100 {
+  background-color: #064e3b !important;
+}
+
+.text-emerald-800 {
+  color: #a7f3d0 !important;
+}
+
+.bg-red-100 {
+  background-color: #7f1d1d !important;
+}
 
 /* Status badges */
 .status-badge {
@@ -9,22 +145,22 @@
   font-size: 0.75rem;
   font-weight: 500;
   white-space: nowrap;
-  background: #f3f4f6; /* gray-100 fallback */
-  color: #374151;      /* gray-700 */
+  background: #1e293b;
+  color: #cbd5e1;
 }
-.status-badge[data-status="queued"]                { background: #f3f4f6; color: #374151; } /* gray */
+.status-badge[data-status="queued"]                { background: #1e293b; color: #cbd5e1; }
 .status-badge[data-status="running"],
 .status-badge[data-status="scraping"],
-.status-badge[data-status="cleaning"]              { background: #e0e7ff; color: #3730a3; } /* indigo */
-.status-badge[data-status="completed"]             { background: #d1fae5; color: #065f46; } /* green */
-.status-badge[data-status="completed_with_errors"] { background: #fef3c7; color: #92400e; } /* amber */
-.status-badge[data-status="failed"]                { background: #fee2e2; color: #991b1b; } /* red */
+.status-badge[data-status="cleaning"]              { background: #312e81; color: #c7d2fe; }
+.status-badge[data-status="completed"]             { background: #064e3b; color: #a7f3d0; }
+.status-badge[data-status="completed_with_errors"] { background: #78350f; color: #fde68a; }
+.status-badge[data-status="failed"]                { background: #7f1d1d; color: #fecaca; }
 
 /* Sticky table headers inside scrollable card bodies */
 table thead.sticky-head th {
   position: sticky;
   top: 0;
-  background: #f9fafb; /* gray-50 */
+  background: #0f172a;
   z-index: 1;
 }
 
@@ -38,5 +174,5 @@ table thead.sticky-head th {
 /* Subtle scrollbars */
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-track { background: transparent; }
-*::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
-*::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+*::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #64748b; }

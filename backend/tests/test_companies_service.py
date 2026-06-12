@@ -147,6 +147,7 @@ class TestSupabaseClient(unittest.TestCase):
         import app.core.supabase_client as sc
         sc._client = None
         sc._attempted = False
+        sc._config_error = None
         self.sc = sc
 
     tearDown = setUp
@@ -169,7 +170,7 @@ class TestSupabaseClient(unittest.TestCase):
     def test_create_client_gets_short_timeouts(self):
         """Default postgrest timeout is 120s — we must pass 10s ClientOptions."""
         env = {"SUPABASE_URL": "https://example.supabase.co",
-               "SUPABASE_SERVICE_ROLE_KEY": "service-key"}
+               "SUPABASE_SERVICE_ROLE_KEY": f"{'a' * 40}.{'b' * 80}.{'c' * 80}"}
         fake_client = mock.MagicMock()
         with mock.patch.dict(os.environ, env), \
                 mock.patch("supabase.create_client",
@@ -177,10 +178,19 @@ class TestSupabaseClient(unittest.TestCase):
             self.assertIs(self.sc.get_supabase(), fake_client)
         create_client.assert_called_once()
         args, kwargs = create_client.call_args
-        self.assertEqual(args, ("https://example.supabase.co", "service-key"))
+        self.assertEqual(args, ("https://example.supabase.co", env["SUPABASE_SERVICE_ROLE_KEY"]))
         options = kwargs["options"]
         self.assertEqual(options.postgrest_client_timeout, 10)
         self.assertEqual(options.storage_client_timeout, 10)
+
+    def test_postgres_connection_string_is_invalid(self):
+        env = {"SUPABASE_URL": "https://example.supabase.co:5432/postgres",
+               "SUPABASE_SERVICE_ROLE_KEY": f"{'a' * 40}.{'b' * 80}.{'c' * 80}"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch("supabase.create_client") as create_client:
+            self.assertIsNone(self.sc.get_supabase())
+        create_client.assert_not_called()
+        self.assertIn("bare project REST URL", self.sc.get_supabase_config_error())
 
 
 if __name__ == "__main__":

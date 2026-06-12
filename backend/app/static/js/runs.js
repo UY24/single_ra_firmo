@@ -1,7 +1,7 @@
 // backend/app/static/js/runs.js — runs history with company/pipeline/status filters.
 // The URL hash is the source of truth: Apply rewrites #/runs?… and the router re-renders.
 import { api, el, fmtUsd, fmtNum } from "./api.js";
-import { errorCard, loadingCard, statusBadge, head, cell, shortDate } from "./ui.js";
+import { errorCard, loadingCard, statusBadge, head, cell, shortDate, fmtDuration } from "./ui.js";
 
 const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
                    "firmographics", "url_discovery"];
@@ -11,14 +11,6 @@ const selectCls = "rounded-lg border border-gray-300 px-3 py-2 text-sm " +
   "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
 
 const runCost = (r) => (r.cost && typeof r.cost === "object") ? r.cost.total_usd : r.cost;
-
-const fmtDuration = (s) => {
-  if (s == null) return "—";
-  const total = Math.round(Number(s));
-  if (Number.isNaN(total)) return "—";
-  const m = Math.floor(total / 60), sec = total % 60;
-  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-};
 
 function filterBar(companies, query) {
   const companySel = el("select", { class: selectCls },

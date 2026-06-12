@@ -30,6 +30,15 @@ export const head = (label, extra = "") =>
 export const cell = (content, extra = "") =>
   el("td", { class: `px-4 py-2.5 text-sm text-gray-700 ${extra}` }, content);
 
+// fmtDuration(95) → "1m 35s"; fmtDuration(42) → "42s"
+export const fmtDuration = (s) => {
+  if (s == null) return "—";
+  const total = Math.round(Number(s));
+  if (Number.isNaN(total)) return "—";
+  const m = Math.floor(total / 60), sec = total % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+};
+
 // shortDate(iso)                      → "Jun 11, 02:30 PM" (with time)
 // shortDate(iso, { withTime: false }) → "Jun 11, 2026"     (date only)
 export const shortDate = (iso, { withTime = true } = {}) => {

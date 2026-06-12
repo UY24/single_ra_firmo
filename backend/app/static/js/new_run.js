@@ -183,13 +183,11 @@ export async function render(root) {
   );
 
   // ---- Step 2: pipeline ----------------------------------------------------
-  const radios = [];
   const pipelineCards = PIPELINES.map((p) => {
     const radio = el("input", {
       type: "radio", name: "pipeline", value: p.key, class: "mt-1 accent-indigo-600",
       onchange: () => { state.pipeline = p; refresh(); },
     });
-    radios.push(radio);
     return el("label", {
       class: "flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 p-3 " +
              "transition hover:border-indigo-300 hover:bg-indigo-50/30",

@@ -1,10 +1,10 @@
 // backend/app/static/js/main.js — hash router for the app shell.
-import { el } from "./api.js";
 import { render as renderDashboard } from "./dashboard.js";
 import { render as renderCompanies } from "./companies.js";
 import { render as renderNewRun } from "./new_run.js";
 import { render as renderRuns } from "./runs.js";
 import { render as renderRunDetail } from "./run_detail.js";
+import { render as renderOperations } from "./operations.js";
 
 const TITLES = {
   dashboard: "Dashboard",
@@ -15,22 +15,13 @@ const TITLES = {
   operations: "Operations",
 };
 
-function placeholder(root, label) {
-  root.replaceChildren(
-    el("div", { class: "rounded-xl border border-gray-200 bg-white p-10 shadow-sm text-center" },
-      el("p", { class: "text-2xl text-gray-300" }, "—"),
-      el("p", { class: "mt-2 text-sm text-gray-500" }, `${label} — coming in a later task.`),
-    ),
-  );
-}
-
 const VIEWS = {
   dashboard: renderDashboard,
   companies: renderCompanies,
   "new-run": renderNewRun,
   runs: renderRuns,
   "run-detail": renderRunDetail,
-  operations: (root) => placeholder(root, "Operations"),
+  operations: renderOperations,
 };
 
 function parseHash() {

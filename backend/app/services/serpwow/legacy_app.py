@@ -20,10 +20,10 @@ import httpx
 from botocore.config import Config as BotoConfig
 from aiormq.exceptions import ChannelInvalidStateError
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from app.core.config import PROJECT_ROOT, TEMPLATES_DIR
+from app.core.config import PROJECT_ROOT
 
 def load_local_env(env_path: str = ".env") -> None:
     if not os.path.exists(env_path):
@@ -51,7 +51,6 @@ app = FastAPI(title="Single RA ISI API", version="2.0.0")
 UPLOAD_BASE_DIR = Path("/tmp/single_ra_isi")
 UPLOAD_BASE_DIR.mkdir(parents=True, exist_ok=True)
 S3_PREFIX = "single_ra_isi"
-UI_TEMPLATE_PATH = TEMPLATES_DIR / "ui.html"
 
 upload_locks: dict[str, asyncio.Lock] = {}
 
@@ -6386,11 +6385,10 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "single-ra-isi"}
 
 
-@app.get("/ui", response_class=HTMLResponse)
-async def ui_page() -> str:
-    if not UI_TEMPLATE_PATH.exists():
-        raise HTTPException(status_code=500, detail=f"UI template not found: {UI_TEMPLATE_PATH}")
-    return UI_TEMPLATE_PATH.read_text(encoding="utf-8")
+@app.get("/ui")
+async def ui_page() -> RedirectResponse:
+    """Legacy UI retired — redirect to the new console at /app."""
+    return RedirectResponse(url="/app", status_code=307)
 
 
 

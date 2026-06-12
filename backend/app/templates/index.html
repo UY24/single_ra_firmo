@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forage Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="h-full bg-gray-50 text-gray-900 antialiased">
+  <div class="flex h-screen overflow-hidden">
+
+    <!-- Sidebar -->
+    <aside class="flex w-56 shrink-0 flex-col bg-slate-900 text-slate-300">
+      <div class="flex items-center gap-2 px-5 py-5 border-b border-slate-800">
+        <span class="inline-block h-2.5 w-2.5 rounded-full bg-indigo-500"></span>
+        <span class="text-sm font-semibold tracking-wide text-white">Forage Console</span>
+      </div>
+      <nav id="sidebar-nav" class="flex-1 space-y-1 px-3 py-4 text-sm">
+        <a href="#/dashboard"  data-nav="dashboard"  class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Dashboard</a>
+        <a href="#/companies"  data-nav="companies"  class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Companies</a>
+        <a href="#/new-run"    data-nav="new-run"    class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">New Run</a>
+        <a href="#/runs"       data-nav="runs"       class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Runs</a>
+        <a href="#/operations" data-nav="operations" class="nav-link block rounded-lg px-3 py-2 hover:bg-slate-800 hover:text-white">Operations</a>
+      </nav>
+      <div class="px-5 py-4 text-xs text-slate-500 border-t border-slate-800">Internal tool</div>
+    </aside>
+
+    <!-- Main area -->
+    <div class="flex flex-1 flex-col overflow-hidden">
+      <header class="flex h-14 shrink-0 items-center border-b border-gray-200 bg-white px-8">
+        <h1 id="view-title" class="text-base font-semibold text-gray-900">Dashboard</h1>
+      </header>
+
+      <main class="flex-1 overflow-y-auto px-8 py-6">
+        <section data-view="dashboard"  class="hidden"></section>
+        <section data-view="companies"  class="hidden"></section>
+        <section data-view="new-run"    class="hidden"></section>
+        <section data-view="runs"       class="hidden"></section>
+        <section data-view="run-detail" class="hidden"></section>
+        <section data-view="operations" class="hidden"></section>
+      </main>
+    </div>
+  </div>
+
+  <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

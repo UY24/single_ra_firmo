@@ -1,0 +1,42 @@
+/* backend/app/static/css/app.css — minimal custom styles; Tailwind (CDN) does the rest. */
+
+/* Status badges */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.625rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+  background: #f3f4f6; /* gray-100 fallback */
+  color: #374151;      /* gray-700 */
+}
+.status-badge[data-status="queued"]                { background: #f3f4f6; color: #374151; } /* gray */
+.status-badge[data-status="running"],
+.status-badge[data-status="scraping"],
+.status-badge[data-status="cleaning"]              { background: #e0e7ff; color: #3730a3; } /* indigo */
+.status-badge[data-status="completed"]             { background: #d1fae5; color: #065f46; } /* green */
+.status-badge[data-status="completed_with_errors"] { background: #fef3c7; color: #92400e; } /* amber */
+.status-badge[data-status="failed"]                { background: #fee2e2; color: #991b1b; } /* red */
+
+/* Sticky table headers inside scrollable card bodies */
+table thead.sticky-head th {
+  position: sticky;
+  top: 0;
+  background: #f9fafb; /* gray-50 */
+  z-index: 1;
+}
+
+/* Active sidebar link (set by router) */
+.nav-link.active {
+  background: #1e293b;     /* slate-800 */
+  color: #ffffff;
+  box-shadow: inset 2px 0 0 0 #6366f1; /* indigo-500 accent */
+}
+
+/* Subtle scrollbars */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #9ca3af; }

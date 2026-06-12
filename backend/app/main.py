@@ -3,13 +3,24 @@
 routers are attached to it here. Run: cd backend && ../.venv/bin/python -m app.main"""
 import os
 
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
 from app.core import config  # noqa: F401  (loads .env first)
+from app.core.config import STATIC_DIR, TEMPLATES_DIR
 from app.services.serpwow.legacy_app import _get_int_env, app  # the existing FastAPI instance
 from app.routers.ai_mode import router as ai_mode_router
 from app.routers.companies import router as companies_router
 
 app.include_router(ai_mode_router)
 app.include_router(companies_router)
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/app")
+def serve_app():
+    return FileResponse(str(TEMPLATES_DIR / "index.html"))
 
 if __name__ == "__main__":
     import uvicorn

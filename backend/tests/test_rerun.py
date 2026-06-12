@@ -253,6 +253,54 @@ class TestCarryoverMerge(unittest.TestCase):
         self.assertEqual(status["carried_over"], 1)
         self.assertEqual(status["websites_found"], 2)
 
+    def test_chained_rerun_does_not_duplicate_carried_over_flag(self):
+        """A carryover entity from an earlier rerun already carries the flag —
+        merging it again must not stack a second carried_over flag."""
+        from app.services.ai_mode import ai_mode_service, run_store
+
+        already_flagged = dict(ACME_CARRY)
+        already_flagged["flags"] = [
+            {"flag": "carried_over", "why": "from previous run"}]
+
+        info = ai_mode_service.prepare_ai_mode_run(
+            b"company_name,country\nBeta,Germany\n", "rerun_of_prev.csv",
+            mode_key="ai_bulk", company_name="Acme Corp", company_id="u1",
+        )
+        run_dir = run_store.find_run_dir(info["run_id"])
+        (run_dir / "carryover.json").write_text(
+            json.dumps([already_flagged]), encoding="utf-8")
+
+        ai_mode_service.run_ai_mode_sync(info["run_id"])
+
+        report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
+        acme_ent = next(e for e in report["entities"] if e["company_name"] == "Acme")
+        carried_flags = [f for f in acme_ent["flags"] if f["flag"] == "carried_over"]
+        self.assertEqual(len(carried_flags), 1)
+        self.assertEqual(report["summary"]["carried_over"], 1)
+
+    def test_unreadable_carryover_is_logged_and_ignored(self):
+        """Corrupt carryover.json must not fail the run — it is logged,
+        ignored, and the run completes with carried_over == 0."""
+        from app.services.ai_mode import ai_mode_service, run_store
+
+        info = ai_mode_service.prepare_ai_mode_run(
+            b"company_name,country\nBeta,Germany\n", "rerun_of_prev.csv",
+            mode_key="ai_bulk", company_name="Acme Corp", company_id="u1",
+        )
+        run_dir = run_store.find_run_dir(info["run_id"])
+        (run_dir / "carryover.json").write_text("{not json!", encoding="utf-8")
+
+        ai_mode_service.run_ai_mode_sync(info["run_id"])
+
+        status = ai_mode_service.get_ai_mode_status(info["run_id"])
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["carried_over"], 0)
+        self.assertEqual(status["websites_found"], 1)  # Beta only
+        report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
+        self.assertEqual([e["company_name"] for e in report["entities"]], ["Beta"])
+        log_text = (run_dir / "run.log").read_text(encoding="utf-8")
+        self.assertIn("carryover.json unreadable; ignoring", log_text)
+
 
 if __name__ == "__main__":
     unittest.main()

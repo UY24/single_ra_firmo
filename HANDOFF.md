@@ -1,6 +1,113 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-10. Read this first if you're picking up this repo.
+Last updated: 2026-06-12. Read this first if you're picking up this repo.
+
+---
+
+## 2026-06-12 — REWORK COMPLETE (read this first)
+
+The whole backend was restructured on branch `rework` (26+ commits over `main`). Everything below
+this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
+`scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
+the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### Repo layout (new)
+```
+backend/app/
+  core/        # config.py (.env + paths), supabase_client.py
+  routers/     # ai_mode.py (preview/upload/rerun/status/result), companies.py
+  services/
+    ai_mode/   # ai_mode_service.py (engine), mode_config.py, rerun.py, run_store.py,
+               #   run_reporting.py, cost.py, cleanup.py, gemini_batch.py,
+               #   scrapedo_client.py, llm_client.py, settings.py, models.py
+    serpwow/   # legacy_app.py — the old ~7.6k-line monolith (still owns the FastAPI instance)
+  models/      # entities.py (canonical CSV parser), results.py (EntityResult/Flag/AttemptLog)
+  prompts/     # ai_bulk_search.txt, ai_deep_search.txt, ai_cleanup.txt
+  static/      # css/ + js/ for the new UI
+  templates/   # index.html (the new console; legacy ui.html DELETED)
+backend/tests/       # full suite (unittest, offline)
+backend/scripts/     # batch-recovery scripts
+supabase/migrations/001_init.sql   # companies + runs tables
+samples/             # test CSVs (sample_address.csv, smalltest.csv, ...)
+ai_mode_results/     # run outputs (gitignored)
+```
+
+### Run it
+- **Server:** `cd backend && ../.venv/bin/python -m app.main` → `http://localhost:8080/app`
+  (port from `.env` `API_PORT=8080`; dev knobs `API_RELOAD`, `UVICORN_LOG_LEVEL`).
+- **Tests:** `cd backend && ../.venv/bin/python -m unittest discover -s tests` — all offline,
+  no live API calls.
+
+### Unified CSV input (ALL pipelines, `backend/app/models/entities.py`)
+- **Required:** a company-name column (`company_name|company|name|entity_name|entity|organization|
+  organisation|legal_name`) + a country column (`country|country_name|nation`).
+- **Optional:** `company_local_name`, `address|full_address|input_full_address`, `firm_id|id`,
+  `industry|input_industry`. Headerless 2+-column files parse positionally (col 1 = company,
+  col 2 = country).
+- **The old Company-Mode format (`Company Name ENG`, `Country Code`, `ISIC`) is REJECTED with a
+  400** and a message listing accepted headers — there is no auto-detect split anymore.
+
+### Two AI modes, one engine (`mode_config.py` + `ai_mode_service.py`)
+- `ai_bulk` ("AI Mode 1 — Bulk"): `AI_BULK_BATCH_SIZE` (10); legacy `SCRAPEDO_BATCH_SIZE` still
+  read as fallback. Prompt: `prompts/ai_bulk_search.txt`.
+- `ai_deep` ("AI Mode 2 — Deep Search"): `AI_DEEP_BATCH_SIZE` (3). Prompt: `prompts/ai_deep_search.txt`.
+- Both share one scrape→clean engine and ONE unified output schema per entity:
+  `website_url, confidence (0-100), flags[{flag,why}], attempt_log[{query,result,url}], error`
+  (the old address/company prompt split + schema mismatch is gone).
+
+### Output layout (per run)
+`ai_mode_results/<company-slug>/<run_id>/` — `input.csv`, `status.json`, **one** `final_report.json`
+(summary + per-entity results + per-request records + cost), `found.csv`, `notFound.csv`, **one**
+`run.log` (level via `AI_MODE_LOG_LEVEL`), `raw_responses/request_NNN.json`, `carryover.json`
+(reruns only). The old `report.json` and `ai_mode_debug.log` are gone.
+
+### Supabase company tracking (all pipelines)
+- Apply `supabase/migrations/001_init.sql` (creates `companies` + `runs`; run rows carry pipeline,
+  status, counts, token_usage, cost, file_links, `rerun_of`).
+- Env: `SUPABASE_URL` (**bare project URL** `https://xyz.supabase.co` — NOT the `:5432` postgres
+  string) + `SUPABASE_SERVICE_ROLE_KEY`.
+- Unconfigured/unreachable → upload & company endpoints return **503** with a clear message.
+- **Never-fails-runs design:** once a run is accepted, Supabase write failures are logged and
+  swallowed — pipelines always finish on disk.
+
+### Cost tracking
+`final_report.json.summary.cost` = LLM USD (env token rates, batch rates when `AI_MODE_LLM_BATCH`)
++ scrape.do (per-request credits from response headers; `SCRAPEDO_COST_PER_REQUEST_USD` env estimate,
+0 disables).
+
+### Endpoints (new/changed)
+- `POST /uploads/preview` — parse a CSV without running; returns detected columns/warnings/rows
+  (400 + helpful message on bad format).
+- `POST /uploads/ai-mode` — multipart `file` + `mode` (`ai_bulk|ai_deep`) + company fields;
+  503 if Supabase unconfigured.
+- `POST /uploads/ai-mode/{run_id}/rerun` — re-runs only failed/unscraped rows of a
+  `failed`/`completed_with_errors` run; previous successes merge into the new run via
+  `carryover.json` (flagged `carried_over`, deduped across chained reruns).
+- `GET /uploads/ai-mode`, `/{run_id}/status`, `/{run_id}/result?file=...` — as before (allowlist
+  updated to the new file set).
+- `GET/POST /companies`, `GET /companies/stats`, `GET /companies/runs` — Supabase-backed views.
+
+### UI
+New console at **`/app`** (FastAPI-served `templates/index.html` + `static/js/*` views: dashboard,
+companies, new-run with CSV preview, runs history, run detail, operations). **`/ui` → 307 redirect
+to `/app`; the legacy `templates/ui.html` was deleted.**
+
+### Deleted in the rework
+8 dead scrapedo CLI modules (`cli.py`, `runner.py`, `cleanup_*`, `csv_loader.py`, `reporting.py`,
+`__main__.py`, ...) + 7 mode-split modules (`extraction.py`, `company_extraction.py`,
+`prompting.py`, `company_prompting.py`, `cleanup_reporting.py`, `company_reporting.py`,
+`company_csv_loader.py`), the old prompt templates (`search_query_template.txt`,
+`company_search_template.txt`), per-run `report.json` + `ai_mode_debug.log`, and `templates/ui.html`.
+
+### Stale-section index
+- §1/§2 (two-phase build + `plancl.md`): the two-phase engine survived the rework, but
+  **`plancl.md` is superseded** — the rework plan replaced it.
+- §3 repo map, §4 AI Mode reference, §0/§7 run instructions: paths/format/endpoints superseded
+  by this section.
+- §6a address-prompt mismatch: **FIXED** — prompts unified with confidence+flags.
+- §6d scrapeDo file deletion: **DONE** (see "Deleted" above).
+- §6e SerpWow caveats: still true (legacy service untouched apart from the move to
+  `backend/app/services/serpwow/legacy_app.py` + recovery-script fixes + company tracking).
 
 This project contains **two independent website-discovery systems** sharing one FastAPI app + one UI:
 
@@ -15,7 +122,7 @@ and a **`.venv/`** — see §0.
 
 ---
 
-## 0. Environment & how to run (set up this session)
+## 0. Environment & how to run (superseded — see top; `app.py` no longer exists)
 
 - **venv:** `.venv/` was created with Homebrew Python 3.12 (`/opt/homebrew/bin/python3.12`).
   Run: `cd website_url_finder && source .venv/bin/activate && python app.py`
@@ -97,7 +204,7 @@ The old interleaved scrape→clean loop in `ai_mode_service.run_ai_mode_sync` is
 
 ---
 
-## 2. `plancl.md` — the design, now BUILT (this session, §1)
+## 2. `plancl.md` — the design, now BUILT (superseded — `plancl.md` itself is superseded by the rework; see top)
 
 `plancl.md` (repo root) holds the implemented design. **Note:** it was rewritten this session — the
 original "separate **LLM Cleaner tab** + `scrape_manifest.json`" two-stage idea was **dropped** in favor
@@ -111,7 +218,7 @@ split** (only needed if you ever exceed one scrape.do account's ~100-concurrent 
 
 ---
 
-## 3. Repo map (key files)
+## 3. Repo map (superseded — see the new layout at top)
 
 ```
 app.py                  # the whole SerpWow service (FastAPI + worker + Gemini batch + XLSX), ~7.6k lines
@@ -138,7 +245,7 @@ sample_address.csv      # 3-row test inputs (company / address mode)
 
 ---
 
-## 4. AI Mode reference
+## 4. AI Mode reference (superseded — input format, endpoints and output files changed; see top)
 
 **Goal:** upload CSV → for each batch of `SCRAPEDO_BATCH_SIZE` (10) entities, send ONE prompt to
 scrape.do Google AI Mode (geo-targeted), then clean the response with an LLM (Gemini *or* OpenAI) →
@@ -206,7 +313,7 @@ Gemini provider), `SCRAPEDO_CONCURRENCY` (parallel scrape, 5), `GEMINI_BATCH_SHA
 
 ## 6. Outstanding decisions, TODOs & caveats
 
-### 6a. ⚠️ Address template ↔ cleanup-prompt mismatch (NEW — verify)
+### 6a. Address template ↔ cleanup-prompt mismatch (FIXED in the rework — prompts unified with confidence+flags; see top)
 The rewritten address `search_query_template.txt` (the **query** sent to Google AI Mode) now asks for a
 `Confidence / Flags / Investigation Summary / **Website:**` format. But the address **cleanup**
 `SYSTEM_PROMPT` in `scrapedo_finder/extraction.py` (and the `EntityCleanResult` schema: `short_details`,
@@ -227,7 +334,7 @@ This session **added** the AI Mode batch keys (`AI_MODE_LLM_BATCH`, `SCRAPEDO_CO
 `AI_MODE_BATCH_TIMEOUT_SEC`) and **removed** dead `REDIS_*`. Still missing: `AI_MODE_LOG_LEVEL`,
 `API_RELOAD`, `UVICORN_LOG_LEVEL`, and `GEMINI_MODEL` (AI Mode falls back to `gemini-2.5-flash-lite`).
 
-### 6d. scrapeDo file reduction — DECISION STILL PENDING
+### 6d. scrapeDo file reduction — DONE in the rework (all 8 deleted; see top)
 `scrapedo_finder/` has 20 `.py` files; the AI Mode integration uses 12. These **8 are imported by
 nothing the integration uses and are safe to delete** (package still imports, AI Mode still works):
 `__main__.py`, `cli.py`, `cleanup_cli.py`, `runner.py`, `cleanup_runner.py`,
@@ -252,7 +359,7 @@ still owed.)
 
 ---
 
-## 7. Fast orientation for a new agent
+## 7. Fast orientation for a new agent (superseded — see "Run it" at top)
 
 - **Run it:** `cd website_url_finder && .venv/bin/python app.py` → `http://localhost:8080/ui`
   (port from `.env`). Set `SCRAPEDO_TOKEN` + an LLM key in `.env` first. Don't use Live Server (§0).

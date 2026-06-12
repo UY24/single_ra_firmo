@@ -2,6 +2,9 @@
 import { el } from "./api.js";
 import { render as renderDashboard } from "./dashboard.js";
 import { render as renderCompanies } from "./companies.js";
+import { render as renderNewRun } from "./new_run.js";
+import { render as renderRuns } from "./runs.js";
+import { render as renderRunDetail } from "./run_detail.js";
 
 const TITLES = {
   dashboard: "Dashboard",
@@ -24,10 +27,9 @@ function placeholder(root, label) {
 const VIEWS = {
   dashboard: renderDashboard,
   companies: renderCompanies,
-  "new-run": (root) => placeholder(root, "New Run"),
-  runs: (root) => placeholder(root, "Runs"),
-  "run-detail": (root, params) =>
-    placeholder(root, params.runRef ? `Run ${params.runRef}` : "Run Detail"),
+  "new-run": renderNewRun,
+  runs: renderRuns,
+  "run-detail": renderRunDetail,
   operations: (root) => placeholder(root, "Operations"),
 };
 

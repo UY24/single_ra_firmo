@@ -34,6 +34,7 @@ from app.core.config import LEGACY_AI_MODE_RESULT_DIR
 from app.models.entities import Entity, InvalidCSVError, format_entities_for_prompt, parse_entities_csv
 from app.models.results import EntityResult
 from app.services.ai_mode import gemini_batch, run_store
+from app.services.ai_mode.cost import build_cost_summary, calculate_llm_cost_usd
 from app.services.ai_mode.cleanup import (
     build_cleanup_messages,
     coerce_json_array,
@@ -544,6 +545,7 @@ def _build_run_update(summary: dict, file_links: dict[str, str]) -> dict:
         "websites_found": websites_found,
         "websites_not_found": websites_not_found,
         "token_usage": summary.get("token_usage"),
+        "cost": summary.get("cost"),
         "duration_seconds": summary.get("batch_duration_seconds"),
         "file_links": file_links,
         "finished_at": summary.get("completed_at"),
@@ -839,12 +841,15 @@ def run_ai_mode_sync(run_id: str) -> None:
                         "request_index": request_index, "group": group, "group_names": group_names,
                         "payload": payload, "error": None, "scrapedo_seconds": 0.0,
                         "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
+                        "request_cost": None,  # resumed: no fresh response header
                     }
                 except (ValueError, OSError):
                     pass
             t0 = time.perf_counter()
             try:
-                payload = scrapedo_client.search_google_ai_mode(query, extra_params=geo_params)
+                payload, request_cost = scrapedo_client.search_google_ai_mode(
+                    query, extra_params=geo_params
+                )
                 seconds = time.perf_counter() - t0
                 raw_path.write_text(
                     json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -853,6 +858,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "request_index": request_index, "group": group, "group_names": group_names,
                     "payload": payload, "error": None, "scrapedo_seconds": seconds,
                     "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
+                    "request_cost": request_cost,
                 }
             except Exception as exc:  # scrape.do failure for this batch
                 seconds = time.perf_counter() - t0
@@ -860,6 +866,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "request_index": request_index, "group": group, "group_names": group_names,
                     "payload": None, "error": sanitize_secret_text(str(exc)),
                     "scrapedo_seconds": seconds, "rel_raw_path": None, "geo_debug": geo_debug,
+                    "request_cost": None,
                 }
 
         scraped: dict[int, dict] = {}
@@ -1080,6 +1087,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                         "combined_seconds": round(rec["scrapedo_seconds"], 3),
                         "raw_json_file": rec["rel_raw_path"],
                         "scrapedo_params": rec["geo_debug"],
+                        "request_cost": rec.get("request_cost"),
                     }
                 )
                 continue
@@ -1098,6 +1106,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "combined_seconds": round(rec["scrapedo_seconds"] + llm_secs, 3),
                     "raw_json_file": rec["rel_raw_path"],
                     "scrapedo_params": rec["geo_debug"],
+                    "request_cost": rec.get("request_cost"),
                 }
             )
 
@@ -1110,6 +1119,20 @@ def run_ai_mode_sync(run_id: str) -> None:
         websites_found = sum(1 for r in results if r.website_url)
         websites_not_found = len(results) - websites_found
         run_status = "completed_with_errors" if failed_request_count else "completed"
+
+        # Per-run cost (Task 15): LLM tokens priced via env rates + scrape.do
+        # per-request credits from response headers (env-rate estimate fallback).
+        llm_usd = calculate_llm_cost_usd(
+            provider=cfg.provider,
+            prompt_tokens=usage_total.prompt_tokens,
+            completion_tokens=usage_total.completion_tokens,
+            batch_mode=batch_mode,
+        )
+        cost = build_cost_summary(
+            llm_usd=llm_usd,
+            request_costs=[r.get("request_cost") for r in per_request_records],
+            request_count=len(per_request_records),
+        )
 
         summary = {
             "run_id": run_id,
@@ -1131,6 +1154,7 @@ def run_ai_mode_sync(run_id: str) -> None:
             "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
             "token_usage": asdict(usage_total),
+            "cost": cost,
             "scrapedo_seconds_total": round(scrapedo_seconds_total, 3),
             "llm_seconds_total": round(llm_seconds_total, 3),
             "batch_duration_seconds": round(total_wall, 3),
@@ -1172,6 +1196,7 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["llm_seconds_total"] = round(llm_seconds_total, 3)
         status["batch_duration_seconds"] = round(total_wall, 3)
         status["token_usage"] = asdict(usage_total)
+        status["cost"] = cost
         status["completed_at"] = completed_at
         status["updated_at"] = utc_now_iso()
         status["error"] = (

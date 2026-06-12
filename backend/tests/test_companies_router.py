@@ -172,6 +172,7 @@ class TestBuildRunUpdate(unittest.TestCase):
             "token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
             "batch_duration_seconds": 12.5,
             "completed_at": "2026-06-11T00:00:00+00:00",
+            "cost": {"llm_usd": 0.1, "scrapedo_usd": 0.02, "total_usd": 0.12},
         }
         links = {"found.csv": "/runs/x/found.csv"}
         update = _build_run_update(summary, links)
@@ -185,7 +186,8 @@ class TestBuildRunUpdate(unittest.TestCase):
         self.assertEqual(update["file_links"], links)
         self.assertEqual(update["finished_at"], "2026-06-11T00:00:00+00:00")
         self.assertIsNone(update["error"])
-        self.assertNotIn("cost", update)  # cost lands in Task 15
+        # cost (Task 15) flows into the runs row `cost jsonb` column
+        self.assertEqual(update["cost"], {"llm_usd": 0.1, "scrapedo_usd": 0.02, "total_usd": 0.12})
 
     def test_completed_with_errors_sets_error(self):
         update = _build_run_update(

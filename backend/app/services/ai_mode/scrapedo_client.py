@@ -7,6 +7,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from app.services.ai_mode.cost import extract_scrapedo_request_cost
+
 
 class ScrapeDoClient:
     def __init__(
@@ -33,7 +35,14 @@ class ScrapeDoClient:
         self.include_html = include_html
         self.log = log
 
-    def search_google_ai_mode(self, query: str, extra_params: dict[str, str] | None = None) -> dict[str, Any]:
+    def search_google_ai_mode(
+        self, query: str, extra_params: dict[str, str] | None = None
+    ) -> tuple[dict[str, Any], float | None]:
+        """Run one AI-Mode search; returns ``(payload, request_cost)``.
+
+        ``request_cost`` is the per-request credit cost reported by scrape.do in a
+        response header, or None when the header is absent/unknown.
+        """
         params = self.build_params(query, extra_params=extra_params)
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -48,10 +57,15 @@ class ScrapeDoClient:
                 with httpx.Client(timeout=self.timeout_seconds) as client:
                     response = client.get("https://api.scrape.do/plugin/google/search/ai-mode", params=params)
                     elapsed = time.perf_counter() - attempt_started
+                    request_cost = extract_scrapedo_request_cost(response.headers)
+                    # Header NAMES only (never values) so the real cost header is
+                    # discoverable from run.log on a live run without leaking secrets.
                     self._log(
                         "Scrape.do attempt "
                         f"{attempt + 1}/{self.max_retries + 1} response "
                         f"http_status={response.status_code} elapsed={elapsed:.2f}s "
+                        f"request_cost={request_cost} "
+                        f"response_headers={sorted(response.headers.keys())} "
                         f"body_preview={self._body_preview(response)}"
                     )
                     if response.status_code >= 400:
@@ -68,7 +82,7 @@ class ScrapeDoClient:
                     f"text_blocks={len(payload.get('text_blocks') or [])} "
                     f"references={len(payload.get('references') or [])}"
                 )
-                return payload
+                return payload, request_cost
             except Exception as exc:
                 last_error = exc
                 self._log(

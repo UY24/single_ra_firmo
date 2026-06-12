@@ -5504,22 +5504,23 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
         pass
 
 
-def _update_supabase_run(state: dict[str, Any]) -> None:
+def _update_supabase_run(state: dict[str, Any]) -> bool:
     """Best-effort Supabase ``runs`` row update at upload terminal status (Task 14).
 
     Maps only what the upload state actually tracks (row success/failed counters,
     timing, state/output artifact locations). Wrapped entirely in try/except so
-    Supabase bookkeeping can NEVER break the worker.
+    Supabase bookkeeping can NEVER break the worker. Returns True only when the
+    runs row was actually updated, so callers can mark the snapshot as synced.
     """
     try:
         run_db_id = state.get("run_db_id")
         if not run_db_id:
-            return
+            return False
         from app.services.companies import get_company_service
 
         svc = get_company_service()
         if svc is None:
-            return
+            return False
         upload_id = str(state.get("upload_id") or "")
         bucket = os.getenv("S3_BUCKET")
         if bucket:
@@ -5532,7 +5533,7 @@ def _update_supabase_run(state: dict[str, Any]) -> None:
                 "state.json": str(_state_file(upload_id)),
                 "output.json": str(_output_file(upload_id)),
             }
-        svc.update_run(
+        return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
             success_count=state.get("success_rows"),
@@ -5546,6 +5547,22 @@ def _update_supabase_run(state: dict[str, Any]) -> None:
             f"[supabase] run update failed for upload {state.get('upload_id')} "
             f"(worker unaffected): {type(exc).__name__}: {exc}"
         )
+        return False
+
+
+def _should_sync_supabase(state: dict[str, Any], marker: str) -> bool:
+    """True when this terminal snapshot still needs a Supabase ``runs`` sync.
+
+    Skips snapshots already synced (``supabase_sync_marker``) AND snapshots whose
+    sync already failed (``supabase_sync_failed_marker``). Trade-off: a failed
+    sync is retried at most once per distinct terminal snapshot — a permanently
+    down Supabase doesn't re-stall every persist call (update_run retries 3x with
+    sleeps), but a later terminal state with different counters retries once.
+    """
+    return (
+        state.get("supabase_sync_marker") != marker
+        and state.get("supabase_sync_failed_marker") != marker
+    )
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
@@ -5560,9 +5577,13 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
         marker = (
             f"{state.get('status')}:{state.get('success_rows')}:{state.get('failed_rows')}"
         )
-        if state.get("supabase_sync_marker") != marker:
-            state["supabase_sync_marker"] = marker
-            await asyncio.to_thread(_update_supabase_run, dict(state))
+        if _should_sync_supabase(state, marker):
+            if await asyncio.to_thread(_update_supabase_run, dict(state)):
+                state["supabase_sync_marker"] = marker
+            else:
+                # Mark the failure so we don't retry this exact snapshot on
+                # every persist (see _should_sync_supabase for the trade-off).
+                state["supabase_sync_failed_marker"] = marker
     update_summary_cache(upload_id, state)
     await write_upload_artifact(upload_id, "state", state)
 
@@ -6453,7 +6474,13 @@ async def _create_upload_with_rows(
             status_code=503,
             detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
         )
-    company = await asyncio.to_thread(company_svc.get_company, company_id)
+    try:
+        company = await asyncio.to_thread(company_svc.get_company, company_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase unreachable — check SUPABASE_URL / project status",
+        ) from exc
     if company is None:
         raise HTTPException(
             status_code=400, detail="unknown company_id — create the company first"

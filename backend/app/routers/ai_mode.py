@@ -30,7 +30,13 @@ async def create_ai_mode_upload(
             status_code=503,
             detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
         )
-    company = await asyncio.to_thread(svc.get_company, company_id)
+    try:
+        company = await asyncio.to_thread(svc.get_company, company_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase unreachable — check SUPABASE_URL / project status",
+        ) from exc
     if company is None:
         raise HTTPException(
             status_code=400, detail="unknown company_id — create the company first"

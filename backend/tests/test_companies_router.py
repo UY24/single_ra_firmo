@@ -100,6 +100,17 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
         self.assertEqual(res.status_code, 503)
         self.assertIn("Supabase not configured", res.json()["detail"])
 
+    def test_get_company_raises_503(self):
+        """Unreachable Supabase (network error) maps to 503, not a raw 500."""
+        svc = mock.MagicMock()
+        svc.get_company.side_effect = ConnectionError("name resolution failed")
+        with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc):
+            res = self.client.post(
+                "/uploads/ai-mode", files={"file": self.csv}, data={"company_id": "u1"}
+            )
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("Supabase unreachable", res.json()["detail"])
+
     def test_unknown_company_400(self):
         svc = mock.MagicMock()
         svc.get_company.return_value = None
@@ -225,7 +236,43 @@ class TestLegacyUpdateSupabaseRun(unittest.TestCase):
             "app.services.companies.get_company_service",
             side_effect=RuntimeError("boom"),
         ):
-            legacy_app._update_supabase_run({"upload_id": "u", "run_db_id": "x"})
+            self.assertFalse(
+                legacy_app._update_supabase_run({"upload_id": "u", "run_db_id": "x"})
+            )
+
+    def test_returns_update_run_result(self):
+        from app.services.serpwow import legacy_app
+
+        state = {"upload_id": "up-1", "run_db_id": "db-9", "status": "completed"}
+        for update_ok in (True, False):
+            svc = mock.MagicMock()
+            svc.update_run.return_value = update_ok
+            with mock.patch(
+                "app.services.companies.get_company_service", return_value=svc
+            ):
+                self.assertEqual(legacy_app._update_supabase_run(state), update_ok)
+
+
+class TestShouldSyncSupabase(unittest.TestCase):
+    def test_unsynced_snapshot_syncs(self):
+        from app.services.serpwow.legacy_app import _should_sync_supabase
+
+        self.assertTrue(_should_sync_supabase({}, "completed:7:3"))
+
+    def test_synced_marker_skips(self):
+        from app.services.serpwow.legacy_app import _should_sync_supabase
+
+        state = {"supabase_sync_marker": "completed:7:3"}
+        self.assertFalse(_should_sync_supabase(state, "completed:7:3"))
+
+    def test_failed_marker_skips_same_snapshot_but_retries_new_one(self):
+        from app.services.serpwow.legacy_app import _should_sync_supabase
+
+        state = {"supabase_sync_failed_marker": "completed_with_errors:5:5"}
+        # Same snapshot whose sync already failed: don't re-stall every persist.
+        self.assertFalse(_should_sync_supabase(state, "completed_with_errors:5:5"))
+        # Different terminal snapshot (e.g. retry re-completed): retry once.
+        self.assertTrue(_should_sync_supabase(state, "completed:10:0"))
 
 
 if __name__ == "__main__":

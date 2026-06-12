@@ -23,3 +23,10 @@ create table runs (
   created_at timestamptz not null default now()
 );
 create index runs_company_idx on runs(company_id);
+
+-- Row Level Security: enabled with NO policies on purpose.
+-- Only the FastAPI backend talks to these tables, using the service_role key,
+-- which bypasses RLS. Enabling RLS without policies means the anon/authenticated
+-- keys get zero access — exactly what we want for an internal tool.
+alter table companies enable row level security;
+alter table runs enable row level security;

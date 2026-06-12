@@ -22,6 +22,8 @@ class TestUiShell(unittest.TestCase):
         for path in ("/static/js/api.js", "/static/js/main.js",
                      "/static/js/ui.js",
                      "/static/js/dashboard.js", "/static/js/companies.js",
+                     "/static/js/new_run.js", "/static/js/runs.js",
+                     "/static/js/run_detail.js",
                      "/static/css/app.css"):
             res = self.client.get(path)
             self.assertEqual(res.status_code, 200, path)

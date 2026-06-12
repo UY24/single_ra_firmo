@@ -166,6 +166,22 @@ class TestSupabaseClient(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertIsNone(get_company_service())
 
+    def test_create_client_gets_short_timeouts(self):
+        """Default postgrest timeout is 120s — we must pass 10s ClientOptions."""
+        env = {"SUPABASE_URL": "https://example.supabase.co",
+               "SUPABASE_SERVICE_ROLE_KEY": "service-key"}
+        fake_client = mock.MagicMock()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch("supabase.create_client",
+                           return_value=fake_client) as create_client:
+            self.assertIs(self.sc.get_supabase(), fake_client)
+        create_client.assert_called_once()
+        args, kwargs = create_client.call_args
+        self.assertEqual(args, ("https://example.supabase.co", "service-key"))
+        options = kwargs["options"]
+        self.assertEqual(options.postgrest_client_timeout, 10)
+        self.assertEqual(options.storage_client_timeout, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

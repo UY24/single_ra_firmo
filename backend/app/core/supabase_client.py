@@ -16,7 +16,14 @@ def get_supabase():
         url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         if url and key:
             from supabase import create_client
-            _client = create_client(url, key)
+            from supabase.client import ClientOptions
+            # Default postgrest timeout is 120s: an unreachable Supabase would
+            # block endpoints ~2min per call (and per-upload locks for minutes
+            # across update_run retries). Fail fast instead.
+            _client = create_client(url, key, options=ClientOptions(
+                postgrest_client_timeout=10,
+                storage_client_timeout=10,
+            ))
         else:
             logger.warning("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — "
                            "company tracking disabled")

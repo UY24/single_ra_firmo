@@ -1,13 +1,6 @@
 // backend/app/static/js/companies.js — create company + companies table with stats.
 import { api, el, fmtUsd, fmtNum } from "./api.js";
-import { errorCard, loadingCard } from "./dashboard.js";
-
-const shortDate = (iso) => {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
-};
+import { errorCard, loadingCard, head, cell, shortDate } from "./ui.js";
 
 function createForm(onCreated) {
   const message = el("p", { class: "mt-2 hidden text-sm" });
@@ -61,11 +54,6 @@ function createForm(onCreated) {
 }
 
 function companiesTable(companies) {
-  const head = (label, extra = "") =>
-    el("th", { class: `px-4 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400 ${extra}` }, label);
-  const cell = (content, extra = "") =>
-    el("td", { class: `px-4 py-2.5 text-sm text-gray-700 ${extra}` }, content);
-
   const rows = companies.map((c) =>
     el("tr", {
       class: "cursor-pointer hover:bg-indigo-50/40",
@@ -75,7 +63,7 @@ function companiesTable(companies) {
       cell(fmtNum(c.runs), "text-right"),
       cell(`${fmtNum(c.websites_found)} / ${fmtNum(c.websites_not_found)}`, "text-right"),
       cell(fmtUsd(c.total_cost_usd), "text-right"),
-      cell(shortDate(c.created_at), "text-gray-400"),
+      cell(shortDate(c.created_at, { withTime: false }), "text-gray-400"),
     ),
   );
 

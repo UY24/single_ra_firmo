@@ -46,7 +46,21 @@ function parseHash() {
   return { view, params: { query } };
 }
 
+// A view's render() may return a cleanup function (directly or via a promise,
+// since renders can be async). The router invokes it before rendering the next
+// view so background work (e.g. status pollers) doesn't leak across views.
+let activeCleanup = null;
+let routeToken = 0;
+
+function runCleanup(fn) {
+  try { fn(); } catch (e) { console.error("view cleanup failed:", e); }
+}
+
 function route() {
+  const token = ++routeToken;
+  if (typeof activeCleanup === "function") runCleanup(activeCleanup);
+  activeCleanup = null;
+
   const { view, params } = parseHash();
 
   document.querySelectorAll("main section[data-view]").forEach((s) => {
@@ -59,8 +73,13 @@ function route() {
   if (title) title.textContent = TITLES[view] ?? view;
 
   const root = document.querySelector(`main section[data-view="${view}"]`);
-  if (root) VIEWS[view](root, params);
+  if (!root) return;
+  Promise.resolve(VIEWS[view](root, params)).then((cleanup) => {
+    if (typeof cleanup !== "function") return;
+    if (token === routeToken) activeCleanup = cleanup;
+    else runCleanup(cleanup); // route changed while rendering: tear down immediately
+  }).catch((e) => console.error(e));
 }
 
 window.addEventListener("hashchange", route);
-window.addEventListener("load", route);
+window.addEventListener("DOMContentLoaded", route);

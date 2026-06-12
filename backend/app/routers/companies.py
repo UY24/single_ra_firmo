@@ -19,29 +19,47 @@ def _svc():
     return svc
 
 
+def _unreachable(exc: Exception) -> HTTPException:
+    """Unexpected service error (network down, bad DNS, …) → 503, not a raw 500."""
+    return HTTPException(503, f"Supabase unreachable: {exc}")
+
+
 @router.post("")
 def create_company(body: CompanyIn):
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "company name is required")
+    svc = _svc()
     try:
-        return _svc().create_company(name)
+        return svc.create_company(name)
     except Exception as exc:
         if "duplicate" in str(exc).lower() or "unique" in str(exc).lower():
             raise HTTPException(409, f"company '{name}' already exists")
-        raise
+        raise _unreachable(exc)
 
 
 @router.get("")
 def list_companies():
-    return {"companies": _svc().list_companies()}
+    svc = _svc()
+    try:
+        return {"companies": svc.list_companies()}
+    except Exception as exc:
+        raise _unreachable(exc)
 
 
 @router.get("/stats")
 def company_stats():
-    return {"companies": _svc().company_stats()}
+    svc = _svc()
+    try:
+        return {"companies": svc.company_stats()}
+    except Exception as exc:
+        raise _unreachable(exc)
 
 
 @router.get("/runs")
 def list_runs(company_id: str | None = None, pipeline: str | None = None):
-    return {"runs": _svc().list_runs(company_id=company_id, pipeline=pipeline)}
+    svc = _svc()
+    try:
+        return {"runs": svc.list_runs(company_id=company_id, pipeline=pipeline)}
+    except Exception as exc:
+        raise _unreachable(exc)

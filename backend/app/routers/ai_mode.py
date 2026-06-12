@@ -93,6 +93,100 @@ async def create_ai_mode_upload(
     return info
 
 
+@router.post("/uploads/ai-mode/{run_id}/rerun")
+async def rerun_ai_mode_upload(run_id: str) -> dict[str, Any]:
+    """Re-run a failed/partial run: retry only failed/unscraped rows, carry successes.
+
+    NOTE: legacy-layout runs (``ai_mode_result/<run_id>``) resolve to no
+    new-layout run dir and get a 404 here — they predate the company-aware
+    layout and cannot be re-run.
+    """
+    from app.services.ai_mode import ai_mode_service, rerun, run_store
+
+    prev_run_dir = await asyncio.to_thread(run_store.find_run_dir, run_id)
+    if prev_run_dir is None:
+        raise HTTPException(status_code=404, detail="AI mode run not found")
+    prev_status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
+    prev_state = str(prev_status.get("status") or "")
+    if prev_state not in {"failed", "completed_with_errors"}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"run status is '{prev_state}'; only failed or "
+                "completed_with_errors runs can be re-run"
+            ),
+        )
+    try:
+        retry_csv, carryover = await asyncio.to_thread(rerun.split_for_rerun, prev_run_dir)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="previous run is missing final_report.json/input.csv; cannot re-run",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    svc = get_company_service()
+    if svc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY)",
+        )
+    mode = str(prev_status.get("mode") or "ai_bulk")
+    company_id = str(prev_status.get("company_id") or "")
+    company_name = str(prev_status.get("company_name") or "")
+    # Refresh the company name from Supabase when possible, but fall back to
+    # the name recorded in the previous run's status: a Supabase blip must not
+    # block a re-run (the run dir slug only needs a stable display name).
+    try:
+        company = await asyncio.to_thread(svc.get_company, company_id) if company_id else None
+    except Exception:
+        company = None
+    if company:
+        company_name = company["name"]
+
+    try:
+        info = ai_mode_service.prepare_ai_mode_run(
+            retry_csv.encode("utf-8"),
+            f"rerun_of_{run_id}.csv",
+            mode_key=mode,
+            company_name=company_name,
+            company_id=company_id,
+        )
+    except (InvalidCSVError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    new_run_id = info["run_id"]
+    if carryover:
+        new_run_dir = await asyncio.to_thread(run_store.find_run_dir, new_run_id)
+        if new_run_dir is not None:
+            await asyncio.to_thread(rerun.write_carryover, new_run_dir, carryover)
+    info["rerun_of_run_id"] = run_id
+    info["carried_over"] = len(carryover)
+    await asyncio.to_thread(
+        ai_mode_service.set_status_fields,
+        new_run_id,
+        rerun_of_run_id=run_id,
+        carried_over=len(carryover),
+    )
+    # Best-effort Supabase tracking, linked to the previous run's row when known.
+    run_db_id = await asyncio.to_thread(
+        svc.create_run,
+        company_id=company_id,
+        pipeline=mode,
+        run_ref=new_run_id,
+        total_rows=info["total_rows"],
+        rerun_of=prev_status.get("run_db_id"),
+    )
+    if run_db_id:
+        info["run_db_id"] = run_db_id
+        await asyncio.to_thread(ai_mode_service.set_run_db_id, new_run_id, run_db_id)
+    task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, new_run_id))
+    ai_mode_tasks.add(task)
+    task.add_done_callback(ai_mode_tasks.discard)
+    return info
+
+
 @router.get("/uploads/ai-mode")
 async def list_ai_mode_uploads() -> dict[str, Any]:
     from app.services.ai_mode import ai_mode_service

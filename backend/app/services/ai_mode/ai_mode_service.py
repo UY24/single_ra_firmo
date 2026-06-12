@@ -32,7 +32,7 @@ from typing import Any, Iterable, TypeVar
 
 from app.core.config import LEGACY_AI_MODE_RESULT_DIR
 from app.models.entities import Entity, InvalidCSVError, format_entities_for_prompt, parse_entities_csv
-from app.models.results import EntityResult
+from app.models.results import EntityResult, Flag
 from app.services.ai_mode import gemini_batch, run_store
 from app.services.ai_mode.cost import build_cost_summary, calculate_llm_cost_usd
 from app.services.ai_mode.cleanup import (
@@ -504,16 +504,21 @@ def _read_status(run_id: str, run_dir: Path) -> dict:
     return {"run_id": run_id}
 
 
-def set_run_db_id(run_id: str, run_db_id: str | None) -> None:
-    """Persist the Supabase ``runs`` row id into the run's status.json (Task 14)."""
-    if not run_db_id:
-        return
+def set_status_fields(run_id: str, **fields: Any) -> None:
+    """Merge extra fields into a run's persisted status.json (no-op if unknown)."""
     run_dir = run_store.find_run_dir(run_id)
     if run_dir is None:
         return
     status = _read_status(run_id, run_dir)
-    status["run_db_id"] = run_db_id
+    status.update(fields)
     _persist_status(run_id, run_dir, status)
+
+
+def set_run_db_id(run_id: str, run_db_id: str | None) -> None:
+    """Persist the Supabase ``runs`` row id into the run's status.json (Task 14)."""
+    if not run_db_id:
+        return
+    set_status_fields(run_id, run_db_id=run_db_id)
 
 
 def _supabase_update_run(run_db_id: str | None, **fields: Any) -> None:
@@ -1111,6 +1116,37 @@ def run_ai_mode_sync(run_id: str) -> None:
             )
 
         # ----------------------------------------------------------------- #
+        # Re-run carryover (Task 17): merge the previous run's successes into
+        # this run's outputs. Carried entities count toward websites_found
+        # (the run's found.csv really contains those URLs) but NOT toward
+        # scrapedo/llm request or token stats; the summary exposes a separate
+        # ``carried_over`` count so the split stays visible.
+        # ----------------------------------------------------------------- #
+        carried_over = 0
+        carryover_path = run_dir / "carryover.json"
+        if carryover_path.exists():
+            try:
+                carried_objs = json.loads(carryover_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                carried_objs = []
+                _ai_log(
+                    run_id, run_dir,
+                    f"carryover.json unreadable; ignoring ({exc})", logging.WARNING,
+                )
+            for obj in carried_objs:
+                if not isinstance(obj, dict):
+                    continue
+                result = EntityResult.from_llm_object(obj)
+                result.flags.append(Flag("carried_over", "from previous run"))
+                results.append(result)
+                carried_over += 1
+            if carried_over:
+                _ai_log(
+                    run_id, run_dir,
+                    f"Merged {carried_over} carried-over success(es) from previous run",
+                )
+
+        # ----------------------------------------------------------------- #
         # Outputs: found.csv / notFound.csv / ONE final_report.json
         # ----------------------------------------------------------------- #
         total_wall = time.perf_counter() - wall_t0
@@ -1150,6 +1186,7 @@ def run_ai_mode_sync(run_id: str) -> None:
             "llm_errors": llm_errors,
             "websites_found": websites_found,
             "websites_not_found": websites_not_found,
+            "carried_over": carried_over,
             "scrapedo_request_count": len(per_request_records),
             "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
@@ -1192,6 +1229,7 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
         status["websites_found"] = websites_found
         status["websites_not_found"] = websites_not_found
+        status["carried_over"] = carried_over
         status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
         status["llm_seconds_total"] = round(llm_seconds_total, 3)
         status["batch_duration_seconds"] = round(total_wall, 3)

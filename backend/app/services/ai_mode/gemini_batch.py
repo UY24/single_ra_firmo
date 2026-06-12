@@ -39,16 +39,6 @@ def _api_key() -> str:
     return key
 
 
-def _float_env(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value.strip())
-    except (ValueError, TypeError):
-        return default
-
-
 def _http_post_json(url: str, body: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
     req = Request(
         url,
@@ -412,21 +402,3 @@ def collect_results(batch_obj: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(obj, dict):
                 results.append(_record(obj))
     return results
-
-
-def calculate_gemini_batch_cost_usd(usage: dict[str, Any] | None) -> float:
-    """Cost from a native Gemini ``usageMetadata`` object at batch (50%) rates."""
-    if not usage:
-        return 0.0
-    input_tokens = int(usage.get("promptTokenCount", 0) or 0)
-    output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
-    input_usd_per_1m = _float_env(
-        "GEMINI_BATCH_INPUT_USD_PER_1M_TOKENS", _float_env("GEMINI_INPUT_USD_PER_1M_TOKENS", 0.10)
-    )
-    output_usd_per_1m = _float_env(
-        "GEMINI_BATCH_OUTPUT_USD_PER_1M_TOKENS", _float_env("GEMINI_OUTPUT_USD_PER_1M_TOKENS", 0.40)
-    )
-    cost = ((input_tokens / 1_000_000) * input_usd_per_1m) + (
-        (output_tokens / 1_000_000) * output_usd_per_1m
-    )
-    return round(cost, 8)

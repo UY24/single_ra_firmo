@@ -1137,7 +1137,10 @@ def run_ai_mode_sync(run_id: str) -> None:
                 if not isinstance(obj, dict):
                     continue
                 result = EntityResult.from_llm_object(obj)
-                result.flags.append(Flag("carried_over", "from previous run"))
+                # Chained reruns: the entity may already carry a carried_over
+                # flag from an earlier run — don't stack duplicates.
+                if not any(f.flag == "carried_over" for f in result.flags):
+                    result.flags.append(Flag("carried_over", "from previous run"))
                 results.append(result)
                 carried_over += 1
             if carried_over:

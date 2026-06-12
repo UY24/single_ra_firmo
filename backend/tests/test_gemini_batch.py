@@ -185,15 +185,5 @@ class ParseJsonFromTextTests(unittest.TestCase):
         self.assertIsNone(gemini_batch.parse_json_from_text("not json"))
 
 
-class CostTests(unittest.TestCase):
-    def test_positive_cost_for_one_million_tokens_each(self) -> None:
-        cost = gemini_batch.calculate_gemini_batch_cost_usd(
-            {"promptTokenCount": 1_000_000, "candidatesTokenCount": 1_000_000}
-        )
-
-        self.assertIsInstance(cost, float)
-        self.assertGreater(cost, 0.0)
-
-
 if __name__ == "__main__":
     unittest.main()

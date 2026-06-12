@@ -6,10 +6,71 @@ Last updated: 2026-06-12. Read this first if you're picking up this repo.
 
 ## 2026-06-12 — REWORK COMPLETE (read this first)
 
-The whole backend was restructured on branch `rework` (26+ commits over `main`). Everything below
+The whole backend was restructured on branch `rework` (~30 commits over `main`). Everything below
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### ⚡ Latest session additions (post-rework, same day) — STATE A NEW AGENT MUST KNOW
+
+**Conventions / hard rules**
+- **NEVER add `Co-Authored-By: Claude` (or any AI attribution) to commits** — user requirement,
+  also saved in agent memory. All 28 rework commits were history-rewritten
+  (`git filter-branch --msg-filter`) to strip the trailer, then force-pushed
+  (`--force-with-lease`, user-authorized). Tell every committing subagent this rule.
+- **Never `git push` without the user explicitly asking.** Never query the production Supabase
+  DB (psql etc.) without the user explicitly approving that exact action.
+
+**Branch state**: `rework` is pushed and in sync with `origin/rework`. NOT merged into `main`
+yet — merge is the user's call. Suite: **147/147** (`cd backend && ../.venv/bin/python -m
+unittest discover -s tests`). Working tree clean.
+
+**⚠️ USER ACTION STILL PENDING — Supabase is NOT live yet:**
+1. The migration (`supabase/migrations/001_init.sql`) has **NOT been applied** — user must run it
+   in the Supabase dashboard SQL Editor. It now includes `enable row level security` on both
+   tables (no policies — service_role bypasses RLS; anon gets nothing; the dashboard RLS warning
+   is satisfied).
+2. The user's `.env` has TWO broken values (do NOT edit `.env` yourself; tell the user):
+   `SUPABASE_URL` still holds the `...supabase.co:5432/postgres` connection string (must be the
+   bare `https://<ref>.supabase.co`), and `SUPABASE_SERVICE_ROLE_KEY` is **truncated** (37 chars;
+   real key ~200+). The project itself is alive (bare URL answers 401 to unauthenticated REST).
+   Until fixed: company/tracking endpoints return 503 (after ~10–40s timeout), uploads with
+   company validation fail — pipelines themselves are unaffected on disk.
+
+**Post-plan fixes landed** (commits after the 24-task plan finished):
+- Unified-CSV validation gate added to the SerpWow upload endpoints (`/uploads`, `/uploads/gmaps`,
+  `/uploads/gsearch`, `/uploads/url-discovery`) — old Company-Mode CSVs now 400 there too
+  (firmographics keeps its own website-column parser). `_validate_canonical_upload_csv` in
+  `legacy_app.py`.
+- SerpWow runs now sync `status="running"` to Supabase when processing starts (one-shot
+  `supabase_running_marker` in upload state), not just at terminal status.
+- `run.py` added at repo root → `python run.py` works like the old `python app.py`
+  (reads API_PORT/API_HOST from `.env`; guarded for uvicorn reload re-import).
+- `readme.md` rewritten as a numbered step-by-step local setup guide.
+- `.env.example` fully audited — **19 dead keys deleted** (all `MASSIVE_*`, `BROWSER_POOL_SIZE`,
+  `USER_AGENT`, dead `SEARCH_FETCH_*` timeouts, etc.), restructured into 5 sections; AI Mode
+  section grouped into 3a batch sizes / 3b cleanup LLM / 3c sync-vs-Gemini-Batch / 3d scraping /
+  3e cost+logging, with an explicit note that `AI_MODE_LLM_BATCH` (3c) is unrelated to SerpWow's
+  `ENABLE_GEMINI_BATCH_POSTPROCESS` (section 4).
+
+**User's working setup & intent** (context for decisions):
+- Workflow: run cheap SerpWow pipelines first (~80% coverage), then feed the residue CSV into
+  AI Mode (`ai_bulk` broad, `ai_deep` thorough). Batch sizes tuned via `AI_BULK_BATCH_SIZE` /
+  `AI_DEEP_BATCH_SIZE`.
+- LLM cleanup: sometimes uses the **OpenCode Zen** OpenAI-compatible gateway —
+  `AI_MODE_LLM_PROVIDER=openai`, `OPENAI_MODEL=deepseek-v4-flash-free`,
+  `OPENAI_BASE_URL=https://opencode.ai/zen/v1`, with `AI_MODE_LLM_BATCH=false` (sync; the batch
+  path is Gemini-only). This works as-is (client calls `{base_url}/chat/completions`); the
+  example is documented in `.env.example` §3b. User will refine the search-prompt wording in
+  `backend/app/prompts/*.txt` themselves.
+
+**Known minor leftovers** (from the final whole-branch review — all low/cosmetic, none blocking):
+rerun re-scrapes notFound-without-error rows (plan-approved but costs tokens); duplicate `sno`s
+possible in merged rerun reports; runs view lacks a date filter; `GET /batch/jobs` makes a live
+Gemini call when `GEMINI_API_KEY` is set; `batch_runner.py` still at repo root.
+
+**Plan/spec docs**: the rework spec is `docs/superpowers/specs/2026-06-11-rework-design.md`; the
+executed 24-task plan is `impplan.md` (all tasks done, each implementer-reviewed twice).
 
 ### Repo layout (new)
 ```

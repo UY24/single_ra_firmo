@@ -165,7 +165,7 @@ function renderLegacyStatus(root, ref, s) {
     ),
     el("div", { class: "rounded-xl border border-gray-200 bg-white p-5 shadow-sm" },
       el("p", { class: "text-xs text-gray-500" },
-        "SerpWow pipeline run — row-level detail and outputs are available in the legacy UI at /ui."),
+        `SerpWow pipeline run — row-level detail and outputs are available via the API status endpoint at /uploads/${ref}/status.`),
     ),
   ));
 }

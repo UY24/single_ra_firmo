@@ -300,5 +300,134 @@ class TestShouldSyncSupabase(unittest.TestCase):
         self.assertTrue(_should_sync_supabase(state, "completed:10:0"))
 
 
+class TestSerpwowUploadCsvGate(unittest.TestCase):
+    """Spec §3: the canonical CSV validator gates the legacy SerpWow upload endpoints."""
+
+    OLD_COMPANY_MODE_CSV = (
+        "companies.csv",
+        "Company Name ENG,Company Name Local,Country Code,ISIC\n"
+        "Acme,アクメ,JP,2200\n".encode("utf-8"),
+        "text/csv",
+    )
+    CANONICAL_CSV = ("companies.csv", b"company_name,country\nAcme,Japan\n", "text/csv")
+
+    def setUp(self):
+        from app.services.serpwow import legacy_app
+
+        self.legacy_app = legacy_app
+        # Plain (non-context-manager) TestClient: startup events don't run, so
+        # no RabbitMQ connection is attempted and rabbitmq_exchange stays as-is.
+        self.client = TestClient(legacy_app.app)
+
+    @staticmethod
+    def _svc():
+        svc = mock.MagicMock()
+        svc.get_company.return_value = {"id": "u1", "name": "Acme"}
+        svc.create_run.return_value = "db-run-1"
+        return svc
+
+    def test_old_company_mode_csv_rejected_400(self):
+        for path in ("/uploads", "/uploads/gmaps"):
+            with mock.patch(
+                "app.services.companies.get_company_service", return_value=self._svc()
+            ):
+                res = self.client.post(
+                    path,
+                    files={"file": self.OLD_COMPANY_MODE_CSV},
+                    data={"company_id": "u1"},
+                )
+            self.assertEqual(res.status_code, 400, path)
+            self.assertIn("missing required columns", res.json()["detail"])
+
+    def test_canonical_csv_passes_gate(self):
+        # The gate passes; with RabbitMQ disconnected the endpoint then 503s —
+        # which proves validation succeeded (a gate rejection would be a 400).
+        with mock.patch(
+            "app.services.companies.get_company_service", return_value=self._svc()
+        ), mock.patch.object(self.legacy_app, "rabbitmq_exchange", None):
+            res = self.client.post(
+                "/uploads", files={"file": self.CANONICAL_CSV}, data={"company_id": "u1"}
+            )
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("RabbitMQ", res.json()["detail"])
+
+    def test_firmographics_keeps_own_parser_no_gate(self):
+        # A website-only CSV fails the canonical validator but is the valid
+        # firmographics format: it must get past validation (503 on RabbitMQ),
+        # proving the canonical gate is NOT applied to /uploads/firmographics.
+        firmo_csv = ("sites.csv", b"official_website\nhttps://acme.com\n", "text/csv")
+        with mock.patch(
+            "app.services.companies.get_company_service", return_value=self._svc()
+        ), mock.patch.object(self.legacy_app, "rabbitmq_exchange", None):
+            res = self.client.post(
+                "/uploads/firmographics",
+                files={"file": firmo_csv},
+                data={"company_id": "u1"},
+            )
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("RabbitMQ", res.json()["detail"])
+
+
+class TestRunningStateSync(unittest.TestCase):
+    """Spec §4: one-shot runs-row 'running' sync when rows start processing."""
+
+    def test_first_processing_snapshot_syncs(self):
+        from app.services.serpwow.legacy_app import _should_sync_running
+
+        self.assertTrue(
+            _should_sync_running({"run_db_id": "db-9", "status": "processing"})
+        )
+
+    def test_marker_prevents_refire(self):
+        from app.services.serpwow.legacy_app import _should_sync_running
+
+        state = {
+            "run_db_id": "db-9",
+            "status": "processing",
+            "supabase_running_marker": True,
+        }
+        self.assertFalse(_should_sync_running(state))
+
+    def test_queued_and_terminal_states_skip(self):
+        from app.services.serpwow.legacy_app import _should_sync_running
+
+        for status in ("queued", "completed", "completed_with_errors", "failed"):
+            self.assertFalse(
+                _should_sync_running({"run_db_id": "db-9", "status": status}), status
+            )
+
+    def test_untracked_upload_skips(self):
+        from app.services.serpwow.legacy_app import _should_sync_running
+
+        self.assertFalse(_should_sync_running({"status": "processing"}))
+
+    def test_mark_running_updates_run(self):
+        from app.services.serpwow import legacy_app
+
+        svc = mock.MagicMock()
+        svc.update_run.return_value = True
+        state = {"upload_id": "up-1", "run_db_id": "db-9", "status": "processing"}
+        with mock.patch("app.services.companies.get_company_service", return_value=svc):
+            self.assertTrue(legacy_app._mark_supabase_run_running(state))
+        svc.update_run.assert_called_once()
+        args, kwargs = svc.update_run.call_args
+        self.assertEqual(args[0], "db-9")
+        self.assertEqual(kwargs["status"], "running")
+        self.assertIn("started_at", kwargs)
+
+    def test_mark_running_never_raises(self):
+        from app.services.serpwow import legacy_app
+
+        with mock.patch(
+            "app.services.companies.get_company_service",
+            side_effect=RuntimeError("boom"),
+        ):
+            self.assertFalse(
+                legacy_app._mark_supabase_run_running(
+                    {"upload_id": "u", "run_db_id": "x"}
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,32 @@
 // backend/app/static/js/ui.js — shared UI helpers (cards, badges, table cells, dates).
 import { el } from "./api.js";
 
+export function copyText(text) {
+  if (!text || text === "-" || text === "—") return;
+  navigator.clipboard.writeText(text).catch(() => {});
+}
+
+export function copyCell(text) {
+  if (!text || text === "-" || text === "—") {
+    return el("span", { class: "font-mono text-xs text-slate-500" }, "—");
+  }
+  const span = el("span", {
+    class: "block max-w-[22rem] truncate font-mono text-xs text-slate-400 cursor-pointer hover:text-slate-200 transition-colors",
+    title: `${text}\n(click to copy)`,
+  }, text);
+  span.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    copyText(text);
+    span.classList.add("text-emerald-400");
+    span.classList.remove("text-slate-400", "text-slate-200");
+    setTimeout(() => {
+      span.classList.remove("text-emerald-400");
+      span.classList.add("text-slate-400");
+    }, 1000);
+  });
+  return span;
+}
+
 export function statusBadge(status) {
   return el("span", { class: "status-badge", "data-status": status ?? "" }, status ?? "—");
 }

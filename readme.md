@@ -68,7 +68,7 @@ worker** (only if you use the SerpWow pipelines — AI Mode needs no worker).
 **Terminal 1 — the app (dev, auto-reload):**
 
 ```sh
-.venv/bin/uvicorn run:app --reload --host 0.0.0.0 --port 8080
+.venv/bin/ uvicorn run:app --reload --host 127.0.0.1 --port 8080
 ```
 
 Then open `http://localhost:8080/app` (port = `API_PORT` in `.env`). The server hot-reloads

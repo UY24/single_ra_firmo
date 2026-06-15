@@ -8,7 +8,7 @@
 // completed/completed_with_errors/failed and is always stopped by the router
 // via the cleanup function this view returns).
 import { api, el, fmtUsd, fmtNum, pollStatus } from "./api.js";
-import { errorCard, loadingCard, statusBadge, fmtDuration, shortDate } from "./ui.js";
+import { errorCard, loadingCard, statusBadge, fmtDuration, shortDate, copyCell } from "./ui.js";
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 
@@ -178,8 +178,7 @@ function renderLegacyStatus(root, ref, s) {
         ...Object.entries(fileLinks).map(([name, path]) =>
           el("div", { class: "panel-muted p-3" },
             el("p", { class: "view-kicker" }, name),
-            el("p", { class: "mt-1 truncate font-mono text-xs text-slate-400", title: String(path) },
-              String(path)),
+            copyCell(String(path)),
           )),
       ),
     ));

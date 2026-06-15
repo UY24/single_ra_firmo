@@ -1,5 +1,5 @@
 // backend/app/static/js/api.js
-export async function api(path, opts = {}) {
+async function _doFetch(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) {
     let detail = res.statusText;
@@ -7,6 +7,20 @@ export async function api(path, opts = {}) {
     throw new Error(detail);
   }
   return res.json();
+}
+
+export async function api(path, opts = {}) {
+  try {
+    return await _doFetch(path, opts);
+  } catch (e) {
+    if (e instanceof TypeError) {
+      // Network error — server may still be starting up (e.g. uvicorn --reload).
+      // Retry once after a short delay before surfacing the error.
+      await new Promise(r => setTimeout(r, 1500));
+      return await _doFetch(path, opts);
+    }
+    throw e;
+  }
 }
 
 export function pollStatus(path, onUpdate, intervalMs = 2000) {

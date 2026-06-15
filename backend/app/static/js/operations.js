@@ -8,7 +8,7 @@
 //   Retry:          POST /uploads/{id}/retry-failed-rows
 //                   GET  /uploads/{id}/status   (poll after a retry)
 import { api, el, pollStatus } from "./api.js";
-import { errorCard, head, cell, shortDate, fmtDuration } from "./ui.js";
+import { errorCard, head, cell, shortDate, fmtDuration, copyCell } from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
 
@@ -83,19 +83,14 @@ const HISTORY_PIPELINES = [
 const pipelineLabel = (pipeline) =>
   HISTORY_PIPELINES.find((p) => p.key === pipeline)?.label ?? String(pipeline ?? "-");
 
-function fileLinkSummary(fileLinks) {
-  if (!fileLinks || typeof fileLinks !== "object") return "-";
-  const state = fileLinks["state.json"];
-  const output = fileLinks["output.json"];
-  return output || state || "-";
-}
-
 function storageCell(fileLinks) {
-  const path = fileLinkSummary(fileLinks);
-  return el("span", {
-    class: "block max-w-[18rem] truncate font-mono text-xs text-slate-400",
-    title: path,
-  }, path);
+  const links = fileLinks && typeof fileLinks === "object" ? fileLinks : {};
+  const stateUrl = String(links["state.json"] || "");
+  const outputUrl = String(links["output.json"] || "");
+  return el("div", { class: "flex flex-col gap-1" },
+    copyCell(stateUrl || "—"),
+    copyCell(outputUrl || "—"),
+  );
 }
 
 function downloadButton(uploadId, label, format) {

@@ -1,12 +1,12 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-12. Read this first if you're picking up this repo.
+Last updated: 2026-06-13. Read this first if you're picking up this repo.
 
 ---
 
 ## 2026-06-12 — REWORK COMPLETE (read this first)
 
-The whole backend was restructured on branch `rework` (~30 commits over `main`). Everything below
+The whole backend was restructured on branch `rework` (~38 commits over `main`). Everything below
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
@@ -21,12 +21,14 @@ the source of truth; stale sections below are tagged "(superseded — see top)".
 - **Never `git push` without the user explicitly asking.** Never query the production Supabase
   DB (psql etc.) without the user explicitly approving that exact action.
 
-**Branch state**: `rework` is pushed and in sync with `origin/rework`. NOT merged into `main`
-yet — merge is the user's call. Suite: **147/147** (`cd backend && ../.venv/bin/python -m
-unittest discover -s tests`). Working tree clean.
+**Branch state**: `rework` is pushed and in sync with `origin/rework` (38 commits over `main`).
+NOT merged into `main` yet — merge is the user's call. Suite: **142/142** (`cd backend &&
+../.venv/bin/python -m unittest discover -s tests`). Working tree clean.
 
-**⚠️ USER ACTION STILL PENDING — Supabase is NOT live yet:**
-1. The migration (`supabase/migrations/001_init.sql`) has **NOT been applied** — user must run it
+**⚠️ Supabase pending — RE-CONFIRM WITH THE USER** (they've since committed Supabase
+error-handling work in `48114d0`, so the `.env`/migration status below may have changed since
+last check):
+1. The migration (`supabase/migrations/001_init.sql`) was **NOT applied** as of last check — run it
    in the Supabase dashboard SQL Editor. It now includes `enable row level security` on both
    tables (no policies — service_role bypasses RLS; anon gets nothing; the dashboard RLS warning
    is satisfied).
@@ -46,12 +48,31 @@ unittest discover -s tests`). Working tree clean.
   `supabase_running_marker` in upload state), not just at terminal status.
 - `run.py` added at repo root → `python run.py` works like the old `python app.py`
   (reads API_PORT/API_HOST from `.env`; guarded for uvicorn reload re-import).
-- `readme.md` rewritten as a numbered step-by-step local setup guide.
+- `readme.md` rewritten — the §Run section is now an explicit **two-terminal local guide**:
+  Terminal 1 = app via `.venv/bin/uvicorn run:app --reload --host 0.0.0.0 --port 8080` (`run.py`
+  exposes `app`); Terminal 2 = SerpWow worker (`docker compose up -d rabbitmq` then
+  `.venv/bin/python worker.py`), only needed for SerpWow pipelines.
 - `.env.example` fully audited — **19 dead keys deleted** (all `MASSIVE_*`, `BROWSER_POOL_SIZE`,
   `USER_AGENT`, dead `SEARCH_FETCH_*` timeouts, etc.), restructured into 5 sections; AI Mode
   section grouped into 3a batch sizes / 3b cleanup LLM / 3c sync-vs-Gemini-Batch / 3d scraping /
   3e cost+logging, with an explicit note that `AI_MODE_LLM_BATCH` (3c) is unrelated to SerpWow's
-  `ENABLE_GEMINI_BATCH_POSTPROCESS` (section 4).
+  `ENABLE_GEMINI_BATCH_POSTPROCESS` (section 4). (User reviewed the deleted keys and chose to keep
+  them deleted — none are read by code, current or `oldCode`; the real values still live in their
+  untouched `.env`.)
+
+**Changes since the last handoff write (re-read these areas — some are the user's own commits):**
+- **scrape.do cost removed** (`b2af5af`): scrape.do is a flat fee, so runs no longer compute a
+  scrape.do USD figure. Cost summary is now `{llm_usd, scrapedo_searches, total_usd=llm_usd}`;
+  per-company `total_searches` is aggregated in `company_stats` and shown on the dashboard
+  ("Searches") + run detail ("Searches / failed"). `SCRAPEDO_COST_PER_REQUEST_USD` env removed,
+  and `scrapedo_client.search_google_ai_mode` now returns just the payload (no cost tuple).
+  Nuance: a "search" = one scrape.do request (covers a batch of ~10 entities in `ai_bulk`), NOT
+  literally one-per-company — the user may later want per-entity counting instead.
+- **RabbitMQ env + worker** (`72603b5`): blank `RABBITMQ_*` env values now fall back to defaults,
+  and `backend/app/services/serpwow/worker.py` surfaces the real broker error.
+- **User's own commits** (`48114d0` "Enhance Supabase configuration error handling and improve UI
+  theme", `d1c2076` "Refactor UI components and styles") — made outside the agent flow (capitalized
+  commit style). Diff these before trusting earlier UI/Supabase descriptions in this doc.
 
 **User's working setup & intent** (context for decisions):
 - Workflow: run cheap SerpWow pipelines first (~80% coverage), then feed the residue CSV into
@@ -63,6 +84,15 @@ unittest discover -s tests`). Working tree clean.
   path is Gemini-only). This works as-is (client calls `{base_url}/chat/completions`); the
   example is documented in `.env.example` §3b. User will refine the search-prompt wording in
   `backend/app/prompts/*.txt` themselves.
+
+**Known UI gap / likely follow-up:** the new **Runs page lists history from Supabase only**
+(`GET /companies/runs`). The 3 pre-rework AI-mode runs live on disk in `ai_mode_result/`
+(singular, OLD layout) and are still reachable via the API — `GET /uploads/ai-mode` plus
+`/uploads/ai-mode/<id>/status` and `/result?file=...` — but **no new-UI page lists disk-based AI
+runs** the way the old AI Mode tab did. They were never in Supabase (predate tracking). Follow-up
+if wanted: surface `GET /uploads/ai-mode` in the UI (e.g. a "Local / untracked AI runs" section,
+or merge disk + Supabase runs on the Runs page). New per-company runs go to `ai_mode_results/`
+(plural) and ARE tracked once Supabase is live.
 
 **Known minor leftovers** (from the final whole-branch review — all low/cosmetic, none blocking):
 rerun re-scrapes notFound-without-error rows (plan-approved but costs tokens); duplicate `sno`s
@@ -131,10 +161,13 @@ ai_mode_results/     # run outputs (gitignored)
 - **Never-fails-runs design:** once a run is accepted, Supabase write failures are logged and
   swallowed — pipelines always finish on disk.
 
-### Cost tracking
-`final_report.json.summary.cost` = LLM USD (env token rates, batch rates when `AI_MODE_LLM_BATCH`)
-+ scrape.do (per-request credits from response headers; `SCRAPEDO_COST_PER_REQUEST_USD` env estimate,
-0 disables).
+### Cost tracking (updated — scrape.do is now a search count, not USD)
+`final_report.json.summary.cost` = `{llm_usd, scrapedo_searches, total_usd}` where `total_usd` is
+**LLM only** (env token rates, batch rates when `AI_MODE_LLM_BATCH`) — scrape.do is a flat fee, so
+there is no scrape.do dollar figure; `scrapedo_searches` just counts scrape.do requests. Per company,
+`company_stats` aggregates `total_searches`; the dashboard shows "Searches" and run detail shows
+"Searches / failed". (`SCRAPEDO_COST_PER_REQUEST_USD` and the response-header credit reading were
+removed.)
 
 ### Endpoints (new/changed)
 - `POST /uploads/preview` — parse a CSV without running; returns detected columns/warnings/rows

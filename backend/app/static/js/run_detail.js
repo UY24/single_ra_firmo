@@ -121,7 +121,11 @@ function renderAiStatus(root, ref, s) {
     statTile("LLM errors", fmtNum(s.llm_errors)),
     statTile("Searches / failed",
       `${fmtNum(s.scrapedo_request_count)} / ${fmtNum(s.failed_request_count)}`),
-    statTile("Tokens", fmtNum(s.token_usage?.total_tokens)),
+    statTile("Input tokens", fmtNum(s.token_usage?.prompt_tokens)),
+    statTile("Output tokens", fmtNum(s.token_usage?.completion_tokens)),
+    statTile("Model", s.model ?? "—"),
+    statTile("Batch mode", s.is_batch == null ? "—" : s.is_batch ? "Yes" : "No"),
+    statTile("Searches", fmtNum(s.cost?.scrapedo_searches)),
     statTile("LLM cost", fmtUsd(s.cost?.total_usd)),
     statTile("Duration", fmtDuration(s.batch_duration_seconds)),
   ];

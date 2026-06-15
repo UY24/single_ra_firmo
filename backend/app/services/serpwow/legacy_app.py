@@ -200,19 +200,6 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
-def _get_str_env(name: str, default: str) -> str:
-    """Like os.getenv, but a blank/whitespace value falls back to the default.
-
-    A bare ``KEY=`` line in .env would otherwise override the default with "" — which
-    for RabbitMQ exchange/vhost names means the reserved empty default exchange and a
-    'not permitted on the default exchange' error.
-    """
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    return value
-
-
 def _get_bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -6004,22 +5991,22 @@ def _build_rabbitmq_url(host: str, port: int, user: str, password: str, vhost: s
 
 
 def get_rabbitmq_url() -> str:
-    host = _get_str_env("RABBITMQ_HOST", "127.0.0.1")
+    host = os.getenv("RABBITMQ_HOST", "127.0.0.1")
     port = _get_int_env("RABBITMQ_PORT", 5672)
-    user = _get_str_env("RABBITMQ_USER", "guest")
-    password = _get_str_env("RABBITMQ_PASS", "guest")
-    vhost = _get_str_env("RABBITMQ_VHOST", "/")
+    user = os.getenv("RABBITMQ_USER", "guest")
+    password = os.getenv("RABBITMQ_PASS", "guest")
+    vhost = os.getenv("RABBITMQ_VHOST", "/")
     return _build_rabbitmq_url(host, port, user, password, vhost)
 
 
 async def init_rabbitmq() -> None:
     global rabbitmq_connection, rabbitmq_channel, rabbitmq_exchange, rabbitmq_queue, rabbitmq_last_error
 
-    host = _get_str_env("RABBITMQ_HOST", "127.0.0.1")
+    host = os.getenv("RABBITMQ_HOST", "127.0.0.1")
     port = _get_int_env("RABBITMQ_PORT", 5672)
-    user = _get_str_env("RABBITMQ_USER", "guest")
-    password = _get_str_env("RABBITMQ_PASS", "guest")
-    vhost = _get_str_env("RABBITMQ_VHOST", "/")
+    user = os.getenv("RABBITMQ_USER", "guest")
+    password = os.getenv("RABBITMQ_PASS", "guest")
+    vhost = os.getenv("RABBITMQ_VHOST", "/")
 
     primary_url = _build_rabbitmq_url(host, port, user, password, vhost)
     try:
@@ -6041,9 +6028,9 @@ async def init_rabbitmq() -> None:
     rabbitmq_channel = await rabbitmq_connection.channel()
     await rabbitmq_channel.set_qos(prefetch_count=max(1, _get_int_env("WORKER_CONCURRENCY", 4)))
 
-    exchange_name = _get_str_env("RABBITMQ_EXCHANGE", "singleRA_search")
-    queue_name = _get_str_env("RABBITMQ_QUEUE", "singleRA_search_jobs")
-    routing_key = _get_str_env("RABBITMQ_ROUTING_KEY", "singleRA.search.validate")
+    exchange_name = os.getenv("RABBITMQ_EXCHANGE", "singleRA_search")
+    queue_name = os.getenv("RABBITMQ_QUEUE", "singleRA_search_jobs")
+    routing_key = os.getenv("RABBITMQ_ROUTING_KEY", "singleRA.search.validate")
 
     rabbitmq_exchange = await rabbitmq_channel.declare_exchange(
         exchange_name,
@@ -6073,7 +6060,7 @@ async def publish_job(job: dict[str, Any]) -> None:
     if rabbitmq_exchange is None:
         raise RuntimeError("RabbitMQ exchange is not initialized")
 
-    routing_key = _get_str_env("RABBITMQ_ROUTING_KEY", "singleRA.search.validate")
+    routing_key = os.getenv("RABBITMQ_ROUTING_KEY", "singleRA.search.validate")
     message = aio_pika.Message(
         body=json.dumps(job).encode("utf-8"),
         delivery_mode=aio_pika.DeliveryMode.PERSISTENT,

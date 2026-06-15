@@ -14,15 +14,6 @@ async def main() -> None:
             pass
 
     await app.startup_event()
-    # startup_event swallows RabbitMQ init failures into rabbitmq_last_error so the API
-    # can boot without a broker; the worker, however, cannot run without it — surface the
-    # real reason instead of the opaque "queue is not initialized".
-    if app.rabbitmq_queue is None:
-        reason = app.rabbitmq_last_error or "unknown error"
-        raise RuntimeError(
-            f"RabbitMQ is not available, worker cannot start: {reason}\n"
-            "Is RabbitMQ running? Try: docker compose up -d rabbitmq"
-        )
     stop_wait_task: asyncio.Task | None = None
     try:
         await app.start_worker_consumers()

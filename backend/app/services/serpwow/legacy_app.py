@@ -342,18 +342,32 @@ def _country_to_gl(country: Optional[str]) -> str:
     return "us"
 
 
-def _upload_dir(upload_id: str) -> Path:
-    path = UPLOAD_BASE_DIR / upload_id
+def _upload_dir(upload_id: str, company_name: str = "") -> Path:
+    safe = _safe_name(company_name) if company_name else ""
+    path = (UPLOAD_BASE_DIR / safe / upload_id) if safe else (UPLOAD_BASE_DIR / upload_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def _find_upload_dir(upload_id: str) -> Path:
+    """Locate an existing upload directory (flat or nested layout). Does not create."""
+    direct = UPLOAD_BASE_DIR / upload_id
+    if direct.exists():
+        return direct
+    for child in UPLOAD_BASE_DIR.iterdir():
+        if child.is_dir() and child.name != upload_id:
+            nested = child / upload_id
+            if nested.exists():
+                return nested
+    return direct
+
+
 def _state_file(upload_id: str) -> Path:
-    return _upload_dir(upload_id) / "state.json"
+    return _find_upload_dir(upload_id) / "state.json"
 
 
 def _output_file(upload_id: str) -> Path:
-    return _upload_dir(upload_id) / "output.json"
+    return _find_upload_dir(upload_id) / "output.json"
 
 
 async def _mark_upload_row_active(upload_id: str, row_index: int) -> None:
@@ -407,20 +421,25 @@ def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, p
     }
 
 
-def _state_s3_key(upload_id: str) -> str:
-    return f"{S3_PREFIX}/{upload_id}/state.json"
+def _upload_s3_prefix(upload_id: str, company_name: str = "") -> str:
+    safe = _safe_name(company_name) if company_name else ""
+    return f"{S3_PREFIX}/{safe}/{upload_id}" if safe else f"{S3_PREFIX}/{upload_id}"
 
 
-def _output_s3_key(upload_id: str) -> str:
-    return f"{S3_PREFIX}/{upload_id}/output.json"
+def _state_s3_key(upload_id: str, company_name: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name)}/state.json"
 
 
-def _batch_input_jsonl_s3_key(upload_id: str) -> str:
-    return f"{S3_PREFIX}/{upload_id}/gemini_batch_input.jsonl"
+def _output_s3_key(upload_id: str, company_name: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name)}/output.json"
 
 
-def _batch_output_json_s3_key(upload_id: str) -> str:
-    return f"{S3_PREFIX}/{upload_id}/gemini_batch_output.json"
+def _batch_input_jsonl_s3_key(upload_id: str, company_name: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name)}/gemini_batch_input.jsonl"
+
+
+def _batch_output_json_s3_key(upload_id: str, company_name: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name)}/gemini_batch_output.json"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -3876,11 +3895,9 @@ def _list_state_keys_from_s3_sync(limit: int) -> list[str]:
 
 
 def _list_local_state_files_sync(limit: int) -> list[Path]:
-    state_files = sorted(
-        UPLOAD_BASE_DIR.glob("*/state.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    flat = list(UPLOAD_BASE_DIR.glob("*/state.json"))
+    nested = list(UPLOAD_BASE_DIR.glob("*/*/state.json"))
+    state_files = sorted(flat + nested, key=lambda p: p.stat().st_mtime, reverse=True)
     return state_files[:limit]
 
 
@@ -3892,8 +3909,9 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
     # 2. If S3 is enabled, schedule S3 write in the background
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
-        key = _state_s3_key(upload_id) if name == "state" else _output_s3_key(upload_id)
-        
+        company_name = str(data.get("company_name") or "")
+        key = _state_s3_key(upload_id, company_name) if name == "state" else _output_s3_key(upload_id, company_name)
+
         async def _write_s3_background():
             max_retries = 5
             base_delay = 1.0
@@ -3950,22 +3968,22 @@ def _write_text_to_s3_sync(key: str, text: str, content_type: str = "text/plain;
     )
 
 
-async def write_upload_text_artifact(upload_id: str, name: str, text: str, content_type: str) -> None:
+async def write_upload_text_artifact(upload_id: str, name: str, text: str, content_type: str, company_name: str = "") -> None:
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
         if name == "batch_input_jsonl":
-            key = _batch_input_jsonl_s3_key(upload_id)
+            key = _batch_input_jsonl_s3_key(upload_id, company_name)
         elif name == "batch_output_json":
-            key = _batch_output_json_s3_key(upload_id)
+            key = _batch_output_json_s3_key(upload_id, company_name)
         else:
             raise ValueError(f"Unsupported text artifact: {name}")
         await asyncio.to_thread(_write_text_to_s3_sync, key, text, content_type)
         return
 
     if name == "batch_input_jsonl":
-        local_path = _upload_dir(upload_id) / "gemini_batch_input.jsonl"
+        local_path = _find_upload_dir(upload_id) / "gemini_batch_input.jsonl"
     elif name == "batch_output_json":
-        local_path = _upload_dir(upload_id) / "gemini_batch_output.json"
+        local_path = _find_upload_dir(upload_id) / "gemini_batch_output.json"
     else:
         raise ValueError(f"Unsupported text artifact: {name}")
     local_path.write_text(text, encoding="utf-8")
@@ -4730,6 +4748,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             }
             await persist_upload_state(upload_id, state)
 
+        _batch_company_name = str(state.get("company_name") or "")
         requests_payload, row_refs, jsonl_text = _build_batch_requests_for_state(state)
         if not requests_payload:
             async with get_upload_lock(upload_id):
@@ -4753,6 +4772,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 "batch_input_jsonl",
                 jsonl_text,
                 "application/x-ndjson; charset=utf-8",
+                company_name=_batch_company_name,
             )
 
             create_resp = await asyncio.to_thread(
@@ -4834,6 +4854,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             "batch_output_json",
             json.dumps(final_batch_obj, ensure_ascii=True, indent=2),
             "application/json; charset=utf-8",
+            company_name=_batch_company_name,
         )
 
         final_state_name = _gemini_batch_state_name(final_batch_obj if isinstance(final_batch_obj, dict) else {})
@@ -5495,16 +5516,16 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
     }
 
 
-def _upload_file_links(upload_id: str) -> dict[str, str]:
+def _upload_file_links(upload_id: str, company_name: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
     if bucket:
         return {
-            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id)}",
-            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id)}",
+            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id, company_name)}",
+            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id, company_name)}",
         }
     return {
-        "state.json": str(_state_file(upload_id)),
-        "output.json": str(_output_file(upload_id)),
+        "state.json": str(_find_upload_dir(upload_id) / "state.json"),
+        "output.json": str(_find_upload_dir(upload_id) / "output.json"),
     }
 
 
@@ -5512,7 +5533,7 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
         state_pipeline = str(summary.get("pipeline") or PIPELINE_FULL)
-        file_links = _upload_file_links(upload_id)
+        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""))
         upload_summaries_cache[upload_id] = {
             "upload_id": summary.get("upload_id"),
             "pipeline": state_pipeline,
@@ -5554,7 +5575,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         if svc is None:
             return False
         upload_id = str(state.get("upload_id") or "")
-        file_links = _upload_file_links(upload_id)
+        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""))
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -6529,6 +6550,7 @@ async def _create_upload_with_rows(
     phase: str = "all",
     *,
     company_id: str,
+    company_name: str = "",
 ) -> dict[str, Any]:
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
@@ -6565,6 +6587,7 @@ async def _create_upload_with_rows(
         raise HTTPException(status_code=503, detail=detail)
 
     upload_id = str(uuid.uuid4())
+    _upload_dir(upload_id, company_name)  # create upload dir with company folder
     now_iso = _now_iso()
     _log_row_stage(
         "upload.create",
@@ -6589,6 +6612,7 @@ async def _create_upload_with_rows(
     state = {
         "upload_id": upload_id,
         "company_id": company_id,
+        "company_name": company_name,
         "run_db_id": run_db_id,
         "pipeline": pipeline,
         "phase": phase,
@@ -6687,6 +6711,7 @@ async def _create_upload_with_rows(
 async def create_upload(
     file: UploadFile = File(...),
     company_id: str = Form(...),
+    company_name: str = Form(""),
 ) -> dict[str, Any]:
     raw = await file.read()
     _validate_canonical_upload_csv(raw)
@@ -6695,7 +6720,7 @@ async def create_upload(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_FULL, company_id=company_id
+        file, parsed_rows, PIPELINE_FULL, company_id=company_id, company_name=company_name
     )
 
 
@@ -6719,6 +6744,7 @@ async def create_url_discovery_upload(
 async def create_firmographics_upload(
     file: UploadFile = File(...),
     company_id: str = Form(...),
+    company_name: str = Form(""),
 ) -> dict[str, Any]:
     raw = await file.read()
     try:
@@ -6726,7 +6752,7 @@ async def create_firmographics_upload(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_FIRMOGRAPHICS, company_id=company_id
+        file, parsed_rows, PIPELINE_FIRMOGRAPHICS, company_id=company_id, company_name=company_name
     )
 
 
@@ -6734,6 +6760,7 @@ async def create_firmographics_upload(
 async def create_gmaps_upload(
     file: UploadFile = File(...),
     company_id: str = Form(...),
+    company_name: str = Form(""),
 ) -> dict[str, Any]:
     raw = await file.read()
     _validate_canonical_upload_csv(raw)
@@ -6742,7 +6769,7 @@ async def create_gmaps_upload(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_GMAPS, company_id=company_id
+        file, parsed_rows, PIPELINE_GMAPS, company_id=company_id, company_name=company_name
     )
 
 
@@ -6751,6 +6778,7 @@ async def create_gsearch_upload(
     file: UploadFile = File(...),
     phase: str = Form("all"),
     company_id: str = Form(...),
+    company_name: str = Form(""),
 ) -> dict[str, Any]:
     raw = await file.read()
     _validate_canonical_upload_csv(raw)
@@ -6759,7 +6787,7 @@ async def create_gsearch_upload(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_GSEARCH, phase=phase, company_id=company_id
+        file, parsed_rows, PIPELINE_GSEARCH, phase=phase, company_id=company_id, company_name=company_name
     )
 
 

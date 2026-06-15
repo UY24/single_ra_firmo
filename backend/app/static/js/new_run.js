@@ -11,7 +11,7 @@ const PIPELINES = [
     desc: "Fast SerpWow Maps discovery for local business signals." },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies." },
-  { key: "full", label: "Full pipeline", endpoint: "/uploads",
+  { key: "full", label: "Upload Console", endpoint: "/uploads",
     desc: "Discovery, crawl, extraction, and post-processing in one run." },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
     desc: "Enrichment for rows that already have a website." },
@@ -257,6 +257,7 @@ export async function render(root) {
     const fd = new FormData();
     fd.append("file", state.file);
     fd.append("company_id", state.companyId);
+    if (!state.pipeline.ai) fd.append("company_name", state.companyName ?? "");
     if (state.pipeline.ai) fd.append("mode", state.pipeline.key);
     if (state.pipeline.key === "gsearch") fd.append("phase", state.phase || "all");
     try {

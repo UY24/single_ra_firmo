@@ -3862,6 +3862,35 @@ def _read_json_from_s3_sync(key: str) -> dict[str, Any]:
     return data
 
 
+def _find_s3_upload_key_sync(upload_id: str, suffix: str) -> Optional[str]:
+    """Find an S3 object key for an upload artifact, trying flat layout first then nested.
+
+    Used as the S3 fallback in read_upload_artifact when local disk has been cleared.
+    head_object for the flat key is O(1); the list fallback for nested is a rare cold path.
+    """
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        return None
+    client = get_s3_client()
+    flat_key = f"{S3_PREFIX}/{upload_id}/{suffix}"
+    try:
+        client.head_object(Bucket=bucket, Key=flat_key)
+        return flat_key
+    except Exception:
+        pass
+    target_suffix = f"/{upload_id}/{suffix}"
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{S3_PREFIX}/", MaxKeys=1000):
+            for obj in page.get("Contents", []):
+                key = str(obj.get("Key") or "")
+                if key.endswith(target_suffix):
+                    return key
+    except Exception:
+        pass
+    return None
+
+
 def _list_state_keys_from_s3_sync(limit: int) -> list[str]:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
@@ -3944,7 +3973,10 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
     # 2. If not found locally and S3 is enabled, download from S3
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
-        key = _state_s3_key(upload_id) if name == "state" else _output_s3_key(upload_id)
+        suffix = "state.json" if name == "state" else "output.json"
+        key = await asyncio.to_thread(_find_s3_upload_key_sync, upload_id, suffix)
+        if key is None:
+            raise FileNotFoundError(f"upload {upload_id!r} not found in S3")
         data = await asyncio.to_thread(_read_json_from_s3_sync, key)
         # Cache it locally so subsequent reads are instant
         try:
@@ -6728,6 +6760,7 @@ async def create_upload(
 async def create_url_discovery_upload(
     file: UploadFile = File(...),
     company_id: str = Form(...),
+    company_name: str = Form(""),
 ) -> dict[str, Any]:
     raw = await file.read()
     _validate_canonical_upload_csv(raw)
@@ -6736,7 +6769,7 @@ async def create_url_discovery_upload(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_URL_DISCOVERY, company_id=company_id
+        file, parsed_rows, PIPELINE_URL_DISCOVERY, company_id=company_id, company_name=company_name
     )
 
 

@@ -1192,6 +1192,8 @@ def run_ai_mode_sync(run_id: str) -> None:
             "scrapedo_request_count": len(per_request_records),
             "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
+            "model": cfg.model,
+            "is_batch": batch_mode,
             "token_usage": asdict(usage_total),
             "cost": cost,
             "scrapedo_seconds_total": round(scrapedo_seconds_total, 3),

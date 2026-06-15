@@ -551,6 +551,8 @@ def _build_run_update(summary: dict, file_links: dict[str, str]) -> dict:
         "websites_not_found": websites_not_found,
         "token_usage": summary.get("token_usage"),
         "cost": summary.get("cost"),
+        "model": summary.get("model"),
+        "is_batch": summary.get("is_batch"),
         "duration_seconds": summary.get("batch_duration_seconds"),
         "file_links": file_links,
         "finished_at": summary.get("completed_at"),
@@ -823,6 +825,9 @@ def run_ai_mode_sync(run_id: str) -> None:
 
         batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
         concurrency = max(1, _int_env("SCRAPEDO_CONCURRENCY", 5))
+        status["model"] = cfg.model
+        status["is_batch"] = batch_mode
+        _persist_status(run_id, run_dir, status)
 
         # ------------------------------------------------------------- #
         # PHASE 1 - scrape every batch (parallel, bounded by concurrency)

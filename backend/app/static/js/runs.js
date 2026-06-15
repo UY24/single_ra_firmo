@@ -5,6 +5,15 @@ import { errorCard, loadingCard, statusBadge, head, cell, shortDate, fmtDuration
 
 const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
                    "firmographics", "url_discovery"];
+const PIPELINE_LABELS = {
+  ai_bulk: "Google AI (Bulk)",
+  ai_deep: "Google AI (Deep)",
+  gmaps: "Google Maps",
+  gsearch: "Google Search",
+  full: "Upload Console",
+  firmographics: "Firmographics",
+  url_discovery: "URL Discovery",
+};
 const STATUSES = ["queued", "running", "completed", "completed_with_errors", "failed"];
 
 const selectCls = "control px-3 py-2 text-sm";
@@ -20,7 +29,7 @@ function filterBar(companies, query) {
 
   const pipelineSel = el("select", { class: selectCls },
     el("option", { value: "" }, "All pipelines"),
-    ...PIPELINES.map((p) => el("option", { value: p }, p)),
+    ...PIPELINES.map((p) => el("option", { value: p }, PIPELINE_LABELS[p] ?? p)),
   );
   pipelineSel.value = query.pipeline ?? "";
 
@@ -54,10 +63,10 @@ function runsTable(runs, companiesById) {
     },
       cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
       cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
-      cell(r.pipeline ?? "-"),
+      cell(PIPELINE_LABELS[r.pipeline] ?? r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
-      cell(fmtNum(r.websites_found), "text-right"),
+      cell(fmtNum(r.websites_found ?? r.success_count), "text-right"),
       cell(fmtUsd(runCost(r)), "text-right"),
       cell(fmtDuration(r.duration_seconds), "text-right"),
     ),

@@ -42,7 +42,7 @@ class FakeScrapeDoClient:
             "text_blocks": [{"snippet": "research notes covering all listed companies"}],
             "references": [],
         }
-        return payload, 5.0  # (payload, per-request credit cost from header)
+        return payload
 
 
 class FakeLLMClient:
@@ -151,16 +151,15 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(len(report["requests"]), 1)
         self.assertEqual(report["requests"][0]["status"], "success")
         self.assertEqual(report["requests"][0]["raw_json_file"], "raw_responses/request_001.json")
-        self.assertEqual(report["requests"][0]["request_cost"], 5.0)
+        self.assertNotIn("request_cost", report["requests"][0])
         self.assertEqual(len(report["entities"]), 6)
 
-        # cost summary (Task 15): llm tokens priced + scrape.do credits from headers
+        # cost summary: llm tokens priced; scrape.do is flat-fee → just a search count
         cost = report["summary"]["cost"]
-        self.assertEqual(cost["scrapedo_requests"], 1)
-        self.assertEqual(cost["scrapedo_credits"], 5.0)
-        self.assertFalse(cost["scrapedo_cost_estimated"])
+        self.assertEqual(cost["scrapedo_searches"], 1)
+        self.assertNotIn("scrapedo_usd", cost)
         self.assertGreater(cost["llm_usd"], 0.0)  # 100/50 tokens at default Gemini rates
-        self.assertAlmostEqual(cost["total_usd"], cost["llm_usd"] + cost["scrapedo_usd"])
+        self.assertEqual(cost["total_usd"], cost["llm_usd"])
 
         status = ai_mode_service.get_ai_mode_status(run_id)
         self.assertEqual(status["status"], "completed")

@@ -846,13 +846,12 @@ def run_ai_mode_sync(run_id: str) -> None:
                         "request_index": request_index, "group": group, "group_names": group_names,
                         "payload": payload, "error": None, "scrapedo_seconds": 0.0,
                         "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
-                        "request_cost": None,  # resumed: no fresh response header
                     }
                 except (ValueError, OSError):
                     pass
             t0 = time.perf_counter()
             try:
-                payload, request_cost = scrapedo_client.search_google_ai_mode(
+                payload = scrapedo_client.search_google_ai_mode(
                     query, extra_params=geo_params
                 )
                 seconds = time.perf_counter() - t0
@@ -863,7 +862,6 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "request_index": request_index, "group": group, "group_names": group_names,
                     "payload": payload, "error": None, "scrapedo_seconds": seconds,
                     "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
-                    "request_cost": request_cost,
                 }
             except Exception as exc:  # scrape.do failure for this batch
                 seconds = time.perf_counter() - t0
@@ -871,7 +869,6 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "request_index": request_index, "group": group, "group_names": group_names,
                     "payload": None, "error": sanitize_secret_text(str(exc)),
                     "scrapedo_seconds": seconds, "rel_raw_path": None, "geo_debug": geo_debug,
-                    "request_cost": None,
                 }
 
         scraped: dict[int, dict] = {}
@@ -1092,7 +1089,6 @@ def run_ai_mode_sync(run_id: str) -> None:
                         "combined_seconds": round(rec["scrapedo_seconds"], 3),
                         "raw_json_file": rec["rel_raw_path"],
                         "scrapedo_params": rec["geo_debug"],
-                        "request_cost": rec.get("request_cost"),
                     }
                 )
                 continue
@@ -1111,7 +1107,6 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "combined_seconds": round(rec["scrapedo_seconds"] + llm_secs, 3),
                     "raw_json_file": rec["rel_raw_path"],
                     "scrapedo_params": rec["geo_debug"],
-                    "request_cost": rec.get("request_cost"),
                 }
             )
 
@@ -1169,7 +1164,6 @@ def run_ai_mode_sync(run_id: str) -> None:
         )
         cost = build_cost_summary(
             llm_usd=llm_usd,
-            request_costs=[r.get("request_cost") for r in per_request_records],
             request_count=len(per_request_records),
         )
 

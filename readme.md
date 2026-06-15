@@ -60,45 +60,46 @@ served at `/app`.
    The value must look like `https://abcxyz.supabase.co` and must not contain `:5432` or
    `/postgres`.
 
-## Run
+## Run locally
 
-```sh
-.venv/bin/python run.py    # from the repo root (`python run.py` if the venv is active)
-```
+You run two things in **separate terminals**: the **app** (always), and the **SerpWow
+worker** (only if you use the SerpWow pipelines — AI Mode needs no worker).
 
-For development with auto-reload, run uvicorn against the root launcher:
+**Terminal 1 — the app (dev, auto-reload):**
 
 ```sh
 .venv/bin/uvicorn run:app --reload --host 0.0.0.0 --port 8080
 ```
 
-`run:app` is intentional: uvicorn needs the `module:asgi_app` import string. `uvicorn run
---reload` is incomplete.
+Then open `http://localhost:8080/app` (port = `API_PORT` in `.env`). The server hot-reloads
+on code changes. `run:app` is intentional — uvicorn needs the `module:asgi_app` import
+string (`run.py` exposes `app`); plain `uvicorn run --reload` won't work.
 
-You can also run the backend module directly:
+No-reload alternatives (same app):
 
 ```sh
-cd backend && ../.venv/bin/python -m app.main
+.venv/bin/python run.py                          # from repo root, reads API_* from .env
+cd backend && ../.venv/bin/python -m app.main    # or run the module directly
 ```
 
-Open `http://localhost:8080/app` (port = `API_PORT` in `.env`).
-
-**RabbitMQ (SerpWow pipelines only):** AI Mode runs standalone. To use the SerpWow
-pipelines, start RabbitMQ via the bundled compose file (it provides a
-`rabbitmq:3.13-management` container; user/pass default to `guest`/`guest` unless set in
-`.env`):
+**Terminal 2 — the SerpWow worker (SerpWow pipelines only):** AI Mode runs entirely
+in-process and needs neither RabbitMQ nor a worker. For the SerpWow pipelines
+(full / url_discovery / firmographics / gmaps / gsearch), first start RabbitMQ (the bundled
+compose file provides a `rabbitmq:3.13-management` container; user/pass default to
+`guest`/`guest` unless set in `.env`):
 
 ```sh
 docker compose up -d rabbitmq
 ```
 
-then run the worker in a second terminal:
+then start the worker in the second terminal:
 
 ```sh
-.venv/bin/python worker.py
+.venv/bin/python worker.py        # from repo root (resolves into backend/app)
 ```
 
-Management UI: `http://localhost:15672`.
+RabbitMQ management UI: `http://localhost:15672`. Uploads sit `queued` until the worker is
+running.
 
 ## Tests
 

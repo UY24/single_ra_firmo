@@ -119,10 +119,10 @@ function renderAiStatus(root, ref, s) {
     statTile("Websites found", fmtNum(s.websites_found)),
     statTile("Not found", fmtNum(s.websites_not_found)),
     statTile("LLM errors", fmtNum(s.llm_errors)),
-    statTile("scrape.do requests / failed",
+    statTile("Searches / failed",
       `${fmtNum(s.scrapedo_request_count)} / ${fmtNum(s.failed_request_count)}`),
     statTile("Tokens", fmtNum(s.token_usage?.total_tokens)),
-    statTile("Cost", fmtUsd(s.cost?.total_usd)),
+    statTile("LLM cost", fmtUsd(s.cost?.total_usd)),
     statTile("Duration", fmtDuration(s.batch_duration_seconds)),
   ];
   if (Number(s.carried_over) > 0) {

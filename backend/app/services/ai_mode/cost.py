@@ -1,16 +1,13 @@
 # backend/app/services/ai_mode/cost.py
-"""Per-run cost: LLM + scrape.do (spec §4 add-on #2).
+"""Per-run cost: LLM only.
 
-scrape.do reports per-request credit cost in a response header. Header name must be
-verified against a real response on first live run (candidates below) — until then the
-env-rate estimate covers it.
+scrape.do is billed as a flat fee, not per-request, so we do NOT compute a scrape.do
+dollar cost — we just count searches done (one scrape.do request = one search, which in
+``ai_bulk`` covers a batch of entities). That count is surfaced per run and per company.
 """
 from __future__ import annotations
 
 import os
-
-_HEADER_CANDIDATES = ("Scrape.do-Request-Cost", "Scrapedo-Request-Cost",
-                      "X-Scrapedo-Request-Cost", "sd-request-cost")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -18,17 +15,6 @@ def _float_env(name: str, default: float) -> float:
         return float(os.getenv(name, "") or default)
     except (TypeError, ValueError):
         return default
-
-
-def extract_scrapedo_request_cost(headers) -> float | None:
-    for name in _HEADER_CANDIDATES:
-        value = headers.get(name) if hasattr(headers, "get") else None
-        if value is not None:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-    return None
 
 
 def calculate_llm_cost_usd(*, provider: str, prompt_tokens: int, completion_tokens: int,
@@ -54,21 +40,9 @@ def calculate_llm_cost_usd(*, provider: str, prompt_tokens: int, completion_toke
     return round(cost, 8)
 
 
-def build_cost_summary(*, llm_usd: float, request_costs: list[float | None],
-                       request_count: int) -> dict:
-    per_request_usd = float(os.getenv("SCRAPEDO_COST_PER_REQUEST_USD", "0") or 0)
-    known = [c for c in request_costs if c is not None]
-    if known and len(known) == len(request_costs):
-        credits = sum(known)
-        # credits→USD conversion depends on the scrape.do plan; expose credits raw and
-        # use the env rate per request for the USD figure until a credit rate is known.
-        scrapedo_usd = request_count * per_request_usd
-        estimated = False
-    else:
-        credits = sum(known) if known else None
-        scrapedo_usd = request_count * per_request_usd
-        estimated = True
-    return {"llm_usd": round(llm_usd, 6), "scrapedo_usd": round(scrapedo_usd, 6),
-            "scrapedo_credits": credits, "scrapedo_requests": request_count,
-            "scrapedo_cost_estimated": estimated,
-            "total_usd": round(llm_usd + scrapedo_usd, 6)}
+def build_cost_summary(*, llm_usd: float, request_count: int) -> dict:
+    """Per-run cost summary. scrape.do is a flat fee, so the only dollar figure is the
+    LLM cleanup cost; ``scrapedo_searches`` is just the count of scrape.do requests."""
+    return {"llm_usd": round(llm_usd, 6),
+            "scrapedo_searches": request_count,
+            "total_usd": round(llm_usd, 6)}

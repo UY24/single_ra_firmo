@@ -19,6 +19,8 @@ venv/
 env/
 ENV/
 docs/
+samples/
+scrapedo_finder/
 .env.*
 !.env.example
 *.pem

@@ -5495,10 +5495,24 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
     }
 
 
+def _upload_file_links(upload_id: str) -> dict[str, str]:
+    bucket = os.getenv("S3_BUCKET")
+    if bucket:
+        return {
+            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id)}",
+            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id)}",
+        }
+    return {
+        "state.json": str(_state_file(upload_id)),
+        "output.json": str(_output_file(upload_id)),
+    }
+
+
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
         state_pipeline = str(summary.get("pipeline") or PIPELINE_FULL)
+        file_links = _upload_file_links(upload_id)
         upload_summaries_cache[upload_id] = {
             "upload_id": summary.get("upload_id"),
             "pipeline": state_pipeline,
@@ -5513,6 +5527,7 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
             "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
             "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
             "processing_seconds_count": summary.get("processing_seconds_count", 0),
+            "file_links": file_links,
             "status_url": f"/uploads/{upload_id}/status",
             "output_url": f"/uploads/{upload_id}/output",
             "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
@@ -5539,17 +5554,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         if svc is None:
             return False
         upload_id = str(state.get("upload_id") or "")
-        bucket = os.getenv("S3_BUCKET")
-        if bucket:
-            file_links = {
-                "state.json": f"s3://{bucket}/{_state_s3_key(upload_id)}",
-                "output.json": f"s3://{bucket}/{_output_s3_key(upload_id)}",
-            }
-        else:
-            file_links = {
-                "state.json": str(_state_file(upload_id)),
-                "output.json": str(_output_file(upload_id)),
-            }
+        file_links = _upload_file_links(upload_id)
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -7205,6 +7210,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
         "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
         "processing_seconds_count": summary.get("processing_seconds_count", 0),
+        "file_links": _upload_file_links(upload_id),
         "rows": [
             {
                 "row_index": row["row_index"],

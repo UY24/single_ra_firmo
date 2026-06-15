@@ -221,6 +221,20 @@ class TestBuildRunUpdate(unittest.TestCase):
 
 
 class TestLegacyUpdateSupabaseRun(unittest.TestCase):
+    def test_upload_file_links_use_s3_when_configured(self):
+        from app.services.serpwow import legacy_app
+
+        with mock.patch.dict("os.environ", {"S3_BUCKET": "bucket-1"}):
+            links = legacy_app._upload_file_links("up-1")
+        self.assertEqual(
+            links["state.json"],
+            "s3://bucket-1/single_ra_isi/up-1/state.json",
+        )
+        self.assertEqual(
+            links["output.json"],
+            "s3://bucket-1/single_ra_isi/up-1/output.json",
+        )
+
     def test_updates_run_from_state(self):
         from app.services.serpwow import legacy_app
 

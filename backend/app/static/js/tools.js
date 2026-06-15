@@ -9,18 +9,10 @@
 import { api, el } from "./api.js";
 import { errorCard } from "./ui.js";
 
-const inputCls =
-  "w-full rounded-lg border border-gray-300 px-3 py-2 text-sm " +
-  "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
-const btnPrimary =
-  "rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white " +
-  "hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed";
-const btnSecondary =
-  "rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium " +
-  "text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed";
-const btnGreen =
-  "rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white " +
-  "hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed";
+const inputCls = "control w-full px-3 py-2 text-sm";
+const btnPrimary = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
+const btnSecondary = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
+const btnGreen = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
 
 const PHASES = [
   { value: "all",      label: "All Phases Combined" },
@@ -35,7 +27,7 @@ const PHASES = [
 function labeled(labelText, input, optional = false) {
   const div = el("div", { class: "flex flex-col gap-1" });
   div.appendChild(el("label", {
-    class: "text-xs font-medium uppercase tracking-wide text-gray-400",
+    class: "view-kicker",
   }, labelText + (optional ? " (optional)" : " *")));
   div.appendChild(input);
   return div;
@@ -48,7 +40,7 @@ function rawJsonToggle(data) {
   }, JSON.stringify(data, null, 2));
   const wrap = el("div", { class: "hidden mt-2" });
   wrap.appendChild(pre);
-  const btn = el("button", { class: btnSecondary + " mt-3 py-1 px-2.5 text-xs" },
+  const btn = el("button", { class: btnSecondary + " mt-3 min-h-0 py-1 px-2.5 text-xs" },
     "Show raw JSON");
   btn.addEventListener("click", () => {
     const nowHidden = wrap.classList.toggle("hidden");
@@ -61,9 +53,9 @@ function rawJsonToggle(data) {
 }
 
 function sectionCard(title, subtitle, body) {
-  const card = el("div", { class: "rounded-xl border border-gray-200 bg-white p-6 shadow-sm" });
-  card.appendChild(el("h2", { class: "text-sm font-semibold text-gray-900" }, title));
-  card.appendChild(el("p", { class: "mt-1 text-sm text-gray-500" }, subtitle));
+  const card = el("div", { class: "panel" });
+  card.appendChild(el("h2", { class: "section-title" }, title));
+  card.appendChild(el("p", { class: "mt-1 section-copy" }, subtitle));
   card.appendChild(body);
   return card;
 }

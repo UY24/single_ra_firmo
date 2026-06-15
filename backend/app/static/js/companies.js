@@ -7,13 +7,11 @@ function createForm(onCreated) {
   const input = el("input", {
     type: "text",
     placeholder: "Company name",
-    class: "w-64 rounded-lg border border-gray-300 px-3 py-2 text-sm " +
-           "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500",
+    class: "control w-full px-3 py-2 text-sm",
   });
   const button = el("button", {
     type: "submit",
-    class: "rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white " +
-           "hover:bg-indigo-500 disabled:opacity-50",
+    class: "btn-primary disabled:opacity-50",
   }, "Add company");
 
   function setMessage(text, ok) {
@@ -34,7 +32,7 @@ function createForm(onCreated) {
           body: JSON.stringify({ name }),
         });
         input.value = "";
-        setMessage(`Created “${company.name ?? name}”.`, true);
+        setMessage(`Created "${company.name ?? name}".`, true);
         onCreated();
       } catch (e) {
         setMessage(e.message, false); // 409 → "already exists", 400/503 → detail
@@ -43,12 +41,12 @@ function createForm(onCreated) {
       }
     },
   },
-    el("div", { class: "flex items-center gap-3" }, input, button),
+    el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_auto]" }, input, button),
     message,
   );
 
-  return el("div", { class: "rounded-xl border border-gray-200 bg-white p-5 shadow-sm" },
-    el("h2", { class: "mb-3 text-sm font-semibold text-gray-700" }, "Create company"),
+  return el("div", { class: "panel" },
+    el("h2", { class: "mb-3 section-title" }, "Create company"),
     form,
   );
 }
@@ -59,24 +57,26 @@ function companiesTable(companies) {
       class: "cursor-pointer hover:bg-indigo-50/40",
       onclick: () => { window.location.hash = `#/runs?company_id=${encodeURIComponent(c.id)}`; },
     },
-      cell(c.name ?? "—", "font-medium text-gray-900"),
+      cell(c.name ?? "-", "font-semibold text-slate-50"),
       cell(fmtNum(c.runs), "text-right"),
       cell(`${fmtNum(c.websites_found)} / ${fmtNum(c.websites_not_found)}`, "text-right"),
       cell(fmtUsd(c.total_cost_usd), "text-right"),
-      cell(shortDate(c.created_at, { withTime: false }), "text-gray-400"),
+      cell(shortDate(c.created_at, { withTime: false }), "text-slate-400"),
     ),
   );
 
-  return el("div", { class: "overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm" },
-    el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
-      el("thead", { class: "bg-gray-50" },
-        el("tr", {},
-          head("Name"), head("Runs", "text-right"),
-          head("Found / not found", "text-right"),
-          head("Cost", "text-right"), head("Created"),
+  return el("div", { class: "table-shell" },
+    el("div", { class: "table-scroll" },
+      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+        el("thead", {},
+          el("tr", {},
+            head("Name"), head("Runs", "text-right"),
+            head("Found / not found", "text-right"),
+            head("Cost", "text-right"), head("Created"),
+          ),
         ),
+        el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
       ),
-      el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
     ),
   );
 }
@@ -97,9 +97,9 @@ export async function render(root) {
     const companies = stats.companies ?? [];
     if (companies.length === 0) {
       listArea.replaceChildren(
-        el("div", { class: "rounded-xl border border-gray-200 bg-white p-10 text-center shadow-sm" },
-          el("p", { class: "text-sm font-medium text-gray-900" }, "No companies yet"),
-          el("p", { class: "mt-1 text-sm text-gray-500" }, "Add one above to get started."),
+        el("div", { class: "panel p-10 text-center" },
+          el("p", { class: "section-title" }, "No companies yet"),
+          el("p", { class: "mt-1 section-copy" }, "Add one above to get started."),
         ),
       );
       return;

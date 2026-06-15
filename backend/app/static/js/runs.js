@@ -7,8 +7,7 @@ const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
                    "firmographics", "url_discovery"];
 const STATUSES = ["queued", "running", "completed", "completed_with_errors", "failed"];
 
-const selectCls = "rounded-lg border border-gray-300 px-3 py-2 text-sm " +
-  "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
+const selectCls = "control px-3 py-2 text-sm";
 
 const runCost = (r) => (r.cost && typeof r.cost === "object") ? r.cost.total_usd : r.cost;
 
@@ -32,7 +31,7 @@ function filterBar(companies, query) {
   statusSel.value = query.status ?? "";
 
   const apply = el("button", {
-    class: "rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500",
+    class: "btn-primary",
     onclick: () => {
       const params = new URLSearchParams();
       if (companySel.value) params.set("company_id", companySel.value);
@@ -43,7 +42,7 @@ function filterBar(companies, query) {
     },
   }, "Apply");
 
-  return el("div", { class: "flex flex-wrap items-center gap-3 rounded-xl border border-gray-200 bg-white p-4 shadow-sm" },
+  return el("div", { class: "panel flex flex-wrap items-center gap-3" },
     companySel, pipelineSel, statusSel, apply);
 }
 
@@ -53,9 +52,9 @@ function runsTable(runs, companiesById) {
       class: "cursor-pointer hover:bg-indigo-50/40",
       onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(r.run_ref)}`; },
     },
-      cell(shortDate(r.created_at), "text-gray-400 whitespace-nowrap"),
-      cell(companiesById.get(r.company_id)?.name ?? "—", "font-medium text-gray-900"),
-      cell(r.pipeline ?? "—"),
+      cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
+      cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
+      cell(r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
       cell(fmtNum(r.websites_found), "text-right"),
@@ -64,16 +63,18 @@ function runsTable(runs, companiesById) {
     ),
   );
 
-  return el("div", { class: "overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm" },
-    el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
-      el("thead", { class: "bg-gray-50" },
-        el("tr", {},
-          head("Created"), head("Company"), head("Pipeline"), head("Status"),
-          head("Rows", "text-right"), head("Found", "text-right"),
-          head("Cost", "text-right"), head("Duration", "text-right"),
+  return el("div", { class: "table-shell" },
+    el("div", { class: "table-scroll" },
+      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+        el("thead", {},
+          el("tr", {},
+            head("Created"), head("Company"), head("Pipeline"), head("Status"),
+            head("Rows", "text-right"), head("Found", "text-right"),
+            head("Cost", "text-right"), head("Duration", "text-right"),
+          ),
         ),
+        el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
       ),
-      el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
     ),
   );
 }
@@ -105,9 +106,9 @@ export async function render(root, params) {
     filterBar(companies, query),
     el("div", { class: "mt-4" },
       runs.length === 0
-        ? el("div", { class: "rounded-xl border border-gray-200 bg-white p-10 text-center shadow-sm" },
-            el("p", { class: "text-sm font-medium text-gray-900" }, "No runs found"),
-            el("p", { class: "mt-1 text-sm text-gray-500" },
+        ? el("div", { class: "panel p-10 text-center" },
+            el("p", { class: "section-title" }, "No runs found"),
+            el("p", { class: "mt-1 section-copy" },
               "Adjust the filters or start a new run."),
           )
         : runsTable(runs, companiesById),

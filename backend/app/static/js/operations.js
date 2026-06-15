@@ -8,7 +8,7 @@
 //   Retry:          POST /uploads/{id}/retry-failed-rows
 //                   GET  /uploads/{id}/status   (poll after a retry)
 import { api, el, pollStatus } from "./api.js";
-import { errorCard, head, cell, shortDate } from "./ui.js";
+import { errorCard, head, cell, shortDate, fmtDuration } from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
 
@@ -68,11 +68,133 @@ function batchClass(status) {
 const shortId = (id) =>
   id.length > 20 ? `${id.slice(0, 8)}...${id.slice(-8)}` : id;
 
-const inputCls = "w-full rounded-lg border border-gray-300 px-3 py-2 text-sm " +
-  "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
+const inputCls = "control w-full px-3 py-2 text-sm";
 
-const actionBtnCls = "rounded-lg border border-gray-300 px-2.5 py-1 text-xs font-medium " +
-  "text-gray-700 hover:bg-gray-50 disabled:opacity-50";
+const actionBtnCls = "btn-ghost min-h-0 px-2.5 py-1 text-xs disabled:opacity-50";
+
+const HISTORY_PIPELINES = [
+  { key: "gmaps", label: "Google Maps" },
+  { key: "gsearch", label: "Google Search" },
+  { key: "full", label: "Full" },
+  { key: "url_discovery", label: "URL Discovery" },
+  { key: "firmographics", label: "Firmographics" },
+];
+
+const pipelineLabel = (pipeline) =>
+  HISTORY_PIPELINES.find((p) => p.key === pipeline)?.label ?? String(pipeline ?? "-");
+
+function fileLinkSummary(fileLinks) {
+  if (!fileLinks || typeof fileLinks !== "object") return "-";
+  const state = fileLinks["state.json"];
+  const output = fileLinks["output.json"];
+  return output || state || "-";
+}
+
+function storageCell(fileLinks) {
+  const path = fileLinkSummary(fileLinks);
+  return el("span", {
+    class: "block max-w-[18rem] truncate font-mono text-xs text-slate-400",
+    title: path,
+  }, path);
+}
+
+function downloadButton(uploadId, label, format) {
+  return el("a", {
+    class: "btn-ghost min-h-0 px-2.5 py-1 text-xs",
+    href: `/uploads/${encodeURIComponent(uploadId)}/output${format === "xlsx" ? "?format=xlsx&download=true" : "?download=true"}`,
+    onclick: (ev) => ev.stopPropagation(),
+  }, label);
+}
+
+function uploadHistoryCard(registerCleanup) {
+  const tbody = el("tbody", { class: "divide-y divide-gray-100" });
+  const empty = el("p", { class: "hidden p-6 text-center text-sm text-gray-400" },
+    "No SerpWow uploads found.");
+  const note = el("p", { class: "mt-3 text-xs text-gray-400" },
+    "Showing all SerpWow uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
+  const errorArea = el("div", { class: "mt-3 hidden" });
+
+  function renderRows(items) {
+    empty.classList.toggle("hidden", items.length > 0);
+    tbody.replaceChildren(...items.map((item) => {
+      const uploadId = String(item.upload_id ?? "");
+      const rowsDone = ["completed", "completed_with_errors"].includes(String(item.status ?? ""));
+      const batch = item.gemini_batch?.status ?? "not_started";
+      const batchTerminal = ["not_started", "succeeded", "failed", "skipped"].includes(String(batch));
+      const ready = item.pipeline === "full" ? rowsDone && batchTerminal : rowsDone;
+      return el("tr", {
+        class: "cursor-pointer hover:bg-gray-50/50",
+        onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(uploadId)}`; },
+      },
+        cell(el("span", { class: "font-mono text-xs", title: uploadId }, uploadId ? shortId(uploadId) : "-")),
+        cell(pill(pipelineLabel(item.pipeline), "")),
+        cell(pill(statusLabel(item.status), statusClass(item.status))),
+        cell(Number(item.total_rows ?? 0).toLocaleString(), "text-right"),
+        cell(Number(item.processed_rows ?? 0).toLocaleString(), "text-right"),
+        cell(Number(item.success_rows ?? 0).toLocaleString(), "text-right"),
+        cell(Number(item.failed_rows ?? 0).toLocaleString(), "text-right"),
+        cell(fmtDuration(item.processing_seconds_total), "text-right"),
+        cell(fmtDuration(item.processing_seconds_avg), "text-right"),
+        cell(shortDate(item.updated_at), "whitespace-nowrap text-slate-400"),
+        cell(storageCell(item.file_links)),
+        cell(ready ? downloadButton(uploadId, "JSON", "json") : el("span", { class: "text-xs text-slate-500" }, "Processing")),
+        cell(ready ? downloadButton(uploadId, "XLSX", "xlsx") : el("span", { class: "text-xs text-slate-500" }, "Processing")),
+      );
+    }));
+  }
+
+  async function refresh() {
+    try {
+      const data = await api("/uploads?limit=200");
+      errorArea.classList.add("hidden");
+      errorArea.replaceChildren();
+      renderRows(Array.isArray(data.uploads) ? data.uploads : []);
+      note.textContent = "Showing all SerpWow uploads. Select a row to open its run detail.";
+    } catch (e) {
+      errorArea.classList.remove("hidden");
+      errorArea.replaceChildren(errorCard(e.message));
+    }
+  }
+
+  const refreshBtn = el("button", {
+    class: "btn-ghost min-h-0 px-3 py-1.5 text-xs",
+    onclick: refresh,
+  }, "Refresh");
+
+  const card = el("div", { class: "panel" },
+    el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
+      el("div", {},
+        el("h2", { class: "section-title" }, "SerpWow Uploads History"),
+        el("p", { class: "mt-1 section-copy" },
+          "All modes in one table: progress, timing, downloads, and artifact storage paths."),
+      ),
+      refreshBtn,
+    ),
+    errorArea,
+    el("div", { class: "table-shell mt-4" },
+      el("div", { class: "table-scroll" },
+        el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+          el("thead", {},
+            el("tr", {},
+              head("Upload ID"), head("Mode"), head("Status"),
+              head("Total", "text-right"), head("Processed", "text-right"),
+              head("Success", "text-right"), head("Failed", "text-right"),
+              head("Time Total", "text-right"), head("Avg/row", "text-right"),
+              head("Updated"), head("Storage"), head("Output JSON"), head("Output XLSX"),
+            ),
+          ),
+          tbody,
+        ),
+      ),
+      empty,
+    ),
+    note,
+  );
+
+  const timer = setInterval(refresh, REFRESH_MS);
+  registerCleanup(() => clearInterval(timer));
+  return { card, refresh };
+}
 
 // ---- Batch Manager ----------------------------------------------------------
 function batchManagerCard() {
@@ -151,28 +273,30 @@ function batchManagerCard() {
   }
 
   const refreshBtn = el("button", {
-    class: "rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50",
+    class: "btn-ghost min-h-0 px-3 py-1.5 text-xs",
     onclick: refresh,
   }, "Refresh");
 
-  const card = el("div", { class: "rounded-xl border border-gray-200 bg-white p-6 shadow-sm" },
+  const card = el("div", { class: "panel" },
     el("div", { class: "flex items-center justify-between" },
       el("div", {},
-        el("h2", { class: "text-sm font-semibold text-gray-900" }, "Batch Manager"),
-        el("p", { class: "mt-1 text-sm text-gray-500" }, "Gemini batch jobs for full-pipeline uploads."),
+        el("h2", { class: "section-title" }, "Batch Manager"),
+        el("p", { class: "mt-1 section-copy" }, "Gemini batch jobs for full-pipeline uploads."),
       ),
       refreshBtn,
     ),
     errorArea,
-    el("div", { class: "mt-4 overflow-x-auto rounded-lg border border-gray-200" },
+    el("div", { class: "table-shell mt-4" },
+      el("div", { class: "table-scroll" },
       el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
-        el("thead", { class: "bg-gray-50" },
+        el("thead", {},
           el("tr", {},
             head("Upload ID"), head("Upload Status"), head("Batch Status"),
             head("Live State"), head("Job Name"), head("Updated"), head("Actions"),
           ),
         ),
-        tbody,
+          tbody,
+        ),
       ),
       empty,
     ),
@@ -198,10 +322,7 @@ function retryCard(registerCleanup) {
   let stopPoll = null;
   registerCleanup(() => { if (stopPoll) stopPoll(); });
 
-  const btn = el("button", {
-    class: "rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white " +
-           "hover:bg-amber-400 disabled:opacity-50",
-  }, "Retry Failed Rows");
+  const btn = el("button", { class: "btn-primary disabled:opacity-50" }, "Retry Failed Rows");
 
   btn.addEventListener("click", async () => {
     const uid = input.value.trim();
@@ -231,12 +352,12 @@ function retryCard(registerCleanup) {
     }
   });
 
-  return el("div", { class: "rounded-xl border border-gray-200 bg-white p-6 shadow-sm" },
-    el("h2", { class: "text-sm font-semibold text-gray-900" }, "Retry Operations"),
-    el("p", { class: "mt-1 text-sm text-gray-500" },
+  return el("div", { class: "panel" },
+    el("h2", { class: "section-title" }, "Retry Operations"),
+    el("p", { class: "mt-1 section-copy" },
       "Manually retry all failed, queued, or stuck processing rows for a specific upload ID instantly."),
     el("div", { class: "mt-4 flex max-w-xl flex-col gap-3" },
-      el("label", { class: "text-xs font-medium uppercase tracking-wide text-gray-400" }, "Upload ID *"),
+      el("label", { class: "view-kicker" }, "Upload ID *"),
       input,
       btn,
     ),
@@ -249,11 +370,13 @@ export async function render(root) {
   const cleanups = [];
   const registerCleanup = (fn) => cleanups.push(fn);
 
+  const history = uploadHistoryCard(registerCleanup);
   const batch = batchManagerCard();
   root.replaceChildren(
-    el("div", { class: "space-y-6" }, batch.card, retryCard(registerCleanup)),
+    el("div", { class: "space-y-6" }, history.card, batch.card, retryCard(registerCleanup)),
   );
 
+  await history.refresh();
   await batch.refresh();
   const timer = setInterval(batch.refresh, REFRESH_MS);
   registerCleanup(() => clearInterval(timer));

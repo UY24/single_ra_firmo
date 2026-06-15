@@ -1,27 +1,20 @@
-// backend/app/static/js/new_run.js — 4-step "start a new run" flow.
-//
-// Endpoint/form-field mapping (read from routers/ai_mode.py + serpwow/legacy_app.py):
-//   ai_bulk / ai_deep → POST /uploads/ai-mode        (file, mode, company_id)
-//   gmaps             → POST /uploads/gmaps          (file, company_id)
-//   gsearch           → POST /uploads/gsearch        (file, company_id; phase defaults to "all")
-//   full              → POST /uploads                (file, company_id)
-//   firmographics     → POST /uploads/firmographics  (file, company_id)
+// backend/app/static/js/new_run.js - full-width "start a new run" workflow.
 import { api, el, fmtNum } from "./api.js";
 import { errorCard, head, cell } from "./ui.js";
 
 const PIPELINES = [
-  { key: "ai_bulk", label: "AI Mode 1 — Bulk", endpoint: "/uploads/ai-mode", ai: true,
-    desc: "Large batches, broad search — get as much as we can." },
-  { key: "ai_deep", label: "AI Mode 2 — Deep Search", endpoint: "/uploads/ai-mode", ai: true,
-    desc: "2–3 entities per request, thorough multi-angle investigation." },
+  { key: "ai_bulk", label: "AI Mode 1 - Bulk", endpoint: "/uploads/ai-mode", ai: true,
+    desc: "Large batches, broad search, high throughput for residue lists." },
+  { key: "ai_deep", label: "AI Mode 2 - Deep Search", endpoint: "/uploads/ai-mode", ai: true,
+    desc: "Small batches, deeper investigation, better for hard targets." },
   { key: "gmaps", label: "Google Maps", endpoint: "/uploads/gmaps",
-    desc: "SerpWow Google Maps discovery pipeline." },
+    desc: "Fast SerpWow Maps discovery for local business signals." },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
-    desc: "SerpWow Google Search pipeline (all phases)." },
+    desc: "Search-phase pipeline across Google result strategies." },
   { key: "full", label: "Full pipeline", endpoint: "/uploads",
-    desc: "SerpWow full pipeline: discovery, crawl and extraction." },
+    desc: "Discovery, crawl, extraction, and post-processing in one run." },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
-    desc: "Firmographics enrichment for rows that already have a website." },
+    desc: "Enrichment for rows that already have a website." },
 ];
 
 const PHASES = [
@@ -37,94 +30,96 @@ const PHASES = [
 const SAMPLE_COLS = ["company_name", "country", "sno", "company_local_name",
                      "address", "firm_id", "industry"];
 
-const inputCls = "rounded-lg border border-gray-300 px-3 py-2 text-sm " +
-  "focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
-const buttonCls = "rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white " +
-  "hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed";
+const inputCls = "control px-3 py-2 text-sm";
+const buttonCls = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
+const secondaryButtonCls = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
 
 function redCallout(text) {
-  return el("div", { class: "rounded-lg border border-red-200 bg-red-50 p-3" },
-    el("p", { class: "text-sm text-red-800 whitespace-pre-wrap" }, text));
+  return el("div", { class: "callout callout-red" },
+    el("p", { class: "text-sm whitespace-pre-wrap" }, text));
 }
 
 function amberCallout(lines) {
-  return el("div", { class: "rounded-lg border border-amber-200 bg-amber-50 p-3" },
-    ...lines.map((w) => el("p", { class: "text-sm text-amber-800" }, w)));
+  return el("div", { class: "callout callout-amber" },
+    ...lines.map((w) => el("p", { class: "text-sm" }, w)));
 }
 
 function stepCard(n, title, body) {
-  const card = el("div", { class: "rounded-xl border border-gray-200 bg-white p-5 shadow-sm" },
-    el("div", { class: "mb-3 flex items-center gap-3" },
-      el("span", {
-        class: "flex h-6 w-6 shrink-0 items-center justify-center rounded-full " +
-               "bg-indigo-600 text-xs font-semibold text-white",
-      }, String(n)),
-      el("h2", { class: "text-sm font-semibold text-gray-700" }, title),
+  const card = el("div", { class: "panel step-card" },
+    el("div", { class: "mb-4 flex items-center gap-3" },
+      el("span", { class: "step-number" }, String(n)),
+      el("h2", { class: "section-title" }, title),
     ),
     body,
   );
   card.setEnabled = (enabled) => {
-    card.classList.toggle("opacity-40", !enabled);
-    card.classList.toggle("pointer-events-none", !enabled);
+    card.setAttribute("aria-disabled", String(!enabled));
   };
   return card;
 }
 
+function tableShell(table) {
+  return el("div", { class: "table-shell" },
+    el("div", { class: "table-scroll" }, table));
+}
+
 function previewTables(preview) {
-  const parts = [];
-  parts.push(el("p", { class: "text-sm text-gray-700" },
-    el("span", { class: "font-medium text-gray-900" }, fmtNum(preview.total_rows)),
-    " rows detected."));
+  const parts = [
+    el("p", { class: "section-copy" },
+      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.total_rows)),
+      " rows detected."),
+  ];
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));
   if (preview.positional) {
     parts.push(amberCallout([
-      "No recognized headers — columns were read positionally (col 1 = company, col 2 = country).",
+      "No recognized headers; columns were read positionally (col 1 = company, col 2 = country).",
     ]));
   }
 
   const mapping = preview.columns_detected ?? {};
   if (Object.keys(mapping).length) {
-    parts.push(
-      el("div", { class: "overflow-hidden rounded-lg border border-gray-200" },
-        el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
-          el("thead", { class: "bg-gray-50" },
-            el("tr", {}, head("Field"), head("CSV header"))),
-          el("tbody", { class: "divide-y divide-gray-100" },
-            ...Object.entries(mapping).map(([field, header]) =>
-              el("tr", {}, cell(field, "font-medium text-gray-900"), cell(header ?? "—"))),
-          ),
+    parts.push(tableShell(
+      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+        el("thead", {},
+          el("tr", {}, head("Field"), head("CSV header"))),
+        el("tbody", { class: "divide-y divide-gray-100" },
+          ...Object.entries(mapping).map(([field, header]) =>
+            el("tr", {}, cell(field, "font-semibold text-slate-50"), cell(header ?? "-"))),
         ),
       ),
-    );
+    ));
   }
 
   const sample = preview.sample_rows ?? [];
   if (sample.length) {
-    parts.push(
-      el("div", { class: "overflow-x-auto rounded-lg border border-gray-200" },
-        el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
-          el("thead", { class: "bg-gray-50" },
-            el("tr", {}, ...SAMPLE_COLS.map((c) => head(c)))),
-          el("tbody", { class: "divide-y divide-gray-100" },
-            ...sample.map((row) =>
-              el("tr", {}, ...SAMPLE_COLS.map((c) =>
-                cell(row[c] == null || row[c] === "" ? "—" : String(row[c]))))),
-          ),
+    parts.push(tableShell(
+      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+        el("thead", {},
+          el("tr", {}, ...SAMPLE_COLS.map((c) => head(c)))),
+        el("tbody", { class: "divide-y divide-gray-100" },
+          ...sample.map((row) =>
+            el("tr", {}, ...SAMPLE_COLS.map((c) =>
+              cell(row[c] == null || row[c] === "" ? "-" : String(row[c]))))),
         ),
       ),
-    );
+    ));
   }
   return el("div", { class: "space-y-3" }, ...parts);
+}
+
+function summaryItem(label, valueNode) {
+  return el("div", { class: "panel-muted p-3" },
+    el("dt", { class: "view-kicker" }, label),
+    valueNode,
+  );
 }
 
 export async function render(root) {
   const state = { companyId: "", companyName: "", pipeline: null, phase: "all", file: null, preview: null };
 
-  // ---- Step 1: company -----------------------------------------------------
-  const companySelect = el("select", { class: `${inputCls} w-72` });
-  const companyArea = el("div", {},
-    el("p", { class: "text-sm text-gray-400" }, "Loading companies…"));
+  const companySelect = el("select", { class: `${inputCls} w-full` });
+  const companyArea = el("div", {}, el("p", { class: "section-copy" }, "Loading companies..."));
 
   async function loadCompanies(selectId) {
     let companies = [];
@@ -135,7 +130,7 @@ export async function render(root) {
       return;
     }
     companySelect.replaceChildren(
-      el("option", { value: "" }, "Select a company…"),
+      el("option", { value: "" }, "Select a company..."),
       ...companies.map((c) => el("option", { value: c.id }, c.name ?? c.id)),
     );
     if (selectId) companySelect.value = selectId;
@@ -152,7 +147,7 @@ export async function render(root) {
 
   const newCompanyMsg = el("p", { class: "mt-2 hidden text-sm" });
   const newCompanyInput = el("input", {
-    type: "text", placeholder: "New company name", class: `${inputCls} w-72`,
+    type: "text", placeholder: "New company name", class: `${inputCls} w-full`,
   });
   const newCompanyBtn = el("button", { type: "submit", class: buttonCls }, "Create");
   const newCompanyForm = el("form", {
@@ -169,8 +164,8 @@ export async function render(root) {
           body: JSON.stringify({ name }),
         });
         newCompanyInput.value = "";
-        newCompanyMsg.textContent = `Created “${company.name ?? name}”.`;
-        newCompanyMsg.className = "mt-2 text-sm text-green-700";
+        newCompanyMsg.textContent = `Created "${company.name ?? name}".`;
+        newCompanyMsg.className = "mt-2 text-sm text-emerald-600";
         await loadCompanies(company.id);
       } catch (e) {
         newCompanyMsg.textContent = e.message;
@@ -180,90 +175,85 @@ export async function render(root) {
       }
     },
   },
-    el("div", { class: "flex items-center gap-3" }, newCompanyInput, newCompanyBtn),
+    el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_auto]" },
+      newCompanyInput, newCompanyBtn),
     newCompanyMsg,
   );
 
   const step1 = stepCard(1, "Company",
     el("div", {},
       companyArea,
-      el("p", { class: "mt-4 text-xs text-gray-400" }, "Or create a new one:"),
+      el("p", { class: "mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500" },
+        "Or create a new one"),
       newCompanyForm,
     ),
   );
 
-  // ---- Step 2: pipeline ----------------------------------------------------
   const pipelineCards = PIPELINES.map((p) => {
     const radio = el("input", {
-      type: "radio", name: "pipeline", value: p.key, class: "mt-1 accent-indigo-600",
+      type: "radio", name: "pipeline", value: p.key, class: "mt-1 accent-amber-500",
       onchange: () => { state.pipeline = p; refresh(); },
     });
-    return el("label", {
-      class: "flex cursor-pointer items-start gap-3 rounded-lg border border-gray-200 p-3 " +
-             "transition hover:border-indigo-300 hover:bg-indigo-50/30",
-    },
+    return el("label", { class: "pipeline-card flex items-start gap-3" },
       radio,
       el("span", {},
-        el("span", { class: "block text-sm font-medium text-gray-900" }, p.label),
-        el("span", { class: "mt-0.5 block text-xs text-gray-500" }, p.desc),
+        el("span", { class: "block text-sm font-semibold text-slate-50" }, p.label),
+        el("span", { class: "mt-1 block text-xs leading-5 text-slate-400" }, p.desc),
       ),
     );
   });
 
-  const phaseSelect = el("select", { class: inputCls + " w-64" },
+  const phaseSelect = el("select", { class: `${inputCls} w-full` },
     ...PHASES.map((p) => el("option", { value: p.value }, p.label)));
-  phaseSelect.addEventListener("change", () => { state.phase = phaseSelect.value; });
+  phaseSelect.addEventListener("change", () => {
+    state.phase = phaseSelect.value;
+    refresh();
+  });
 
   const phaseRow = el("div", { class: "hidden mt-4 border-t border-gray-100 pt-4" },
-    el("label", {
-      class: "mb-1.5 block text-xs font-medium uppercase tracking-wide text-gray-400",
-    }, "Search Phase"),
+    el("label", { class: "mb-1.5 block view-kicker" }, "Search phase"),
     phaseSelect,
-    el("p", { class: "mt-1 text-xs text-gray-400" },
-      "Which phase(s) to run across all uploaded rows."),
+    el("p", { class: "mt-2 text-xs text-slate-400" },
+      "Only applies to Google Search uploads."),
   );
 
   const step2 = stepCard(2, "Pipeline",
     el("div", {},
-      el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-2" }, ...pipelineCards),
+      el("div", { class: "grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3" }, ...pipelineCards),
       phaseRow,
     ));
 
-  // ---- Step 3: file + preview ----------------------------------------------
   const previewArea = el("div", { class: "mt-4" });
   const fileInput = el("input", {
     type: "file", accept: ".csv",
-    class: "block text-sm text-gray-700 file:mr-3 file:rounded-lg file:border-0 " +
-           "file:bg-indigo-50 file:px-4 file:py-2 file:text-sm file:font-medium " +
-           "file:text-indigo-700 hover:file:bg-indigo-100",
+    class: "block w-full text-sm text-slate-300",
     onchange: async () => {
       state.file = fileInput.files[0] ?? null;
       state.preview = null;
       refresh();
       if (!state.file) { previewArea.replaceChildren(); return; }
-      previewArea.replaceChildren(el("p", { class: "text-sm text-gray-400" }, "Previewing…"));
+      previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
       const fd = new FormData();
       fd.append("file", state.file);
       try {
         state.preview = await api("/uploads/preview", { method: "POST", body: fd });
         previewArea.replaceChildren(previewTables(state.preview));
       } catch (e) {
-        previewArea.replaceChildren(redCallout(e.message)); // 400 detail lists accepted columns
+        previewArea.replaceChildren(redCallout(e.message));
       }
       refresh();
     },
   });
-  const step3 = stepCard(3, "File & preview", el("div", {}, fileInput, previewArea));
+  const step3 = stepCard(3, "File and preview", el("div", {}, fileInput, previewArea));
 
-  // ---- Step 4: confirm & start ----------------------------------------------
-  const summary = el("p", { class: "text-sm text-gray-700" }, "—");
+  const summary = el("p", { class: "section-copy" }, "-");
   const startMsg = el("div", { class: "mt-3 hidden" });
   const startBtn = el("button", { class: buttonCls, disabled: "" }, "Start run");
   startBtn.addEventListener("click", async () => {
     if (!state.companyId || !state.pipeline || !state.file || !state.preview) return;
     startBtn.disabled = true;
     startMsg.className = "mt-3";
-    startMsg.replaceChildren(el("p", { class: "text-sm text-gray-400" }, "Starting…"));
+    startMsg.replaceChildren(el("p", { class: "section-copy" }, "Starting..."));
     const fd = new FormData();
     fd.append("file", state.file);
     fd.append("company_id", state.companyId);
@@ -272,21 +262,46 @@ export async function render(root) {
     try {
       const info = await api(state.pipeline.endpoint, { method: "POST", body: fd });
       startMsg.replaceChildren(
-        el("p", { class: "text-sm font-medium text-green-700" },
-          `Run started (${info.run_id ?? info.upload_id ?? "ok"}). Redirecting…`));
+        el("p", { class: "text-sm font-semibold text-emerald-600" },
+          `Run started (${info.run_id ?? info.upload_id ?? "ok"}). Redirecting...`));
       const target = state.pipeline.ai
         ? `#/runs/${encodeURIComponent(info.run_id)}`
-        : "#/runs"; // SerpWow run_ref = upload_id; list shows it once Supabase records it
+        : "#/runs";
       setTimeout(() => { window.location.hash = target; }, 700);
     } catch (e) {
       startBtn.disabled = false;
       startMsg.replaceChildren(redCallout(e.message));
     }
   });
-  const step4 = stepCard(4, "Confirm & start",
+  const step4 = stepCard(4, "Confirm and start",
     el("div", {}, summary, el("div", { class: "mt-4" }, startBtn), startMsg));
 
-  // ---- gating ---------------------------------------------------------------
+  const summaryCompany = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
+  const summaryPipeline = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
+  const summaryPhase = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
+  const summaryFile = el("dd", { class: "mt-1 truncate text-sm font-semibold text-slate-50" }, "-");
+  const summaryRows = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
+  const readiness = el("p", { class: "mt-4 text-sm text-slate-400" },
+    "Complete the workflow to enable launch.");
+  const summaryPanel = el("aside", { class: "summary-panel panel" },
+    el("p", { class: "view-kicker" }, "Run setup"),
+    el("h2", { class: "mt-1 text-base font-semibold text-slate-50" }, "Launch summary"),
+    el("dl", { class: "mt-4 grid grid-cols-1 gap-3" },
+      summaryItem("Company", summaryCompany),
+      summaryItem("Pipeline", summaryPipeline),
+      summaryItem("Phase", summaryPhase),
+      summaryItem("Input file", summaryFile),
+      summaryItem("Rows", summaryRows),
+    ),
+    readiness,
+    el("div", { class: "mt-4" },
+      el("button", {
+        class: secondaryButtonCls,
+        onclick: () => { window.location.hash = "#/companies"; },
+      }, "Manage companies"),
+    ),
+  );
+
   function refresh() {
     const hasCompany = Boolean(state.companyId);
     const hasPipeline = Boolean(state.pipeline);
@@ -297,13 +312,38 @@ export async function render(root) {
     startBtn.disabled = !(hasCompany && hasPipeline && hasPreview);
     phaseRow.classList.toggle("hidden", state.pipeline?.key !== "gsearch");
     const phaseInfo = state.pipeline?.key === "gsearch" && state.phase && state.phase !== "all"
-      ? ` · ${PHASES.find((p) => p.value === state.phase)?.label ?? state.phase}` : "";
+      ? ` - ${PHASES.find((p) => p.value === state.phase)?.label ?? state.phase}` : "";
     summary.textContent = hasCompany && hasPipeline && hasPreview
-      ? `${state.companyName} · ${state.pipeline.label}${phaseInfo} · ${fmtNum(state.preview.total_rows)} rows`
+      ? `${state.companyName} / ${state.pipeline.label}${phaseInfo} / ${fmtNum(state.preview.total_rows)} rows`
       : "Complete the steps above to start.";
+    summaryCompany.textContent = state.companyName || "-";
+    summaryPipeline.textContent = state.pipeline?.label || "-";
+    summaryPhase.textContent = state.pipeline?.key === "gsearch"
+      ? PHASES.find((p) => p.value === state.phase)?.label ?? state.phase
+      : "Default";
+    summaryFile.textContent = state.file?.name || "-";
+    summaryRows.textContent = state.preview ? fmtNum(state.preview.total_rows) : "-";
+    readiness.textContent = hasCompany && hasPipeline && hasPreview
+      ? "Ready to launch. Review the preview before starting."
+      : "Complete the workflow to enable launch.";
+    readiness.className = hasCompany && hasPipeline && hasPreview
+      ? "mt-4 text-sm font-semibold text-amber-700"
+      : "mt-4 text-sm text-slate-400";
   }
 
-  root.replaceChildren(el("div", { class: "max-w-3xl space-y-4" }, step1, step2, step3, step4));
+  root.replaceChildren(
+    el("div", { class: "mb-5 flex flex-wrap items-end justify-between gap-3" },
+      el("div", {},
+        el("p", { class: "view-kicker" }, "Upload workflow"),
+        el("p", { class: "mt-1 max-w-3xl text-sm text-slate-400" },
+          "Select a company, choose a discovery pipeline, validate the CSV, then start the run."),
+      ),
+    ),
+    el("div", { class: "run-grid" },
+      el("div", { class: "space-y-4" }, step1, step2, step3, step4),
+      summaryPanel,
+    ),
+  );
   refresh();
   await loadCompanies();
 }

@@ -64,86 +64,6 @@ _AI_MODE_LOGGER = logging.getLogger("ai_mode")
 
 T = TypeVar("T")
 
-COUNTRY_GL_ALIASES: dict[str, str] = {
-    "united states": "us",
-    "usa": "us",
-    "u.s.a": "us",
-    "u.s.": "us",
-    "us": "us",
-    "united kingdom": "gb",
-    "uk": "gb",
-    "great britain": "gb",
-    "england": "gb",
-    "gb": "gb",
-    "india": "in",
-    "bangladesh": "bd",
-    "canada": "ca",
-    "australia": "au",
-    "germany": "de",
-    "france": "fr",
-    "italy": "it",
-    "spain": "es",
-    "netherlands": "nl",
-    "sweden": "se",
-    "norway": "no",
-    "denmark": "dk",
-    "finland": "fi",
-    "japan": "jp",
-    "south korea": "kr",
-    "korea": "kr",
-    "china": "cn",
-    "singapore": "sg",
-    "united arab emirates": "ae",
-    "uae": "ae",
-    "saudi arabia": "sa",
-    "qatar": "qa",
-    "kuwait": "kw",
-    "oman": "om",
-    "bahrain": "bh",
-    "ireland": "ie",
-    "poland": "pl",
-    "switzerland": "ch",
-    "austria": "at",
-    "belgium": "be",
-    "portugal": "pt",
-    "mexico": "mx",
-    "brazil": "br",
-    "argentina": "ar",
-    "south africa": "za",
-    "new zealand": "nz",
-    "turkiye": "tr",
-    "turkey": "tr",
-    "hungary": "hu",
-    "nigeria": "ng",
-    "colombia": "co",
-    "estonia": "ee",
-    "bulgaria": "bg",
-    "latvia": "lv",
-    "czech republic": "cz",
-    "czechia": "cz",
-    "thailand": "th",
-    "serbia": "rs",
-    "bosnia and herzegovina": "ba",
-    "ecuador": "ec",
-    "albania": "al",
-    "egypt": "eg",
-    "uruguay": "uy",
-    "papua new guinea": "pg",
-}
-
-GOOGLE_DOMAIN_BY_GL: dict[str, str] = {
-    "us": "google.com",
-    "gb": "google.co.uk",
-    "kr": "google.co.kr",
-    "br": "google.com.br",
-    "tr": "google.com.tr",
-    "mx": "google.com.mx",
-    "ar": "google.com.ar",
-    "bd": "google.com.bd",
-    "co": "google.com.co",
-    "uy": "google.com.uy",
-    "pg": "google.com.pg",
-}
 
 
 def chunked(items: list[T], size: int) -> Iterable[list[T]]:
@@ -209,78 +129,15 @@ def _ai_log(run_id: str, run_dir: Path, message: str, level: int = logging.INFO)
 # --------------------------------------------------------------------------- #
 # Geo targeting helpers
 # --------------------------------------------------------------------------- #
-def _country_to_gl(country: str | None, fallback: str = "us") -> str:
-    value = str(country or "").strip().lower()
-    fallback_value = str(fallback or "us").strip().lower() or "us"
-    if not value:
-        return fallback_value
-    if value in COUNTRY_GL_ALIASES:
-        return COUNTRY_GL_ALIASES[value]
-    compact = re.sub(r"[^a-z]", "", value)
-    if compact in COUNTRY_GL_ALIASES:
-        return COUNTRY_GL_ALIASES[compact]
-    if len(compact) == 2:
-        return compact
-    return fallback_value
-
-
-def _google_domain_for_gl(gl: str, fallback: str = "google.com") -> str:
-    clean_gl = str(gl or "").strip().lower()
-    if clean_gl in GOOGLE_DOMAIN_BY_GL:
-        return GOOGLE_DOMAIN_BY_GL[clean_gl]
-    return f"google.{clean_gl}" if len(clean_gl) == 2 else (fallback or "google.com")
-
-
-def _entity_country(entity: Any) -> str:
-    return str(getattr(entity, "country_code", "") or getattr(entity, "country", "") or "").strip()
-
-
-def _location_from_entity(entity: Any, country: str) -> str:
-    address = str(getattr(entity, "address", "") or "").replace("\n", ", ").strip(" ,")
-    if not address:
-        return country if len(country.strip()) > 2 else ""
-    parts = [part.strip() for part in address.split(",") if part.strip()]
-    location_parts = [part for part in parts if not re.fullmatch(r"[A-Za-z]{0,3}[- ]?\d{3,8}", part)]
-    if len(location_parts) >= 3:
-        return ",".join(location_parts[-3:-1] + [country])
-    if len(location_parts) >= 2:
-        return ",".join(location_parts[-2:] + [country])
-    return ",".join([location_parts[0] if location_parts else address, country])
-
-
 def _geo_params_for_group(
-    group: list[Any],
     settings: Settings,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    countries = [_entity_country(entity) for entity in group if _entity_country(entity)]
-    unique_countries = []
-    for country in countries:
-        if country not in unique_countries:
-            unique_countries.append(country)
-
-    selected_country = unique_countries[0] if unique_countries else ""
-    fallback_gl = settings.scrapedo_gl or "us"
-    gl = _country_to_gl(selected_country, fallback=fallback_gl)
-    google_domain = _google_domain_for_gl(gl, fallback=settings.scrapedo_google_domain or "google.com")
-
-    params = {
-        "gl": gl,
-        "google_domain": google_domain,
-    }
+    gl = settings.scrapedo_gl or "us"
+    google_domain = settings.scrapedo_google_domain or "google.com"
+    params: dict[str, str] = {"gl": gl, "google_domain": google_domain}
     if settings.scrapedo_hl:
         params["hl"] = settings.scrapedo_hl
-    location = _location_from_entity(group[0], selected_country) if selected_country and group else ""
-    if location:
-        params["location"] = location
-
-    return params, {
-        "selected_country": selected_country,
-        "countries": unique_countries,
-        "mixed_countries": len(unique_countries) > 1,
-        "gl": gl,
-        "google_domain": google_domain,
-        "location": location,
-    }
+    return params, {"gl": gl, "google_domain": google_domain}
 
 
 # --------------------------------------------------------------------------- #
@@ -839,7 +696,7 @@ def run_ai_mode_sync(run_id: str) -> None:
         def _scrape_one(request_index: int, group: list[Entity]) -> dict:
             group_names = [e.company_name for e in group]
             query = search_prompt.replace("{entities}", format_entities_for_prompt(group))
-            geo_params, geo_debug = _geo_params_for_group(group, settings)
+            geo_params, geo_debug = _geo_params_for_group(settings)
             raw_name = f"request_{request_index:03d}.json"
             raw_path = raw_dir / raw_name
             rel_raw_path = f"{RAW_RESPONSES_DIRNAME}/{raw_name}"

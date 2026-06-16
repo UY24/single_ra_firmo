@@ -28,4 +28,5 @@ Rules:
 - If the text contains nothing about a company, return it with website_url null,
   confidence 0, flags [{"flag": "no_results", "why": "no data in response"}], and an
   empty attempt_log.
+- your job is just to clean up the data do not make any assumption do not create any answers from yourself always use the data provided to you.
 - Output the JSON array only - no prose, no markdown fences.

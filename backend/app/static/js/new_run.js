@@ -2,19 +2,43 @@
 import { api, el, fmtNum } from "./api.js";
 import { errorCard, head, cell } from "./ui.js";
 
+const _AI_COLS = [
+  { name: "company_name", req: true,  hint: "company, name, entity_name, entity, organization" },
+  { name: "country",      req: true,  hint: "country_name, nation  (2-letter code or full name)" },
+  { name: "company_local_name", req: false, hint: "local_name, company_name_local, name_local" },
+  { name: "firm_id",      req: false, hint: "firmid, id" },
+  { name: "industry",     req: false, hint: "input_industry" },
+  { name: "full_address", req: false, hint: "address, fulladdress, input_full_address" },
+];
+const _SW_COLS = [
+  { name: "company_name", req: true,  hint: "company, name, entity_name, entity, organization" },
+  { name: "country",      req: true,  hint: "country_name, nation  (2-letter code or full name)" },
+  { name: "firm_id",      req: false, hint: "firmid, id" },
+  { name: "industry",     req: false, hint: "input_industry" },
+  { name: "full_address", req: false, hint: "address, fulladdress, input_full_address" },
+];
+const _FIRMO_COLS = [
+  { name: "official_website", req: true,  hint: "website, url, domain" },
+  { name: "company_name",     req: false, hint: "company, name  (falls back to domain)" },
+  { name: "country",          req: false, hint: "country_name, nation" },
+  { name: "firm_id",          req: false, hint: "firmid, id" },
+  { name: "industry",         req: false, hint: "input_industry" },
+  { name: "full_address",     req: false, hint: "address, fulladdress, input_full_address" },
+];
+
 const PIPELINES = [
   { key: "ai_bulk", label: "AI Mode 1 - Bulk", endpoint: "/uploads/ai-mode", ai: true,
-    desc: "Large batches, broad search, high throughput for residue lists." },
+    desc: "Large batches, broad search, high throughput for residue lists.", csvCols: _AI_COLS },
   { key: "ai_deep", label: "AI Mode 2 - Deep Search", endpoint: "/uploads/ai-mode", ai: true,
-    desc: "Small batches, deeper investigation, better for hard targets." },
+    desc: "Small batches, deeper investigation, better for hard targets.", csvCols: _AI_COLS },
   { key: "gmaps", label: "Google Maps", endpoint: "/uploads/gmaps",
-    desc: "Fast SerpWow Maps discovery for local business signals." },
+    desc: "Fast SerpWow Maps discovery for local business signals.", csvCols: _SW_COLS },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
-    desc: "Search-phase pipeline across Google result strategies." },
+    desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "full", label: "Upload Console", endpoint: "/uploads",
-    desc: "Discovery, crawl, extraction, and post-processing in one run." },
+    desc: "Discovery, crawl, extraction, and post-processing in one run.", csvCols: _SW_COLS },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
-    desc: "Enrichment for rows that already have a website." },
+    desc: "Enrichment for rows that already have a website.", csvCols: _FIRMO_COLS },
 ];
 
 const PHASES = [
@@ -56,6 +80,41 @@ function stepCard(n, title, body) {
     card.setAttribute("aria-disabled", String(!enabled));
   };
   return card;
+}
+
+function csvSchemaPanel(pipeline) {
+  if (!pipeline?.csvCols) return el("span");
+  const req = pipeline.csvCols.filter((c) => c.req);
+  const opt = pipeline.csvCols.filter((c) => !c.req);
+  const chip = (col) => el("span", {
+    class: `inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-xs ring-1 cursor-default ${
+      col.req
+        ? "bg-amber-500/15 text-amber-300 ring-amber-500/30"
+        : "bg-slate-700/50 text-slate-400 ring-slate-600/30"
+    }`,
+    title: `Accepted aliases: ${col.hint}`,
+  },
+    col.name,
+    col.req
+      ? el("span", { class: "ml-0.5 text-amber-400 font-bold leading-none" }, "*")
+      : el("span", { class: "ml-0.5 text-slate-500 text-[10px] leading-none" }, "opt"),
+  );
+  return el("div", { class: "mb-4 rounded-lg border border-slate-700/50 bg-slate-800/40 p-3" },
+    el("p", { class: "mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500" },
+      `Expected CSV columns — ${pipeline.label}`),
+    el("div", { class: "flex flex-col gap-2" },
+      el("div", { class: "flex flex-wrap items-center gap-2" },
+        el("span", { class: "w-16 shrink-0 text-xs text-slate-500" }, "Required"),
+        ...req.map(chip),
+      ),
+      opt.length ? el("div", { class: "flex flex-wrap items-center gap-2" },
+        el("span", { class: "w-16 shrink-0 text-xs text-slate-500" }, "Optional"),
+        ...opt.map(chip),
+      ) : el("span"),
+    ),
+    el("p", { class: "mt-2 text-xs text-slate-600" },
+      "* required · hover any column to see accepted header aliases"),
+  );
 }
 
 function tableShell(table) {
@@ -223,6 +282,7 @@ export async function render(root) {
       phaseRow,
     ));
 
+  const schemaArea = el("div");
   const previewArea = el("div", { class: "mt-4" });
   const fileInput = el("input", {
     type: "file", accept: ".csv",
@@ -244,7 +304,7 @@ export async function render(root) {
       refresh();
     },
   });
-  const step3 = stepCard(3, "File and preview", el("div", {}, fileInput, previewArea));
+  const step3 = stepCard(3, "File and preview", el("div", {}, schemaArea, fileInput, previewArea));
 
   const summary = el("p", { class: "section-copy" }, "-");
   const startMsg = el("div", { class: "mt-3 hidden" });
@@ -312,6 +372,7 @@ export async function render(root) {
     step4.setEnabled(hasCompany && hasPipeline && hasPreview);
     startBtn.disabled = !(hasCompany && hasPipeline && hasPreview);
     phaseRow.classList.toggle("hidden", state.pipeline?.key !== "gsearch");
+    schemaArea.replaceChildren(csvSchemaPanel(state.pipeline));
     const phaseInfo = state.pipeline?.key === "gsearch" && state.phase && state.phase !== "all"
       ? ` - ${PHASES.find((p) => p.value === state.phase)?.label ?? state.phase}` : "";
     summary.textContent = hasCompany && hasPipeline && hasPreview

@@ -12,6 +12,63 @@ import { errorCard, loadingCard, statusBadge, fmtDuration, shortDate, copyCell }
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 
+// ── inline file viewer modal ──────────────────────────────────────────────────
+let _modal = null;
+
+function _ensureModal() {
+  if (_modal) return _modal;
+  const title = el("span", { class: "truncate text-sm font-semibold text-slate-50" });
+  const dlBtn = el("a", {
+    class: "btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
+    target: "_blank",
+  }, "Download");
+  const closeBtn = el("button", {
+    class: "btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
+    onclick: () => overlay.classList.add("hidden"),
+  }, "✕ Close");
+  const pre = el("pre", {
+    class: "flex-1 overflow-auto whitespace-pre-wrap break-words p-4 text-xs leading-5 text-slate-300 font-mono",
+  });
+  const loadingMsg = el("p", {
+    class: "p-6 text-sm text-slate-400",
+  }, "Loading…");
+  const body = el("div", { class: "flex flex-col overflow-hidden" }, loadingMsg);
+  const overlay = el("div", {
+    class: "hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4",
+    onclick: (e) => { if (e.target === overlay) overlay.classList.add("hidden"); },
+  },
+    el("div", { class: "flex flex-col w-full max-w-4xl h-[80vh] rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden" },
+      el("div", { class: "flex items-center gap-3 border-b border-slate-700 px-4 py-3 shrink-0" },
+        title, dlBtn, closeBtn,
+      ),
+      body,
+    ),
+  );
+  document.body.appendChild(overlay);
+  _modal = { overlay, title, dlBtn, pre, loadingMsg, body };
+  return _modal;
+}
+
+async function viewFile(url, filename, downloadUrl) {
+  const m = _ensureModal();
+  m.title.textContent = filename;
+  m.dlBtn.href = downloadUrl;
+  m.body.replaceChildren(m.loadingMsg);
+  m.overlay.classList.remove("hidden");
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const text = await res.text();
+    m.pre.textContent = text;
+    m.body.replaceChildren(m.pre);
+  } catch (e) {
+    m.body.replaceChildren(
+      el("p", { class: "p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),
+    );
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function statTile(label, value) {
   return el("div", { class: "metric-card" },
     el("p", { class: "metric-label" }, label),
@@ -63,19 +120,25 @@ function progressCard(done, total, running) {
 
 function downloadsCard(ref, available) {
   const files = available?.length ? available : RESULT_FILES;
+  const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
   return el("div", { class: "panel" },
-    el("h2", { class: "section-title" }, "Downloads"),
-    el("div", { class: "mt-3 flex flex-wrap gap-2" },
-      ...RESULT_FILES.map((name) => el("button", {
-        class: "btn-ghost min-h-0 px-3 py-1.5 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
-        ...(files.includes(name) ? {} : { disabled: "" }),
-        onclick: () => {
-          window.open(
-            `/uploads/ai-mode/${encodeURIComponent(ref)}/result` +
-            `?file=${encodeURIComponent(name)}&download=true`,
-            "_blank");
-        },
-      }, name)),
+    el("h2", { class: "section-title" }, "Files"),
+    el("div", { class: "mt-3 flex flex-col gap-2" },
+      ...RESULT_FILES.map((name) => {
+        const isAvailable = files.includes(name);
+        return el("div", { class: "flex items-center gap-2" },
+          el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
+          el("button", {
+            class: "btn-ghost min-h-0 px-3 py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
+            ...(isAvailable ? {} : { disabled: "" }),
+            onclick: () => viewFile(baseUrl(name), name, `${baseUrl(name)}&download=true`),
+          }, "View"),
+          el("a", {
+            class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
+            ...(isAvailable ? { href: `${baseUrl(name)}&download=true`, download: name } : {}),
+          }, "Download"),
+        );
+      }),
     ),
   );
 }

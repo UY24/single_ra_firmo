@@ -1119,6 +1119,17 @@ def run_ai_mode_sync(run_id: str) -> None:
             f"entities_without_scrape_data={entities_without_scrape_data}",
         )
 
+        # Mirror the completed run dir to S3 (best-effort; never fails the run).
+        from app.services.ai_mode.s3_sync import mirror_run_to_s3
+        mirrored = mirror_run_to_s3(run_dir, mode.key)
+        if mirrored:
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Mirrored {len(mirrored)} file(s) to S3 "
+                f"under {run_dir.parent.name}/{mode.key}/{run_id}",
+            )
+
     except Exception as exc:  # never raise to caller
         status["status"] = "failed"
         status["error"] = sanitize_secret_text(str(exc))

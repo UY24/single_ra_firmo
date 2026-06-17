@@ -25,6 +25,9 @@ FAKE_ENV = {
     "AI_MODE_LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
     "SCRAPEDO_CONCURRENCY": "2",
+    # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated
+    # .env would otherwise make run_ai_mode_sync attempt a live S3 upload).
+    "S3_BUCKET": "",
 }
 
 

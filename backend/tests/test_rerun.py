@@ -197,6 +197,8 @@ class TestCarryoverMerge(unittest.TestCase):
         "GEMINI_API_KEY": "fake-key",
         "AI_MODE_LLM_BATCH": "",
         "AI_MODE_LLM_PROVIDER": "gemini",
+        # Keep offline: unset so the S3 mirror no-ops (see test_engine_smoke).
+        "S3_BUCKET": "",
     }
 
     def setUp(self):

@@ -31,7 +31,7 @@ class EntityResult:
     error: str | None = None
 
     def flags_csv(self) -> str:
-        return "; ".join(f"{f.flag}: {f.why}" for f in self.flags)
+        return "\n".join(f"{f.flag}: {f.why}" for f in self.flags)
 
     def attempt_log_csv(self) -> str:
         lines = []

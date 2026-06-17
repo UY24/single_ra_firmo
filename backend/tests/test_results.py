@@ -16,7 +16,7 @@ class TestEntityResultSerialization(unittest.TestCase):
 
     def test_flags_csv(self):
         self.assertEqual(self._result().flags_csv(),
-                         "name_match: exact ENG match; tld_match: .jp matches country")
+                         "name_match: exact ENG match\ntld_match: .jp matches country")
 
     def test_attempt_log_csv(self):
         self.assertEqual(self._result().attempt_log_csv(),

@@ -4029,13 +4029,13 @@ async def write_upload_text_artifact(upload_id: str, name: str, text: str, conte
     local_path.write_text(text, encoding="utf-8")
 
 
-def _upload_serpwow_json_sync(upload_id: str, row_index: int, company_name: str, raw_json: str) -> str:
+def _upload_serpwow_json_sync(upload_id: str, row_index: int, company_name: str, raw_json: str, pipeline: str = "") -> str:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         raise RuntimeError("S3_BUCKET not configured")
 
     safe_name = _safe_name(company_name)
-    key = f"{S3_PREFIX}/{upload_id}/{row_index:05d}_{safe_name}_serpwow.json"
+    key = f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/{row_index:05d}_{safe_name}_serpwow.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -4045,7 +4045,7 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, company_name: str,
     return key
 
 
-async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name: str, raw_json: str) -> tuple[Optional[str], Optional[str]]:
+async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name: str, raw_json: str, pipeline: str = "") -> tuple[Optional[str], Optional[str]]:
     if not raw_json:
         return None, "No SerpWow raw JSON available to upload"
     try:
@@ -4055,6 +4055,7 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name
             row_index,
             company_name,
             raw_json,
+            pipeline,
         )
         return key, None
     except Exception as exc:
@@ -6247,6 +6248,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             row_index=row_index,
             company_name=company_name,
             raw_json=serpwow_raw_json,
+            pipeline=pipeline,
         )
 
         result = crawl_response.model_dump()

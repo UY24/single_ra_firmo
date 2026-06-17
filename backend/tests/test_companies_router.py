@@ -225,15 +225,19 @@ class TestLegacyUpdateSupabaseRun(unittest.TestCase):
         from app.services.serpwow import legacy_app
 
         with mock.patch.dict("os.environ", {"S3_BUCKET": "bucket-1"}):
-            links = legacy_app._upload_file_links("up-1")
+            links = legacy_app._upload_file_links("up-1", "Acme Inc", "gmaps")
+            bare = legacy_app._upload_file_links("up-1")
+        # New layout: <company>/<pipeline>/<upload_id>/...
         self.assertEqual(
             links["state.json"],
-            "s3://bucket-1/single_ra_isi/up-1/state.json",
+            "s3://bucket-1/Acme_Inc/gmaps/up-1/state.json",
         )
         self.assertEqual(
             links["output.json"],
-            "s3://bucket-1/single_ra_isi/up-1/output.json",
+            "s3://bucket-1/Acme_Inc/gmaps/up-1/output.json",
         )
+        # Bare upload_id (no company/pipeline) falls back to the id alone.
+        self.assertEqual(bare["state.json"], "s3://bucket-1/up-1/state.json")
 
     def test_updates_run_from_state(self):
         from app.services.serpwow import legacy_app

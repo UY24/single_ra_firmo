@@ -421,25 +421,30 @@ def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, p
     }
 
 
-def _upload_s3_prefix(upload_id: str, company_name: str = "") -> str:
+def _upload_s3_prefix(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
     safe = _safe_name(company_name) if company_name else ""
-    return f"{S3_PREFIX}/{safe}/{upload_id}" if safe else f"{S3_PREFIX}/{upload_id}"
+    pipe = (pipeline or "").strip()
+    if safe and pipe:
+        return f"{safe}/{pipe}/{upload_id}"
+    if safe:
+        return f"{safe}/{upload_id}"
+    return upload_id
 
 
-def _state_s3_key(upload_id: str, company_name: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name)}/state.json"
+def _state_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/state.json"
 
 
-def _output_s3_key(upload_id: str, company_name: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name)}/output.json"
+def _output_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/output.json"
 
 
-def _batch_input_jsonl_s3_key(upload_id: str, company_name: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name)}/gemini_batch_input.jsonl"
+def _batch_input_jsonl_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_input.jsonl"
 
 
-def _batch_output_json_s3_key(upload_id: str, company_name: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name)}/gemini_batch_output.json"
+def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
+    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_output.json"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -3872,16 +3877,12 @@ def _find_s3_upload_key_sync(upload_id: str, suffix: str) -> Optional[str]:
     if not bucket:
         return None
     client = get_s3_client()
-    flat_key = f"{S3_PREFIX}/{upload_id}/{suffix}"
-    try:
-        client.head_object(Bucket=bucket, Key=flat_key)
-        return flat_key
-    except Exception:
-        pass
+    # New layout is <company>/<pipeline>/<upload_id>/<suffix>; company+pipeline are
+    # unknown at read time, so match by suffix across the whole bucket.
     target_suffix = f"/{upload_id}/{suffix}"
     try:
         paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=f"{S3_PREFIX}/", MaxKeys=1000):
+        for page in paginator.paginate(Bucket=bucket, MaxKeys=1000):
             for obj in page.get("Contents", []):
                 key = str(obj.get("Key") or "")
                 if key.endswith(target_suffix):
@@ -3897,7 +3898,9 @@ def _list_state_keys_from_s3_sync(limit: int) -> list[str]:
         return []
 
     client = get_s3_client()
-    prefix = f"{S3_PREFIX}/"
+    # New layout has no shared top-level prefix; scan the whole bucket and select
+    # state.json keys by suffix.
+    prefix = ""
     continuation_token: Optional[str] = None
     keys_with_time: list[tuple[str, Any]] = []
 
@@ -3939,7 +3942,12 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
         company_name = str(data.get("company_name") or "")
-        key = _state_s3_key(upload_id, company_name) if name == "state" else _output_s3_key(upload_id, company_name)
+        pipeline = str(data.get("pipeline") or PIPELINE_FULL)
+        key = (
+            _state_s3_key(upload_id, company_name, pipeline)
+            if name == "state"
+            else _output_s3_key(upload_id, company_name, pipeline)
+        )
 
         async def _write_s3_background():
             max_retries = 5
@@ -4000,13 +4008,13 @@ def _write_text_to_s3_sync(key: str, text: str, content_type: str = "text/plain;
     )
 
 
-async def write_upload_text_artifact(upload_id: str, name: str, text: str, content_type: str, company_name: str = "") -> None:
+async def write_upload_text_artifact(upload_id: str, name: str, text: str, content_type: str, company_name: str = "", pipeline: str = "") -> None:
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
         if name == "batch_input_jsonl":
-            key = _batch_input_jsonl_s3_key(upload_id, company_name)
+            key = _batch_input_jsonl_s3_key(upload_id, company_name, pipeline)
         elif name == "batch_output_json":
-            key = _batch_output_json_s3_key(upload_id, company_name)
+            key = _batch_output_json_s3_key(upload_id, company_name, pipeline)
         else:
             raise ValueError(f"Unsupported text artifact: {name}")
         await asyncio.to_thread(_write_text_to_s3_sync, key, text, content_type)
@@ -4057,6 +4065,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
     timing_summary = build_processing_timing_summary(state.get("rows", []))
     return {
         "upload_id": state["upload_id"],
+        "company_name": state.get("company_name") or "",
         "pipeline": state.get("pipeline") or PIPELINE_FULL,
         "status": state["status"],
         "gemini_batch": state.get("gemini_batch"),
@@ -4781,6 +4790,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             await persist_upload_state(upload_id, state)
 
         _batch_company_name = str(state.get("company_name") or "")
+        _batch_pipeline = str(state.get("pipeline") or PIPELINE_FULL)
         requests_payload, row_refs, jsonl_text = _build_batch_requests_for_state(state)
         if not requests_payload:
             async with get_upload_lock(upload_id):
@@ -4805,6 +4815,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 jsonl_text,
                 "application/x-ndjson; charset=utf-8",
                 company_name=_batch_company_name,
+                pipeline=_batch_pipeline,
             )
 
             create_resp = await asyncio.to_thread(
@@ -5548,12 +5559,12 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
     }
 
 
-def _upload_file_links(upload_id: str, company_name: str = "") -> dict[str, str]:
+def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
     if bucket:
         return {
-            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id, company_name)}",
-            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id, company_name)}",
+            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id, company_name, pipeline)}",
+            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id, company_name, pipeline)}",
         }
     return {
         "state.json": str(_find_upload_dir(upload_id) / "state.json"),
@@ -5565,7 +5576,7 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
         state_pipeline = str(summary.get("pipeline") or PIPELINE_FULL)
-        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""))
+        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL))
         upload_summaries_cache[upload_id] = {
             "upload_id": summary.get("upload_id"),
             "pipeline": state_pipeline,
@@ -5607,7 +5618,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         if svc is None:
             return False
         upload_id = str(state.get("upload_id") or "")
-        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""))
+        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -7271,7 +7282,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
         "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
         "processing_seconds_count": summary.get("processing_seconds_count", 0),
-        "file_links": _upload_file_links(upload_id),
+        "file_links": _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL)),
         "rows": [
             {
                 "row_index": row["row_index"],

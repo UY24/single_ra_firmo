@@ -4,10 +4,11 @@ Used by :mod:`ai_mode_service` for the batch LLM-cleanup phase. Intentionally ha
 NO imports from ``app.py`` (avoids a circular import and keeps the SerpWow path
 untouched). Stdlib-only (``urllib``) so it stays dependency-light.
 
-Supports both batch input methods:
-  * **inline** requests (small jobs, total payload < ~20 MB), and
-  * **File API** upload (large jobs — one 2 GB file holds ~hundreds of thousands
-    of requests, so no sharding is needed at our scale).
+Batch input always goes through the **File API**: a JSONL file is uploaded and
+referenced by ``input_config.file_name`` regardless of size. (We deliberately do
+NOT use the inline-requests route — at our scale shards exceed the ~20 MB inline
+cap anyway, and the inline format keys requests differently, so one route keeps
+it simple and correct.)
 
 Results are mapped back to each request by a caller-supplied ``key`` (the
 ``"batch-NNN"`` scrape-batch index), never by position.
@@ -21,12 +22,10 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Iterable
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 _API_ROOT = "https://generativelanguage.googleapis.com"
-# Inline batch input must stay under 20 MB total; switch to the File API below
-# this safe margin.
-_INLINE_MAX_BYTES = 18 * 1024 * 1024
 
 
 # --------------------------------------------------------------------------- #
@@ -39,6 +38,27 @@ def _api_key() -> str:
     return key
 
 
+def _urlopen_or_raise(req: Request, timeout: float):
+    """``urlopen`` that turns an ``HTTPError`` into a ``RuntimeError`` with the body.
+
+    urllib's ``HTTPError`` stringifies to just ``"HTTP Error 400: Bad Request"`` and
+    discards the response body — but the Gemini API's actual diagnostic (e.g.
+    ``Invalid JSON payload received. Unknown name "key"``) lives in that body. Read
+    it so the failure reaches status.json / run.log instead of an opaque code.
+    """
+    try:
+        return urlopen(req, timeout=timeout)
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:  # pragma: no cover - body already consumed/unavailable
+            body = ""
+        detail = f"HTTP {exc.code} {exc.reason}"
+        if body:
+            detail += f": {body[:2000]}"
+        raise RuntimeError(detail) from exc
+
+
 def _http_post_json(url: str, body: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
     req = Request(
         url,
@@ -46,21 +66,21 @@ def _http_post_json(url: str, body: dict[str, Any], timeout: float = 120.0) -> d
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(req, timeout=timeout) as response:
+    with _urlopen_or_raise(req, timeout) as response:
         raw = response.read().decode("utf-8")
     return json.loads(raw) if raw.strip() else {}
 
 
 def _http_get_json(url: str, timeout: float = 60.0) -> dict[str, Any]:
     req = Request(url, headers={"Content-Type": "application/json"}, method="GET")
-    with urlopen(req, timeout=timeout) as response:
+    with _urlopen_or_raise(req, timeout) as response:
         raw = response.read().decode("utf-8")
     return json.loads(raw) if raw.strip() else {}
 
 
 def _http_get_bytes(url: str, headers: dict[str, str], timeout: float = 300.0) -> bytes:
     req = Request(url, headers=headers, method="GET")
-    with urlopen(req, timeout=timeout) as response:
+    with _urlopen_or_raise(req, timeout) as response:
         return response.read()
 
 
@@ -130,7 +150,7 @@ def upload_jsonl_file(jsonl_text: str, display_name: str) -> str:
         },
         method="POST",
     )
-    with urlopen(start, timeout=60) as response:
+    with _urlopen_or_raise(start, 60) as response:
         upload_url = response.headers.get("x-goog-upload-url") or response.headers.get(
             "X-Goog-Upload-URL"
         )
@@ -150,7 +170,7 @@ def upload_jsonl_file(jsonl_text: str, display_name: str) -> str:
         },
         method="POST",
     )
-    with urlopen(upload, timeout=300) as response:
+    with _urlopen_or_raise(upload, 300) as response:
         raw = response.read().decode("utf-8")
     payload = json.loads(raw) if raw.strip() else {}
     file_obj = payload.get("file") if isinstance(payload, dict) else None
@@ -170,28 +190,20 @@ def upload_jsonl_file(jsonl_text: str, display_name: str) -> str:
 def create_batch(model: str, items: list[tuple[str, dict[str, Any]]], *, display_name: str) -> dict[str, Any]:
     """Create a batch job from ``items`` = ``[(key, request_dict), ...]``.
 
-    Uses inline input when the payload is small, otherwise uploads a JSONL via the
-    File API. Returns the create response (which carries the batch ``name``).
+    Always uploads the requests as a JSONL file via the File API and references it
+    with ``input_config.file_name`` (single route, any size). Returns the create
+    response (which carries the batch ``name``).
     """
     api_key = _api_key()
     endpoint = f"{_API_ROOT}/v1beta/models/{model}:batchGenerateContent?key={api_key}"
     jsonl_text = build_jsonl(items)
-    if len(jsonl_text.encode("utf-8")) <= _INLINE_MAX_BYTES:
-        requests_payload = [{"key": key, "request": request} for key, request in items]
-        body = {
-            "batch": {
-                "display_name": display_name,
-                "input_config": {"requests": {"requests": requests_payload}},
-            }
+    file_name = upload_jsonl_file(jsonl_text, display_name)
+    body = {
+        "batch": {
+            "display_name": display_name,
+            "input_config": {"file_name": file_name},
         }
-    else:
-        file_name = upload_jsonl_file(jsonl_text, display_name)
-        body = {
-            "batch": {
-                "display_name": display_name,
-                "input_config": {"file_name": file_name},
-            }
-        }
+    }
     return _http_post_json(endpoint, body, timeout=120)
 
 

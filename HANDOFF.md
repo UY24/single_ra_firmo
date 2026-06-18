@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-18. Read this first if you're picking up this repo.
+Last updated: 2026-06-18 (Gemini-batch JSONL-only + Phase-2 resume). Read this first if you're picking up this repo.
 
 ---
 
@@ -10,6 +10,70 @@ The whole backend was restructured on branch `rework` (~38 commits over `main`).
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### ⚡ Session 2026-06-18 — AI Mode Gemini-batch fix, JSONL-only, Phase-2 resume (read this first)
+
+**Trigger:** an `ai_bulk` run with `AI_MODE_LLM_BATCH=true` crashed in Phase 2 with `HTTP Error 400:
+Bad Request`. **Root cause:** the Gemini Batch **inline** payload put the per-request `key` at the top
+level, but the inline (`InlinedRequest`) format requires it under `metadata.key` (only the JSONL/File
+route uses a top-level `key`). The batch path had only ever been tested with Gemini **mocked**, so this
+was its first real hit — NOT an AWS-specific failure. Side effect: the crash also explained the empty
+`website-url-finder` S3 bucket (the run dies before the success-path S3 mirror).
+
+**Round 1 (diagnostics + immediate fix), then Round 2 (the design the user wanted):**
+
+1. **Gemini batch is now JSONL-only** — `services/ai_mode/gemini_batch.py` `create_batch` always
+   uploads the requests as a JSONL file via the File API and references `input_config.file_name`
+   (single path, any size). The inline branch + `_INLINE_MAX_BYTES` were **deleted** (`build_jsonl`'s
+   top-level-key shape is the correct one and was already right; `collect_results` already handles
+   file-style output). Rationale: at scale shards exceed the ~20 MB inline cap anyway, and one route
+   avoids the inline/file key-shape footgun. **⚠️ The File-API path had never run against the real
+   Gemini API before this** — it is now the ONLY path, so live-verify it.
+2. **HTTP error bodies are surfaced** — new `_urlopen_or_raise` in `gemini_batch.py` reads the
+   `HTTPError` body so future 4xx/5xx show Gemini's real message, not bare `HTTP Error 400`.
+3. **Phase-2 resume (no scrape.do re-spend)** — `services/ai_mode/ai_mode_service.py`. Each
+   successfully-cleaned batch is persisted to `cleaned/batch-NNNNNN.json` (`{key,text,usage}`; written
+   in BOTH the Gemini-batch and sync paths; sync usage stored in Gemini `usageMetadata` shape so it
+   reads back through `parse_gemini_usage`). `run_ai_mode_sync(run_id, resume=False)` gained a `resume`
+   flag; Phase 2 **always** pre-loads `cleaned/` (harmless on fresh runs) and only submits the
+   uncleaned batches — so re-entering the same run_id reuses `raw_responses/` (zero scrape.do) AND
+   reuses cleaned batches, re-doing only failed LLM cleanup. On resume the prior `run.log` is kept (not
+   wiped) and stale `gemini_batch_jobs` are cleared.
+4. **Single "Rerun failed" action** — `POST /uploads/ai-mode/{run_id}/resume` (`routers/ai_mode.py`):
+   409 unless status ∈ {`failed`,`completed_with_errors`}; schedules `run_ai_mode_sync(run_id, True)`;
+   the engine updates the **existing** Supabase row (no new row). The UI button (on failed runs,
+   `static/js/run_detail.js`) is labelled **"Rerun failed"** and spells out that it redoes only the
+   failed parts of Phase 1 (scrape) + Phase 2 (cleanup), reusing successes.
+   **The old row-level rerun was REMOVED** — `rerun.py`, `test_rerun.py`, the `POST …/{run_id}/rerun`
+   endpoint, the `carryover.json` merge in assemble, and the `carried_over`/`rerun_of_run_id` UI tiles
+   are all gone. Rationale (user's call): re-running genuinely not-found rows with the same prompt just
+   reproduces the same answer — use **AI Mode Deep (`ai_deep`)** for those instead. (The Supabase
+   `runs.rerun_of` column + `companies.create_run(rerun_of=…)` param were left in place — harmless
+   tracking infra.)
+5. **Crashed runs now mirror to S3** — the `except` path in `run_ai_mode_sync` also calls
+   `mirror_run_to_s3` (best-effort) so `raw_responses/`/`run.log` land in the bucket for debugging.
+6. **Richer progress logging** — Phase 3 emits one `_ai_log` line per entity
+   (`batch N <company> (<country>) -> found <url> (confidence=X%)` / `-> not found`) + a per-batch
+   scrape-failure line. These go to BOTH stdout and `run.log`, gated by `AI_MODE_LOG_LEVEL`. (Context:
+   the user only saw uvicorn `/status` access-log spam in the terminal because the UI polls every 2 s
+   and the engine previously logged only at phase boundaries.)
+
+**Scale note (all config, no code):** 33k rows → `AI_BULK_BATCH_SIZE=10` ⇒ 3,300 scrape.do requests
+(= `scrapedo_searches` cost) ⇒ 3,300 raw files; `SCRAPEDO_CONCURRENCY≈100`; `GEMINI_BATCH_SHARD_SIZE`
+counts scrape-batches per Gemini job (e.g. 1000 ⇒ ~7 jobs), `GEMINI_BATCH_MAX_INFLIGHT` jobs at once.
+
+**Tests:** suite **163/163** green (`cd backend && ../.venv/bin/python -m unittest discover -s tests`).
+`tests/test_gemini_batch.py` rewritten for the File-API path + error-body; new
+`tests/test_ai_mode_resume.py` proves the rerun-failed/resume reuses a pre-cleaned batch and never
+re-scrapes; `tests/test_rerun.py` deleted with the feature. New disk artifact: `cleaned/` (added to
+the per-run layout below).
+
+**NOT yet live-verified (needs real keys):** (a) the JSONL/File-API path end-to-end against real
+Gemini; (b) a real resume after a forced Phase-2 failure. AWS S3 env (`S3_BUCKET`/`S3_REGION`/creds) is
+confirmed present, so successful + resumed runs should mirror to `s3://website-url-finder/`.
+**Not committed** (user will commit).
+
+---
 
 ### ⚡ Session 2026-06-17/18 — S3 per-company/per-pipeline layout (read this first)
 
@@ -245,9 +309,9 @@ or merge disk + Supabase runs on the Runs page). New per-company runs go to `ai_
 (plural) and ARE tracked once Supabase is live.
 
 **Known minor leftovers** (from the final whole-branch review — all low/cosmetic, none blocking):
-rerun re-scrapes notFound-without-error rows (plan-approved but costs tokens); duplicate `sno`s
-possible in merged rerun reports; runs view lacks a date filter; `GET /batch/jobs` makes a live
-Gemini call when `GEMINI_API_KEY` is set; `batch_runner.py` still at repo root.
+runs view lacks a date filter; `GET /batch/jobs` makes a live Gemini call when `GEMINI_API_KEY` is
+set; `batch_runner.py` still at repo root. (The old rerun-specific leftovers are obsolete — rerun was
+removed; see the 2026-06-18 session note at top.)
 
 **Plan/spec docs**: the rework spec is `docs/superpowers/specs/2026-06-11-rework-design.md`; the
 executed 24-task plan is `impplan.md` (all tasks done, each implementer-reviewed twice).
@@ -256,11 +320,12 @@ executed 24-task plan is `impplan.md` (all tasks done, each implementer-reviewed
 ```
 backend/app/
   core/        # config.py (.env + paths), supabase_client.py
-  routers/     # ai_mode.py (preview/upload/rerun/status/result), companies.py
+  routers/     # ai_mode.py (preview/upload/resume/status/result), companies.py
   services/
-    ai_mode/   # ai_mode_service.py (engine), mode_config.py, rerun.py, run_store.py,
-               #   run_reporting.py, cost.py, cleanup.py, gemini_batch.py,
+    ai_mode/   # ai_mode_service.py (engine), mode_config.py, run_store.py,
+               #   run_reporting.py, cost.py, cleanup.py, gemini_batch.py, s3_sync.py,
                #   scrapedo_client.py, llm_client.py, settings.py, models.py
+               #   (rerun.py removed — single "Rerun failed"/resume action only)
     serpwow/   # legacy_app.py — the old ~7.6k-line monolith (still owns the FastAPI instance)
   models/      # entities.py (canonical CSV parser), results.py (EntityResult/Flag/AttemptLog)
   prompts/     # ai_bulk_search.txt, ai_deep_search.txt, ai_cleanup.txt
@@ -299,8 +364,9 @@ ai_mode_results/     # run outputs (gitignored)
 ### Output layout (per run)
 `ai_mode_results/<company-slug>/<run_id>/` — `input.csv`, `status.json`, **one** `final_report.json`
 (summary + per-entity results + per-request records + cost), `found.csv`, `notFound.csv`, **one**
-`run.log` (level via `AI_MODE_LOG_LEVEL`), `raw_responses/request_NNN.json`, `carryover.json`
-(reruns only). The old `report.json` and `ai_mode_debug.log` are gone.
+`run.log` (level via `AI_MODE_LOG_LEVEL`), `raw_responses/request_NNN.json`,
+`cleaned/batch-NNNNNN.json` (one per successfully-cleaned batch — enables the "Rerun failed" resume).
+The old `report.json`, `ai_mode_debug.log`, and `carryover.json` (rerun was removed) are gone.
 
 ### Supabase company tracking (all pipelines)
 - Apply `supabase/migrations/001_init.sql` (creates `companies` + `runs`; run rows carry pipeline,
@@ -324,9 +390,11 @@ removed.)
   (400 + helpful message on bad format).
 - `POST /uploads/ai-mode` — multipart `file` + `mode` (`ai_bulk|ai_deep`) + company fields;
   503 if Supabase unconfigured.
-- `POST /uploads/ai-mode/{run_id}/rerun` — re-runs only failed/unscraped rows of a
-  `failed`/`completed_with_errors` run; previous successes merge into the new run via
-  `carryover.json` (flagged `carried_over`, deduped across chained reruns).
+- `POST /uploads/ai-mode/{run_id}/resume` — the ONLY retry action (UI: "Rerun failed"). Re-enters the
+  SAME run_id (`run_ai_mode_sync(run_id, resume=True)`): reuses `raw_responses/` + re-scrapes only
+  failed-scrape batches (no scrape.do re-spend on successes), reuses `cleaned/` + re-cleans only
+  failed batches; updates the existing Supabase row. 409 unless `failed`/`completed_with_errors`.
+  (The old `POST …/{run_id}/rerun` was removed — see the latest-session note above.)
 - `GET /uploads/ai-mode`, `/{run_id}/status`, `/{run_id}/result?file=...` — as before (allowlist
   updated to the new file set).
 - `GET/POST /companies`, `GET /companies/stats`, `GET /companies/runs` — Supabase-backed views.

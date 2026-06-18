@@ -32,7 +32,7 @@ from typing import Any, Iterable, TypeVar
 
 from app.core.config import LEGACY_AI_MODE_RESULT_DIR
 from app.models.entities import Entity, InvalidCSVError, format_entities_for_prompt, parse_entities_csv
-from app.models.results import EntityResult, Flag
+from app.models.results import EntityResult
 from app.services.ai_mode import gemini_batch, run_store
 from app.services.ai_mode.cost import build_cost_summary, calculate_llm_cost_usd
 from app.services.ai_mode.cleanup import (
@@ -57,6 +57,7 @@ ALLOWED_RESULT_FILES = {
 }
 
 RAW_RESPONSES_DIRNAME = "raw_responses"
+CLEANED_DIRNAME = "cleaned"
 
 # In-memory write-through cache of run status dicts.
 _RUNS: dict[str, dict] = {}
@@ -591,12 +592,19 @@ def _initial_status(
 # --------------------------------------------------------------------------- #
 # run_ai_mode_sync (orchestrator)
 # --------------------------------------------------------------------------- #
-def run_ai_mode_sync(run_id: str) -> None:
+def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
     """Execute the full scrape.do -> LLM pipeline for a prepared run.
 
     Synchronous; intended to be called via ``asyncio.to_thread``. Never raises to
     the caller: any unexpected error is captured in status.json (status="failed").
     Persists status after every batch so a UI can poll progress.
+
+    When ``resume`` is True (re-running a failed/partial run on the SAME run_id),
+    Phase 1 reuses existing ``raw_responses/`` (no scrape.do re-spend) and Phase 2
+    reuses existing ``cleaned/`` batches, so only the still-failed Gemini work is
+    redone. Phase 2 resume is automatic (the cleaned/ pre-load is harmless on a
+    fresh run); ``resume`` additionally preserves the prior run.log and drops stale
+    batch-job names.
     """
     run_dir = run_store.find_run_dir(run_id)
     if run_dir is None:
@@ -606,12 +614,12 @@ def run_ai_mode_sync(run_id: str) -> None:
     started_at = utc_now_iso()
     wall_t0 = time.perf_counter()
     run_log = _run_log_path(run_dir)
-    if run_log.exists():
+    if not resume and run_log.exists():
         try:
             run_log.unlink()
         except OSError:
             pass
-    _ai_log(run_id, run_dir, "AI Mode run starting")
+    _ai_log(run_id, run_dir, "AI Mode run resuming" if resume else "AI Mode run starting")
 
     status["status"] = "running"
     status["started_at"] = started_at
@@ -671,6 +679,8 @@ def run_ai_mode_sync(run_id: str) -> None:
 
         raw_dir = run_dir / RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_dir = run_dir / CLEANED_DIRNAME
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
 
         results: list[EntityResult] = []
         per_request_records: list[dict] = []
@@ -790,6 +800,41 @@ def run_ai_mode_sync(run_id: str) -> None:
                 for entity in rec["group"]
             ]
 
+        def _usage_metadata(usage: TokenUsage) -> dict:
+            # Store usage in Gemini's native usageMetadata shape so a resumed batch
+            # (sync OR Gemini-batch origin) reads back through parse_gemini_usage.
+            return {
+                "promptTokenCount": usage.prompt_tokens,
+                "candidatesTokenCount": usage.completion_tokens,
+                "totalTokenCount": usage.total_tokens,
+            }
+
+        def _write_cleaned(key: str, text: str, usage_md: dict | None) -> None:
+            # Persist one successfully-cleaned batch so a resume can skip it.
+            # Best-effort: a write failure must never fail the run.
+            if not (text or "").strip():
+                return
+            try:
+                (cleaned_dir / f"{key}.json").write_text(
+                    json.dumps({"key": key, "text": text, "usage": usage_md}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                _ai_log(run_id, run_dir, f"failed to write cleaned/{key}.json: {exc}", logging.WARNING)
+
+        def _load_cleaned(key: str) -> dict | None:
+            # Return a previously-cleaned {key,text,usage} record, or None.
+            path = cleaned_dir / f"{key}.json"
+            if not path.exists():
+                return None
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                return None
+            if isinstance(obj, dict) and str(obj.get("text") or "").strip():
+                return obj
+            return None
+
         def _messages_for(rec: dict) -> list[dict]:
             return build_cleanup_messages(_payload_text(rec["payload"]), rec["group"])
 
@@ -802,19 +847,32 @@ def run_ai_mode_sync(run_id: str) -> None:
             timeout_sec = max(60, _int_env("AI_MODE_BATCH_TIMEOUT_SEC", 172800))
             clean_t0 = time.perf_counter()
 
+            collected_by_key: dict[str, dict] = {}
+            # Resume: reuse batches already cleaned on a prior attempt; only the
+            # rest get re-submitted to Gemini (Phase 1 already reused raw files, so
+            # scrape.do is never re-billed). Harmless on a fresh run (cleaned/ empty).
+            for rec in ok_batches:
+                key = f"batch-{rec['request_index']:06d}"
+                loaded = _load_cleaned(key)
+                if loaded is not None:
+                    collected_by_key[key] = loaded
+            already_cleaned = len(collected_by_key)
+
             items: list[tuple[str, dict]] = []
             for rec in ok_batches:
                 key = f"batch-{rec['request_index']:06d}"
+                if key in collected_by_key:
+                    continue
                 items.append((key, gemini_batch.messages_to_gemini_request(_messages_for(rec))))
             shards = [items[i : i + shard_size] for i in range(0, len(items), shard_size)]
             _ai_log(
                 run_id, run_dir,
                 f"Phase 2 Gemini batch: {len(items)} requests in {len(shards)} shard(s) "
-                f"shard_size={shard_size} max_inflight={max_inflight} model={cfg.model}",
+                f"shard_size={shard_size} max_inflight={max_inflight} model={cfg.model}"
+                + (f" (reusing {already_cleaned} already-cleaned)" if already_cleaned else ""),
             )
 
-            collected_by_key: dict[str, dict] = {}
-            job_names: list[str] = list(status.get("gemini_batch_jobs") or [])
+            job_names: list[str] = [] if resume else list(status.get("gemini_batch_jobs") or [])
             next_shard = 0
             inflight: dict[str, int] = {}  # batch_name -> shard index
             deadline = time.monotonic() + timeout_sec
@@ -861,6 +919,8 @@ def run_ai_mode_sync(run_id: str) -> None:
                             for c in gemini_batch.collect_results(batch_obj):
                                 if c.get("key"):
                                     collected_by_key[c["key"]] = c
+                                    if c.get("text") and not c.get("error"):
+                                        _write_cleaned(c["key"], c["text"], c.get("usage"))
                             _ai_log(
                                 run_id, run_dir,
                                 f"Gemini batch shard {si + 1} succeeded job={name} state={sname}",
@@ -904,6 +964,16 @@ def run_ai_mode_sync(run_id: str) -> None:
         else:
             for rec in ok_batches:
                 idx = rec["request_index"]
+                key = f"batch-{idx:06d}"
+                # Resume: reuse a previously-cleaned batch instead of re-calling the LLM.
+                loaded = _load_cleaned(key)
+                if loaded is not None:
+                    parsed_array = parse_json_array_from_text(loaded["text"])
+                    if parsed_array is not None:
+                        usage_total = usage_total + parse_gemini_usage(loaded.get("usage"))
+                        batch_results_by_index[idx] = parse_cleanup_response(parsed_array, rec["group"])
+                        llm_seconds_by_index[idx] = 0.0
+                        continue
                 messages = _messages_for(rec)
                 t0 = time.perf_counter()
                 try:
@@ -920,6 +990,7 @@ def run_ai_mode_sync(run_id: str) -> None:
                         batch_results_by_index[idx] = parse_cleanup_response(
                             parsed_array, rec["group"]
                         )
+                        _write_cleaned(key, json.dumps(parsed_array, ensure_ascii=False), _usage_metadata(usage))
                 except Exception as exc:
                     secs = time.perf_counter() - t0
                     msg = sanitize_secret_text(f"LLM error: {exc}")
@@ -939,6 +1010,13 @@ def run_ai_mode_sync(run_id: str) -> None:
             idx = rec["request_index"]
             if rec["payload"] is None:
                 results.extend(_error_results(rec, f"scrape.do error: {rec['error']}"))
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"batch {idx} scrape failed -> {len(rec['group'])} entities not found "
+                    f"({rec['error']})",
+                    logging.WARNING,
+                )
                 per_request_records.append(
                     {
                         "request_index": idx,
@@ -954,7 +1032,23 @@ def run_ai_mode_sync(run_id: str) -> None:
                     }
                 )
                 continue
-            results.extend(batch_results_by_index.get(idx, []))
+            batch_results = batch_results_by_index.get(idx, [])
+            results.extend(batch_results)
+            for r in batch_results:
+                if r.website_url:
+                    _ai_log(
+                        run_id,
+                        run_dir,
+                        f"batch {idx} {r.company_name} ({r.country}) -> "
+                        f"found {r.website_url} (confidence={r.confidence}%)",
+                    )
+                else:
+                    _ai_log(
+                        run_id,
+                        run_dir,
+                        f"batch {idx} {r.company_name} ({r.country}) -> not found"
+                        + (f" ({r.error})" if r.error else ""),
+                    )
             rec_error = llm_error_by_index.get(idx)
             llm_secs = llm_seconds_by_index.get(idx, 0.0)
             per_request_records.append(
@@ -971,40 +1065,6 @@ def run_ai_mode_sync(run_id: str) -> None:
                     "scrapedo_params": rec["geo_debug"],
                 }
             )
-
-        # ----------------------------------------------------------------- #
-        # Re-run carryover (Task 17): merge the previous run's successes into
-        # this run's outputs. Carried entities count toward websites_found
-        # (the run's found.csv really contains those URLs) but NOT toward
-        # scrapedo/llm request or token stats; the summary exposes a separate
-        # ``carried_over`` count so the split stays visible.
-        # ----------------------------------------------------------------- #
-        carried_over = 0
-        carryover_path = run_dir / "carryover.json"
-        if carryover_path.exists():
-            try:
-                carried_objs = json.loads(carryover_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError) as exc:
-                carried_objs = []
-                _ai_log(
-                    run_id, run_dir,
-                    f"carryover.json unreadable; ignoring ({exc})", logging.WARNING,
-                )
-            for obj in carried_objs:
-                if not isinstance(obj, dict):
-                    continue
-                result = EntityResult.from_llm_object(obj)
-                # Chained reruns: the entity may already carry a carried_over
-                # flag from an earlier run — don't stack duplicates.
-                if not any(f.flag == "carried_over" for f in result.flags):
-                    result.flags.append(Flag("carried_over", "from previous run"))
-                results.append(result)
-                carried_over += 1
-            if carried_over:
-                _ai_log(
-                    run_id, run_dir,
-                    f"Merged {carried_over} carried-over success(es) from previous run",
-                )
 
         # ----------------------------------------------------------------- #
         # Outputs: found.csv / notFound.csv / ONE final_report.json
@@ -1045,7 +1105,6 @@ def run_ai_mode_sync(run_id: str) -> None:
             "llm_errors": llm_errors,
             "websites_found": websites_found,
             "websites_not_found": websites_not_found,
-            "carried_over": carried_over,
             "scrapedo_request_count": len(per_request_records),
             "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
@@ -1090,7 +1149,6 @@ def run_ai_mode_sync(run_id: str) -> None:
         status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
         status["websites_found"] = websites_found
         status["websites_not_found"] = websites_not_found
-        status["carried_over"] = carried_over
         status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
         status["llm_seconds_total"] = round(llm_seconds_total, 3)
         status["batch_duration_seconds"] = round(total_wall, 3)
@@ -1148,4 +1206,19 @@ def run_ai_mode_sync(run_id: str) -> None:
             f"AI Mode run crashed error={status['error']}",
             logging.ERROR,
         )
+        # Mirror the failed run dir to S3 too, so raw_responses/run.log are available
+        # for debugging (best-effort; never mask the original failure).
+        try:
+            from app.services.ai_mode.s3_sync import mirror_run_to_s3
+            mode_key = str(status.get("mode") or "ai_bulk")
+            mirrored = mirror_run_to_s3(run_dir, mode_key)
+            if mirrored:
+                _ai_log(
+                    run_id,
+                    run_dir,
+                    f"Mirrored {len(mirrored)} file(s) of the failed run to S3 "
+                    f"under {run_dir.parent.name}/{mode_key}/{run_id}",
+                )
+        except Exception:  # never let mirroring obscure the crash
+            pass
         return

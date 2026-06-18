@@ -5,9 +5,11 @@ are monkeypatched so nothing touches the network. Uses ``unittest`` to match the
 style of the existing ``tests/`` suite (see ``test_timing_summary.py``).
 """
 
+import io
 import json
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from app.services.ai_mode import gemini_batch
 
@@ -144,9 +146,14 @@ class CollectResultsFileTests(unittest.TestCase):
         self.assertEqual(record["text"], '{"y":2}')
 
 
-class CreateBatchInlineTests(unittest.TestCase):
-    def test_tiny_payload_uses_inline_path(self) -> None:
+class CreateBatchFileTests(unittest.TestCase):
+    def test_payload_is_uploaded_as_file_and_referenced_by_name(self) -> None:
         captured: dict[str, object] = {}
+
+        def fake_upload(jsonl_text, display_name):
+            captured["jsonl_text"] = jsonl_text
+            captured["display_name"] = display_name
+            return "files/abc"
 
         def fake_post(url, body, timeout=120):
             captured["url"] = url
@@ -154,8 +161,8 @@ class CreateBatchInlineTests(unittest.TestCase):
             return {"name": "batches/test"}
 
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), patch.object(
-            gemini_batch, "_http_post_json", side_effect=fake_post
-        ):
+            gemini_batch, "upload_jsonl_file", side_effect=fake_upload
+        ), patch.object(gemini_batch, "_http_post_json", side_effect=fake_post):
             create_obj = gemini_batch.create_batch(
                 "gemini-2.5-flash-lite",
                 [("k", {"contents": []})],
@@ -165,13 +172,34 @@ class CreateBatchInlineTests(unittest.TestCase):
         self.assertEqual(gemini_batch.batch_name_from_create(create_obj), "batches/test")
 
         input_config = captured["body"]["batch"]["input_config"]
-        # Inline path: requests present, no file_name.
-        self.assertIn("requests", input_config)
-        self.assertIn("requests", input_config["requests"])
-        self.assertNotIn("file_name", input_config)
-        inline_requests = input_config["requests"]["requests"]
-        self.assertEqual(len(inline_requests), 1)
-        self.assertEqual(inline_requests[0]["key"], "k")
+        # File-API path is the ONLY path now: file_name present, no inline requests.
+        self.assertEqual(input_config["file_name"], "files/abc")
+        self.assertNotIn("requests", input_config)
+
+    def test_uploaded_jsonl_uses_top_level_key_and_round_trips(self) -> None:
+        """The JSONL we upload uses build_jsonl's top-level-key shape, and that key
+        is what collect_results would read back via _response_key."""
+        captured: dict[str, object] = {}
+
+        def fake_upload(jsonl_text, display_name):
+            captured["jsonl_text"] = jsonl_text
+            return "files/abc"
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), patch.object(
+            gemini_batch, "upload_jsonl_file", side_effect=fake_upload
+        ), patch.object(gemini_batch, "_http_post_json", return_value={"name": "b"}):
+            gemini_batch.create_batch(
+                "gemini-2.5-flash-lite",
+                [("batch-000007", {"contents": []})],
+                display_name="t",
+            )
+
+        lines = [l for l in str(captured["jsonl_text"]).splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        line_obj = json.loads(lines[0])
+        self.assertEqual(set(line_obj.keys()), {"key", "request"})
+        self.assertEqual(line_obj["key"], "batch-000007")
+        self.assertEqual(gemini_batch._response_key(line_obj), "batch-000007")
 
 
 class ParseJsonFromTextTests(unittest.TestCase):
@@ -183,6 +211,20 @@ class ParseJsonFromTextTests(unittest.TestCase):
 
     def test_non_json_returns_none(self) -> None:
         self.assertIsNone(gemini_batch.parse_json_from_text("not json"))
+
+
+class HttpErrorBodyTests(unittest.TestCase):
+    def test_http_error_body_is_surfaced_in_runtime_error(self) -> None:
+        body = b'{"error":{"message":"Invalid JSON payload received. Unknown name \\"key\\""}}'
+        err = HTTPError("http://x", 400, "Bad Request", {}, io.BytesIO(body))
+
+        with patch.object(gemini_batch, "urlopen", side_effect=err):
+            with self.assertRaises(RuntimeError) as ctx:
+                gemini_batch._http_get_json("http://x")
+
+        message = str(ctx.exception)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("Unknown name", message)
 
 
 if __name__ == "__main__":

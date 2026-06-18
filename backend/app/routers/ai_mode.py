@@ -100,98 +100,38 @@ async def create_ai_mode_upload(
     return info
 
 
-@router.post("/uploads/ai-mode/{run_id}/rerun")
-async def rerun_ai_mode_upload(run_id: str) -> dict[str, Any]:
-    """Re-run a failed/partial run: retry only failed/unscraped rows, carry successes.
+@router.post("/uploads/ai-mode/{run_id}/resume")
+async def resume_ai_mode_upload(run_id: str) -> dict[str, Any]:
+    """Re-run a failed/partial run IN PLACE (same run_id) — the only retry action.
 
-    NOTE: legacy-layout runs (``ai_mode_result/<run_id>``) resolve to no
-    new-layout run dir and get a 404 here — they predate the company-aware
-    layout and cannot be re-run.
+    The UI labels this "Rerun failed". It re-enters the same run: Phase 1 reuses
+    existing ``raw_responses/`` and re-scrapes only batches that failed to scrape
+    (no scrape.do re-spend on successes); Phase 2 reuses existing ``cleaned/``
+    batches and re-cleans only the failed ones. The engine updates the existing
+    Supabase run row (no new row). Genuinely not-found rows are NOT retried here —
+    use AI Mode Deep (``ai_deep``) for those.
     """
-    from app.services.ai_mode import ai_mode_service, rerun, run_store
+    from app.services.ai_mode import ai_mode_service, run_store
 
-    prev_run_dir = await asyncio.to_thread(run_store.find_run_dir, run_id)
-    if prev_run_dir is None:
+    run_dir = await asyncio.to_thread(run_store.find_run_dir, run_id)
+    if run_dir is None:
         raise HTTPException(status_code=404, detail="AI mode run not found")
-    prev_status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
-    prev_state = str(prev_status.get("status") or "")
-    if prev_state not in {"failed", "completed_with_errors"}:
+    status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
+    state = str(status.get("status") or "")
+    if state not in {"failed", "completed_with_errors"}:
         raise HTTPException(
-            status_code=400,
+            status_code=409,
             detail=(
-                f"run status is '{prev_state}'; only failed or "
-                "completed_with_errors runs can be re-run"
+                f"run status is '{state}'; resume only applies to failed or "
+                "completed_with_errors runs"
             ),
         )
-    try:
-        retry_csv, carryover = await asyncio.to_thread(rerun.split_for_rerun, prev_run_dir)
-    except FileNotFoundError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="previous run is missing final_report.json/input.csv; cannot re-run",
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    svc = get_company_service()
-    if svc is None:
-        raise HTTPException(
-            status_code=503,
-            detail=_supabase_not_configured_detail(),
-        )
-    mode = str(prev_status.get("mode") or "ai_bulk")
-    company_id = str(prev_status.get("company_id") or "")
-    company_name = str(prev_status.get("company_name") or "")
-    # Refresh the company name from Supabase when possible, but fall back to
-    # the name recorded in the previous run's status: a Supabase blip must not
-    # block a re-run (the run dir slug only needs a stable display name).
-    try:
-        company = await asyncio.to_thread(svc.get_company, company_id) if company_id else None
-    except Exception:
-        company = None
-    if company:
-        company_name = company["name"]
-
-    try:
-        info = ai_mode_service.prepare_ai_mode_run(
-            retry_csv.encode("utf-8"),
-            f"rerun_of_{run_id}.csv",
-            mode_key=mode,
-            company_name=company_name,
-            company_id=company_id,
-        )
-    except (InvalidCSVError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    new_run_id = info["run_id"]
-    if carryover:
-        new_run_dir = await asyncio.to_thread(run_store.find_run_dir, new_run_id)
-        if new_run_dir is not None:
-            await asyncio.to_thread(rerun.write_carryover, new_run_dir, carryover)
-    info["rerun_of_run_id"] = run_id
-    info["carried_over"] = len(carryover)
-    await asyncio.to_thread(
-        ai_mode_service.set_status_fields,
-        new_run_id,
-        rerun_of_run_id=run_id,
-        carried_over=len(carryover),
+    task = asyncio.create_task(
+        asyncio.to_thread(ai_mode_service.run_ai_mode_sync, run_id, True)
     )
-    # Best-effort Supabase tracking, linked to the previous run's row when known.
-    run_db_id = await asyncio.to_thread(
-        svc.create_run,
-        company_id=company_id,
-        pipeline=mode,
-        run_ref=new_run_id,
-        total_rows=info["total_rows"],
-        rerun_of=prev_status.get("run_db_id"),
-    )
-    if run_db_id:
-        info["run_db_id"] = run_db_id
-        await asyncio.to_thread(ai_mode_service.set_run_db_id, new_run_id, run_db_id)
-    task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, new_run_id))
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)
-    return info
+    return {"run_id": run_id, "status": "running", "resumed": True}
 
 
 @router.get("/uploads/ai-mode")

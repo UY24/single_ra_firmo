@@ -143,29 +143,32 @@ function downloadsCard(ref, available) {
   );
 }
 
-function rerunCard(ref) {
+function rerunFailedCard(ref) {
   const msg = el("div", { class: "mt-3 hidden" });
   const btn = el("button", {
     class: "btn-primary disabled:opacity-50",
     onclick: async () => {
       btn.disabled = true;
       msg.className = "mt-3";
-      msg.replaceChildren(el("p", { class: "section-copy" }, "Starting re-run..."));
+      msg.replaceChildren(el("p", { class: "section-copy" }, "Rerunning failed work..."));
       try {
-        const info = await api(`/uploads/ai-mode/${encodeURIComponent(ref)}/rerun`, { method: "POST" });
+        await api(`/uploads/ai-mode/${encodeURIComponent(ref)}/resume`, { method: "POST" });
         msg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
-          `Re-run started (carried over ${fmtNum(info.carried_over)} rows). Redirecting...`));
-        setTimeout(() => { window.location.hash = `#/runs/${encodeURIComponent(info.run_id)}`; }, 700);
+          "Rerun started. Reloading..."));
+        setTimeout(() => { window.location.reload(); }, 700);
       } catch (e) {
-        btn.disabled = false; // 400/404/503 → inline detail
+        btn.disabled = false; // 404/409 → inline detail
         msg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
       }
     },
-  }, "Re-run failed rows");
+  }, "Rerun failed");
   return el("div", { class: "panel" },
-    el("h2", { class: "section-title" }, "Re-run"),
+    el("h2", { class: "section-title" }, "Rerun failed"),
     el("p", { class: "mt-1 text-xs text-slate-400" },
-      "Retries failed/unscraped rows; successful results are carried over."),
+      "Re-runs this same run and redoes only what failed: Phase 1 (scrape) re-fetches "
+      + "only batches that failed to scrape, Phase 2 (LLM cleanup) re-does only batches "
+      + "that failed to clean. Successful scrapes and cleaned results are reused — no "
+      + "scrape.do or LLM re-spend on them. (Not-found rows are final; use AI Mode Deep for those.)"),
     el("div", { class: "mt-3" }, btn), msg,
   );
 }
@@ -192,18 +195,6 @@ function renderAiStatus(root, ref, s) {
     statTile("LLM cost", fmtUsd(s.cost?.total_usd)),
     statTile("Duration", fmtDuration(s.batch_duration_seconds)),
   ];
-  if (Number(s.carried_over) > 0) {
-    tiles.push(statTile("Carried over", fmtNum(s.carried_over)));
-  }
-  if (s.rerun_of_run_id) {
-    tiles.push(el("a", {
-      href: `#/runs/${encodeURIComponent(s.rerun_of_run_id)}`,
-      class: "metric-card block transition hover:border-cyan-400/60",
-    },
-      el("p", { class: "metric-label" }, "Re-run of"),
-      el("p", { class: "mt-1 truncate text-sm font-semibold text-indigo-600" }, s.rerun_of_run_id),
-    ));
-  }
 
   const parts = [
     headerCard(s.company_name || "—",
@@ -217,7 +208,7 @@ function renderAiStatus(root, ref, s) {
       el("p", { class: "text-sm" }, s.error)));
   }
   parts.push(downloadsCard(ref, s.available_files));
-  if (["failed", "completed_with_errors"].includes(s.status)) parts.push(rerunCard(ref));
+  if (["failed", "completed_with_errors"].includes(s.status)) parts.push(rerunFailedCard(ref));
 
   root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
 }

@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-13. Read this first if you're picking up this repo.
+Last updated: 2026-06-18. Read this first if you're picking up this repo.
 
 ---
 
@@ -10,6 +10,156 @@ The whole backend was restructured on branch `rework` (~38 commits over `main`).
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### ⚡ Session 2026-06-17/18 — S3 per-company/per-pipeline layout (read this first)
+
+**Goal achieved:** every pipeline now writes results to a NEW S3 bucket `website-url-finder`
+(region `ap-south-1`), keyed **`<company>/<pipeline>/<run_id|upload_id>/…`**. AI Mode (previously
+disk-only) now mirrors to S3; SerpWow moved off the old `single_ra_isi/` prefix. There is also a new
+repo-root **`CLAUDE.md`** (code-derived project guide — start there for the big picture).
+
+AWS: the creds in `.env` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) are IAM user
+`himanshu.mirchandani`, account `714677628526`. To browse S3:
+`export AWS_ACCESS_KEY_ID=$(grep '^AWS_ACCESS_KEY_ID=' .env|cut -d= -f2-); … ; AWS_DEFAULT_REGION=ap-south-1 aws s3 ls s3://website-url-finder/`.
+
+**New files**
+- `backend/app/core/s3.py` — shared S3 helper (`get_s3_client`, `is_configured`, `bucket_name`,
+  `upload_file`, `upload_directory`). Reads `S3_BUCKET`/`S3_REGION`. Used by AI Mode.
+- `backend/app/services/ai_mode/s3_sync.py` — `mirror_run_to_s3(run_dir, mode_key)` walks the run dir
+  and uploads to `<company_slug>/<mode_key>/<run_id>/`; key prefix = `run_dir.parent.name`/`mode_key`/
+  `run_dir.name`. **Best-effort: logs + swallows all errors, never fails the run; no-ops if S3 unset.**
+- Tests: `tests/test_s3_helper.py`, `tests/test_ai_mode_s3_sync.py`, `tests/test_s3_layout.py`.
+
+**AI Mode wiring** — `ai_mode_service.run_ai_mode_sync` calls `mirror_run_to_s3(run_dir, mode.key)` at
+the very end of the success path (after `_persist_status`, before the `except`). Reruns re-enter the
+same function, so they mirror too. Folder names are the raw mode keys: `ai_bulk`, `ai_deep`.
+
+**SerpWow changes (`legacy_app.py`)**
+- `_upload_s3_prefix(upload_id, company_name="", pipeline="")` → `<company>/<pipeline>/<upload_id>`
+  (graceful fallback to `<company>/<upload_id>` then `<upload_id>`). **`S3_PREFIX` ("single_ra_isi")
+  is now a dead constant** — local `/tmp/single_ra_isi` layout is unchanged, but no S3 key uses it.
+- `pipeline` threaded into the 4 key helpers + `_upload_file_links` (and its 3 callers) +
+  `write_upload_artifact` (reads `data["pipeline"]`) + `write_upload_text_artifact` (+`_batch_pipeline`)
+  + the per-row `_upload_serpwow_json_sync`/`upload_serpwow_json_to_s3` (was still flat).
+- **`build_upload_output_payload` now includes `company_name`** — it was missing, so previously a
+  company-named upload's `output.json` split to a different S3 folder than its `state.json`. Fixed.
+- Cold-start scanners (`_find_s3_upload_key_sync`, `_list_state_keys_from_s3_sync`) now paginate the
+  **whole bucket** (new layout has no shared top-level prefix); they still match by suffix.
+
+**Env** — `.env` already set to `S3_BUCKET=website-url-finder` / `S3_REGION=ap-south-1` (by the user);
+`.env.example` updated to match. The bucket was created this session (`aws s3api create-bucket`).
+**Old `era2-india-2026/single_ra_isi/…` runs were NOT migrated** (user's choice) — they won't be
+re-found after a server restart; new runs go to the new bucket.
+
+**Test hermeticity (important)** — `config.py` `load_dotenv` puts the real `S3_BUCKET` into the env, so
+any test that drives `run_ai_mode_sync` would otherwise attempt a LIVE S3 upload. Added
+`"S3_BUCKET": ""` to `FAKE_ENV` in **`tests/test_engine_smoke.py`** and **`tests/test_rerun.py`** to keep
+them offline. New code keeps the suite at **160/160 green** (`cd backend && ../.venv/bin/python -m
+unittest discover -s tests`).
+
+**Flags CSV** — `EntityResult.flags_csv()` now `"\n".join(...)` (was `"; "`); `tests/test_results.py`
+updated to expect the newline form. Verified via the real `write_outputs` path that the newline is a
+genuine embedded char in a **quoted** cell → CSV readers keep it as ONE row (Excel shows multi-line),
+NOT a literal `\n` and NOT a row split. (This was the user's in-flight `results.py` edit, now committed
+with its test.)
+
+**Commits this session (on `rework`):** `Add shared core/s3 helper…`, `Add AI Mode S3 mirror…`,
+`Mirror AI Mode runs to S3 at finalization`, `Key SerpWow S3 artifacts by company/pipeline/upload_id`,
+`Point S3_BUCKET at website-url-finder`, `Key per-row SerpWow JSON uploads by company/pipeline too`,
+`Render flags one-per-line in CSV cells`. Spec/plan (on disk only; `docs/` is gitignored):
+`docs/superpowers/{specs,plans}/2026-06-17-s3-per-company-pipeline-layout*`.
+
+**Live-verified:** ran `mirror_run_to_s3` against the real bucket — files landed at
+`smoke-test-co/ai_bulk/<run_id>/…` (incl. the `raw_responses/` subfolder), then deleted. A full
+end-to-end AI-Mode/SerpWow run against the bucket was NOT done (would spend scrape.do/LLM credits).
+
+---
+
+### ⚡ Session 2026-06-15/16 — changes a new agent must know
+
+**Files touched this session:**
+`backend/app/services/serpwow/legacy_app.py`, `backend/app/static/js/new_run.js`,
+`backend/app/static/js/runs.js`, `backend/app/static/js/run_detail.js`,
+`backend/app/services/ai_mode/ai_mode_service.py`, `backend/app/models/results.py`,
+`.env.example`
+
+**1. Company-name folder structure (disk + S3) — `legacy_app.py`**
+
+Upload files now live under `{UPLOAD_BASE_DIR}/{safe_company_name}/{upload_id}/` instead of
+flat `{UPLOAD_BASE_DIR}/{upload_id}/`. `_safe_name()` sanitises the company name for path use.
+
+- **`_upload_dir(upload_id, company_name="")`** — creates the directory at write time;
+  flat path when `company_name` is empty (backward compat).
+- **`_find_upload_dir(upload_id)`** — read-time scanner: tries flat path first, then iterates
+  children of `UPLOAD_BASE_DIR`; old flat-layout uploads keep working.
+- **`_upload_s3_prefix(upload_id, company_name="")`** — new helper; 4 S3 key functions
+  (`_state_s3_key`, `_output_s3_key`, `_batch_input_jsonl_s3_key`, `_batch_output_json_s3_key`)
+  delegate to it, all accept optional `company_name=""`.
+- **`_find_s3_upload_key_sync(upload_id, suffix)`** — S3 cold-start read for nested paths;
+  tries `head_object` on flat key first (O(1)), then paginates `list_objects_v2` as fallback.
+  Used by `read_upload_artifact` so runs written under the new layout survive a server restart
+  (no `/tmp` state).
+- **`_create_upload_with_rows`** now accepts `company_name: str = ""`, stores it in state dict,
+  and calls `_upload_dir(upload_id, company_name)`.
+- **`_list_local_state_files_sync`** globs both `*/state.json` (flat) and `*/*/state.json` (nested).
+- Five upload endpoints (`/uploads`, `/uploads/gmaps`, `/uploads/gsearch`, `/uploads/firmographics`,
+  `/uploads/url-discovery`) now accept `company_name: str = Form("")` and pass it through.
+
+**2. Supabase tracking for SerpWow** — already fully implemented before this session; no changes.
+
+**3. Runs page shows all pipeline types — `runs.js`**
+
+- Added `PIPELINE_LABELS` mapping raw keys to human-readable names:
+  `full→"Upload Console"`, `gmaps→"Google Maps"`, `gsearch→"Google Search"`,
+  `firmographics→"Firmographics"`, `url_discovery→"URL Discovery"`,
+  `ai_bulk→"AI Mode — Bulk"`, `ai_deep→"AI Mode — Deep Search"`.
+- Pipeline filter dropdown and table cell use `PIPELINE_LABELS[p] ?? p`.
+- "Found" column shows `fmtNum(r.websites_found ?? r.success_count)` (covers both AI Mode
+  and SerpWow run schemas).
+
+**4. CSV column schema panel in new-run UI — `new_run.js`**
+
+Shows required/optional columns for each pipeline type before upload:
+- `_AI_COLS` for `ai_bulk` / `ai_deep`; `_SW_COLS` for SerpWow pipelines; `_FIRMO_COLS` for
+  `firmographics` (has `official_website` required instead of being output).
+- `csvSchemaPanel(pipeline)` renders amber chips (required `*`) and gray chips (`opt`); hover
+  shows accepted alias column names.
+- Wired into step 3 via `schemaArea.replaceChildren(csvSchemaPanel(state.pipeline))` in `refresh()`.
+- `startRun` appends `company_name` to the FormData for non-AI pipelines:
+  `if (!state.pipeline.ai) fd.append("company_name", state.companyName ?? "");`
+
+**5. Geo-targeting hardcoded via env — `ai_mode_service.py`**
+
+Removed per-row country→GL derivation; geo is now hardcoded globally via env vars:
+- **Removed:** `COUNTRY_GL_ALIASES` dict (64 entries), `_country_to_gl()`, `_entity_country()`,
+  `_location_from_entity()` functions, `GOOGLE_DOMAIN_BY_GL` dict, `_google_domain_for_gl()`.
+- **`_geo_params_for_group(settings)`** now takes only `settings` (no `group` arg):
+  reads `settings.scrapedo_gl` (default `"us"`) and `settings.scrapedo_google_domain`
+  (default `"google.com"`) directly.
+- **`.env.example`** `§3d` updated: `SCRAPEDO_GL` and `SCRAPEDO_GOOGLE_DOMAIN` now documented
+  as the **only** geo-targeting mechanism with usage examples.
+
+**6. Inline file viewer on run detail — `run_detail.js`**
+
+- `_ensureModal()` / `viewFile(url, filename, downloadUrl)` — singleton overlay modal rendered
+  once into `document.body`; fetches file content (no `download=true`) and shows it in a `<pre>`
+  block inside the modal.
+- `downloadsCard` renamed to "Files"; each row now shows `[filename] [View] [Download]`.
+- **`el()` attribute gotcha** (important for future work): `el()` calls `Object.entries(attrs)`
+  and `node.setAttribute(k, v)` for all keys — passing `disabled: undefined` still sets the
+  attribute (to the string `"undefined"`), disabling the element. Use the spread pattern:
+  `...(condition ? {} : { disabled: "" })`. Same applies to `href: undefined` → broken link.
+  The `downloadsCard` was fixed to use `...(isAvailable ? {} : { disabled: "" })` for the View
+  button and `...(isAvailable ? { href: ..., download: name } : {})` for the Download anchor.
+
+**7. Flags format in CSV output — `backend/app/models/results.py`**
+
+`EntityResult.flags_csv()` (line 34) changed from `"; ".join(...)` to `"\n".join(...)`.
+Each flag now occupies its own line in the CSV cell (`flag_name: description\nflag2: ...`),
+matching the attempt_log column format. The JSON report (`to_report_dict`) is unchanged
+(still a list of `{flag, why}` objects).
+
+---
 
 ### ⚡ Latest session additions (post-rework, same day) — STATE A NEW AGENT MUST KNOW
 

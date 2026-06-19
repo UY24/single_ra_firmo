@@ -682,6 +682,15 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         cleaned_dir = run_dir / CLEANED_DIRNAME
         cleaned_dir.mkdir(parents=True, exist_ok=True)
 
+        # Write-through to S3 as files are produced (mirrors SerpWow's per-row
+        # uploads): stream input.csv/status.json now and each raw/cleaned file as
+        # it lands, so a hard kill (OOM/SIGKILL/spot reclaim) that bypasses the
+        # end-of-run mirror still leaves a resumable copy in S3. The end-of-run
+        # mirror still writes the aggregates (final_report/found/notFound).
+        from app.services.ai_mode import s3_sync
+        for _seed in ("input.csv", "status.json"):
+            s3_sync.mirror_file_to_s3(run_dir, mode.key, run_dir / _seed)
+
         results: list[EntityResult] = []
         per_request_records: list[dict] = []
         usage_total = TokenUsage()
@@ -707,7 +716,7 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             group_names = [e.company_name for e in group]
             query = search_prompt.replace("{entities}", format_entities_for_prompt(group))
             geo_params, geo_debug = _geo_params_for_group(settings)
-            raw_name = f"request_{request_index:03d}.json"
+            raw_name = f"request_{request_index:06d}.json"
             raw_path = raw_dir / raw_name
             rel_raw_path = f"{RAW_RESPONSES_DIRNAME}/{raw_name}"
             # Resume: reuse an existing, parseable raw response instead of re-scraping.
@@ -730,6 +739,9 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 raw_path.write_text(
                     json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
+                # Stream the scrape to S3 immediately (runs in the scrape worker
+                # thread, off the main path; best-effort).
+                s3_sync.mirror_file_to_s3(run_dir, mode.key, raw_path)
                 return {
                     "request_index": request_index, "group": group, "group_names": group_names,
                     "payload": payload, "error": None, "scrapedo_seconds": seconds,
@@ -814,13 +826,16 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             # Best-effort: a write failure must never fail the run.
             if not (text or "").strip():
                 return
+            path = cleaned_dir / f"{key}.json"
             try:
-                (cleaned_dir / f"{key}.json").write_text(
+                path.write_text(
                     json.dumps({"key": key, "text": text, "usage": usage_md}, ensure_ascii=False),
                     encoding="utf-8",
                 )
             except OSError as exc:
                 _ai_log(run_id, run_dir, f"failed to write cleaned/{key}.json: {exc}", logging.WARNING)
+                return
+            s3_sync.mirror_file_to_s3(run_dir, mode.key, path)
 
         def _load_cleaned(key: str) -> dict | None:
             # Return a previously-cleaned {key,text,usage} record, or None.
@@ -1177,9 +1192,9 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             f"entities_without_scrape_data={entities_without_scrape_data}",
         )
 
-        # Mirror the completed run dir to S3 (best-effort; never fails the run).
-        from app.services.ai_mode.s3_sync import mirror_run_to_s3
-        mirrored = mirror_run_to_s3(run_dir, mode.key)
+        # Mirror the completed run dir to S3 (best-effort; never fails the run) —
+        # the backstop that also writes the aggregates (final_report/found/notFound).
+        mirrored = s3_sync.mirror_run_to_s3(run_dir, mode.key)
         if mirrored:
             _ai_log(
                 run_id,

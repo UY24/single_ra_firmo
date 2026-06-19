@@ -124,7 +124,7 @@ def build_jsonl(items: Iterable[tuple[str, dict[str, Any]]]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# File API upload (resumable) — used when inline would exceed the cap
+# File API upload (resumable) — the single batch-input route (see create_batch)
 # --------------------------------------------------------------------------- #
 def upload_jsonl_file(jsonl_text: str, display_name: str) -> str:
     """Upload ``jsonl_text`` via the File API (resumable) and return its name.

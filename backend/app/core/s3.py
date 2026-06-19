@@ -9,6 +9,7 @@ from __future__ import annotations
 import mimetypes
 import os
 from pathlib import Path
+from typing import Iterator
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -81,3 +82,17 @@ def upload_directory(local_dir: Path, key_prefix: str) -> list[str]:
         upload_file(path, key)
         keys.append(key)
     return keys
+
+
+def iter_keys(prefix: str = "") -> Iterator[str]:
+    """Yield every object key under ``prefix`` (whole bucket when prefix is empty)."""
+    paginator = get_s3_client().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket_name(), Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield obj["Key"]
+
+
+def download_file(key: str, local_path: Path) -> None:
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    get_s3_client().download_file(bucket_name(), key, str(local_path))

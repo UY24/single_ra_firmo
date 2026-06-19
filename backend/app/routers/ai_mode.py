@@ -111,11 +111,18 @@ async def resume_ai_mode_upload(run_id: str) -> dict[str, Any]:
     Supabase run row (no new row). Genuinely not-found rows are NOT retried here —
     use AI Mode Deep (``ai_deep``) for those.
     """
-    from app.services.ai_mode import ai_mode_service, run_store
+    from app.services.ai_mode import ai_mode_service, run_store, s3_sync
 
     run_dir = await asyncio.to_thread(run_store.find_run_dir, run_id)
     if run_dir is None:
-        raise HTTPException(status_code=404, detail="AI mode run not found")
+        # Hosted/ephemeral disk: the local run dir may be gone, but the run was
+        # mirrored to S3 — pull it back so resume can reuse raw_responses/cleaned.
+        run_dir = await asyncio.to_thread(s3_sync.rehydrate_run_from_s3, run_id)
+    if run_dir is None:
+        raise HTTPException(
+            status_code=404,
+            detail="AI mode run not found (no local run dir, and nothing in S3 to restore)",
+        )
     status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
     state = str(status.get("status") or "")
     if state not in {"failed", "completed_with_errors"}:

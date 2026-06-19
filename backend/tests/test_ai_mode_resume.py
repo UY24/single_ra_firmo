@@ -14,7 +14,7 @@ from unittest import mock
 
 from app.services.ai_mode import ai_mode_service, run_store
 
-# Two ai_deep batches of 3 → request_001 (snos 1-3), request_002 (snos 4-6).
+# Two ai_deep batches of 3 → request_000001 (snos 1-3), request_000002 (snos 4-6).
 CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in range(1, 7))
 
 FAKE_ENV = {
@@ -119,7 +119,7 @@ class TestPhase2Resume(unittest.TestCase):
         raw_dir = run_dir / ai_mode_service.RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
         for i in (1, 2):
-            (raw_dir / f"request_{i:03d}.json").write_text(json.dumps(RAW_PAYLOAD), encoding="utf-8")
+            (raw_dir / f"request_{i:06d}.json").write_text(json.dumps(RAW_PAYLOAD), encoding="utf-8")
         cleaned_dir = run_dir / ai_mode_service.CLEANED_DIRNAME
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         (cleaned_dir / "batch-000001.json").write_text(
@@ -145,6 +145,75 @@ class TestPhase2Resume(unittest.TestCase):
         self.assertEqual(report["summary"]["websites_found"], 3)
         # A cleaned file now exists for the batch that was (re)submitted this run.
         self.assertTrue((cleaned_dir / "batch-000002.json").exists())
+
+
+class TestS3Rehydrate(unittest.TestCase):
+    def test_rehydrate_pulls_only_matching_run_to_local(self):
+        from app.services.ai_mode import s3_sync
+
+        run_id = "abc123def"
+        keys = [
+            f"acme-corp/ai_bulk/{run_id}/status.json",
+            f"acme-corp/ai_bulk/{run_id}/raw_responses/request_000001.json",
+            f"acme-corp/ai_bulk/{run_id}/cleaned/batch-000001.json",
+            "other-co/ai_deep/zzz999/status.json",  # unrelated → must be ignored
+        ]
+
+        def fake_download(key, local_path):
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(local_path).write_text("{}", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results_root = Path(tmp) / "ai_mode_results"
+            with mock.patch.object(s3_sync, "AI_MODE_RESULTS_DIR", results_root), \
+                 mock.patch.object(s3_sync.s3, "is_configured", return_value=True), \
+                 mock.patch.object(s3_sync.s3, "iter_keys", return_value=iter(keys)), \
+                 mock.patch.object(s3_sync.s3, "download_file", side_effect=fake_download):
+                out = s3_sync.rehydrate_run_from_s3(run_id)
+
+            run_dir = results_root / "acme-corp" / run_id
+            self.assertEqual(out, run_dir)
+            self.assertTrue((run_dir / "status.json").exists())
+            self.assertTrue((run_dir / "raw_responses" / "request_000001.json").exists())
+            self.assertTrue((run_dir / "cleaned" / "batch-000001.json").exists())
+            # the unrelated run's company folder must NOT be created
+            self.assertFalse((results_root / "other-co").exists())
+
+    def test_rehydrate_returns_none_when_unconfigured(self):
+        from app.services.ai_mode import s3_sync
+        with mock.patch.object(s3_sync.s3, "is_configured", return_value=False):
+            self.assertIsNone(s3_sync.rehydrate_run_from_s3("whatever"))
+
+
+class TestWriteThroughFile(unittest.TestCase):
+    def test_mirror_file_uses_run_prefixed_key(self):
+        from app.services.ai_mode import s3_sync
+        captured = {}
+
+        def fake_upload(local_path, key):
+            captured["key"] = key
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "acme-corp" / "run9"  # <company>/<run_id>
+            (run_dir / "raw_responses").mkdir(parents=True)
+            f = run_dir / "raw_responses" / "request_000007.json"
+            f.write_text("{}", encoding="utf-8")
+            with mock.patch.object(s3_sync.s3, "is_configured", return_value=True), \
+                 mock.patch.object(s3_sync.s3, "upload_file", side_effect=fake_upload):
+                ok = s3_sync.mirror_file_to_s3(run_dir, "ai_bulk", f)
+        self.assertTrue(ok)
+        self.assertEqual(captured["key"],
+                         "acme-corp/ai_bulk/run9/raw_responses/request_000007.json")
+
+    def test_mirror_file_noop_when_unconfigured(self):
+        from app.services.ai_mode import s3_sync
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "co" / "r"
+            run_dir.mkdir(parents=True)
+            f = run_dir / "x.txt"
+            f.write_text("y", encoding="utf-8")
+            with mock.patch.object(s3_sync.s3, "is_configured", return_value=False):
+                self.assertFalse(s3_sync.mirror_file_to_s3(run_dir, "ai_bulk", f))
 
 
 if __name__ == "__main__":

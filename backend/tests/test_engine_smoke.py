@@ -126,7 +126,7 @@ class TestEngineSmoke(unittest.TestCase):
         for name in ("input.csv", "found.csv", "notFound.csv", "final_report.json",
                      "run.log", "status.json"):
             self.assertTrue((run_dir / name).exists(), name)
-        self.assertTrue((run_dir / "raw_responses" / "request_001.json").exists())
+        self.assertTrue((run_dir / "raw_responses" / "request_000001.json").exists())
         self.assertFalse((run_dir / "report.json").exists())
         self.assertFalse((run_dir / "ai_mode_debug.log").exists())
 
@@ -153,7 +153,7 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(report["summary"]["token_usage"]["total_tokens"], 150)
         self.assertEqual(len(report["requests"]), 1)
         self.assertEqual(report["requests"][0]["status"], "success")
-        self.assertEqual(report["requests"][0]["raw_json_file"], "raw_responses/request_001.json")
+        self.assertEqual(report["requests"][0]["raw_json_file"], "raw_responses/request_000001.json")
         self.assertNotIn("request_cost", report["requests"][0])
         self.assertEqual(len(report["entities"]), 6)
 

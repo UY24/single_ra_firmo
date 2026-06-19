@@ -52,6 +52,26 @@ was its first real hit — NOT an AWS-specific failure. Side effect: the crash a
    tracking infra.)
 5. **Crashed runs now mirror to S3** — the `except` path in `run_ai_mode_sync` also calls
    `mirror_run_to_s3` (best-effort) so `raw_responses/`/`run.log` land in the bucket for debugging.
+5b. **Resume survives ephemeral hosts (S3 rehydrate)** — `s3_sync.rehydrate_run_from_s3(run_id)`
+   (uses new `core/s3.py` `iter_keys`/`download_file`) scans the bucket for `…/<run_id>/…` and pulls
+   the run dir back to local disk. The `/resume` endpoint calls it when `find_run_dir` returns None,
+   so "Rerun failed" works even after the instance/disk was replaced (data's in S3 from #5). Maps S3
+   `<company>/<mode>/<run_id>/<rel>` → local `ai_mode_results/<company>/<run_id>/<rel>` (drops mode
+   segment). Best-effort; needs `s3:GetObject` + `ListBucket` (verified present on the live creds).
+5d. **Write-through S3 (per-file, as produced)** — `s3_sync.mirror_file_to_s3(run_dir, mode_key,
+   path)` uploads each file the instant it's written: `input.csv`/`status.json` at run start, every
+   `raw_responses/request_NNNNNN.json` (inside the scrape worker thread, off the main path) and every
+   `cleaned/batch-NNNNNN.json`. This mirrors SerpWow's per-row S3 pattern (`upload_serpwow_json_to_s3`
+   per row + `state.json` per update; it deliberately defers the heavy aggregate — see
+   `legacy_app.py:5723`). We follow the same rule: stream the small per-batch files, but the
+   **aggregates** (`final_report.json`/`found`/`notFound`) are written only by the end-of-run
+   `mirror_run_to_s3` backstop. Closes the hard-kill gap (OOM/SIGKILL/spot reclaim bypasses the
+   `except`-path mirror). Best-effort, ~$0.03/33k-run in PUTs, no wall-clock impact (scrape dominates).
+5c. **Raw-file naming widened to 6 digits** — `request_{idx:06d}.json` (was `:03d`); `:03d` only
+   zero-pads to 3 so it sorted wrong past 1000 (`request_1000` < `request_999` lexicographically) and
+   mismatched the `:06d` cleaned keys. Now consistent, handles up to 999,999 requests. **Migration
+   note:** pre-existing runs with 3-digit raw files won't be reused on resume (they'd re-scrape) — only
+   the throwaway `953…` test run is affected.
 6. **Richer progress logging** — Phase 3 emits one `_ai_log` line per entity
    (`batch N <company> (<country>) -> found <url> (confidence=X%)` / `-> not found`) + a per-batch
    scrape-failure line. These go to BOTH stdout and `run.log`, gated by `AI_MODE_LOG_LEVEL`. (Context:
@@ -68,10 +88,19 @@ counts scrape-batches per Gemini job (e.g. 1000 ⇒ ~7 jobs), `GEMINI_BATCH_MAX_
 re-scrapes; `tests/test_rerun.py` deleted with the feature. New disk artifact: `cleaned/` (added to
 the per-run layout below).
 
-**NOT yet live-verified (needs real keys):** (a) the JSONL/File-API path end-to-end against real
-Gemini; (b) a real resume after a forced Phase-2 failure. AWS S3 env (`S3_BUCKET`/`S3_REGION`/creds) is
-confirmed present, so successful + resumed runs should mirror to `s3://website-url-finder/`.
-**Not committed** (user will commit).
+**Live S3 check (done this session):** the `.env` creds (IAM user `ujjwal.yadav@forage.ai`) can
+**ListBucket + GetObject + PutObject** on `website-url-finder` but **NOT DeleteObject** (AccessDenied).
+The mirror + rehydrate only put/get, so they work; nothing AI-Mode deletes from S3. The bucket was
+empty (KeyCount=0) because no run had reached the mirror yet (the `953…` crash predates the
+mirror-on-failure fix, and the fix isn't deployed). **A stray 15-byte test object
+`_connectivity_check/from_claude.txt` is in the bucket** — the connectivity test couldn't delete it
+(no DeleteObject perm); remove it from the console or ignore.
+
+**NOT yet live-verified (needs real keys / a restart):** (a) the JSONL/File-API path end-to-end
+against real Gemini; (b) a real "Rerun failed"/resume after a forced Phase-2 failure; (c) the S3
+rehydrate path against a genuinely-wiped local dir. To populate S3 / test resume: restart the server
+(load this code) then run something that finishes, or "Rerun failed" the `953…` run. **Not committed**
+(user will commit).
 
 ---
 
@@ -364,7 +393,7 @@ ai_mode_results/     # run outputs (gitignored)
 ### Output layout (per run)
 `ai_mode_results/<company-slug>/<run_id>/` — `input.csv`, `status.json`, **one** `final_report.json`
 (summary + per-entity results + per-request records + cost), `found.csv`, `notFound.csv`, **one**
-`run.log` (level via `AI_MODE_LOG_LEVEL`), `raw_responses/request_NNN.json`,
+`run.log` (level via `AI_MODE_LOG_LEVEL`), `raw_responses/request_NNNNNN.json` (6-digit),
 `cleaned/batch-NNNNNN.json` (one per successfully-cleaned batch — enables the "Rerun failed" resume).
 The old `report.json`, `ai_mode_debug.log`, and `carryover.json` (rerun was removed) are gone.
 

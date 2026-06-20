@@ -215,6 +215,20 @@ class TestWriteThroughFile(unittest.TestCase):
             with mock.patch.object(s3_sync.s3, "is_configured", return_value=False):
                 self.assertFalse(s3_sync.mirror_file_to_s3(run_dir, "ai_bulk", f))
 
+    def test_run_s3_uri(self):
+        from app.services.ai_mode import s3_sync
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "acme-corp" / "run9"
+            run_dir.mkdir(parents=True)
+            with mock.patch.object(s3_sync.s3, "is_configured", return_value=True), \
+                 mock.patch.object(s3_sync.s3, "bucket_name", return_value="website-url-finder"):
+                self.assertEqual(
+                    s3_sync.run_s3_uri(run_dir, "ai_bulk", "found.csv"),
+                    "s3://website-url-finder/acme-corp/ai_bulk/run9/found.csv",
+                )
+            with mock.patch.object(s3_sync.s3, "is_configured", return_value=False):
+                self.assertIsNone(s3_sync.run_s3_uri(run_dir, "ai_bulk", "found.csv"))
+
 
 if __name__ == "__main__":
     unittest.main()

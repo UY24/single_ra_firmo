@@ -19,6 +19,13 @@ def s3_key_prefix(run_dir: Path, mode_key: str) -> str:
     return f"{run_dir.parent.name}/{mode_key}/{run_dir.name}"
 
 
+def run_s3_uri(run_dir: Path, mode_key: str, filename: str) -> str | None:
+    """``s3://<bucket>/<company>/<mode>/<run_id>/<filename>`` or None if S3 unset."""
+    if not s3.is_configured():
+        return None
+    return f"s3://{s3.bucket_name()}/{s3_key_prefix(run_dir, mode_key)}/{filename}"
+
+
 def mirror_file_to_s3(run_dir: Path, mode_key: str, local_path: Path) -> bool:
     """Write-through one file to S3 under the run's prefix, as it's produced.
 

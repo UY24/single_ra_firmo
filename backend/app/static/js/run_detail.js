@@ -49,6 +49,56 @@ function _ensureModal() {
   return _modal;
 }
 
+// RFC-4180-ish parser: handles quoted fields, "" escapes, and embedded
+// newlines/commas (our flags/attempt_log cells contain real newlines).
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+      continue;
+    }
+    if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ""; }
+    else if (c === '\r') { /* skip */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
+    else field += c;
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function csvTable(text) {
+  const rows = parseCsv(text);
+  if (!rows.length) return el("p", { class: "p-6 text-sm text-slate-400" }, "Empty file");
+  const [header, ...bodyRows] = rows;
+  const table = el("table", { class: "w-full border-collapse text-xs" },
+    el("thead", {},
+      el("tr", {},
+        ...header.map((h) => el("th", {
+          class: "sticky top-0 z-10 bg-slate-800 border border-slate-700 px-3 py-2 text-left font-semibold text-slate-100 whitespace-nowrap",
+        }, h)),
+      ),
+    ),
+    el("tbody", {},
+      ...bodyRows.map((r, ri) => el("tr", { class: ri % 2 ? "bg-slate-900/40" : "" },
+        ...header.map((_, ci) => el("td", {
+          class: "border border-slate-800 px-3 py-2 align-top text-slate-300 whitespace-pre-wrap break-words",
+        }, r[ci] ?? "")),
+      )),
+    ),
+  );
+  return el("div", { class: "flex-1 overflow-auto p-2" }, table,
+    el("p", { class: "px-2 pb-2 pt-1 text-[11px] text-slate-500" },
+      `${bodyRows.length} row${bodyRows.length === 1 ? "" : "s"}`),
+  );
+}
+
 async function viewFile(url, filename, downloadUrl) {
   const m = _ensureModal();
   m.title.textContent = filename;
@@ -59,8 +109,12 @@ async function viewFile(url, filename, downloadUrl) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const text = await res.text();
-    m.pre.textContent = text;
-    m.body.replaceChildren(m.pre);
+    if (/\.csv$/i.test(filename)) {
+      m.body.replaceChildren(csvTable(text));
+    } else {
+      m.pre.textContent = text;
+      m.body.replaceChildren(m.pre);
+    }
   } catch (e) {
     m.body.replaceChildren(
       el("p", { class: "p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),

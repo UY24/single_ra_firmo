@@ -72,6 +72,12 @@ was its first real hit — NOT an AWS-specific failure. Side effect: the crash a
    mismatched the `:06d` cleaned keys. Now consistent, handles up to 999,999 requests. **Migration
    note:** pre-existing runs with 3-digit raw files won't be reused on resume (they'd re-scrape) — only
    the throwaway `953…` test run is affected.
+6b. **Supabase `file_links` now point to S3** — AI Mode previously stored local
+   `/Users/.../ai_mode_results/...` paths in the run row's `file_links`; now they're `s3://<bucket>/
+   <company>/<mode>/<run_id>/<file>` URIs (matches SerpWow's `_upload_file_links`), via
+   `s3_sync.run_s3_uri`, with a local-path fallback when S3 is unconfigured. Built in the success path
+   of `run_ai_mode_sync` just before the `_supabase_update_run`. (Old run rows keep their stale local
+   paths — only new/resumed runs get S3 URIs.)
 6. **Richer progress logging** — Phase 3 emits one `_ai_log` line per entity
    (`batch N <company> (<country>) -> found <url> (confidence=X%)` / `-> not found`) + a per-batch
    scrape-failure line. These go to BOTH stdout and `run.log`, gated by `AI_MODE_LOG_LEVEL`. (Context:

@@ -1177,9 +1177,17 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             else None
         )
         _persist_status(run_id, run_dir, status)
-        file_links = {name: str(path) for name, path in output_paths.items()}
-        file_links["input.csv"] = str(input_csv)
-        file_links["run.log"] = str(run_log)
+        # Tracked file links point to S3 (matches SerpWow's s3:// links) when S3 is
+        # configured; fall back to the local path otherwise. The run dir is mirrored
+        # to S3 (write-through during the run + the end-of-run mirror below), so
+        # these URIs resolve to real objects.
+        local_paths = dict(output_paths)
+        local_paths["input.csv"] = input_csv
+        local_paths["run.log"] = run_log
+        file_links = {
+            name: (s3_sync.run_s3_uri(run_dir, mode.key, name) or str(path))
+            for name, path in local_paths.items()
+        }
         _supabase_update_run(
             status.get("run_db_id"), **_build_run_update(summary, file_links)
         )

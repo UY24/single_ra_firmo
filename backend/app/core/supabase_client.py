@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 _client = None
 _attempted = False
 _config_error: str | None = None
+_init_lock = threading.Lock()
 
 
 def _redact_url(url: str) -> str:
@@ -64,9 +66,19 @@ def get_supabase_config_error() -> str | None:
 
 
 def get_supabase():
+    # FastAPI runs the sync company/ai-mode endpoints in a threadpool, and the
+    # dashboard fires several in parallel on load. The init below is slow (first
+    # `import supabase` + network handshake), so `_attempted` must flip to True
+    # ONLY after `_client` is settled — otherwise a concurrent caller short-circuits
+    # on the half-set flag, sees `_client is None`, and wrongly 503s "not configured"
+    # (transient, clears on reload once init finishes). The lock + re-check serialize
+    # the one-time init; the fast path stays lock-free once `_attempted` is True.
     global _client, _attempted
-    if not _attempted:
-        _attempted = True
+    if _attempted:
+        return _client
+    with _init_lock:
+        if _attempted:
+            return _client
         config = _validate_config(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
         if config:
             url, key = config
@@ -82,4 +94,5 @@ def get_supabase():
             ))
         else:
             logger.warning("supabase: company tracking disabled (%s)", _config_error)
+        _attempted = True
     return _client

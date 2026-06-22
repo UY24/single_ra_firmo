@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -194,6 +195,39 @@ class TestSupabaseClient(unittest.TestCase):
             self.assertIsNone(self.sc.get_supabase())
         create_client.assert_not_called()
         self.assertIn("bare project REST URL", self.sc.get_supabase_config_error())
+
+    def test_concurrent_init_never_returns_none(self):
+        """Two parallel callers (FastAPI threadpool) must not see the half-set
+        singleton while the first caller is still inside the slow create_client."""
+        import threading
+        env = {"SUPABASE_URL": "https://example.supabase.co",
+               "SUPABASE_SERVICE_ROLE_KEY": f"{'a' * 40}.{'b' * 80}.{'c' * 80}"}
+        fake_client = mock.MagicMock()
+        both_started = threading.Barrier(2)
+
+        def slow_create_client(*args, **kwargs):
+            # Widen the init window so a second caller is guaranteed to race in.
+            both_started.wait(timeout=5)
+            time.sleep(0.1)
+            return fake_client
+
+        results = []
+
+        def worker():
+            results.append(self.sc.get_supabase())
+
+        with mock.patch.dict(os.environ, env), \
+                mock.patch("supabase.create_client", side_effect=slow_create_client) as cc:
+            # The first thread enters create_client and waits on the barrier; the
+            # second thread is released into get_supabase by the same barrier, so it
+            # arrives while the singleton is still being built.
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=lambda: (both_started.wait(timeout=5), worker()))
+            t1.start(); t2.start()
+            t1.join(timeout=5); t2.join(timeout=5)
+
+        self.assertEqual(results, [fake_client, fake_client])  # neither got None
+        cc.assert_called_once()  # init ran exactly once, not per-thread
 
 
 if __name__ == "__main__":

@@ -22,8 +22,10 @@ function companyCard(c) {
       statPair("Found", fmtNum(c.websites_found)),
       statPair("Not found", fmtNum(c.websites_not_found)),
       statPair("Success / failed", `${fmtNum(c.success_count)} / ${fmtNum(c.failed_count)}`),
-      statPair("Searches", fmtNum(c.total_searches)),
-      statPair("Tokens", fmtNum(c.total_tokens)),
+      statPair("Scrape.do searches", fmtNum(c.total_searches)),
+      statPair("Total rows", fmtNum(c.total_rows)),
+      statPair("Input tokens", fmtNum(c.total_input_tokens)),
+      statPair("Output tokens", fmtNum(c.total_output_tokens)),
       statPair("LLM cost", fmtUsd(c.total_cost_usd)),
     ),
   );

@@ -78,13 +78,17 @@ class CompanyService:
                 return sum((r.get(key) or 0) for r in rs)
             cost = sum(((r.get("cost") or {}).get("total_usd") or 0) for r in rs)
             tokens = sum(((r.get("token_usage") or {}).get("total_tokens") or 0) for r in rs)
+            input_tokens = sum(((r.get("token_usage") or {}).get("prompt_tokens") or 0) for r in rs)
+            output_tokens = sum(((r.get("token_usage") or {}).get("completion_tokens") or 0) for r in rs)
             searches = sum(((r.get("cost") or {}).get("scrapedo_searches") or 0) for r in rs)
             out.append({**c, "runs": len(rs), "total_rows": s("total_rows"),
                         "success_count": s("success_count"), "failed_count": s("failed_count"),
                         "websites_found": s("websites_found"),
                         "websites_not_found": s("websites_not_found"),
                         "total_searches": searches,
-                        "total_cost_usd": round(cost, 4), "total_tokens": tokens})
+                        "total_cost_usd": round(cost, 4), "total_tokens": tokens,
+                        "total_input_tokens": input_tokens,
+                        "total_output_tokens": output_tokens})
         return out
 
 

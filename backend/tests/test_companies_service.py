@@ -118,7 +118,8 @@ class TestCompanyService(unittest.TestCase):
              "success_count": 90, "failed_count": 10,
              "websites_found": 80, "websites_not_found": 20,
              "cost": {"total_usd": 1.25, "scrapedo_searches": 12},
-             "token_usage": {"total_tokens": 1000}},
+             "token_usage": {"total_tokens": 1000, "prompt_tokens": 700,
+                             "completion_tokens": 300}},
             {"company_id": "c1", "status": "failed", "total_rows": 50,
              "success_count": None, "failed_count": None,
              "websites_found": None, "websites_not_found": None,
@@ -137,12 +138,16 @@ class TestCompanyService(unittest.TestCase):
         self.assertEqual(acme["websites_not_found"], 20)
         self.assertEqual(acme["total_cost_usd"], 1.25)
         self.assertEqual(acme["total_tokens"], 1000)
+        self.assertEqual(acme["total_input_tokens"], 700)
+        self.assertEqual(acme["total_output_tokens"], 300)
         self.assertEqual(acme["total_searches"], 12)
         empty = next(s for s in stats if s["id"] == "c2")
         self.assertEqual(empty["runs"], 0)
         self.assertEqual(empty["total_rows"], 0)
         self.assertEqual(empty["total_cost_usd"], 0)
         self.assertEqual(empty["total_tokens"], 0)
+        self.assertEqual(empty["total_input_tokens"], 0)
+        self.assertEqual(empty["total_output_tokens"], 0)
         self.assertEqual(empty["total_searches"], 0)
 
 

@@ -211,6 +211,20 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _batch_postprocess_enabled_for(pipeline: str) -> bool:
+    """True when Gemini batch confidence scoring applies to this pipeline.
+
+    full  -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
+    gsearch -> GSEARCH_LLM_BATCH (independent toggle)
+    """
+    pipe = str(pipeline or PIPELINE_FULL)
+    if pipe == PIPELINE_GSEARCH:
+        return _get_bool_env("GSEARCH_LLM_BATCH", False)
+    if pipe == PIPELINE_FULL:
+        return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
+    return False
+
+
 def _short_text(value: Any, limit: int = 240) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -5161,9 +5175,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
 
 
 async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_FULL:
-        return
-    if not _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
         return
     if state.get("status") not in {"completed", "completed_with_errors"}:
         return
@@ -5183,9 +5195,7 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
 
 
 async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_FULL:
-        return
-    if not _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     status = str(gemini_batch_meta.get("status") or "")
@@ -5201,7 +5211,7 @@ async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, 
 
 
 async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_FULL:
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
         return state
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     local_status = str(gemini_batch_meta.get("status") or "").strip()
@@ -6392,7 +6402,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
 
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
-        batch_postprocess_enabled = _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
+        batch_postprocess_enabled = _batch_postprocess_enabled_for(str(job.get("pipeline") or PIPELINE_FULL))
         if is_successful:
             row_status = "completed"
             row_error = None
@@ -6814,7 +6824,7 @@ async def _create_upload_with_rows(
             for row in parsed_rows
         ],
     }
-    if pipeline == PIPELINE_FULL and _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False):
+    if _batch_postprocess_enabled_for(pipeline):
         state["gemini_batch"] = {
             "status": "waiting_for_rows",
             "queued_at": None,
@@ -7028,7 +7038,7 @@ async def retry_failed_rows(
                 }
             )
 
-        if pipeline == PIPELINE_FULL and _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False):
+        if _batch_postprocess_enabled_for(pipeline):
             state["gemini_batch"] = {
                 "status": "waiting_for_rows",
                 "queued_at": None,

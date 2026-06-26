@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from app.core.config import PROJECT_ROOT
+from app.services.serpwow import gsearch_reporting
 
 def load_local_env(env_path: str = ".env") -> None:
     if not os.path.exists(env_path):
@@ -5780,6 +5781,26 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
               f"(worker unaffected): {type(exc).__name__}: {exc}")
 
 
+async def _finalize_gsearch_outputs(upload_id: str, state: dict[str, Any]) -> None:
+    """Write found/notFound/report/run.log for a terminal gsearch upload and mirror
+    them to S3. Best-effort: logs + swallows everything, never raises."""
+    try:
+        upload_dir = _find_upload_dir(upload_id)
+        paths = await asyncio.to_thread(gsearch_reporting.write_gsearch_outputs, upload_dir, state)
+    except Exception as exc:
+        print(f"[gsearch] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
+        return
+    if not os.getenv("S3_BUCKET"):
+        return
+    from app.core import s3 as core_s3
+    prefix = _upload_s3_prefix(upload_id, str(state.get("company_name") or ""), PIPELINE_GSEARCH)
+    for name, path in paths.items():
+        try:
+            await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")
+        except Exception as exc:
+            print(f"[gsearch] S3 mirror failed for {name} ({upload_id}): {type(exc).__name__}: {exc}")
+
+
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     state = summarize_upload_state(state)
     if _should_sync_running(state):
@@ -5814,6 +5835,8 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     if state["status"] in {"completed", "completed_with_errors"}:
         combined = build_upload_output_payload(state)
         await write_upload_artifact(upload_id, "output", combined)
+    if state.get("pipeline") == PIPELINE_GSEARCH and state["status"] in {"completed", "completed_with_errors"}:
+        await _finalize_gsearch_outputs(upload_id, state)
     await maybe_start_gemini_batch_for_upload(upload_id, state)
 
 

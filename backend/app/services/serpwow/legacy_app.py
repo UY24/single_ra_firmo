@@ -343,7 +343,7 @@ def _country_to_gl(country: Optional[str]) -> str:
 
 
 def _upload_dir(upload_id: str, company_name: str = "") -> Path:
-    safe = _safe_name(company_name) if company_name else ""
+    safe = _company_slug(company_name) if company_name else ""
     path = (UPLOAD_BASE_DIR / safe / upload_id) if safe else (UPLOAD_BASE_DIR / upload_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -422,7 +422,7 @@ def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, p
 
 
 def _upload_s3_prefix(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    safe = _safe_name(company_name) if company_name else ""
+    safe = _company_slug(company_name) if company_name else ""
     pipe = (pipeline or "").strip()
     if safe and pipe:
         return f"{safe}/{pipe}/{upload_id}"
@@ -449,6 +449,17 @@ def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _company_slug(value: str) -> str:
+    """Company folder slug, unified with AI Mode's slugify_company.
+
+    Lowercase, non-alphanumeric runs collapse to '-', trimmed. Used for the
+    company SEGMENT of S3 keys + local run dirs so SerpWow and AI Mode share one
+    company folder. (_safe_name is still used for per-row file NAMES.)
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return slug or "unnamed"
 
 
 def _safe_name(value: str) -> str:

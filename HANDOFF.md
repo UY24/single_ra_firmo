@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-26 (Supabase race fix + dashboard metric tweaks + Slack notifications). Read this first if you're picking up this repo.
+Last updated: 2026-06-26 (gsearch rework — confidence + AI-Mode-parity outputs + S3 slug fix + Supabase + UI; on branch `gsearchFix`). Read this first if you're picking up this repo.
 
 ---
 
@@ -10,6 +10,30 @@ The whole backend was restructured on branch `rework` (~38 commits over `main`).
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### ⚡ Session 2026-06-26 (later) — gsearch rework (read this first; on branch `gsearchFix`, NOT merged)
+
+**What & why.** `gsearch` (SerpWow Google **AI Overview** search — `/live/search` `engine=google` + `include_ai_overview=true`) was missing the confidence/selection step and the AI-Mode-style output files. It picked `candidates[0]` blindly, never populated `context.final_url_selection_ai`, so `output_confidence_score`/`output_confidence` were always blank; it wrote only `state.json`/`output.json`; and it saved S3/disk under a different company slug (`ISI_Market_Test`) than AI Mode (`isi-market-test`), splitting one company across two folders. Reworked to fix all of it. **12 commits on `gsearchFix`** (`bbed9f8..c9a08ef`), suite **203/203** green. **Not committed to main / not merged — user's call.** Full plan/spec on disk (gitignored): `docs/superpowers/plans/2026-06-26-gsearch-rework.md`, `docs/superpowers/specs/2026-06-26-gsearch-rework-design.md`.
+
+**Pipeline taxonomy (confirmed):** AI Mode = Google **AI Mode** via scrape.do (in-process, ~100 concurrent); **gsearch = SerpWow Google AI Overview** (kept on **RabbitMQ** — per-request billed, needs queue throttling/persistence/retry); gmaps = SerpWow Places. RabbitMQ stays for gsearch by design (NOT rebuilt as an in-process ai_mode clone).
+
+**Design decisions (settled with user):**
+- **Confidence = LLM cleanup/selection only, never invents** — ported `single_ra`'s `choose_final_website_with_gemini`. Picks `official_website` from the candidate list ONLY, scores 0–100, re-validated against the candidate set + `_official_website_looks_plausible` (out-of-set/implausible → null + 0). Lives **in `legacy_app.py`** (not a new module) because all its helper deps already live there — avoids a circular import. HTTP isolated in `_gemini_generate_content_json` (test seam).
+- **No sequential early-stop** — all selected phases run in parallel (as `single_ra` did), candidates gathered + deduped, then one LLM call. "Phase-wise" is preserved by labeling each candidate/attempt with its phase in `attempt_log`/`report.json`, not by stopping early.
+- **Two modes via `GSEARCH_LLM_BATCH`** (default false): per-row Gemini call in the worker, OR Gemini-batch at finalization. `ENABLE_FINAL_URL_GEMINI` (default true) can disable the call.
+
+**What changed (file-by-file):**
+- `services/serpwow/legacy_app.py`: `_company_slug` (unified dash/lowercase slug for the company folder; `_safe_name` now only for per-row filenames) wired into `_upload_s3_prefix`/`_upload_dir`; ported `choose_final_website_with_gemini` + `_gemini_generate_content_json`; `execute_gsearch_lookup_for_worker` now runs the confidence step (env-gated) and writes `context.final_url_selection_ai` + `search_attempts` + `gemini_cost_usd`; `_finalize_gsearch_outputs` (writes the 4 files + best-effort S3 mirror) called from `persist_upload_state` on gsearch terminal status; `_update_supabase_run` adds `websites_found`/`websites_not_found`/`cost`/`token_usage` for gsearch; `_upload_file_links` advertises the gsearch files; new `GET /uploads/{upload_id}/result?file=` endpoint + `_GSEARCH_RESULT_FILES` allowlist; `_batch_postprocess_enabled_for(pipeline)` centralizes the 5 batch-gate sites and extends batching to gsearch; `_build_batch_prompt_for_row` now folds `context["candidates"]` into its candidate set (no-op for `full`).
+- **NEW** `services/serpwow/gsearch_reporting.py` — standalone (imports only `models/results.py`): `state_to_entity_results`, `build_summary`, `write_gsearch_outputs` → found.csv/notFound.csv/report.json/run.log; reads confidence from `final_url_selection_ai.raw` then `gemini_batch_ai.raw`.
+- `static/js/run_detail.js`: "Files" card on the legacy detail view (View/Download via the new endpoint), shown only for `s.pipeline === "gsearch"`.
+- `.env.example`: `ENABLE_FINAL_URL_GEMINI=true`, `GSEARCH_LLM_BATCH=false`.
+- Tests: `test_gsearch_slug`, `test_gsearch_confidence`, `test_gsearch_worker`, `test_gsearch_reporting`, `test_gsearch_finalize`, `test_gsearch_supabase`, `test_gsearch_result_endpoint`, `test_gsearch_batch_gate`, `test_gsearch_batch_prompt` (all offline, mocked Gemini/S3).
+
+**Reviewed:** each task got a spec+quality review; a final whole-branch review (opus) found one Important issue — batch-mode prompt only saw 1 candidate — **fixed** (the `context["candidates"]` bridge above; `full` non-regression verified: `full` never sets that key). Open Minors (non-blocking, see plan/ledger): `choose_final_website` 404-detection is a string-scan; a couple of test-coverage polish items.
+
+**NOT yet live-verified (needs real `SERPWOW_API_KEY` + `GEMINI_API_KEY` + a run; would spend credits):** an end-to-end gsearch run confirming S3 lands at `website-url-finder/<slug>/gsearch/<id>/` with all files, confidence populated, Supabase row carrying counts/cost, and the UI Files card viewing them — for BOTH `GSEARCH_LLM_BATCH=false` and `=true`. The UI card was `node --check`'d only (no browser test). **To enable on a running server, restart it** (env loads at startup).
+
+---
 
 ### ⚡ Session 2026-06-26 — Supabase race fix, dashboard metric naming, Slack notifications (read this first)
 

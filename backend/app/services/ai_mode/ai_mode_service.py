@@ -1211,6 +1211,31 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 f"under {run_dir.parent.name}/{mode.key}/{run_id}",
             )
 
+        # Slack ping on completion (best-effort; notify never raises, but guard anyway).
+        try:
+            from app.core import notify
+            _tokens = status.get("token_usage") or {}
+            _cost = status.get("cost") or {}
+            notify.notify_run_complete(
+                pipeline=str(status.get("mode_label") or mode.label),
+                company=status.get("company_name"),
+                run_ref=run_id,
+                status=status["status"],
+                found=status.get("websites_found"),
+                not_found=status.get("websites_not_found"),
+                total_rows=status.get("total_rows"),
+                searches=_cost.get("scrapedo_searches"),
+                search_label="Scrape.do searches",
+                tokens=_tokens.get("total_tokens"),
+                input_tokens=_tokens.get("prompt_tokens"),
+                output_tokens=_tokens.get("completion_tokens"),
+                cost_usd=_cost.get("total_usd"),
+                duration_seconds=status.get("batch_duration_seconds"),
+                llm_errors=status.get("llm_errors"),
+            )
+        except Exception:
+            logging.getLogger("ai_mode").warning("slack notify (complete) failed", exc_info=True)
+
     except Exception as exc:  # never raise to caller
         status["status"] = "failed"
         status["error"] = sanitize_secret_text(str(exc))
@@ -1244,4 +1269,17 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 )
         except Exception:  # never let mirroring obscure the crash
             pass
+        # Slack ping on failure (best-effort; never mask the original crash).
+        try:
+            from app.core import notify
+            notify.notify_run_failed(
+                pipeline=str(status.get("mode_label") or status.get("mode") or "AI Mode"),
+                company=status.get("company_name"),
+                run_ref=run_id,
+                error=status["error"],
+                total_rows=status.get("total_rows"),
+                duration_seconds=round(time.perf_counter() - wall_t0, 3),
+            )
+        except Exception:
+            logging.getLogger("ai_mode").warning("slack notify (failed) failed", exc_info=True)
         return

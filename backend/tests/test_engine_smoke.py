@@ -28,6 +28,9 @@ FAKE_ENV = {
     # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated
     # .env would otherwise make run_ai_mode_sync attempt a live S3 upload).
     "S3_BUCKET": "",
+    # Unset so the Slack notifier no-ops (a populated .env would otherwise make
+    # run_ai_mode_sync POST to a live webhook). Notify tests assert the calls.
+    "SLACK_WEBHOOK_URL": "",
 }
 
 
@@ -180,6 +183,31 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(path, run_dir / "found.csv")
         with self.assertRaises(ValueError):
             ai_mode_service.get_ai_mode_result_path(run_id, "report.json")
+
+    def test_notify_run_complete_fires_on_success(self):
+        with mock.patch("app.core.notify.notify_run_complete") as done, \
+                mock.patch("app.core.notify.notify_run_failed") as failed:
+            self._run("ai_bulk")
+        failed.assert_not_called()
+        done.assert_called_once()
+        kw = done.call_args.kwargs
+        self.assertEqual(kw["status"], "completed")
+        self.assertEqual(kw["company"], "Acme Corp")
+        self.assertEqual(kw["found"], 3)
+        self.assertEqual(kw["not_found"], 3)
+        self.assertEqual(kw["total_rows"], 6)
+
+    def test_notify_run_failed_fires_on_crash(self):
+        # Force the run_ai_mode_sync except-path: assemble (write_outputs) raises.
+        with mock.patch.object(ai_mode_service, "write_outputs",
+                               side_effect=RuntimeError("disk full")), \
+                mock.patch("app.core.notify.notify_run_complete") as done, \
+                mock.patch("app.core.notify.notify_run_failed") as failed:
+            info = self._run("ai_bulk")
+        done.assert_not_called()
+        failed.assert_called_once()
+        self.assertEqual(
+            ai_mode_service.get_ai_mode_status(info["run_id"])["status"], "failed")
 
     def test_scrape_failure_yields_error_rows_and_partial_status(self):
         def boom(self, query, extra_params=None):

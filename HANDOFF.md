@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-18 (Gemini-batch JSONL-only + Phase-2 resume). Read this first if you're picking up this repo.
+Last updated: 2026-06-26 (Supabase race fix + dashboard metric tweaks + Slack notifications). Read this first if you're picking up this repo.
 
 ---
 
@@ -10,6 +10,65 @@ The whole backend was restructured on branch `rework` (~38 commits over `main`).
 this section predates the rework — file paths like `app.py`, `ai_mode_service.py`,
 `scrapedo_finder/`, `templates/ui.html` no longer exist at those locations. Use this section as
 the source of truth; stale sections below are tagged "(superseded — see top)".
+
+### ⚡ Session 2026-06-26 — Supabase race fix, dashboard metric naming, Slack notifications (read this first)
+
+Three things landed this session. **NOT committed** (user commits). Full suite **180/180** green
+(`cd backend && ../.venv/bin/python -m unittest discover -s tests`).
+
+**1. Supabase intermittent "not configured" race — FIXED** (`core/supabase_client.py`).
+Symptom: on a fresh page load the dashboard sometimes showed "Supabase not configured", but a reload
+or two cleared it. Root cause: `get_supabase()` was a lazy singleton that set `_attempted=True`
+*before* the slow `import supabase` + `create_client()` finished. The dashboard fires several **sync**
+endpoints in parallel (FastAPI runs them on threadpool threads — `/companies/stats` + `/companies/runs`
+via `Promise.all`); a second thread saw `_attempted=True` and returned the still-`None` `_client` → 503.
+Fix: a `threading.Lock` + double-checked locking; `_attempted` flips only AFTER `_client` is settled.
+Regression test `tests/test_companies_service.py::test_concurrent_init_never_returns_none` (two threads
+race a sleeping `create_client`; verified to fail against the pre-fix code).
+
+**2. Dashboard metric naming/detail** (`static/js/dashboard.js`, `static/js/run_detail.js`,
+`services/companies.py`).
+- "Searches" → **"Scrape.do searches"** everywhere (dashboard cards + run detail). It only ever counts
+  scrape.do requests (AI Mode `cost.scrapedo_searches`); SerpWow's `_update_supabase_run` writes
+  neither `cost` nor `token_usage`, so SerpWow contributes 0 to Searches/Tokens — **both metrics are
+  AI-Mode-only**.
+- Company cards now show **Total rows** and split **Input tokens / Output tokens** (was one "Tokens").
+- `companies.company_stats()` now also aggregates `total_input_tokens` / `total_output_tokens` (from
+  `token_usage.prompt_tokens`/`completion_tokens`; `token_usage` was already selected).
+
+**3. Slack notifications on run completion/failure — NEW** (both pipelines).
+- New module **`core/notify.py`**: best-effort (no-op when `SLACK_WEBHOOK_URL` unset, swallows+logs all
+  errors, **NEVER raises** — mirrors `s3_sync.py`). Posts Slack **Block Kit** messages (header + summary
+  + divider + two-column field grid + context footer) with a concise `text` fallback for push
+  notifications. Public API: `is_configured()`, `pipeline_label()`, `notify_run_complete(...)`,
+  `notify_run_failed(...)`. `notify_run_complete` takes a **`search_label`** param so each engine names
+  its own search unit — AI Mode passes `"Scrape.do searches"`. Fields are omitted when their value
+  isn't passed, so each run type shows only its relevant detail (AI Mode: found/not-found, rows,
+  scrape.do searches, tokens in/out, cost, duration, LLM errors; SerpWow: succeeded/failed, rows,
+  duration). Light emoji + a one-line "funny" flavor per outcome (user wanted readable + nice).
+- **Events: completion + failure only** (no "started" ping). **Scope: both pipelines.** No run link
+  (no `APP_BASE_URL`).
+- **AI Mode wiring** (`ai_mode_service.run_ai_mode_sync`): `notify_run_complete` at the end of the
+  success path (passes `search_label="Scrape.do searches"` + token/cost/duration detail);
+  `notify_run_failed` in the `except` block. Each call in its own try/except (defense-in-depth).
+- **SerpWow wiring** (`legacy_app.persist_upload_state`): new `_notify_slack_terminal(state)` helper
+  dispatched via `asyncio.to_thread`, guarded by a new **`slack_notified_marker`** (parallel to
+  `supabase_sync_marker`) so it fires **once per distinct terminal snapshot**, not per row. The terminal
+  block was **restructured** to key on terminal status alone (the Supabase sync stays nested under
+  `run_db_id`) so the Slack ping fires **even when Supabase is unconfigured**.
+- **Env**: `SLACK_WEBHOOK_URL` added to `.env.example` (new section 5; old "Deprecated" section
+  renumbered to 6).
+- **Tests**: `tests/test_notify.py` + `tests/test_serpwow_notify.py` (incl. the once-per-snapshot dedup
+  proof) + 2 in `test_engine_smoke.py`; `"SLACK_WEBHOOK_URL": ""` added to that file's `FAKE_ENV` for
+  hermeticity (same precaution as `S3_BUCKET`).
+- **Live-verified**: real webhook in the user's `.env`; sample completion / completed-with-errors /
+  failure messages posted to Slack successfully. A real end-to-end pipeline run was NOT done (would
+  spend scrape.do/LLM credits). **To enable on a running server, restart it** (`.env`'s
+  `SLACK_WEBHOOK_URL` loads at startup). SerpWow searches aren't surfaced in Slack yet (its state
+  doesn't track a search count) — the hook is ready: pass `searches=` + `search_label="SerpWow searches"`
+  from `_notify_slack_terminal`.
+
+---
 
 ### ⚡ Session 2026-06-18 — AI Mode Gemini-batch fix, JSONL-only, Phase-2 resume (read this first)
 

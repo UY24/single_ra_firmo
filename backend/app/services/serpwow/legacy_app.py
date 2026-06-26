@@ -5692,6 +5692,34 @@ def _should_sync_supabase(state: dict[str, Any], marker: str) -> bool:
     )
 
 
+def _notify_slack_terminal(state: dict[str, Any]) -> None:
+    """Best-effort Slack ping when an upload reaches a terminal state. Never raises."""
+    try:
+        from app.core import notify
+
+        status = str(state.get("status") or "")
+        pipeline = notify.pipeline_label(state.get("pipeline") or PIPELINE_FULL)
+        common = {
+            "pipeline": pipeline,
+            "company": state.get("company_name"),
+            "run_ref": str(state.get("upload_id") or ""),
+            "total_rows": state.get("total_rows"),
+            "duration_seconds": state.get("processing_seconds_total"),
+        }
+        if status == "failed":
+            notify.notify_run_failed(error=state.get("error") or "run failed", **common)
+        else:  # completed | completed_with_errors
+            notify.notify_run_complete(
+                status=status,
+                success=state.get("success_rows"),
+                failed=state.get("failed_rows"),
+                **common,
+            )
+    except Exception as exc:
+        print(f"[slack] notify failed for upload {state.get('upload_id')} "
+              f"(worker unaffected): {type(exc).__name__}: {exc}")
+
+
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     state = summarize_upload_state(state)
     if _should_sync_running(state):
@@ -5700,23 +5728,24 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
         # subsequent persist; the terminal sync below has its own retry story.
         state["supabase_running_marker"] = True
         await asyncio.to_thread(_mark_supabase_run_running, dict(state))
-    if state.get("run_db_id") and state.get("status") in {
-        "completed",
-        "completed_with_errors",
-        "failed",
-    }:
+    if state.get("status") in {"completed", "completed_with_errors", "failed"}:
         # Sync once per distinct terminal snapshot (retries can re-open an upload
         # and re-complete it with different counters; resync then).
         marker = (
             f"{state.get('status')}:{state.get('success_rows')}:{state.get('failed_rows')}"
         )
-        if _should_sync_supabase(state, marker):
+        if state.get("run_db_id") and _should_sync_supabase(state, marker):
             if await asyncio.to_thread(_update_supabase_run, dict(state)):
                 state["supabase_sync_marker"] = marker
             else:
                 # Mark the failure so we don't retry this exact snapshot on
                 # every persist (see _should_sync_supabase for the trade-off).
                 state["supabase_sync_failed_marker"] = marker
+        # Slack ping once per distinct terminal snapshot — independent of the
+        # Supabase sync above so it still fires when Supabase is unconfigured.
+        if state.get("slack_notified_marker") != marker:
+            state["slack_notified_marker"] = marker
+            await asyncio.to_thread(_notify_slack_terminal, dict(state))
     update_summary_cache(upload_id, state)
     await write_upload_artifact(upload_id, "state", state)
 

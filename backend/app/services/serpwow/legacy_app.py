@@ -2070,6 +2070,54 @@ def classify_address_with_gemini(
     return None, (last_error or "Gemini model resolution failed"), configured_model, None
 
 
+def _gemini_generate_content_json(
+    model: str, prompt: str, timeout: float = 45.0
+) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
+    """Single Gemini generateContent call returning (text, usage_metadata, error).
+
+    Isolated so the confidence step is unit-testable without network (tests patch
+    this). Mirrors single_ra's inline urlopen call.
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None, None, "GEMINI_API_KEY not configured"
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+    }
+    req = Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as exc:
+        return None, None, f"Gemini HTTPError: {exc.code}"
+    except URLError as exc:
+        return None, None, f"Gemini URLError: {exc.reason}"
+    except Exception as exc:
+        return None, None, f"Gemini error: {exc}"
+    try:
+        response_json = json.loads(body)
+        text = (
+            response_json.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        usage_metadata = response_json.get("usageMetadata", {})
+        return text, usage_metadata, None
+    except Exception:
+        return None, None, "Gemini response parse error"
+
+
 def choose_final_website_with_gemini(
     company_name: str,
     country: str,
@@ -2080,17 +2128,13 @@ def choose_final_website_with_gemini(
     search_raw: Optional[dict[str, Any]],
     gmaps_context: dict[str, Any],
 ) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None, "GEMINI_API_KEY not configured", None, None
-
+    """LLM domain-validation + confidence scoring. Selects from candidate_urls ONLY,
+    never invents; rejects out-of-set / implausible picks to score 0. Ported from
+    single_ra.app.choose_final_website_with_gemini."""
     configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    model_candidates = [configured_model, "gemini-2.5-flash-lite"]
-    seen_models = set()
-    ordered_models = []
-    for model_name in model_candidates:
-        if model_name and model_name not in seen_models:
-            seen_models.add(model_name)
+    ordered_models: list[str] = []
+    for model_name in (configured_model, "gemini-2.5-flash-lite"):
+        if model_name and model_name not in ordered_models:
             ordered_models.append(model_name)
 
     search_summary: dict[str, Any] = {
@@ -2160,59 +2204,21 @@ def choose_final_website_with_gemini(
         f"GMaps Summary: {json.dumps(gmaps_summary, ensure_ascii=True)[:5000]}"
     )
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json",
-        },
-    }
-
     last_error: Optional[str] = None
     for model in ordered_models:
-        endpoint = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={api_key}"
-        )
-        req = Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urlopen(req, timeout=45) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            last_error = f"Gemini HTTPError: {exc.code}"
-            if exc.code == 404:
+        text, usage_metadata, err = _gemini_generate_content_json(model, prompt)
+        if err:
+            last_error = err
+            if "404" in err:
                 continue
-            return None, last_error, model, None
-        except URLError as exc:
-            return None, f"Gemini URLError: {exc.reason}", model, None
-        except Exception as exc:
-            return None, f"Gemini error: {str(exc)}", model, None
+            return None, err, model, usage_metadata
 
-        try:
-            response_json = json.loads(body)
-            text = (
-                response_json.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [{}])[0]
-                .get("text", "")
-            )
-            usage_metadata = response_json.get("usageMetadata", {})
-        except Exception:
-            return None, "Gemini response parse error", model, None
-
-        parsed = _parse_json_from_text(text)
+        parsed = _parse_json_from_text(text or "")
         if not parsed:
             return None, "Gemini returned non-JSON output", model, usage_metadata
 
-        confidence_score_raw = parsed.get("confidence_score", 0)
         try:
-            confidence_score = int(float(confidence_score_raw))
+            confidence_score = int(float(parsed.get("confidence_score", 0)))
         except Exception:
             confidence_score = 0
         confidence_score = max(0, min(100, confidence_score))
@@ -2233,14 +2239,14 @@ def choose_final_website_with_gemini(
                 normalized["confidence_score"] = 0
                 normalized["confidence"] = "low"
                 normalized["reason"] = (
-                    f"Rejected Gemini-selected URL outside candidate set: {selected_norm or selected.strip()}"
+                    f"Rejected URL outside candidate set: {selected_norm or selected.strip()}"
                 )
             elif not _official_website_looks_plausible(selected_norm, company_name, country):
                 normalized["official_website"] = None
                 normalized["confidence_score"] = 0
                 normalized["confidence"] = "low"
                 normalized["reason"] = (
-                    f"Rejected Gemini-selected URL due to low company-domain plausibility: {selected_norm}"
+                    f"Rejected URL due to low company-domain plausibility: {selected_norm}"
                 )
             else:
                 normalized["official_website"] = selected_norm

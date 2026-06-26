@@ -282,6 +282,30 @@ function renderLegacyStatus(root, ref, s) {
       statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
     ),
   ];
+  const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
+  const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+  let filesCard = null;
+  if (s.pipeline === "gsearch") {
+    filesCard = el("div", { class: "card" },
+      el("h3", { class: "card-title" }, "Files"),
+      el("div", { class: "files-list" },
+        ...GSEARCH_FILES.map((name) =>
+          el("div", { class: "file-row" },
+            el("span", { class: "file-name" }, name),
+            el("button", {
+              class: "btn-ghost",
+              onclick: () => viewFile(resultUrl(name), name, resultUrl(name) + "&download=true"),
+            }, "View"),
+            el("a", {
+              class: "btn-ghost",
+              href: resultUrl(name) + "&download=true",
+              download: name,
+            }, "Download"),
+          )
+        )
+      )
+    );
+  }
   const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;
   if (fileLinks) {
     parts.push(el("div", { class: "panel" },
@@ -327,6 +351,7 @@ function renderLegacyStatus(root, ref, s) {
       summaryPair("Storage", fileLinks ? Object.values(fileLinks).join(" | ") : "-"),
     ),
   ));
+  if (filesCard) parts.push(filesCard);
   root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
 }
 

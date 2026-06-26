@@ -5681,6 +5681,16 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             return False
         upload_id = str(state.get("upload_id") or "")
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
+        extra: dict[str, Any] = {}
+        if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
+            results = gsearch_reporting.state_to_entity_results(state)
+            summ = gsearch_reporting.build_summary(state, results)
+            extra = {
+                "websites_found": summ["websites_found"],
+                "websites_not_found": summ["websites_not_found"],
+                "cost": summ["cost"],
+                "token_usage": summ["token_usage"],
+            }
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -5689,6 +5699,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             duration_seconds=state.get("processing_seconds_total"),
             file_links=file_links,
             finished_at=_now_iso(),
+            **extra,
         )
     except Exception as exc:
         print(

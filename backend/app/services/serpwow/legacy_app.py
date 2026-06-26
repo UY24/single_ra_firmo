@@ -126,6 +126,9 @@ PIPELINE_FIRMOGRAPHICS = "firmographics"
 PIPELINE_GMAPS = "gmaps"
 PIPELINE_GSEARCH = "gsearch"
 
+_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "report.json", "run.log",
+                         "output.json", "state.json"}
+
 
 def patch_aio_pika_connection_del() -> None:
     # aio_pika Connection.__del__ schedules self.close() via ensure_future().
@@ -5623,15 +5626,15 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 
 def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
+    pipe = pipeline or ""
+    names = ["state.json", "output.json"]
+    if pipe == PIPELINE_GSEARCH:
+        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
-        return {
-            "state.json": f"s3://{bucket}/{_state_s3_key(upload_id, company_name, pipeline)}",
-            "output.json": f"s3://{bucket}/{_output_s3_key(upload_id, company_name, pipeline)}",
-        }
-    return {
-        "state.json": str(_find_upload_dir(upload_id) / "state.json"),
-        "output.json": str(_find_upload_dir(upload_id) / "output.json"),
-    }
+        prefix = _upload_s3_prefix(upload_id, company_name, pipe)
+        return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
+    base = _find_upload_dir(upload_id)
+    return {name: str(base / name) for name in names}
 
 
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
@@ -7497,6 +7500,42 @@ async def upload_output(
         headers = {"Content-Disposition": f'attachment; filename="{upload_id}.json"'}
         return Response(content=body, media_type="application/json", headers=headers)
     return Response(content=body, media_type="application/json")
+
+
+@app.get("/uploads/{upload_id}/result")
+async def upload_result_file(
+    upload_id: str,
+    file: str = Query(...),
+    download: bool = Query(False),
+) -> Response:
+    if file not in _GSEARCH_RESULT_FILES:
+        raise HTTPException(status_code=400, detail="file not allowed")
+    upload_dir = _find_upload_dir(upload_id)
+    path = upload_dir / file
+    data: Optional[bytes] = None
+    if path.exists():
+        data = path.read_bytes()
+    elif os.getenv("S3_BUCKET"):
+        key = await asyncio.to_thread(_find_s3_upload_key_sync, upload_id, file)
+        if key is not None:
+            from app.core import s3 as core_s3
+            def _get() -> bytes:
+                return core_s3.get_s3_client().get_object(
+                    Bucket=core_s3.bucket_name(), Key=key)["Body"].read()
+            try:
+                data = await asyncio.to_thread(_get)
+            except Exception:
+                data = None
+    if data is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    if file.endswith(".csv"):
+        media = "text/csv"
+    elif file.endswith(".json"):
+        media = "application/json"
+    else:
+        media = "text/plain"
+    headers = {"Content-Disposition": f'attachment; filename="{file}"'} if download else {}
+    return Response(content=data, media_type=media, headers=headers)
 
 
 @app.get("/gmaps/discover")

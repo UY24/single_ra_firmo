@@ -1,0 +1,47 @@
+import asyncio
+import unittest
+from unittest import mock
+
+from app.services.serpwow import legacy_app
+
+
+def _fake_serpwow(query, country=None, client=None):
+    async def _coro():
+        return {
+            "provider": "serpwow", "used": True, "query": query,
+            "official_website": "https://acme-motors.com",
+            "candidates": ["https://acme-motors.com", "https://acme-parts.com"],
+            "status_code": 200, "search_url": "http://serp/u", "raw_response": {},
+            "error": None,
+        }
+    return _coro()
+
+
+class TestGsearchWorker(unittest.TestCase):
+    def test_confidence_populated_and_website_selected(self):
+        confidence_raw = {"official_website": "https://acme-motors.com",
+                          "confidence_score": 91, "confidence": "high",
+                          "reason": "match", "evidence": [], "alternatives": []}
+        with mock.patch.object(legacy_app, "run_serpwow_search", _fake_serpwow), \
+             mock.patch.object(legacy_app, "choose_final_website_with_gemini",
+                               return_value=(confidence_raw, None, "gemini-2.5-flash-lite",
+                                             {"promptTokenCount": 50, "candidatesTokenCount": 10})), \
+             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false",
+                                            "ENABLE_FINAL_URL_GEMINI": "true",
+                                            "GEMINI_API_KEY": "k"}):
+            resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
+                company_name="Acme Motors", country="us", phase="phase1"))
+        ctx = resp.context
+        self.assertEqual(resp.official_website, "https://acme-motors.com")
+        self.assertTrue(ctx["final_url_selection_ai"]["used"])
+        self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 91)
+        self.assertGreater(resp.gemini_cost_usd, 0.0)
+
+    def test_batch_mode_skips_per_row_llm(self):
+        with mock.patch.object(legacy_app, "run_serpwow_search", _fake_serpwow), \
+             mock.patch.object(legacy_app, "choose_final_website_with_gemini") as chooser, \
+             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}):
+            resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
+                company_name="Acme Motors", country="us", phase="phase1"))
+        chooser.assert_not_called()
+        self.assertFalse(resp.context["final_url_selection_ai"]["used"])

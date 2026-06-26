@@ -2509,7 +2509,9 @@ async def execute_gsearch_lookup_for_worker(
     formatted_results = []
     candidates = []
     seen_candidates = set()
-    
+    search_attempts: list[dict[str, Any]] = []
+    first_raw: Optional[dict[str, Any]] = None
+
     serpwow_cost = 0.0
     for (label, query), raw_result in zip(queries, results):
         if isinstance(raw_result, Exception):
@@ -2524,14 +2526,14 @@ async def execute_gsearch_lookup_for_worker(
                 "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {str(raw_result)}",
             }
-        
+
         serpwow_cost += 0.02
         attempt_cands = raw_result.get("candidates") or []
         for cand in attempt_cands:
             if cand and cand not in seen_candidates and not is_disallowed_official_url(cand):
                 seen_candidates.add(cand)
                 candidates.append(cand)
-                
+
         formatted_results.append({
             "phase": label,
             "query": query,
@@ -2540,8 +2542,48 @@ async def execute_gsearch_lookup_for_worker(
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_result.get("raw_response"),
         })
-        
+
+        search_attempts.append({
+            "attempt": label,
+            "query": query,
+            "search_url": raw_result.get("search_url"),
+            "status": "official_website_found" if raw_result.get("official_website") else "no_valid_website",
+            "status_code": raw_result.get("status_code"),
+            "error": raw_result.get("error"),
+            "official_website": raw_result.get("official_website"),
+        })
+
+        if first_raw is None and isinstance(raw_result.get("raw_response"), dict):
+            first_raw = raw_result.get("raw_response")
+
     best_candidate = candidates[0] if candidates else None
+    official_website = best_candidate
+
+    final_url_selection_ai = {
+        "provider": "google-gemini", "model": None, "used": False,
+        "error": "Skipped (GSEARCH_LLM_BATCH or no candidates).",
+        "usage": {}, "raw": None,
+    }
+    gemini_cost = 0.0
+    batch_mode = _get_bool_env("GSEARCH_LLM_BATCH", False)
+    enable_final = _get_bool_env("ENABLE_FINAL_URL_GEMINI", True)
+    if not batch_mode and enable_final and candidates:
+        final_output, final_error, final_model, final_usage = await asyncio.to_thread(
+            choose_final_website_with_gemini,
+            company_name, country, input_industry, input_full_address,
+            candidates, search_attempts, first_raw, {},
+        )
+        final_url_selection_ai = {
+            "provider": "google-gemini", "model": final_model,
+            "used": final_output is not None, "error": final_error,
+            "usage": final_usage or {}, "raw": final_output,
+        }
+        gemini_cost = calculate_gemini_cost_usd(final_usage)
+        ai_website = final_output.get("official_website") if isinstance(final_output, dict) else None
+        if (isinstance(ai_website, str) and ai_website.strip()
+                and not is_disallowed_official_url(ai_website)
+                and _official_website_looks_plausible(ai_website.strip(), company_name, country)):
+            official_website = ai_website.strip()
     
     summary_text = (
         f"Modular Search Phase: {phase} completed. "
@@ -2555,7 +2597,7 @@ async def execute_gsearch_lookup_for_worker(
         firm_id=firm_id,
         input_industry=input_industry,
         input_full_address=input_full_address,
-        official_website=best_candidate,
+        official_website=official_website,
         summary=summary_text,
         address=input_full_address,
         phone=None,
@@ -2567,21 +2609,22 @@ async def execute_gsearch_lookup_for_worker(
         website_company_descirption_translated_ai=None,
         massive_proxy_cost_usd=0.0,
         serpwow_cost_usd=serpwow_cost,
-        gemini_cost_usd=0.0,
-        total_cost_usd=serpwow_cost,
+        gemini_cost_usd=gemini_cost,
+        total_cost_usd=serpwow_cost + gemini_cost,
         context={
             "pipeline": PIPELINE_GSEARCH,
             "phase": phase,
-            "success": bool(best_candidate),
+            "success": bool(official_website),
             "used_proxy": False,
             "blocked": False,
             "candidates": candidates,
             "formatted_results": formatted_results,
+            "final_url_selection_ai": final_url_selection_ai,
             "cost_breakdown": {
                 "massive_proxy_cost_usd": 0.0,
                 "serpwow_cost_usd": serpwow_cost,
-                "gemini_cost_usd": 0.0,
-                "total_cost_usd": serpwow_cost,
+                "gemini_cost_usd": gemini_cost,
+                "total_cost_usd": serpwow_cost + gemini_cost,
                 "serpwow_request_count": len(queries),
             }
         }

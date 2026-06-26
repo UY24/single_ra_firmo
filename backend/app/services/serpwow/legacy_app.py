@@ -2579,7 +2579,7 @@ async def execute_gsearch_lookup_for_worker(
 
     final_url_selection_ai = {
         "provider": "google-gemini", "model": None, "used": False,
-        "error": "Skipped (GSEARCH_LLM_BATCH or no candidates).",
+        "error": "Skipped: batch mode, ENABLE_FINAL_URL_GEMINI off, or no candidates.",
         "usage": {}, "raw": None,
     }
     gemini_cost = 0.0
@@ -2602,7 +2602,7 @@ async def execute_gsearch_lookup_for_worker(
                 and not is_disallowed_official_url(ai_website)
                 and _official_website_looks_plausible(ai_website.strip(), company_name, country)):
             official_website = ai_website.strip()
-    
+
     summary_text = (
         f"Modular Search Phase: {phase} completed. "
         f"Executed {len(queries)} query variations. "
@@ -2636,6 +2636,7 @@ async def execute_gsearch_lookup_for_worker(
             "used_proxy": False,
             "blocked": False,
             "candidates": candidates,
+            "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,
             "cost_breakdown": {
@@ -4449,6 +4450,12 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
         value = attempt.get("official_website")
         if isinstance(value, str) and value.strip():
             candidate_urls.append(value.strip())
+    # Also include the full pre-deduped candidate list written by the gsearch
+    # worker (context["candidates"]).  For the full pipeline this key is absent,
+    # so the loop below is a no-op for that path.
+    for cand in (context_obj.get("candidates") or []):
+        if isinstance(cand, str) and cand.strip():
+            candidate_urls.append(cand.strip())
     dedup: list[str] = []
     seen: set[str] = set()
     for url in candidate_urls:

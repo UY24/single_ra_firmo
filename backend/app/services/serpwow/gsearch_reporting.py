@@ -103,6 +103,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "websites_not_found": len(results) - found,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
+        # SerpWow is a flat fee (no per-search USD charge), so total_usd == llm_usd by design.
         "cost": {"llm_usd": round(llm_usd, 6), "serpwow_searches": serpwow_searches,
                  "total_usd": round(llm_usd, 6)},
         "processing_seconds_total": state.get("processing_seconds_total"),

@@ -32,7 +32,18 @@ class TestChooseFinalWebsite(unittest.TestCase):
         self.assertIsNone(out["official_website"])
         self.assertEqual(out["confidence_score"], 0)
 
-    def test_score_clamped_and_non_json_handled(self):
+    def test_score_clamped(self):
+        """A score of 150 returned by the LLM must be clamped to 100."""
+        candidates = ["https://acme.com"]
+        text = ('{"official_website":"https://acme.com","confidence_score":150,'
+                '"confidence":"high","reason":"match","evidence":[],"alternatives":[]}')
+        with self._patch_gemini(text):
+            out, err, model, usage = legacy_app.choose_final_website_with_gemini(
+                "Acme", "us", "", "", candidates, [], None, {})
+        self.assertIsNone(err)
+        self.assertEqual(out["confidence_score"], 100)
+
+    def test_non_json_handled(self):
         with mock.patch.object(legacy_app, "_gemini_generate_content_json",
                                return_value=("not json", {}, None)):
             out, err, model, usage = legacy_app.choose_final_website_with_gemini(

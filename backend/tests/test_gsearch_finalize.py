@@ -21,6 +21,24 @@ def _state():
 
 
 class TestFinalizeGsearch(unittest.TestCase):
+    def test_finalize_reads_batch_confidence(self):
+        state = _state()
+        # simulate batch-only confidence (no per-row final_url_selection_ai)
+        ctx = state["rows"][0]["result"]["context"]
+        ctx.pop("final_url_selection_ai", None)
+        ctx["gemini_batch_ai"] = {"used": True, "usage": {},
+            "raw": {"official_website": "https://acme.com", "confidence_score": 73, "confidence": "medium"}}
+        import csv
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            upload_dir = Path(d) / "isi" / "up1"; upload_dir.mkdir(parents=True)
+            with mock.patch.object(legacy_app, "_find_upload_dir", return_value=upload_dir), \
+                 mock.patch.dict("os.environ", {}, clear=False):
+                asyncio.run(legacy_app._finalize_gsearch_outputs("up1", state))
+            with (upload_dir / "found.csv").open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["confidence"], "73")
+
     def test_writes_files_and_mirrors(self):
         with tempfile.TemporaryDirectory() as d:
             upload_dir = Path(d) / "isi" / "up1"

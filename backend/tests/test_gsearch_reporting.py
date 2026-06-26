@@ -1,0 +1,67 @@
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.services.serpwow import gsearch_reporting
+
+
+def _state():
+    return {
+        "upload_id": "up1", "company_name": "Acme Motors", "pipeline": "gsearch",
+        "status": "completed_with_errors", "processing_seconds_total": 3.5,
+        "rows": [
+            {"row_index": 0, "company_name": "Acme Motors", "country": "us", "status": "completed",
+             "error": None, "result": {
+                 "official_website": "https://acme-motors.com", "gemini_cost_usd": 0.0001,
+                 "context": {
+                     "cost_breakdown": {"serpwow_request_count": 4},
+                     "formatted_results": [
+                         {"phase": "phase1_exact_hook", "query": "q1", "success": True,
+                          "error": None, "search_url": "http://s/1"}],
+                     "final_url_selection_ai": {"used": True, "usage": {
+                         "promptTokenCount": 100, "candidatesTokenCount": 20}, "raw": {
+                         "official_website": "https://acme-motors.com", "confidence_score": 88,
+                         "confidence": "high", "reason": "match", "alternatives": ["https://x.com"]}},
+                 }}},
+            {"row_index": 1, "company_name": "NoWeb Co", "country": "us", "status": "failed",
+             "error": "not found", "result": {
+                 "official_website": None, "gemini_cost_usd": 0.0,
+                 "context": {"cost_breakdown": {"serpwow_request_count": 6},
+                             "formatted_results": [],
+                             "final_url_selection_ai": {"used": True, "usage": {},
+                                 "raw": {"official_website": None, "confidence_score": 0,
+                                         "confidence": "low", "reason": "none"}}}}},
+        ],
+    }
+
+
+class TestGsearchReporting(unittest.TestCase):
+    def test_entity_results_and_summary(self):
+        state = _state()
+        results = gsearch_reporting.state_to_entity_results(state)
+        self.assertEqual(results[0].website_url, "https://acme-motors.com")
+        self.assertEqual(results[0].confidence, 88)
+        self.assertIsNone(results[1].website_url)
+        summary = gsearch_reporting.build_summary(state, results)
+        self.assertEqual(summary["websites_found"], 1)
+        self.assertEqual(summary["websites_not_found"], 1)
+        self.assertEqual(summary["cost"]["serpwow_searches"], 10)
+        self.assertEqual(summary["token_usage"]["prompt_tokens"], 100)
+
+    def test_write_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = gsearch_reporting.write_gsearch_outputs(Path(d), _state())
+            self.assertTrue(paths["found.csv"].exists())
+            self.assertTrue(paths["notFound.csv"].exists())
+            self.assertTrue(paths["report.json"].exists())
+            self.assertTrue(paths["run.log"].exists())
+            with paths["found.csv"].open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["website_url"], "https://acme-motors.com")
+            self.assertEqual(rows[0]["confidence"], "88")
+            report = json.loads(paths["report.json"].read_text())
+            self.assertEqual(report["summary"]["websites_found"], 1)
+            self.assertEqual(len(report["rows"]), 2)
+            self.assertIn("acme-motors.com", paths["run.log"].read_text())

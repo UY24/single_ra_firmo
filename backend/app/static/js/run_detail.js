@@ -279,16 +279,30 @@ function renderLegacyStatus(root, ref, s) {
   const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
   const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
   const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
+  const tiles = [
+    statTile("Total rows", fmtNum(s.total_rows)),
+    statTile("Processed", fmtNum(s.processed_rows)),
+    statTile("Succeeded", fmtNum(s.success_rows)),
+    statTile("Failed", fmtNum(s.failed_rows)),
+    statTile("Processing time", fmtDuration(s.processing_seconds_total)),
+    statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
+  ];
+  const g = s.gsearch;
+  if (g) {
+    tiles.push(
+      statTile("Websites found", fmtNum(g.websites_found)),
+      statTile("Not found", fmtNum(g.websites_not_found)),
+      statTile("Model", g.model ?? "—"),
+      statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
+      statTile("LLM cost", fmtUsd(g.cost?.total_usd)),
+      statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
+      statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
+    );
+    if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
+  }
   const parts = [
     headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
-    el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" },
-      statTile("Total rows", fmtNum(s.total_rows)),
-      statTile("Processed", fmtNum(s.processed_rows)),
-      statTile("Succeeded", fmtNum(s.success_rows)),
-      statTile("Failed", fmtNum(s.failed_rows)),
-      statTile("Processing time", fmtDuration(s.processing_seconds_total)),
-      statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
-    ),
+    el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
   ];
   const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
   const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;

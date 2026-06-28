@@ -81,6 +81,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
+    model: str | None = None
     for row in state.get("rows", []):
         result = row.get("result") or {}
         ctx = result.get("context") or {}
@@ -89,10 +90,16 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         llm_usd += float(result.get("gemini_cost_usd") or 0.0)
         for key in ("final_url_selection_ai", "gemini_batch_ai"):
             obj = ctx.get(key)
-            usage = obj.get("usage") if isinstance(obj, dict) else None
-            if isinstance(usage, dict):
-                prompt_tokens += int(usage.get("promptTokenCount", 0) or 0)
-                completion_tokens += int(usage.get("candidatesTokenCount", 0) or 0)
+            if isinstance(obj, dict):
+                if model is None and obj.get("model"):
+                    model = str(obj.get("model"))
+                usage = obj.get("usage")
+                if isinstance(usage, dict):
+                    prompt_tokens += int(usage.get("promptTokenCount", 0) or 0)
+                    completion_tokens += int(usage.get("candidatesTokenCount", 0) or 0)
+    # is_batch: the gemini_batch block is only seeded when batch post-processing is
+    # enabled for this upload (GSEARCH_LLM_BATCH), so its presence is the reliable signal.
+    is_batch = bool(state.get("gemini_batch"))
     return {
         "upload_id": state.get("upload_id"),
         "company_name": state.get("company_name"),
@@ -101,6 +108,8 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "total_rows": len(results),
         "websites_found": found,
         "websites_not_found": len(results) - found,
+        "model": model,
+        "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
         # SerpWow is a flat fee (no per-search USD charge), so total_usd == llm_usd by design.

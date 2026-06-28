@@ -7412,11 +7412,29 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         pass
     state = await maybe_fail_stale_processing_rows(upload_id, state)
     summary = summarize_upload_state(dict(state))
+    # gsearch surfaces a confidence/cost summary (model, batch mode, found counts,
+    # cost, tokens) so the run-detail UI can show the same tiles AI Mode does.
+    gsearch_block = None
+    if (summary.get("pipeline") or PIPELINE_FULL) == PIPELINE_GSEARCH:
+        try:
+            gs = gsearch_reporting.build_summary(
+                summary, gsearch_reporting.state_to_entity_results(summary))
+            gsearch_block = {
+                "websites_found": gs["websites_found"],
+                "websites_not_found": gs["websites_not_found"],
+                "model": gs["model"],
+                "is_batch": gs["is_batch"],
+                "cost": gs["cost"],
+                "token_usage": gs["token_usage"],
+            }
+        except Exception:
+            gsearch_block = None
     return {
         "upload_id": summary["upload_id"],
         "pipeline": summary.get("pipeline") or PIPELINE_FULL,
         "status": summary["status"],
         "gemini_batch": summary.get("gemini_batch"),
+        "gsearch": gsearch_block,
         "queue_recovery": summary.get("queue_recovery"),
         "created_at": summary.get("created_at"),
         "updated_at": summary.get("updated_at"),

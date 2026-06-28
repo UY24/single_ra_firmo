@@ -50,6 +50,18 @@ class TestGsearchReporting(unittest.TestCase):
         self.assertEqual(summary["cost"]["serpwow_searches"], 10)
         self.assertEqual(summary["token_usage"]["prompt_tokens"], 100)
 
+    def test_summary_model_and_batch_mode(self):
+        # per-row mode: model comes from final_url_selection_ai, no gemini_batch block
+        state = _state()
+        state["rows"][0]["result"]["context"]["final_url_selection_ai"]["model"] = "gemini-2.5-flash-lite"
+        summary = gsearch_reporting.build_summary(state, gsearch_reporting.state_to_entity_results(state))
+        self.assertEqual(summary["model"], "gemini-2.5-flash-lite")
+        self.assertFalse(summary["is_batch"])
+        # batch mode: presence of the gemini_batch block flips is_batch
+        state["gemini_batch"] = {"status": "succeeded"}
+        summary = gsearch_reporting.build_summary(state, gsearch_reporting.state_to_entity_results(state))
+        self.assertTrue(summary["is_batch"])
+
     def test_write_outputs(self):
         with tempfile.TemporaryDirectory() as d:
             paths = gsearch_reporting.write_gsearch_outputs(Path(d), _state())

@@ -172,13 +172,16 @@ function progressCard(done, total, running) {
   );
 }
 
-function downloadsCard(ref, available) {
-  const files = available?.length ? available : RESULT_FILES;
-  const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+// Shared "Files" card (View + Download per file). `allFiles` is the full list to
+// list; `available` (optional) is the subset that actually exists — others render
+// disabled. `baseUrl(name)` builds the per-file result URL (download appends
+// "&download=true"). Used by both AI Mode and the SerpWow gsearch detail view.
+function filesCard(allFiles, baseUrl, available) {
+  const files = available?.length ? available : allFiles;
   return el("div", { class: "panel" },
     el("h2", { class: "section-title" }, "Files"),
     el("div", { class: "mt-3 flex flex-col gap-2" },
-      ...RESULT_FILES.map((name) => {
+      ...allFiles.map((name) => {
         const isAvailable = files.includes(name);
         return el("div", { class: "flex items-center gap-2" },
           el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
@@ -195,6 +198,11 @@ function downloadsCard(ref, available) {
       }),
     ),
   );
+}
+
+function downloadsCard(ref, available) {
+  const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+  return filesCard(RESULT_FILES, baseUrl, available);
 }
 
 function rerunFailedCard(ref) {
@@ -284,27 +292,10 @@ function renderLegacyStatus(root, ref, s) {
   ];
   const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
   const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-  let filesCard = null;
-  if (s.pipeline === "gsearch") {
-    filesCard = el("div", { class: "card" },
-      el("h3", { class: "card-title" }, "Files"),
-      el("div", { class: "files-list" },
-        ...GSEARCH_FILES.map((name) =>
-          el("div", { class: "file-row" },
-            el("span", { class: "file-name" }, name),
-            el("button", {
-              class: "btn-ghost",
-              onclick: () => viewFile(resultUrl(name), name, resultUrl(name) + "&download=true"),
-            }, "View"),
-            el("a", {
-              class: "btn-ghost",
-              href: resultUrl(name) + "&download=true",
-              download: name,
-            }, "Download"),
-          )
-        )
-      )
-    );
+  // Same Files card component AI Mode uses. gsearch files only exist once the run
+  // is terminal, so show it only then (avoids View/Download 404s mid-run).
+  if (s.pipeline === "gsearch" && rowsDone) {
+    parts.push(filesCard(GSEARCH_FILES, resultUrl));
   }
   const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;
   if (fileLinks) {
@@ -351,7 +342,6 @@ function renderLegacyStatus(root, ref, s) {
       summaryPair("Storage", fileLinks ? Object.values(fileLinks).join(" | ") : "-"),
     ),
   ));
-  if (filesCard) parts.push(filesCard);
   root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
 }
 

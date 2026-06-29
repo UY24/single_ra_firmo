@@ -38,6 +38,42 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["pipeline"], "Upload Console")
         self.assertEqual(kw["error"], "queue down")
 
+    def test_gsearch_includes_searches_tokens_cost(self):
+        state = {
+            "upload_id": "UP3", "company_name": "ISI Market Test", "pipeline": "gsearch",
+            "status": "completed", "total_rows": 1, "success_rows": 1, "failed_rows": 0,
+            "processing_seconds_total": 12.0,
+            "rows": [{"row_index": 0, "company_name": "ISI", "country": "us",
+                      "status": "completed", "error": None, "result": {
+                          "official_website": "https://isi.com", "gemini_cost_usd": 0.0002,
+                          "context": {"cost_breakdown": {"serpwow_request_count": 3},
+                                      "final_url_selection_ai": {"usage": {
+                                          "promptTokenCount": 40, "candidatesTokenCount": 8},
+                                          "raw": {"official_website": "https://isi.com",
+                                                  "confidence_score": 80}}}}}],
+        }
+        with mock.patch("app.core.notify.notify_run_complete") as done, \
+                mock.patch("app.core.notify.notify_run_failed"):
+            la._notify_slack_terminal(state)
+        kw = done.call_args.kwargs
+        self.assertEqual(kw["search_label"], "SerpWow searches")
+        self.assertEqual(kw["searches"], 3)
+        self.assertEqual(kw["tokens"], 48)
+        self.assertEqual(kw["input_tokens"], 40)
+        self.assertEqual(kw["output_tokens"], 8)
+        self.assertAlmostEqual(kw["cost_usd"], 0.0002)
+
+    def test_non_gsearch_omits_search_token_cost(self):
+        state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "gmaps",
+                 "status": "completed", "total_rows": 2, "success_rows": 2, "failed_rows": 0}
+        with mock.patch("app.core.notify.notify_run_complete") as done, \
+                mock.patch("app.core.notify.notify_run_failed"):
+            la._notify_slack_terminal(state)
+        kw = done.call_args.kwargs
+        self.assertNotIn("searches", kw)
+        self.assertNotIn("tokens", kw)
+        self.assertNotIn("cost_usd", kw)
+
     def test_never_raises(self):
         with mock.patch("app.core.notify.notify_run_complete",
                         side_effect=RuntimeError("boom")):

@@ -5801,11 +5801,30 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
         if status == "failed":
             notify.notify_run_failed(error=state.get("error") or "run failed", **common)
         else:  # completed | completed_with_errors
+            # gsearch tracks SerpWow searches + Gemini tokens/cost — surface them in
+            # the ping like AI Mode does. Other SerpWow pipelines have none, so omit.
+            extra: dict[str, Any] = {}
+            if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
+                try:
+                    gs = gsearch_reporting.build_summary(
+                        state, gsearch_reporting.state_to_entity_results(state))
+                    tu = gs.get("token_usage") or {}
+                    extra = {
+                        "searches": gs["cost"]["serpwow_searches"],
+                        "search_label": "SerpWow searches",
+                        "tokens": tu.get("total_tokens"),
+                        "input_tokens": tu.get("prompt_tokens"),
+                        "output_tokens": tu.get("completion_tokens"),
+                        "cost_usd": gs["cost"]["total_usd"],
+                    }
+                except Exception:
+                    extra = {}
             notify.notify_run_complete(
                 status=status,
                 success=state.get("success_rows"),
                 failed=state.get("failed_rows"),
                 **common,
+                **extra,
             )
     except Exception as exc:
         print(f"[slack] notify failed for upload {state.get('upload_id')} "

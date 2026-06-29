@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-26 (gsearch rework — confidence + AI-Mode-parity outputs + S3 slug fix + Supabase + UI; on branch `gsearchFix`). Read this first if you're picking up this repo.
+Last updated: 2026-06-29 (gsearch rework + UI/Slack follow-ups + test→Slack leak fix; on branch `gsearchFix`, NOT pushed). Read this first if you're picking up this repo.
 
 ---
 
@@ -32,6 +32,14 @@ the source of truth; stale sections below are tagged "(superseded — see top)".
 **Reviewed:** each task got a spec+quality review; a final whole-branch review (opus) found one Important issue — batch-mode prompt only saw 1 candidate — **fixed** (the `context["candidates"]` bridge above; `full` non-regression verified: `full` never sets that key). Open Minors (non-blocking, see plan/ledger): `choose_final_website` 404-detection is a string-scan; a couple of test-coverage polish items.
 
 **NOT yet live-verified (needs real `SERPWOW_API_KEY` + `GEMINI_API_KEY` + a run; would spend credits):** an end-to-end gsearch run confirming S3 lands at `website-url-finder/<slug>/gsearch/<id>/` with all files, confidence populated, Supabase row carrying counts/cost, and the UI Files card viewing them — for BOTH `GSEARCH_LLM_BATCH=false` and `=true`. The UI card was `node --check`'d only (no browser test). **To enable on a running server, restart it** (env loads at startup).
+
+**Follow-ups (2026-06-28/29, same branch — 5 more commits, suite 206/206):**
+1. **Run-detail UI — reuse AI Mode's Files card.** The gsearch Files card was using made-up CSS classes (`card`/`files-list`/`file-row`) → rendered unstyled/ugly. Extracted AI Mode's card into a shared `filesCard(allFiles, baseUrl, available)` in `run_detail.js`; both `downloadsCard` (AI Mode) and the gsearch detail now call it. The gsearch card now renders only when the run is terminal (files don't exist mid-run) and sits right after the stat tiles.
+2. **Run-detail UI — gsearch tiles.** The legacy SerpWow detail view showed no model/batch/cost for gsearch. Added a `gsearch` block to `GET /uploads/{upload_id}/status` (computed live via `gsearch_reporting.build_summary`) and tiles in `renderLegacyStatus`: Websites found/Not found, **Model**, **Batch mode**, LLM cost, Input/Output tokens, plus a **Batch job** tile from `gemini_batch.status`. `build_summary` gained `model` (from `final_url_selection_ai`/`gemini_batch_ai`) + `is_batch` (`bool(state["gemini_batch"])`).
+3. **gsearch Slack ping — tokens/cost/searches.** `_notify_slack_terminal` now passes `searches` (+ `search_label="SerpWow searches"`), `tokens`/`input_tokens`/`output_tokens`, and `cost_usd` for gsearch (from `build_summary`); other SerpWow pipelines unchanged (`notify_run_complete` already supported these fields; cost only renders when >0).
+4. **⚠️ FIXED: tests were posting to the REAL Slack webhook.** `test_ai_mode_resume.py` ran `run_ai_mode_sync` end-to-end with `company_name="Acme Corp"` (ai_deep, 6 rows) but its `FAKE_ENV` omitted `SLACK_WEBHOOK_URL`, and `patch.dict` MERGES — so the real `.env` webhook stayed live and every `unittest discover` posted a real "Acme Corp" completion to Slack (the mystery pings the user saw). Fix: added `"SLACK_WEBHOOK_URL": ""` to that `FAKE_ENV` **and** a process-wide guard in **`tests/__init__.py`** (`os.environ["SLACK_WEBHOOK_URL"] = ""`) — it runs before `app.core.config`'s `load_dotenv(override=False)`, so it can't be repopulated; verified `notify.is_configured()` is False in-test. `test_engine_smoke` already guarded it; `test_companies_router` mocks `run_ai_mode_sync` (no leak). **Lesson for new tests:** any test exercising a real run path (`run_ai_mode_sync`/`persist_upload_state`) must keep `SLACK_WEBHOOK_URL` blank — the `tests/__init__.py` guard now covers this by default.
+
+**Note on stray Slack pings:** the bot posts on every real run completion against whatever server has `SLACK_WEBHOOK_URL` set; the message's "Company:" is the run's `company_name`, not anything to do with the Slack app's icon/name. Deleting old channel messages is purely cosmetic (one-way webhook; no effect on app/data). For dev/smoke-test boxes, point at a test channel or unset the webhook.
 
 ---
 

@@ -69,6 +69,8 @@ rabbitmq_last_error: Optional[str] = None
 rabbitmq_stop_event: Optional[asyncio.Event] = None
 search_fetch_semaphore: Optional[asyncio.Semaphore] = None
 gemini_batch_tasks: dict[str, asyncio.Task] = {}
+gemini_batch_reconciler_task: Optional[asyncio.Task] = None
+gemini_batch_reconciler_stop: Optional[asyncio.Event] = None
 upload_active_rows: dict[str, set[int]] = {}
 upload_active_rows_lock = asyncio.Lock()
 upload_summaries_cache: dict[str, dict[str, Any]] = {}
@@ -223,6 +225,22 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     if pipe == PIPELINE_FULL:
         return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
+
+
+def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
+    """gsearch only: True while its Gemini batch hasn't reached a terminal status.
+
+    Used to DEFER the terminal completion side-effects (Supabase 'completed' sync,
+    Slack ping, output-file finalize) until the batch is done, so a gsearch batch
+    run reports completion once with final numbers — like AI Mode. The `full`
+    pipeline is intentionally left unchanged.
+    """
+    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+        return False
+    if not _batch_postprocess_enabled_for(PIPELINE_GSEARCH):
+        return False
+    gb = state.get("gemini_batch")
+    return isinstance(gb, dict) and gb.get("status") in {"waiting_for_rows", "queued", "running"}
 
 
 def _short_text(value: Any, limit: int = 240) -> str:
@@ -2253,21 +2271,20 @@ def choose_final_website_with_gemini(
         if isinstance(selected, str) and selected.strip():
             selected_norm = _normalize_url_for_compare(selected)
             if not selected_norm or selected_norm not in candidate_set:
+                # Hard reject: the LLM invented a URL the search never returned.
                 normalized["official_website"] = None
                 normalized["confidence_score"] = 0
                 normalized["confidence"] = "low"
                 normalized["reason"] = (
                     f"Rejected URL outside candidate set: {selected_norm or selected.strip()}"
                 )
-            elif not _official_website_looks_plausible(selected_norm, company_name, country):
-                normalized["official_website"] = None
-                normalized["confidence_score"] = 0
-                normalized["confidence"] = "low"
-                normalized["reason"] = (
-                    f"Rejected URL due to low company-domain plausibility: {selected_norm}"
-                )
             else:
+                # Keep the in-candidate pick. The domain-token heuristic is crude
+                # (brand/abbreviation domains fail it), so it no longer DROPS the
+                # URL — it only flags it for review so nothing correct is lost.
                 normalized["official_website"] = selected_norm
+                if not _official_website_looks_plausible(selected_norm, company_name, country):
+                    normalized["domain_name_mismatch"] = True
         return normalized, None, model, usage_metadata
 
     return None, (last_error or "Gemini model resolution failed"), configured_model, None
@@ -2598,9 +2615,13 @@ async def execute_gsearch_lookup_for_worker(
         }
         gemini_cost = calculate_gemini_cost_usd(final_usage)
         ai_website = final_output.get("official_website") if isinstance(final_output, dict) else None
+        # Accept the LLM's validated pick (it's already constrained to candidates +
+        # not-disallowed by choose_final_website_with_gemini). The domain-token
+        # heuristic is NOT a gate here — it only adds a domain_name_mismatch flag
+        # (carried in final_url_selection_ai.raw), so correct brand/abbreviation
+        # domains aren't silently dropped.
         if (isinstance(ai_website, str) and ai_website.strip()
-                and not is_disallowed_official_url(ai_website)
-                and _official_website_looks_plausible(ai_website.strip(), company_name, country)):
+                and not is_disallowed_official_url(ai_website)):
             official_website = ai_website.strip()
 
     summary_text = (
@@ -5117,23 +5138,23 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 result["context"] = context
                 row["result"] = result
                 finalized_official = str(result.get("official_website") or "").strip()
-                is_plausible_official = (
-                    bool(finalized_official)
-                    and _official_website_looks_plausible(
+                if finalized_official:
+                    # Keep the batch-picked URL. The domain-token heuristic is
+                    # non-fatal: flag a mismatch for review instead of dropping a
+                    # possibly-correct brand/abbreviation domain (was previously
+                    # nulled -> false "not found"). Only a genuinely empty pick fails.
+                    if not _official_website_looks_plausible(
                         finalized_official,
                         str(row.get("company_name") or ""),
                         str(row.get("country") or ""),
-                    )
-                )
-                if not is_plausible_official:
-                    result["official_website"] = None
-                row["status"] = "completed" if is_plausible_official else "failed"
-                row["error"] = None if row["status"] == "completed" else (
-                    "Official website not found after Gemini batch post-processing."
-                )
-                if row["status"] == "completed":
+                    ) and isinstance(parsed, dict):
+                        parsed["domain_name_mismatch"] = True
+                    row["status"] = "completed"
+                    row["error"] = None
                     batch_rows_completed += 1
                 else:
+                    row["status"] = "failed"
+                    row["error"] = "Official website not found after Gemini batch post-processing."
                     batch_rows_failed += 1
             state["gemini_batch"] = {
                 "status": "succeeded",
@@ -5853,13 +5874,18 @@ async def _finalize_gsearch_outputs(upload_id: str, state: dict[str, Any]) -> No
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     state = summarize_upload_state(state)
+    # gsearch batch mode: rows reach "completed" before the Gemini batch (the LLM
+    # confidence step) runs. Defer the terminal side-effects (Supabase 'completed'
+    # sync, Slack ping, output-file finalize) until the batch is terminal so we
+    # report completion ONCE, with the final post-batch numbers (like AI Mode).
+    batch_pending = _batch_postprocess_pending(state)
     if _should_sync_running(state):
         # One-shot 'running' sync: the marker is set regardless of outcome so a
         # down Supabase (update_run retries 3x with sleeps) can't re-stall every
         # subsequent persist; the terminal sync below has its own retry story.
         state["supabase_running_marker"] = True
         await asyncio.to_thread(_mark_supabase_run_running, dict(state))
-    if state.get("status") in {"completed", "completed_with_errors", "failed"}:
+    if (not batch_pending) and state.get("status") in {"completed", "completed_with_errors", "failed"}:
         # Sync once per distinct terminal snapshot (retries can re-open an upload
         # and re-complete it with different counters; resync then).
         marker = (
@@ -5885,7 +5911,7 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     if state["status"] in {"completed", "completed_with_errors"}:
         combined = build_upload_output_payload(state)
         await write_upload_artifact(upload_id, "output", combined)
-    if state.get("pipeline") == PIPELINE_GSEARCH and state["status"] in {"completed", "completed_with_errors"}:
+    if (not batch_pending) and state.get("pipeline") == PIPELINE_GSEARCH and state["status"] in {"completed", "completed_with_errors"}:
         await _finalize_gsearch_outputs(upload_id, state)
     await maybe_start_gemini_batch_for_upload(upload_id, state)
 
@@ -6607,8 +6633,81 @@ async def rabbitmq_worker_loop(worker_id: int) -> None:
                     await _mark_upload_row_inactive(tracking_upload_id, tracking_row_index)
 
 
+async def reconcile_pending_gemini_batches() -> None:
+    """Resume any upload whose Gemini batch isn't terminal yet (durability sweep).
+
+    The remote batch + its results live on Google's side and ``job_name`` is
+    persisted to state.json BEFORE polling, so recovery is just "re-poll":
+    re-dispatch ``run_gemini_batch_for_upload`` (which re-polls an existing
+    job_name, or creates the job if none yet). Runs in the worker process (where
+    batches are normally kicked) to avoid racing the API's on-status-poll resume;
+    ``gemini_batch_tasks`` + ``get_upload_lock`` guard against duplicates.
+    Best-effort: per-upload and sweep-wide errors are swallowed, never raised.
+    """
+    try:
+        limit = _get_int_env("GEMINI_BATCH_RECONCILE_SCAN_LIMIT", 500)
+        states: list[dict[str, Any]] = []
+        try:
+            paths = await asyncio.to_thread(_list_local_state_files_sync, limit)
+            for p in paths:
+                try:
+                    states.append(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not states and os.getenv("S3_BUCKET"):
+            try:
+                keys = await asyncio.to_thread(_list_state_keys_from_s3_sync, limit)
+                for k in keys:
+                    try:
+                        states.append(await asyncio.to_thread(_read_json_from_s3_sync, k))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        for state in states:
+            if not isinstance(state, dict):
+                continue
+            upload_id = str(state.get("upload_id") or "").strip()
+            if not upload_id:
+                continue
+            if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+                continue
+            gb = state.get("gemini_batch")
+            if not isinstance(gb, dict) or gb.get("status") not in {"queued", "running"}:
+                continue
+            existing = gemini_batch_tasks.get(upload_id)
+            if existing is not None and not existing.done():
+                continue
+            print(f"[reconcile] resuming gemini batch for upload {upload_id} "
+                  f"(status={gb.get('status')})")
+            gemini_batch_tasks[upload_id] = asyncio.create_task(
+                run_gemini_batch_for_upload(upload_id))
+    except Exception as exc:
+        print(f"[reconcile] sweep failed (ignored): {type(exc).__name__}: {exc}")
+
+
+async def periodic_batch_reconciler() -> None:
+    """Re-run the batch reconciler sweep every GEMINI_BATCH_RECONCILE_INTERVAL_SEC
+    until the stop event is set."""
+    interval = max(30.0, _get_float_env("GEMINI_BATCH_RECONCILE_INTERVAL_SEC", 300.0))
+    stop = gemini_batch_reconciler_stop
+    if stop is None:
+        return
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        if stop.is_set():
+            break
+        await reconcile_pending_gemini_batches()
+
+
 async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
     global rabbitmq_consumer_tasks, rabbitmq_stop_event
+    global gemini_batch_reconciler_task, gemini_batch_reconciler_stop
     if rabbitmq_queue is None:
         raise RuntimeError("RabbitMQ queue is not initialized")
     if rabbitmq_consumer_tasks:
@@ -6621,6 +6720,13 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         asyncio.create_task(rabbitmq_worker_loop(i + 1))
         for i in range(count)
     ]
+
+    # Durability: resume any in-flight Gemini batch now (catches a restart) and
+    # keep sweeping periodically (catches a lost in-process task without restart).
+    if gemini_batch_reconciler_task is None:
+        await reconcile_pending_gemini_batches()
+        gemini_batch_reconciler_stop = asyncio.Event()
+        gemini_batch_reconciler_task = asyncio.create_task(periodic_batch_reconciler())
 
 
 async def stop_worker_consumers() -> None:
@@ -6669,6 +6775,17 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global gemini_batch_reconciler_task, gemini_batch_reconciler_stop
+    if gemini_batch_reconciler_stop is not None:
+        gemini_batch_reconciler_stop.set()
+    if gemini_batch_reconciler_task is not None:
+        gemini_batch_reconciler_task.cancel()
+        try:
+            await gemini_batch_reconciler_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        gemini_batch_reconciler_task = None
+        gemini_batch_reconciler_stop = None
     for task in list(gemini_batch_tasks.values()):
         task.cancel()
     if gemini_batch_tasks:

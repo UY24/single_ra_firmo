@@ -32,7 +32,11 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     ctx = result.get("context") or {}
     raw = _confidence_raw(result)
 
-    website = raw.get("official_website") or result.get("official_website") or None
+    # Authoritative website = the row's validated official_website (matches
+    # row["status"] / the success/failed counts). The raw LLM pick can hold a URL
+    # that was rejected (e.g. invented / out-of-candidate) where result.official_website
+    # is None — so reading raw here would wrongly count it as found. Use result.
+    website = result.get("official_website") or None
     try:
         confidence = max(0, min(100, int(raw.get("confidence_score") or 0)))
     except (TypeError, ValueError):
@@ -45,6 +49,9 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     reason = str(raw.get("reason") or "").strip()
     if reason:
         flags.append(Flag("reason", reason))
+    if raw.get("domain_name_mismatch"):
+        flags.append(Flag("domain_name_mismatch",
+                          "chosen domain doesn't obviously match the company name — verify"))
     for alt in (raw.get("alternatives") or [])[:5]:
         if alt:
             flags.append(Flag("alternative", str(alt)))

@@ -22,6 +22,19 @@ class TestChooseFinalWebsite(unittest.TestCase):
         self.assertEqual(out["official_website"], "https://acme-motors.com")
         self.assertEqual(out["confidence_score"], 88)
 
+    def test_implausible_in_candidate_pick_is_kept_with_flag(self):
+        # Domain has no company-name token (heuristic fails) but it IS a candidate:
+        # keep it (don't null) and flag domain_name_mismatch.
+        candidates = ["https://brandxyz.com"]
+        text = ('{"official_website":"https://brandxyz.com","confidence_score":70,'
+                '"confidence":"medium","reason":"r","evidence":[],"alternatives":[]}')
+        with self._patch_gemini(text):
+            out, err, model, usage = legacy_app.choose_final_website_with_gemini(
+                "Totally Different Name", "us", "", "", candidates, [], None, {})
+        self.assertEqual(out["official_website"], "https://brandxyz.com")  # kept, not nulled
+        self.assertTrue(out.get("domain_name_mismatch"))
+        self.assertEqual(out["confidence_score"], 70)
+
     def test_out_of_candidate_pick_is_rejected_to_zero(self):
         candidates = ["https://acme-motors.com"]
         text = ('{"official_website":"https://invented-elsewhere.com","confidence_score":90,'

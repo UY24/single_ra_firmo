@@ -50,6 +50,34 @@ class TestGsearchReporting(unittest.TestCase):
         self.assertEqual(summary["cost"]["serpwow_searches"], 10)
         self.assertEqual(summary["token_usage"]["prompt_tokens"], 100)
 
+    def test_website_from_validated_result_and_mismatch_flag(self):
+        state = {
+            "upload_id": "u", "company_name": "C", "pipeline": "gsearch",
+            "status": "completed_with_errors",
+            "rows": [
+                # rejected pick: result.official_website None, raw still holds a URL -> NOT found
+                {"row_index": 0, "company_name": "A", "country": "us", "status": "failed",
+                 "error": "x", "result": {"official_website": None, "context": {
+                     "cost_breakdown": {},
+                     "gemini_batch_ai": {"raw": {"official_website": "https://rejected.com",
+                                                 "confidence_score": 50}}}}},
+                # kept but domain-mismatch flagged: result.official_website set -> found + flag
+                {"row_index": 1, "company_name": "B", "country": "us", "status": "completed",
+                 "error": None, "result": {"official_website": "https://brand.com", "context": {
+                     "cost_breakdown": {},
+                     "gemini_batch_ai": {"raw": {"official_website": "https://brand.com",
+                                                 "confidence_score": 70,
+                                                 "domain_name_mismatch": True}}}}},
+            ],
+        }
+        results = gsearch_reporting.state_to_entity_results(state)
+        self.assertIsNone(results[0].website_url)          # rejected -> not found
+        self.assertEqual(results[1].website_url, "https://brand.com")
+        self.assertTrue(any(f.flag == "domain_name_mismatch" for f in results[1].flags))
+        summary = gsearch_reporting.build_summary(state, results)
+        self.assertEqual(summary["websites_found"], 1)
+        self.assertEqual(summary["websites_not_found"], 1)
+
     def test_summary_model_and_batch_mode(self):
         # per-row mode: model comes from final_url_selection_ai, no gemini_batch block
         state = _state()

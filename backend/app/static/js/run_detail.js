@@ -277,6 +277,12 @@ function renderAiStatus(root, ref, s) {
 
 function renderLegacyStatus(root, ref, s) {
   const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
+  // gsearch batch mode: rows finish before the Gemini batch. Treat the run as
+  // "done" only once the batch is terminal so the UI doesn't claim completion early.
+  const batchStatus = s.gemini_batch?.status ?? null;
+  const batchTerminal = batchStatus == null
+    || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
+  const gsearchFinalizing = s.pipeline === "gsearch" && rowsDone && !batchTerminal;
   const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
   const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
   const tiles = [
@@ -301,14 +307,16 @@ function renderLegacyStatus(root, ref, s) {
     if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
   }
   const parts = [
-    headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
+    gsearchFinalizing
+      ? headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, "running", "finalizing")
+      : headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
     el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
   ];
   const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
   const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-  // Same Files card component AI Mode uses. gsearch files only exist once the run
-  // is terminal, so show it only then (avoids View/Download 404s mid-run).
-  if (s.pipeline === "gsearch" && rowsDone) {
+  // Same Files card component AI Mode uses. gsearch files are written only once the
+  // batch is terminal, so show it only then (avoids View/Download 404s mid-batch).
+  if (s.pipeline === "gsearch" && rowsDone && batchTerminal) {
     parts.push(filesCard(GSEARCH_FILES, resultUrl));
   }
   const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;

@@ -81,6 +81,43 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
                                        "pipeline": "gmaps"})  # must not raise
 
 
+class GsearchBatchDeferralTests(unittest.TestCase):
+    """gsearch batch mode: terminal side-effects (Slack/Supabase/finalize) are
+    deferred until the Gemini batch is terminal, then fire once."""
+
+    def _state(self, batch_status):
+        return {"upload_id": "UPB", "company_name": "ISI", "pipeline": "gsearch",
+                "run_db_id": "db1", "gemini_batch": {"status": batch_status},
+                "rows": [{"status": "completed", "row_index": 0, "company_name": "ISI",
+                          "country": "us", "result": {"official_website": "https://isi.com",
+                                                      "context": {}}}]}
+
+    def _persist(self, state):
+        with mock.patch.object(la, "write_upload_artifact", new=mock.AsyncMock()), \
+                mock.patch.object(la, "maybe_start_gemini_batch_for_upload", new=mock.AsyncMock()), \
+                mock.patch.object(la, "update_summary_cache"), \
+                mock.patch.object(la, "build_upload_output_payload", return_value={}), \
+                mock.patch.object(la, "_batch_postprocess_enabled_for", return_value=True), \
+                mock.patch.object(la, "_finalize_gsearch_outputs", new=mock.AsyncMock()) as fin, \
+                mock.patch.object(la, "_update_supabase_run", return_value=True) as sup, \
+                mock.patch.object(la, "_notify_slack_terminal") as notify_term:
+            asyncio.run(la.persist_upload_state("UPB", state))
+            return notify_term, fin, sup
+
+    def test_defers_while_batch_pending(self):
+        for st in ("waiting_for_rows", "queued", "running"):
+            notify_term, fin, sup = self._persist(self._state(st))
+            notify_term.assert_not_called()
+            fin.assert_not_called()
+            sup.assert_not_called()
+
+    def test_fires_once_after_batch_terminal(self):
+        notify_term, fin, sup = self._persist(self._state("succeeded"))
+        notify_term.assert_called_once()
+        fin.assert_called_once()
+        sup.assert_called_once()
+
+
 class PersistDedupTests(unittest.TestCase):
     """The terminal Slack ping fires once per distinct snapshot, even across
     multiple persist_upload_state calls (which happen on every row update)."""

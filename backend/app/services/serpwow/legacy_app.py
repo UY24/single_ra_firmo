@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
 
@@ -1549,6 +1549,44 @@ def is_disallowed_official_url(url: Optional[str]) -> bool:
     return False
 
 
+def canonicalize_official_url(url: str) -> str:
+    """Normalize a URL for equality/dedup: lower scheme+host, force https, strip a
+    leading www., drop fragment, normalize a bare trailing slash. Returns "" if the
+    input has no host (invalid). Does NOT mutate a meaningful path."""
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    raw = url.strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if not host or "." not in host:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    path = parts.path or ""
+    if path == "/":
+        path = ""
+    return urlunsplit(("https", host, path, "", ""))
+
+
+def dedupe_candidate_urls(urls: list[str]) -> list[str]:
+    """Drop later URLs whose canonical form already appeared; keep first-seen order
+    and the ORIGINAL string (canonicalization is for comparison only)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        c = canonicalize_official_url(u)
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(u)
+    return out
+
+
 def _parse_json_from_text(raw_text: str) -> Optional[dict[str, Any]]:
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
@@ -2659,7 +2697,7 @@ async def execute_gsearch_lookup_for_worker(
             "success": bool(official_website),
             "used_proxy": False,
             "blocked": False,
-            "candidates": candidates,
+            "candidates": dedupe_candidate_urls(candidates),
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,
@@ -2675,7 +2713,7 @@ async def execute_gsearch_lookup_for_worker(
     
     unified_raw_serpwow = {
         "queries": queries,
-        "candidates": candidates,
+        "candidates": dedupe_candidate_urls(candidates),
         "results": formatted_results,
     }
     

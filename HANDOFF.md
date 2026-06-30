@@ -4,6 +4,36 @@ Last updated: 2026-06-29 (gsearch rework + UI/Slack follow-ups + test→Slack le
 
 ---
 
+## ⭐ gsearchFix branch — current state (NEW AGENT START HERE)
+
+**Branch `gsearchFix`: 20 commits over `bbed9f8` (its base), NOT pushed, NOT merged — user's call. Suite 212/212 green** (`cd backend && ../.venv/bin/python -m unittest discover -s tests`). Plan/spec on disk (gitignored): `docs/superpowers/{plans,specs}/2026-06-26-gsearch-rework*`. Detailed change-by-change history is in the dated sections below; this block is the consolidated snapshot.
+
+**What gsearch is now.** SerpWow Google **AI Overview** pipeline (`/live/search`, `engine=google`, `include_ai_overview=true`), still RabbitMQ-based. Per row it runs phase queries (`build_selected_phase_queries`), gathers candidate URLs, then an **LLM confidence/selection** step picks the official site **from the candidates only** + scores 0–100. It now produces AI-Mode-parity outputs and tracking. Pipeline taxonomy: **AI Mode** = Google AI Mode via scrape.do (in-process); **gsearch** = SerpWow AI Overview (RabbitMQ); **gmaps** = SerpWow Places.
+
+**Two confidence modes (env `GSEARCH_LLM_BATCH`, default false):**
+- **false** — per-row Gemini call inside the worker (`choose_final_website_with_gemini`, in `legacy_app.py`; HTTP seam `_gemini_generate_content_json`).
+- **true** — Gemini **batch** post-process at finalization. Gated for all sites by `_batch_postprocess_enabled_for(pipeline)` (`full`→`ENABLE_GEMINI_BATCH_POSTPROCESS`, `gsearch`→`GSEARCH_LLM_BATCH`). In batch mode, completion (Slack ping + Supabase 'completed' + output files) is **deferred until the batch is terminal** via `_batch_postprocess_pending(state)` (gsearch-scoped; `full` unchanged) — so it reports completion ONCE with final numbers. The UI shows a **running/finalizing** badge meanwhile.
+
+**Confidence/URL validation rules.** The LLM pick must be one of the candidates (else nulled → not found) and must pass `is_disallowed_official_url` (no directories/social/file URLs). The crude domain-token heuristic `_official_website_looks_plausible` is **non-fatal** — a mismatch keeps the URL and adds a `domain_name_mismatch` flag (prevents false-failing correct brand/abbreviation domains).
+
+**Outputs & where to view.** At terminal status, `_finalize_gsearch_outputs` → `gsearch_reporting.write_gsearch_outputs` writes `found.csv` / `notFound.csv` / `report.json` (summary+rows+cost) / `run.log` next to `state.json`/`output.json`, best-effort mirrored to S3. `gsearch_reporting.row_to_entity_result` derives `website_url` from the **validated** `result.official_website` (NOT the raw LLM pick) so found/notFound counts match Slack/Supabase. Served via `GET /uploads/{id}/result?file=<name>` (allowlist `_GSEARCH_RESULT_FILES`) and the run-detail **Files card** (reuses AI Mode's `filesCard`). Run-detail also shows Model/Batch-mode/cost/tokens/Batch-job tiles from a `gsearch` block on `/uploads/{id}/status`.
+
+**S3/disk slug.** SerpWow now uses `_company_slug` (lowercase/dash, matches AI Mode's `slugify_company`) for the **company folder**: `website-url-finder/<slug>/gsearch/<upload_id>/…`. `_safe_name` is kept only for per-row filenames. Old `ISI_Market_Test/`-slug runs weren't migrated (still findable by `upload_id` suffix).
+
+**Supabase.** gsearch terminal `_update_supabase_run` writes `websites_found`/`websites_not_found`/`cost`/`token_usage` (not just success/failed counts).
+
+**Durability.** `reconcile_pending_gemini_batches()` + `periodic_batch_reconciler()` run in the **worker** process (started in `start_worker_consumers`, stopped in `shutdown_event`; interval `GEMINI_BATCH_RECONCILE_INTERVAL_SEC`, default 300): they re-dispatch `run_gemini_batch_for_upload` for any upload whose `gemini_batch.status in {queued,running}` — re-polling the saved `job_name` (the remote job + results live on Google's side). So a server/worker restart still finishes + notifies.
+
+**New env (in `.env.example`):** `GSEARCH_LLM_BATCH`, `ENABLE_FINAL_URL_GEMINI`, `GEMINI_BATCH_RECONCILE_INTERVAL_SEC`.
+
+**New files:** `backend/app/services/serpwow/gsearch_reporting.py` (standalone; imports only `models/results.py`). New tests: `test_gsearch_{slug,confidence,worker,reporting,finalize,supabase,result_endpoint,batch_gate,batch_prompt,reconcile}.py`. Test hermeticity guard added: `backend/tests/__init__.py` blanks `SLACK_WEBHOOK_URL` so tests never post to a real webhook (an engine test was doing so — see 2026-06-29 note).
+
+**⚠️ NOT live-verified (needs real `SERPWOW_API_KEY` + `GEMINI_API_KEY`, would spend credits):** a full gsearch run (both `GSEARCH_LLM_BATCH=false` and `=true`) confirming S3 layout, populated confidence, one post-batch Slack ping, found/notFound matching Supabase, the Files-card view in a browser, and a mid-batch **worker restart** resuming via the reconciler. To enable on a running server, **restart it** (env loads at startup).
+
+**Conventions (also in CLAUDE.md):** never add `Co-Authored-By: Claude`; never `git push` or query prod Supabase without explicit OK; tests are unittest (not pytest), offline.
+
+---
+
 ## 2026-06-12 — REWORK COMPLETE (read this first)
 
 The whole backend was restructured on branch `rework` (~38 commits over `main`). Everything below

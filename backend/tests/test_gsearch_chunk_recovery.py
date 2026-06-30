@@ -77,23 +77,6 @@ def _failed_row(idx, candidate="https://c%d.com"):
     }
 
 
-def _make_fake_collect(keys_to_return=None, *, all_keys=True):
-    """Return a fake collect_results that maps key->URL for the given key set."""
-    def _collect(obj):
-        out = []
-        for k in (obj.get("_keys") or []):
-            if all_keys or (keys_to_return and k in keys_to_return):
-                idx = int(k.split("-")[1])
-                out.append({
-                    "key": k,
-                    "text": json.dumps({
-                        "official_website": f"https://c{idx}.com",
-                        "confidence_score": 90,
-                    }),
-                    "usage": {},
-                })
-        return out
-    return _collect
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +212,14 @@ class TestBatchTimeout(unittest.IsolatedAsyncioTestCase):
         }
         persisted = {"state": state}
 
-        created = {"n": 0}
-
         def fake_create(model, items, display_name):
-            created["n"] += 1
+            # Extract chunk_id from display_name (format: gsearch-{upload_id}-chunk{chunk_id})
+            chunk_id = display_name.rsplit("chunk", 1)[-1]
             keys = [k for k, _ in items]
-            return {"name": f"jobs/C{created['n']}", "_keys": keys}
+            return {"name": f"jobs/chunk-{chunk_id}", "_keys": keys}
 
         def fake_get(name):
-            if name == "jobs/C2":
+            if name == "jobs/chunk-1":
                 # Never returns terminal (simulates perpetually running job)
                 return {"name": name, "done": False, "state": {"name": "JOB_STATE_RUNNING"}}
             # Chunk 0's job terminates immediately
@@ -279,7 +261,7 @@ class TestBatchTimeout(unittest.IsolatedAsyncioTestCase):
 
         def fake_get_with_bump(name):
             result = original_get_batch(name)
-            if name == "jobs/C2" and not result.get("done"):
+            if name == "jobs/chunk-1" and not result.get("done"):
                 # After returning non-terminal, bump time so next deadline check fires.
                 time_offset["v"] = 10000.0
             return result

@@ -127,6 +127,9 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
                 }]
             }
 
+        async def _fake_persist(uid, s):
+            pass
+
         with mock.patch.object(app, "execute_gsearch_lookup_for_worker",
                                side_effect=_fake_gsearch), \
              mock.patch.object(app, "upload_serpwow_json_to_s3",
@@ -136,7 +139,7 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
              mock.patch.object(app, "get_upload_state",
                                side_effect=fake_get_upload_state), \
              mock.patch.object(app, "persist_upload_state",
-                               side_effect=lambda uid, s: asyncio.sleep(0)), \
+                               side_effect=_fake_persist), \
              mock.patch.dict("os.environ", {
                  "GSEARCH_LLM_BATCH": "false",
                  "ENABLE_FINAL_URL_GEMINI": "false",

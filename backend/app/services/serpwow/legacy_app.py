@@ -2672,6 +2672,7 @@ async def execute_gsearch_lookup_for_worker(
         f"Found {len(candidates)} unique candidates."
     )
     
+    deduped = dedupe_candidate_urls(candidates)
     crawl_resp = CrawlResponse(
         company_name=company_name,
         country=country,
@@ -2698,7 +2699,7 @@ async def execute_gsearch_lookup_for_worker(
             "success": bool(official_website),
             "used_proxy": False,
             "blocked": False,
-            "candidates": dedupe_candidate_urls(candidates),
+            "candidates": deduped,
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,
@@ -2711,10 +2712,10 @@ async def execute_gsearch_lookup_for_worker(
             }
         }
     )
-    
+
     unified_raw_serpwow = {
         "queries": queries,
-        "candidates": dedupe_candidate_urls(candidates),
+        "candidates": deduped,
         "results": formatted_results,
     }
     
@@ -4573,42 +4574,6 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
     return prompt
 
 
-def _build_batch_requests_for_state(state: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
-    requests_payload: list[dict[str, Any]] = []
-    row_refs: list[dict[str, Any]] = []
-    jsonl_lines: list[str] = []
-    for row in state.get("rows", []):
-        if not isinstance(row, dict):
-            continue
-        if row.get("status") not in {"completed", "failed"}:
-            continue
-        prompt = _build_batch_prompt_for_row(row)
-        row_index = int(row.get("row_index", 0) or 0)
-        key = f"row-{row_index}"
-        request_obj = {
-            "request": {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "responseMimeType": "application/json",
-                },
-            },
-            "metadata": {"key": key},
-        }
-        requests_payload.append(request_obj)
-        row_refs.append({"row_index": row_index, "key": key})
-        jsonl_lines.append(
-            json.dumps(
-                {
-                    "key": key,
-                    "request": request_obj["request"],
-                },
-                ensure_ascii=True,
-            )
-        )
-    return requests_payload, row_refs, "\n".join(jsonl_lines) + ("\n" if jsonl_lines else "")
-
-
 def _gemini_batch_create_sync(
     model: str,
     requests_payload: list[dict[str, Any]],
@@ -5207,6 +5172,11 @@ async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, A
     job_name = str(gemini_batch_meta.get("job_name") or "").strip()
     started_at_dt = _parse_iso_datetime(gemini_batch_meta.get("started_at"))
     startup_timeout_sec = max(30.0, _get_float_env("GEMINI_BATCH_STARTUP_TIMEOUT_SEC", 180.0))
+
+    # Chunked runs: the worker's reconcile_pending_gemini_batches owns re-poll.
+    # Do NOT apply the single-job stale-guard or single-job re-poll here.
+    if isinstance(gemini_batch_meta.get("chunks"), list) and gemini_batch_meta.get("chunks"):
+        return state
 
     # Guard against stale "running" states when no remote job was ever recorded.
     if local_status == "running" and not job_name and started_at_dt is not None:
@@ -7510,25 +7480,42 @@ async def batch_job_cancel(upload_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Upload ID not found") from exc
 
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-    job_name = str(gemini_batch_meta.get("job_name") or "").strip()
-    if not job_name:
+
+    # Chunked run: gather job_names from chunks
+    chunks = gemini_batch_meta.get("chunks") if isinstance(gemini_batch_meta.get("chunks"), list) else []
+    chunk_job_names = [str(c.get("job_name") or "").strip() for c in chunks if isinstance(c, dict)]
+    chunk_job_names = [n for n in chunk_job_names if n]
+
+    # Legacy single-job fallback
+    top_level_job_name = str(gemini_batch_meta.get("job_name") or "").strip()
+
+    if not chunk_job_names and not top_level_job_name:
         raise HTTPException(status_code=400, detail="No Gemini batch job found for upload")
 
-    try:
-        cancel_resp = await asyncio.to_thread(_gemini_batch_cancel_sync, job_name)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
+    cancel_results: list[dict[str, Any]] = []
+    if chunk_job_names:
+        # Best-effort cancel each chunk
+        for jn in chunk_job_names:
+            try:
+                resp = await asyncio.to_thread(_gemini_batch_cancel_sync, jn)
+                cancel_results.append({"job_name": jn, "status": "cancel_requested", "response": resp})
+            except Exception as exc:
+                cancel_results.append({"job_name": jn, "status": "error", "error": str(exc)})
+    else:
+        # Legacy single-job cancel
+        try:
+            resp = await asyncio.to_thread(_gemini_batch_cancel_sync, top_level_job_name)
+            cancel_results.append({"job_name": top_level_job_name, "status": "cancel_requested", "response": resp})
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
 
     async with get_upload_lock(upload_id):
         try:
             state = await read_upload_artifact(upload_id, "state")
             current_batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
             state["gemini_batch"] = {
+                **current_batch,
                 "status": "cancel_requested",
-                "started_at": current_batch.get("started_at"),
-                "completed_at": current_batch.get("completed_at"),
-                "job_name": job_name,
-                "error": None,
             }
             await persist_upload_state(upload_id, state)
         except Exception:
@@ -7536,9 +7523,8 @@ async def batch_job_cancel(upload_id: str) -> dict[str, Any]:
 
     return {
         "upload_id": upload_id,
-        "job_name": job_name,
         "status": "cancel_requested",
-        "response": cancel_resp,
+        "cancelled_jobs": cancel_results,
     }
 
 

@@ -443,7 +443,7 @@ async def _get_rabbitmq_queue_depth() -> Optional[int]:
         return None
 
 
-def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, phase: str = "all") -> dict[str, Any]:
+def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, phase: str = "all", upload_company_name: str = "") -> dict[str, Any]:
     return {
         "upload_id": upload_id,
         "row_index": int(row.get("row_index", 0) or 0),
@@ -456,6 +456,7 @@ def _build_row_job_payload(upload_id: str, row: dict[str, Any], pipeline: str, p
         "pipeline": pipeline,
         "phase": phase,
         "uploaded_at": _now_iso(),
+        "upload_company_name": upload_company_name,
     }
 
 
@@ -6039,7 +6040,8 @@ async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any])
 
     pipeline = str(state.get("pipeline") or PIPELINE_FULL)
     phase = str(state.get("phase") or "all")
-    jobs = [_build_row_job_payload(upload_id, row, pipeline, phase) for row in queued_rows]
+    upload_company_name = str(state.get("company_name") or "")
+    jobs = [_build_row_job_payload(upload_id, row, pipeline, phase, upload_company_name=upload_company_name) for row in queued_rows]
     republished = 0
     publish_errors: list[tuple[int, str]] = []
 
@@ -6394,7 +6396,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
             upload_id=upload_id,
             row_index=row_index,
-            company_name=company_name,
+            company_name=str(job.get("upload_company_name") or company_name),
             raw_json=serpwow_raw_json,
             pipeline=pipeline,
         )
@@ -6703,6 +6705,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
                 continue
             pipeline = str(state.get("pipeline") or PIPELINE_FULL)
             phase = str(state.get("phase") or "all")
+            upload_company_name = str(state.get("company_name") or "")
             async with get_upload_lock(upload_id):
                 latest = await read_upload_artifact(upload_id, "state")
                 by_index = {int(r.get("row_index", 0) or 0): r
@@ -6719,7 +6722,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
                         row["status_updated_at"] = _now_iso()
                         row["processing_started_at"] = None
                         try:
-                            await publish_job(_build_row_job_payload(upload_id, row, pipeline, phase))
+                            await publish_job(_build_row_job_payload(upload_id, row, pipeline, phase, upload_company_name=upload_company_name))
                             requeued += 1
                         except Exception as exc:
                             row["status"] = "failed"
@@ -7052,6 +7055,7 @@ async def _create_upload_with_rows(
             "pipeline": pipeline,
             "phase": phase,
             "uploaded_at": _now_iso(),
+            "upload_company_name": company_name,
         }
         try:
             await publish_job(job)
@@ -7237,6 +7241,7 @@ async def retry_failed_rows(
                     "pipeline": pipeline,
                     "phase": phase,
                     "uploaded_at": _now_iso(),
+                    "upload_company_name": str(state.get("company_name") or ""),
                 }
             )
 

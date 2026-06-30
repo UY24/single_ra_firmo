@@ -53,7 +53,8 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
                                                   "confidence_score": 80}}}}}],
         }
         with mock.patch("app.core.notify.notify_run_complete") as done, \
-                mock.patch("app.core.notify.notify_run_failed"):
+                mock.patch("app.core.notify.notify_run_failed"), \
+                mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}, clear=False):
             la._notify_slack_terminal(state)
         kw = done.call_args.kwargs
         self.assertEqual(kw["search_label"], "SerpWow searches")
@@ -61,7 +62,8 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["tokens"], 48)
         self.assertEqual(kw["input_tokens"], 40)
         self.assertEqual(kw["output_tokens"], 8)
-        self.assertAlmostEqual(kw["cost_usd"], 0.0002)
+        # total_usd now includes both LLM (0.0002) + SerpWow (3 * 0.00035 = 0.00105)
+        self.assertAlmostEqual(kw["cost_usd"], 0.00125, places=6)
 
     def test_non_gsearch_omits_search_token_cost(self):
         state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "gmaps",

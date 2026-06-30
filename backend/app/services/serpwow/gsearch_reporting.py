@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,20 @@ def state_to_entity_results(state: dict[str, Any]) -> list[EntityResult]:
     return [row_to_entity_result(r, i + 1) for i, r in enumerate(state.get("rows", []))]
 
 
+def _build_cost(llm_usd: float, serpwow_searches: int) -> dict[str, Any]:
+    try:
+        rate = float(os.getenv("SERPWOW_USD_PER_SEARCH", "") or 0.0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    serpwow_usd = serpwow_searches * rate
+    return {
+        "llm_usd": round(llm_usd, 6),
+        "serpwow_searches": serpwow_searches,
+        "serpwow_usd": round(serpwow_usd, 6),
+        "total_usd": round(llm_usd + serpwow_usd, 6),
+    }
+
+
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
@@ -107,6 +122,8 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     # is_batch: the gemini_batch block is only seeded when batch post-processing is
     # enabled for this upload (GSEARCH_LLM_BATCH), so its presence is the reliable signal.
     is_batch = bool(state.get("gemini_batch"))
+    # SerpWow gsearch is per-request billed (unlike scrape.do's flat fee), so
+    # surface a USD figure. Rate unset -> 0 (no crash).
     return {
         "upload_id": state.get("upload_id"),
         "company_name": state.get("company_name"),
@@ -119,9 +136,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
-        # SerpWow is a flat fee (no per-search USD charge), so total_usd == llm_usd by design.
-        "cost": {"llm_usd": round(llm_usd, 6), "serpwow_searches": serpwow_searches,
-                 "total_usd": round(llm_usd, 6)},
+        "cost": _build_cost(llm_usd, serpwow_searches),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
 

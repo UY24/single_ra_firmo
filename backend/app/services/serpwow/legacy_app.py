@@ -5012,14 +5012,17 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
         create_obj: dict[str, Any] = {}
         if not job_name:
             create_obj = await asyncio.to_thread(
-                gb.create_batch, batch_model, items, f"gsearch-{upload_id}-chunk{chunk_id}")
+                lambda: gb.create_batch(batch_model, items, display_name=f"gsearch-{upload_id}-chunk{chunk_id}"))
             job_name = gb.batch_name_from_create(create_obj)
             if not job_name:
                 raise RuntimeError(f"no job name from create: {create_obj}")
         result["job_name"] = job_name
         _log_gemini_batch(upload_id, f"chunk={chunk_id} submitted job_name={job_name} rows={len(items)}")
         # Persist the job_name immediately so a restart can re-poll this chunk.
-        await _persist_chunk_meta(upload_id, chunk_id, {"job_name": job_name, "status": "running"})
+        try:
+            await _persist_chunk_meta(upload_id, chunk_id, {"job_name": job_name, "status": "running"})
+        except Exception as _pm_exc:
+            _log_gemini_batch(upload_id, f"chunk={chunk_id} _persist_chunk_meta failed (non-fatal): {_pm_exc!r}")
         deadline = asyncio.get_event_loop().time() + poll_timeout
         final_obj: dict[str, Any] = {}
         while True:

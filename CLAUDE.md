@@ -27,7 +27,7 @@ python worker.py                     # from repo root; consumes RabbitMQ jobs
 # The API is producer-only by default; it consumes in-process only if ENABLE_EMBEDDED_WORKER=true.
 
 # Tests — all offline (no network); unittest, NOT pytest (pytest isn't installed).
-cd backend && ../.venv/bin/python -m unittest discover -s tests       # full suite
+cd backend && ../.venv/bin/python -m unittest discover -s tests -t .       # full suite (the -t . makes tests import as the 'tests' package so tests/__init__.py's hermeticity guard runs)
 cd backend && ../.venv/bin/python -m unittest tests.test_s3_layout -v # one module
 cd backend && ../.venv/bin/python -m unittest tests.test_results.TestEntityResultSerialization.test_flags_csv  # one test
 ```

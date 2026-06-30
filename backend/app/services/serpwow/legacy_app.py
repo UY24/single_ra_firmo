@@ -4950,10 +4950,11 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
     selected_url = parsed.get("official_website")
     if isinstance(selected_url, str) and selected_url.strip() and not is_disallowed_official_url(selected_url):
         result["official_website"] = selected_url.strip()
-    for k in ("summary", "address", "phone", "email", "industry",
+    for k in ("address", "phone", "email", "industry",
               "website_company_descirption_ai", "website_company_descirption_translated_ai"):
         if parsed.get(k) is not None:
             result[k] = parsed.get(k)
+    result["summary"] = str(parsed.get("summary") or result.get("summary") or "")
     for k in ("products", "services"):
         if isinstance(parsed.get(k), list):
             result[k] = parsed.get(k)

@@ -82,6 +82,38 @@ class TestChunked(unittest.IsolatedAsyncioTestCase):
             result = app._batch_postprocess_pending(state)
         self.assertFalse(result)
 
+    def test_apply_batch_parsed_to_row_summary_parity(self):
+        """summary field should always be str, defaulting to '' when absent."""
+        # Test 1: parsed has no summary, row has no summary -> should be ""
+        row = {"result": {}, "company_name": "TestCo", "country": "US"}
+        parsed = {"official_website": "https://example.com"}
+        usage = {}
+        app._apply_batch_parsed_to_row(row, parsed, usage, "gemini-2.0-flash-001")
+        self.assertEqual(row["result"]["summary"], "")
+        self.assertIsInstance(row["result"]["summary"], str)
+
+        # Test 2: parsed has non-string truthy value -> should be str-coerced
+        row = {"result": {}, "company_name": "TestCo", "country": "US"}
+        parsed = {"official_website": "https://example.com", "summary": 123}
+        usage = {}
+        app._apply_batch_parsed_to_row(row, parsed, usage, "gemini-2.0-flash-001")
+        self.assertEqual(row["result"]["summary"], "123")
+        self.assertIsInstance(row["result"]["summary"], str)
+
+        # Test 3: row had prior summary, parsed has no summary -> preserve prior
+        row = {"result": {"summary": "Prior summary text"}, "company_name": "TestCo", "country": "US"}
+        parsed = {"official_website": "https://example.com"}
+        usage = {}
+        app._apply_batch_parsed_to_row(row, parsed, usage, "gemini-2.0-flash-001")
+        self.assertEqual(row["result"]["summary"], "Prior summary text")
+
+        # Test 4: parsed has string summary -> use it
+        row = {"result": {}, "company_name": "TestCo", "country": "US"}
+        parsed = {"official_website": "https://example.com", "summary": "New summary"}
+        usage = {}
+        app._apply_batch_parsed_to_row(row, parsed, usage, "gemini-2.0-flash-001")
+        self.assertEqual(row["result"]["summary"], "New summary")
+
 
 if __name__ == "__main__":
     unittest.main()

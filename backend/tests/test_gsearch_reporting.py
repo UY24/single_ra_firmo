@@ -105,3 +105,22 @@ class TestGsearchReporting(unittest.TestCase):
             self.assertEqual(report["summary"]["websites_found"], 1)
             self.assertEqual(len(report["rows"]), 2)
             self.assertIn("acme-motors.com", paths["run.log"].read_text())
+
+    def test_run_log_header(self):
+        """Assert run.log starts with a 4-line header (status, counts, cost, blank line)."""
+        with tempfile.TemporaryDirectory() as d:
+            state = _state()
+            paths = gsearch_reporting.write_gsearch_outputs(Path(d), state)
+            log_text = paths["run.log"].read_text()
+            lines = log_text.split("\n")
+            # Header should be: status line, counts line, cost line, blank line
+            self.assertIn("# gsearch run up1 — status=completed_with_errors", lines[0])
+            self.assertIn("# rows=2 found=1 not_found=1 batch=False model=None", lines[1])
+            self.assertIn("# cost: llm_usd=", lines[2])
+            self.assertIn("serpwow_usd=", lines[2])
+            self.assertIn("total_usd=", lines[2])
+            self.assertIn("serpwow_searches=10", lines[2])
+            self.assertEqual(lines[3], "")  # blank line
+            # per-row lines follow
+            self.assertIn("[1]", lines[4])
+            self.assertIn("Acme Motors", lines[4])

@@ -181,8 +181,18 @@ def write_gsearch_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, 
         else:
             tail = f" — {r.error}" if r.error else ""
             log_lines.append(f"[{r.sno}] {r.company_name} ({r.country}) -> not found{tail}")
+
+    summary_hdr = [
+        f"# gsearch run {summary.get('upload_id')} — status={summary.get('status')}",
+        f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
+        f"not_found={summary.get('websites_not_found')} batch={summary.get('is_batch')} "
+        f"model={summary.get('model')}",
+        f"# cost: llm_usd={summary['cost']['llm_usd']} serpwow_usd={summary['cost']['serpwow_usd']} "
+        f"total_usd={summary['cost']['total_usd']} serpwow_searches={summary['cost']['serpwow_searches']}",
+        "",
+    ]
     log_path = upload_dir / "run.log"
-    log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+    log_path.write_text("\n".join(summary_hdr + log_lines) + "\n", encoding="utf-8")
     paths["run.log"] = log_path
 
     return paths

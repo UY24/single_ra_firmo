@@ -4915,327 +4915,242 @@ def _log_gemini_batch(upload_id: str, message: str) -> None:
     print(f"[gemini-batch][{_now_iso()}][upload:{upload_id}] {message}")
 
 
-async def run_gemini_batch_for_upload(upload_id: str) -> None:
-    started_monotonic = asyncio.get_event_loop().time()
-    batch_name = ""
-    final_state_name = ""
+def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, int]]:
+    """File-API shape: list of (key, gemini_request_dict) for every terminal row, plus
+    a key->row_index map. Reuses _build_batch_prompt_for_row (folds in candidates)."""
+    items: list[tuple[str, dict[str, Any]]] = []
+    row_index_by_key: dict[str, int] = {}
+    for row in state.get("rows", []):
+        if not isinstance(row, dict) or row.get("status") not in {"completed", "failed"}:
+            continue
+        row_index = int(row.get("row_index", 0) or 0)
+        key = f"row-{row_index}"
+        prompt = _build_batch_prompt_for_row(row)
+        request = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+        }
+        items.append((key, request))
+        row_index_by_key[key] = row_index
+    return items, row_index_by_key
+
+
+def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
+                               row_usage: dict[str, Any], batch_model: str) -> str:
+    """Apply one parsed Gemini result onto a row. Returns 'completed' or 'failed'.
+    Mirrors the existing single-job mapping (candidate-set guard via
+    is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
+    prev_gemini = _as_float(result.get("gemini_cost_usd"), 0.0)
+    prev_total = _as_float(result.get("total_cost_usd"), 0.0)
+    updated_gemini = round(prev_gemini + row_batch_cost_usd, 8)
+    updated_total = round(prev_total + row_batch_cost_usd, 8)
+    selected_url = parsed.get("official_website")
+    if isinstance(selected_url, str) and selected_url.strip() and not is_disallowed_official_url(selected_url):
+        result["official_website"] = selected_url.strip()
+    for k in ("summary", "address", "phone", "email", "industry",
+              "website_company_descirption_ai", "website_company_descirption_translated_ai"):
+        if parsed.get(k) is not None:
+            result[k] = parsed.get(k)
+    for k in ("products", "services"):
+        if isinstance(parsed.get(k), list):
+            result[k] = parsed.get(k)
+    result["gemini_cost_usd"] = updated_gemini
+    result["total_cost_usd"] = updated_total
+    cb = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
+    cb["gemini_batch_cost_usd"] = round(_as_float(cb.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd, 8)
+    cb["gemini_cost_usd"] = updated_gemini
+    cb["total_cost_usd"] = updated_total
+    context["cost_breakdown"] = cb
+    context["gemini_batch_ai"] = {"provider": "google-gemini-batch", "model": batch_model,
+                                  "used": True, "usage": row_usage, "cost_usd": row_batch_cost_usd,
+                                  "raw": parsed, "error": None}
+    result["context"] = context
+    row["result"] = result
+    finalized = str(result.get("official_website") or "").strip()
+    if finalized:
+        if not _official_website_looks_plausible(finalized, str(row.get("company_name") or ""),
+                                                 str(row.get("country") or "")):
+            parsed["domain_name_mismatch"] = True
+        row["status"] = "completed"
+        row["error"] = None
+        return "completed"
+    row["status"] = "failed"
+    row["error"] = "Official website not found after Gemini batch post-processing."
+    return "failed"
+
+
+async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
+    async with get_upload_lock(upload_id):
+        state = await read_upload_artifact(upload_id, "state")
+        gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+        chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
+        found = next((c for c in chunks if isinstance(c, dict) and c.get("chunk_id") == chunk_id), None)
+        if found is None:
+            found = {"chunk_id": chunk_id}; chunks.append(found)
+        found.update(patch)
+        gb["chunks"] = chunks
+        state["gemini_batch"] = gb
+        await persist_upload_state(upload_id, state)
+
+
+async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
+                                items: list[tuple[str, dict[str, Any]]],
+                                existing_job_name: str, batch_model: str) -> dict[str, Any]:
+    """Submit (or resume) one chunk's Gemini batch job, poll to terminal, and return
+    {chunk_id, job_name, status, error, parsed_by_row, usage}. Never raises — a failed
+    chunk returns status='failed' with its rows unmapped (-> not found)."""
+    from app.services.ai_mode import gemini_batch as gb
+    poll_interval = max(5, _get_int_env("GEMINI_BATCH_POLL_SEC", 15))
+    poll_timeout = max(60, _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 1800))
+    result = {"chunk_id": chunk_id, "job_name": existing_job_name or None,
+              "status": "failed", "error": None, "parsed_by_row": {}, "usage": {}}
     try:
-        existing_job_name = ""
-        started_at_value: Optional[str] = None
+        job_name = existing_job_name
+        create_obj: dict[str, Any] = {}
+        if not job_name:
+            create_obj = await asyncio.to_thread(
+                gb.create_batch, batch_model, items, f"gsearch-{upload_id}-chunk{chunk_id}")
+            job_name = gb.batch_name_from_create(create_obj)
+            if not job_name:
+                raise RuntimeError(f"no job name from create: {create_obj}")
+        result["job_name"] = job_name
+        _log_gemini_batch(upload_id, f"chunk={chunk_id} submitted job_name={job_name} rows={len(items)}")
+        # Persist the job_name immediately so a restart can re-poll this chunk.
+        await _persist_chunk_meta(upload_id, chunk_id, {"job_name": job_name, "status": "running"})
+        deadline = asyncio.get_event_loop().time() + poll_timeout
+        final_obj: dict[str, Any] = {}
+        while True:
+            try:
+                obj = await asyncio.to_thread(gb.get_batch, job_name)
+            except Exception as exc:
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise TimeoutError(f"chunk {chunk_id} poll timeout: {exc}") from exc
+                await asyncio.sleep(min(poll_interval, 5)); continue
+            sname = gb.state_name(obj); done = bool(obj.get("done"))
+            if gb.is_terminal(sname, done):
+                # Merge create_obj's extra fields (e.g. _keys in tests) into the terminal object
+                # so collect_results has access to any metadata stored at create time.
+                final_obj = {**create_obj, **obj}; break
+            if asyncio.get_event_loop().time() >= deadline:
+                raise TimeoutError(f"chunk {chunk_id} batch timeout after {poll_timeout}s")
+            await asyncio.sleep(poll_interval)
+        sname = gb.state_name(final_obj); done = bool(final_obj.get("done"))
+        _failed_states = {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
+                          "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED"}
+        if sname in _failed_states or not gb.is_success(sname, done, final_obj):
+            raise RuntimeError(f"chunk {chunk_id} ended state={sname} error={final_obj.get('error')}")
+        records = await asyncio.to_thread(gb.collect_results, final_obj)
+        row_index_by_key = {k: int(k.split("-")[1]) for k, _ in items}
+        parsed_by_row, usage_by_row = {}, {}
+        for rec in records:
+            ridx = row_index_by_key.get(str(rec.get("key") or ""))
+            if ridx is None:
+                continue
+            parsed_by_row[ridx] = gb.parse_json_from_text(rec.get("text") or "") or {}
+            usage_by_row[ridx] = rec.get("usage") or {}
+        result.update(status="succeeded", parsed_by_row=parsed_by_row, usage=usage_by_row)
+        _log_gemini_batch(upload_id, f"chunk={chunk_id} succeeded job_name={job_name} mapped={len(parsed_by_row)}")
+    except Exception as exc:
+        result["status"] = "failed"; result["error"] = str(exc)
+        _log_gemini_batch(upload_id, f"chunk={chunk_id} FAILED job_name={result['job_name']} error={repr(exc)}")
+    return result
+
+
+async def run_gemini_batch_for_upload(upload_id: str) -> None:
+    try:
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
-            gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-            if gemini_batch_meta.get("status") == "succeeded":
+            gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+            if gb.get("status") == "succeeded":
                 return
-            existing_job_name = str(gemini_batch_meta.get("job_name") or "").strip()
-            started_at_value = gemini_batch_meta.get("started_at") or _now_iso()
-            state["gemini_batch"] = {
-                "status": "running",
-                "started_at": started_at_value,
-                "job_name": existing_job_name or None,
-                "error": None,
-            }
+            gb_started = gb.get("started_at") or _now_iso()
+            existing_chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
+            state["gemini_batch"] = {**gb, "status": "running", "started_at": gb_started,
+                                     "chunks": existing_chunks, "error": None}
             await persist_upload_state(upload_id, state)
 
-        _batch_company_name = str(state.get("company_name") or "")
-        _batch_pipeline = str(state.get("pipeline") or PIPELINE_FULL)
-        requests_payload, row_refs, jsonl_text = _build_batch_requests_for_state(state)
-        if not requests_payload:
+        items, _ = _build_batch_items_for_state(state)
+        if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
-                state["gemini_batch"] = {
-                    "status": "skipped",
-                    "started_at": state.get("gemini_batch", {}).get("started_at"),
-                    "completed_at": _now_iso(),
-                    "job_name": None,
-                    "error": "No rows available for Gemini batch processing.",
-                }
+                state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "skipped",
+                                         "completed_at": _now_iso(),
+                                         "error": "No rows available for Gemini batch processing."}
                 await persist_upload_state(upload_id, state)
             return
 
         batch_model = os.getenv("GEMINI_BATCH_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-        batch_name = existing_job_name
+        chunk_size = max(1, _get_int_env("GSEARCH_GEMINI_CHUNK_SIZE", 5000))
+        max_inflight = max(1, _get_int_env("GSEARCH_GEMINI_MAX_INFLIGHT", 5))
+        chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+        prior = {int(c.get("chunk_id")): str(c.get("job_name") or "")
+                 for c in (existing_chunks or []) if isinstance(c, dict) and c.get("chunk_id") is not None}
+        _log_gemini_batch(upload_id, f"chunking total_rows={len(items)} chunk_size={chunk_size} "
+                                     f"chunks={len(chunks)} max_inflight={max_inflight}")
 
-        if not batch_name:
-            await write_upload_text_artifact(
-                upload_id,
-                "batch_input_jsonl",
-                jsonl_text,
-                "application/x-ndjson; charset=utf-8",
-                company_name=_batch_company_name,
-                pipeline=_batch_pipeline,
-            )
+        sem = asyncio.Semaphore(max_inflight)
 
-            create_resp = await asyncio.to_thread(
-                _gemini_batch_create_sync,
-                batch_model,
-                requests_payload,
-                upload_id,
-            )
-            batch_name = str(create_resp.get("name") or "")
-            if not batch_name:
-                raise RuntimeError(f"Unexpected Gemini batch create response: {create_resp}")
-            _log_gemini_batch(
-                upload_id,
-                f"submitted job_name={batch_name} model={batch_model} rows={len(row_refs)}",
-            )
-        else:
-            _log_gemini_batch(
-                upload_id,
-                f"resumed existing job_name={batch_name} model={batch_model} rows={len(row_refs)}",
-            )
+        async def _guarded(cid: int, chunk_items):
+            # Skip chunks already succeeded on a prior pass (resume).
+            done = next((c for c in (existing_chunks or [])
+                         if isinstance(c, dict) and c.get("chunk_id") == cid and c.get("status") == "succeeded"), None)
+            if done:
+                return {"chunk_id": cid, "job_name": done.get("job_name"), "status": "succeeded",
+                        "error": None, "parsed_by_row": {}, "usage": {}}
+            async with sem:
+                return await _run_one_gemini_chunk(upload_id, cid, chunk_items, prior.get(cid, ""), batch_model)
 
+        results = await asyncio.gather(*[_guarded(i, c) for i, c in enumerate(chunks)])
+
+        # Apply all parsed results, set chunk + aggregate status, persist once -> gated finalize.
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
-            state["gemini_batch"] = {
-                "status": "running",
-                "started_at": state.get("gemini_batch", {}).get("started_at"),
-                "job_name": batch_name,
-                "error": None,
-            }
-            await persist_upload_state(upload_id, state)
-
-        poll_interval = max(5, _get_int_env("GEMINI_BATCH_POLL_SEC", 15))
-        poll_timeout = max(60, _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 1800))
-        deadline = asyncio.get_event_loop().time() + poll_timeout
-        _log_gemini_batch(
-            upload_id,
-            f"polling started job_name={batch_name} poll_interval={poll_interval}s timeout={poll_timeout}s",
-        )
-        final_batch_obj: Optional[dict[str, Any]] = None
-        transient_poll_errors = 0
-        last_poll_error: Optional[str] = None
-        while True:
-            try:
-                batch_obj = await asyncio.to_thread(_gemini_batch_get_sync, batch_name)
-                transient_poll_errors = 0
-                last_poll_error = None
-            except Exception as exc:
-                transient_poll_errors += 1
-                last_poll_error = f"{type(exc).__name__}: {str(exc)}"
-                if asyncio.get_event_loop().time() >= deadline:
-                    raise TimeoutError(
-                        f"Gemini batch status polling timed out after {poll_timeout}s; "
-                        f"last_error={last_poll_error}"
-                    ) from exc
-                _log_gemini_batch(
-                    upload_id,
-                    (
-                        f"poll_transient_error count={transient_poll_errors} "
-                        f"job_name={batch_name} error={_short_text(last_poll_error, 220)!r}"
-                    ),
-                )
-                await asyncio.sleep(min(poll_interval, 5))
-                continue
-
-            state_name = _gemini_batch_state_name(batch_obj)
-            done_flag = bool(batch_obj.get("done"))
-            if _gemini_batch_is_terminal(state_name, done_flag):
-                final_batch_obj = batch_obj
-                break
-            if asyncio.get_event_loop().time() >= deadline:
-                raise TimeoutError(
-                    f"Gemini batch timed out after {poll_timeout}s"
-                    + (f"; last_poll_error={last_poll_error}" if last_poll_error else "")
-                )
-            await asyncio.sleep(poll_interval)
-
-        await write_upload_text_artifact(
-            upload_id,
-            "batch_output_json",
-            json.dumps(final_batch_obj, ensure_ascii=True, indent=2),
-            "application/json; charset=utf-8",
-            company_name=_batch_company_name,
-        )
-
-        final_state_name = _gemini_batch_state_name(final_batch_obj if isinstance(final_batch_obj, dict) else {})
-        done_flag = bool(final_batch_obj.get("done")) if isinstance(final_batch_obj, dict) else False
-        if not _gemini_batch_is_success(final_state_name, done_flag, final_batch_obj if isinstance(final_batch_obj, dict) else {}):
-            error_obj = final_batch_obj.get("error") if isinstance(final_batch_obj, dict) else None
-            raise RuntimeError(f"Gemini batch ended with state={final_state_name} error={error_obj}")
-
-        inlined = _extract_batch_inlined_responses(final_batch_obj if isinstance(final_batch_obj, dict) else {})
-
-        parsed_by_row: dict[int, dict[str, Any]] = {}
-        usage_by_row: dict[int, dict[str, Any]] = {}
-        usage_total_prompt = 0
-        usage_total_candidates = 0
-        row_index_by_key: dict[str, int] = {
-            str(ref.get("key") or "").strip(): int(ref.get("row_index", 0) or 0)
-            for ref in row_refs
-            if isinstance(ref, dict) and str(ref.get("key") or "").strip()
-        }
-        use_index_fallback = len(inlined) == len(row_refs)
-        mapped_by_key_count = 0
-        mapped_by_index_count = 0
-        unmapped_count = 0
-        for idx, inline_item in enumerate(inlined):
-            if not isinstance(inline_item, dict):
-                continue
-            response_key = _extract_batch_response_key(inline_item)
-            row_index = row_index_by_key.get(response_key) if response_key else None
-            if row_index:
-                mapped_by_key_count += 1
-            elif use_index_fallback and idx < len(row_refs):
-                row_index = row_refs[idx]["row_index"]
-                mapped_by_index_count += 1
-            if row_index is None:
-                unmapped_count += 1
-                continue
-            response_obj = inline_item.get("response") if isinstance(inline_item.get("response"), dict) else {}
-            text = _extract_text_from_generate_response(response_obj)
-            parsed = _parse_json_from_text(text) or {}
-            usage = response_obj.get("usageMetadata") if isinstance(response_obj.get("usageMetadata"), dict) else {}
-            usage_total_prompt += int(usage.get("promptTokenCount", 0) or 0)
-            usage_total_candidates += int(usage.get("candidatesTokenCount", 0) or 0)
-            parsed_by_row[int(row_index)] = parsed
-            usage_by_row[int(row_index)] = usage
-
-        _log_gemini_batch(
-            upload_id,
-            (
-                f"response_mapping inlined={len(inlined)} row_refs={len(row_refs)} "
-                f"mapped_by_key={mapped_by_key_count} mapped_by_index={mapped_by_index_count} "
-                f"unmapped={unmapped_count} index_fallback={use_index_fallback}"
-            ),
-        )
-
-        batch_usage = {
-            "promptTokenCount": usage_total_prompt,
-            "candidatesTokenCount": usage_total_candidates,
-        }
-        batch_cost_usd = calculate_gemini_batch_cost_usd(batch_usage)
-
-        async with get_upload_lock(upload_id):
-            state = await read_upload_artifact(upload_id, "state")
-            batch_rows_touched = 0
-            batch_rows_completed = 0
-            batch_rows_failed = 0
+            parsed_all, usage_all = {}, {}
+            for r in results:
+                parsed_all.update(r.get("parsed_by_row") or {})
+                usage_all.update(r.get("usage") or {})
+            total_prompt = total_cand = 0
             for row in state.get("rows", []):
                 if not isinstance(row, dict):
                     continue
-                row_index = int(row.get("row_index", 0) or 0)
-                parsed = parsed_by_row.get(row_index)
+                ridx = int(row.get("row_index", 0) or 0)
+                parsed = parsed_all.get(ridx)
                 if not isinstance(parsed, dict):
                     continue
-                batch_rows_touched += 1
-                result = row.get("result") if isinstance(row.get("result"), dict) else {}
-                context = result.get("context") if isinstance(result.get("context"), dict) else {}
-                row_usage = usage_by_row.get(row_index) if isinstance(usage_by_row.get(row_index), dict) else {}
-                row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage)
-                prev_gemini_cost = _as_float(result.get("gemini_cost_usd"), 0.0)
-                prev_total_cost = _as_float(result.get("total_cost_usd"), 0.0)
-                updated_gemini_cost = round(prev_gemini_cost + row_batch_cost_usd, 8)
-                updated_total_cost = round(prev_total_cost + row_batch_cost_usd, 8)
-                selected_url = parsed.get("official_website")
-                if isinstance(selected_url, str) and selected_url.strip() and not is_disallowed_official_url(selected_url):
-                    candidate_url = selected_url.strip()
-                    if _official_website_looks_plausible(
-                        candidate_url,
-                        str(row.get("company_name") or ""),
-                        str(row.get("country") or ""),
-                    ):
-                        result["official_website"] = candidate_url
-                result["summary"] = str(parsed.get("summary") or result.get("summary") or "")
-                if parsed.get("website_company_descirption_ai") is not None:
-                    result["website_company_descirption_ai"] = parsed.get(
-                        "website_company_descirption_ai"
-                    )
-                if parsed.get("website_company_descirption_translated_ai") is not None:
-                    result["website_company_descirption_translated_ai"] = parsed.get(
-                        "website_company_descirption_translated_ai"
-                    )
-                if parsed.get("address") is not None:
-                    result["address"] = parsed.get("address")
-                if parsed.get("phone") is not None:
-                    result["phone"] = parsed.get("phone")
-                if parsed.get("email") is not None:
-                    result["email"] = parsed.get("email")
-                if parsed.get("industry") is not None:
-                    result["industry"] = parsed.get("industry")
-                if isinstance(parsed.get("products"), list):
-                    result["products"] = parsed.get("products")
-                if isinstance(parsed.get("services"), list):
-                    result["services"] = parsed.get("services")
-                result["gemini_cost_usd"] = updated_gemini_cost
-                result["total_cost_usd"] = updated_total_cost
-                cost_breakdown = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
-                cost_breakdown["gemini_batch_cost_usd"] = round(
-                    _as_float(cost_breakdown.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd,
-                    8,
-                )
-                cost_breakdown["gemini_cost_usd"] = updated_gemini_cost
-                cost_breakdown["total_cost_usd"] = updated_total_cost
-                context["cost_breakdown"] = cost_breakdown
-                context["gemini_batch_ai"] = {
-                    "provider": "google-gemini-batch",
-                    "model": batch_model,
-                    "used": True,
-                    "usage": row_usage,
-                    "cost_usd": row_batch_cost_usd,
-                    "raw": parsed,
-                    "error": None,
-                }
-                result["context"] = context
-                row["result"] = result
-                finalized_official = str(result.get("official_website") or "").strip()
-                if finalized_official:
-                    # Keep the batch-picked URL. The domain-token heuristic is
-                    # non-fatal: flag a mismatch for review instead of dropping a
-                    # possibly-correct brand/abbreviation domain (was previously
-                    # nulled -> false "not found"). Only a genuinely empty pick fails.
-                    if not _official_website_looks_plausible(
-                        finalized_official,
-                        str(row.get("company_name") or ""),
-                        str(row.get("country") or ""),
-                    ) and isinstance(parsed, dict):
-                        parsed["domain_name_mismatch"] = True
-                    row["status"] = "completed"
-                    row["error"] = None
-                    batch_rows_completed += 1
-                else:
+                usage = usage_all.get(ridx) or {}
+                total_prompt += int(usage.get("promptTokenCount", 0) or 0)
+                total_cand += int(usage.get("candidatesTokenCount", 0) or 0)
+                _apply_batch_parsed_to_row(row, parsed, usage, batch_model)
+            # Rows in a failed chunk never got a parsed result -> finalize them not-found.
+            for row in state.get("rows", []):
+                if isinstance(row, dict) and row.get("status") == "completed" \
+                        and not str((row.get("result") or {}).get("official_website") or "").strip():
                     row["status"] = "failed"
-                    row["error"] = "Official website not found after Gemini batch post-processing."
-                    batch_rows_failed += 1
+                    row["error"] = row.get("error") or "Official website not found after Gemini batch post-processing."
+            n_ok = sum(1 for r in results if r["status"] == "succeeded")
+            n_fail = sum(1 for r in results if r["status"] != "succeeded")
+            agg = "succeeded" if n_fail == 0 else ("failed" if n_ok == 0 else "completed_with_errors")
+            batch_usage = {"promptTokenCount": total_prompt, "candidatesTokenCount": total_cand}
             state["gemini_batch"] = {
-                "status": "succeeded",
-                "started_at": state.get("gemini_batch", {}).get("started_at"),
+                "status": agg, "started_at": state.get("gemini_batch", {}).get("started_at"),
                 "completed_at": _now_iso(),
-                "job_name": batch_name,
-                "error": None,
-                "usage": batch_usage,
-                "batch_cost_usd": batch_cost_usd,
+                "chunks": [{"chunk_id": r["chunk_id"], "job_name": r["job_name"],
+                            "status": r["status"], "error": r["error"]} for r in results],
+                "usage": batch_usage, "batch_cost_usd": calculate_gemini_batch_cost_usd(batch_usage),
+                "error": None if n_fail == 0 else f"{n_fail}/{len(results)} chunk(s) failed",
             }
             await persist_upload_state(upload_id, state)
-        elapsed_sec = asyncio.get_event_loop().time() - started_monotonic
-        _log_gemini_batch(
-            upload_id,
-            (
-                f"completed job_name={batch_name} state={final_state_name} "
-                f"duration_sec={elapsed_sec:.2f} rows_with_output={len(parsed_by_row)} "
-                f"batch_cost_usd={batch_cost_usd} rows_touched={batch_rows_touched} "
-                f"rows_completed={batch_rows_completed} rows_failed={batch_rows_failed}"
-            ),
-        )
+        _log_gemini_batch(upload_id, f"all_chunks_done ok={n_ok} failed={n_fail} agg={agg}")
     except Exception as exc:
-        elapsed_sec = asyncio.get_event_loop().time() - started_monotonic
-        _log_gemini_batch(
-            upload_id,
-            (
-                f"failed job_name={batch_name or 'unknown'} state={final_state_name or 'unknown'} "
-                f"duration_sec={elapsed_sec:.2f} error_type={type(exc).__name__} error={repr(exc)}"
-            ),
-        )
+        _log_gemini_batch(upload_id, f"driver failed error_type={type(exc).__name__} error={repr(exc)}")
         async with get_upload_lock(upload_id):
             try:
                 state = await read_upload_artifact(upload_id, "state")
-                state["gemini_batch"] = {
-                    "status": "failed",
-                    "started_at": (state.get("gemini_batch") or {}).get("started_at"),
-                    "completed_at": _now_iso(),
-                    "job_name": (state.get("gemini_batch") or {}).get("job_name"),
-                    "error": str(exc),
-                }
+                state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "failed",
+                                         "completed_at": _now_iso(), "error": str(exc)}
                 await persist_upload_state(upload_id, state)
             except Exception:
                 pass
@@ -6722,7 +6637,11 @@ async def reconcile_pending_gemini_batches() -> None:
             if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
                 continue
             gb = state.get("gemini_batch")
-            if not isinstance(gb, dict) or gb.get("status") not in {"queued", "running"}:
+            if not isinstance(gb, dict):
+                continue
+            chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
+            chunk_pending = any(isinstance(c, dict) and c.get("status") in {"queued", "running"} for c in chunks)
+            if gb.get("status") not in {"queued", "running"} and not chunk_pending:
                 continue
             existing = gemini_batch_tasks.get(upload_id)
             if existing is not None and not existing.done():

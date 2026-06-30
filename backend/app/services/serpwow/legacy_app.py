@@ -6674,6 +6674,31 @@ async def rabbitmq_worker_loop(worker_id: int) -> None:
                     await _mark_upload_row_inactive(tracking_upload_id, tracking_row_index)
 
 
+async def _collect_states_for_reconcile(limit: int) -> list[dict[str, Any]]:
+    """Load upload state dicts from local disk, falling back to S3 cold-start."""
+    states: list[dict[str, Any]] = []
+    try:
+        paths = await asyncio.to_thread(_list_local_state_files_sync, limit)
+        for p in paths:
+            try:
+                states.append(json.loads(p.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not states and os.getenv("S3_BUCKET"):
+        try:
+            keys = await asyncio.to_thread(_list_state_keys_from_s3_sync, limit)
+            for k in keys:
+                try:
+                    states.append(await asyncio.to_thread(_read_json_from_s3_sync, k))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return states
+
+
 async def reconcile_pending_gemini_batches() -> None:
     """Resume any upload whose Gemini batch isn't terminal yet (durability sweep).
 
@@ -6687,26 +6712,7 @@ async def reconcile_pending_gemini_batches() -> None:
     """
     try:
         limit = _get_int_env("GEMINI_BATCH_RECONCILE_SCAN_LIMIT", 500)
-        states: list[dict[str, Any]] = []
-        try:
-            paths = await asyncio.to_thread(_list_local_state_files_sync, limit)
-            for p in paths:
-                try:
-                    states.append(json.loads(p.read_text(encoding="utf-8")))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        if not states and os.getenv("S3_BUCKET"):
-            try:
-                keys = await asyncio.to_thread(_list_state_keys_from_s3_sync, limit)
-                for k in keys:
-                    try:
-                        states.append(await asyncio.to_thread(_read_json_from_s3_sync, k))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+        states = await _collect_states_for_reconcile(limit)
         for state in states:
             if not isinstance(state, dict):
                 continue
@@ -6729,6 +6735,94 @@ async def reconcile_pending_gemini_batches() -> None:
         print(f"[reconcile] sweep failed (ignored): {type(exc).__name__}: {exc}")
 
 
+async def reconcile_stuck_gsearch_rows() -> None:
+    """Always-on terminalization net for gsearch rows (worker process).
+
+    Works purely off durable timestamps in state.json (NOT in-memory counts), so it
+    behaves identically in embedded and split API+worker deployments. For each gsearch
+    upload still non-terminal, any row stuck in queued/processing past
+    GSEARCH_ROW_STALE_TIMEOUT_SEC is re-published up to GSEARCH_ROW_MAX_REQUEUE times,
+    then FORCE-FAILED so the completion barrier can always resolve. Best-effort.
+    """
+    if rabbitmq_exchange is None or rabbitmq_queue is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        stale_sec = max(60.0, _get_float_env("GSEARCH_ROW_STALE_TIMEOUT_SEC", 600.0))
+        max_requeue = max(0, _get_int_env("GSEARCH_ROW_MAX_REQUEUE", 1))
+        limit = _get_int_env("GEMINI_BATCH_RECONCILE_SCAN_LIMIT", 500)
+        states = await _collect_states_for_reconcile(limit)
+        # Only act when the queue is drained — avoids racing rows that are genuinely
+        # in flight on a busy worker.
+        queue_depth = await _get_rabbitmq_queue_depth()
+        if queue_depth is None or queue_depth > 0:
+            return
+        now = datetime.now(timezone.utc)
+        for state in states:
+            if not isinstance(state, dict):
+                continue
+            if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+                continue
+            if str(state.get("status") or "") not in {"queued", "processing"}:
+                continue
+            upload_id = str(state.get("upload_id") or "").strip()
+            if not upload_id:
+                continue
+            stuck = []
+            for row in state.get("rows", []) or []:
+                if not isinstance(row, dict) or row.get("status") not in {"queued", "processing"}:
+                    continue
+                ts = _parse_iso_datetime(row.get("status_updated_at") or row.get("processing_started_at"))
+                if ts is None or (now - ts).total_seconds() < stale_sec:
+                    continue
+                stuck.append(row)
+            if not stuck:
+                continue
+            pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+            phase = str(state.get("phase") or "all")
+            async with get_upload_lock(upload_id):
+                latest = await read_upload_artifact(upload_id, "state")
+                by_index = {int(r.get("row_index", 0) or 0): r
+                            for r in latest.get("rows", []) or [] if isinstance(r, dict)}
+                requeued, failed = 0, 0
+                for s in stuck:
+                    row = by_index.get(int(s.get("row_index", 0) or 0))
+                    if row is None or row.get("status") not in {"queued", "processing"}:
+                        continue
+                    attempts = int(row.get("requeue_attempts", 0) or 0)
+                    if attempts < max_requeue:
+                        row["requeue_attempts"] = attempts + 1
+                        row["status"] = "queued"
+                        row["status_updated_at"] = _now_iso()
+                        row["processing_started_at"] = None
+                        try:
+                            await publish_job(_build_row_job_payload(upload_id, row, pipeline, phase))
+                            requeued += 1
+                        except Exception as exc:
+                            row["status"] = "failed"
+                            row["error"] = f"Queue recovery publish failed: {exc}"
+                            failed += 1
+                    else:
+                        row["status"] = "failed"
+                        row["status_updated_at"] = _now_iso()
+                        row["processing_started_at"] = None
+                        row["error"] = (
+                            f"Row terminalized by reconciler after {attempts} requeue(s) "
+                            f"(stale > {int(stale_sec)}s)."
+                        )
+                        failed += 1
+                await persist_upload_state(upload_id, latest)
+                _log_row_stage(
+                    "gsearch.row_reconcile",
+                    f"stuck={len(stuck)} requeued={requeued} force_failed={failed} "
+                    f"queue_depth={queue_depth}",
+                    upload_id=upload_id, row_index=None,
+                    level="WARN" if failed else "INFO",
+                )
+    except Exception as exc:
+        print(f"[gsearch.row_reconcile] sweep failed (ignored): {type(exc).__name__}: {exc}")
+
+
 async def periodic_batch_reconciler() -> None:
     """Re-run the batch reconciler sweep every GEMINI_BATCH_RECONCILE_INTERVAL_SEC
     until the stop event is set."""
@@ -6744,6 +6838,7 @@ async def periodic_batch_reconciler() -> None:
         if stop.is_set():
             break
         await reconcile_pending_gemini_batches()
+        await reconcile_stuck_gsearch_rows()
 
 
 async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
@@ -7583,10 +7678,6 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         pass
     state = await maybe_reconcile_gemini_batch_status(upload_id, state)
 
-    try:
-        state = await maybe_requeue_stuck_queued_rows(upload_id, state)
-    except Exception:
-        pass
     state = await maybe_fail_stale_processing_rows(upload_id, state)
     summary = summarize_upload_state(dict(state))
     # gsearch surfaces a confidence/cost summary (model, batch mode, found counts,
@@ -7658,10 +7749,6 @@ async def upload_failure_analysis(
     except KeyError:
         pass
     state = await maybe_reconcile_gemini_batch_status(upload_id, state)
-    try:
-        state = await maybe_requeue_stuck_queued_rows(upload_id, state)
-    except Exception:
-        pass
     state = await maybe_fail_stale_processing_rows(upload_id, state)
     summary = summarize_upload_state(dict(state))
     return build_failure_analysis(summary, sample_limit=sample_limit)

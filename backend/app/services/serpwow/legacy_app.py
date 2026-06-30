@@ -1603,7 +1603,8 @@ def calculate_gemini_batch_cost_usd(usage: Optional[dict[str, Any]]) -> float:
 def calculate_serpwow_cost_usd(requests: int) -> float:
     if requests <= 0:
         return 0.0
-    usd_per_request = _get_float_env("SERPWOW_USD_PER_REQUEST", 0.0)
+    usd_per_request = _get_float_env("SERPWOW_USD_PER_SEARCH",
+                                     _get_float_env("SERPWOW_USD_PER_REQUEST", 0.0))
     return round(requests * usd_per_request, 8)
 
 

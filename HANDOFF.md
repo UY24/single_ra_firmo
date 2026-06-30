@@ -1,6 +1,26 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-29 (gsearch rework + UI/Slack follow-ups + test→Slack leak fix; on branch `gsearchFix`, NOT pushed). Read this first if you're picking up this repo.
+Last updated: 2026-06-30 (gsearch batch re-architecture: chunked File-API batch, terminalization reconciler, USD cost reporting, one S3 folder; on branch `gsearchFix`, NOT pushed). Read this first if you're picking up this repo.
+
+---
+
+## ⭐ 2026-06-30 — gsearch batch re-architecture (Task 10 — docs + env final)
+
+**What changed (committed on `gsearchFix`, NOT pushed).** This rework (Tasks 1–10) re-architected the gsearch `GSEARCH_LLM_BATCH=true` path end-to-end. Summary:
+
+1. **Chunked Gemini batch (File-API).** The single-job Gemini batch is now split into chunks of `GSEARCH_GEMINI_CHUNK_SIZE` rows (default 5000), up to `GSEARCH_GEMINI_MAX_INFLIGHT` (default 5) concurrent jobs. Each chunk is one File-API JSONL upload, results mapped by key. Chunk state persisted in `state["gemini_batch"]["chunks"]`; aggregate status: `succeeded` / `completed_with_errors` / `failed` / `skipped`.
+
+2. **Always-on terminalization reconciler (the wedge fix).** `reconcile_stuck_gsearch_rows()` is folded into `periodic_batch_reconciler` in the **worker process**. It operates off durable timestamps in `state.json` (never shared memory) — so it works identically in split API+worker deployments. Rows stuck `queued`/`processing` past `GSEARCH_ROW_STALE_TIMEOUT_SEC` are requeued once (up to `GSEARCH_ROW_MAX_REQUEUE` attempts) then force-failed, guaranteeing the Phase 1→2 barrier always resolves. The old poll-gated `maybe_requeue_stuck_queued_rows` status-endpoint calls are **removed**.
+
+3. **SerpWow cost in USD.** gsearch is per-request billed: `serpwow_usd = serpwow_searches × SERPWOW_USD_PER_SEARCH`; `total_usd = llm_usd + serpwow_usd`. `report.json.summary.cost` now has `{llm_usd, serpwow_searches, serpwow_usd, total_usd}`. The duplicate `SERPWOW_USD_PER_REQUEST` env was removed; `SERPWOW_USD_PER_SEARCH` (with legacy fallback) is the sole key.
+
+4. **One S3 folder per run.** Per-row `*_serpwow.json` artifacts now keyed under the upload's company slug (not each row's own slug), so one run = one S3 prefix: `website-url-finder/<upload-company-slug>/gsearch/<upload_id>/…`.
+
+5. **New env keys** (in `.env.example`): `GSEARCH_GEMINI_CHUNK_SIZE=5000`, `GSEARCH_GEMINI_MAX_INFLIGHT=5`, `GSEARCH_ROW_STALE_TIMEOUT_SEC=600`, `GSEARCH_ROW_MAX_REQUEUE=1`.
+
+**⚠️ NOT live-verified end-to-end** (needs real `SERPWOW_API_KEY` + `GEMINI_API_KEY`, would spend credits): a full gsearch batch run (both small and ≥5001-row chunked), mid-batch worker restart resuming via the reconciler, and the UI Files card across Phase 1/2/3 per `docs/superpowers/plans/UI-smoke-checklist-gsearch.md`. Refer to that checklist before production use. **Server + worker must be restarted** to pick up the new env values.
+
+**Suite at commit:** see commit message for count. Tests are unittest, offline — `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`.
 
 ---
 

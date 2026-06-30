@@ -39,8 +39,10 @@ def load_local_env(env_path: str = ".env") -> None:
                 key, value = stripped.split("=", 1)
                 key = key.strip()
                 value = value.strip().strip("'").strip('"')
-                # Allow .env to fill keys that are missing OR present-but-empty.
-                if key and (key not in os.environ or not os.environ.get(key)):
+                # Only fill keys that are truly missing. Tests may intentionally blank
+                # credential vars (via tests/__init__.py) to prevent accidental hits to
+                # real cloud endpoints; respect that by not re-populating blanked vars.
+                if key and key not in os.environ:
                     os.environ[key] = value
     except Exception:
         pass

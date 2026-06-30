@@ -20,13 +20,20 @@ Last updated: 2026-06-30 (gsearch batch re-architecture: chunked File-API batch,
 
 **⚠️ NOT live-verified end-to-end** (needs real `SERPWOW_API_KEY` + `GEMINI_API_KEY`, would spend credits): a full gsearch batch run (both small and ≥5001-row chunked), mid-batch worker restart resuming via the reconciler, and the UI Files card across Phase 1/2/3 per `docs/superpowers/plans/UI-smoke-checklist-gsearch.md`. Refer to that checklist before production use. **Server + worker must be restarted** to pick up the new env values.
 
-**Suite at commit:** see commit message for count. Tests are unittest, offline — `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`.
+**Gotchas a new agent MUST know (from the final whole-branch review):**
+- **The test command now REQUIRES `-t .`**: `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`. Without `-t .`, modules import top-level and `tests/__init__.py`'s hermeticity guard never runs → real cloud creds from `.env` leak into tests. (The guard blanks `S3_BUCKET`/`AWS_*`/`SUPABASE_*`/`GEMINI_API_KEY`/`SERPWOW_API_KEY`/`SLACK_WEBHOOK_URL`.)
+- **`maybe_reconcile_gemini_batch_status` (status-endpoint reconcile) is chunk-aware on purpose.** The chunked driver no longer writes a top-level `gemini_batch["job_name"]` (jobs live per-chunk in `chunks[]`). If `chunks` is a non-empty list, that function **early-returns** — it does NOT apply the single-job 180s stale-fail guard or single-job re-poll; the worker-side `reconcile_pending_gemini_batches` (chunk-aware) owns chunked resume. **Do NOT remove that early-return:** without it a routine status poll after `GEMINI_BATCH_STARTUP_TIMEOUT_SEC` (180s) force-fails any long batch and double-fires finalize/Slack. Regression test: `tests/test_gsearch_status_reconcile.py`.
+- **`POST /batch/jobs/{upload_id}/cancel`** now cancels each chunk's `job_name` (best-effort), falling back to a legacy top-level `job_name`.
+- **Both `gsearch` and `full` batch runs use the chunked driver** (`run_gemini_batch_for_upload`); the chunked shape (`chunks[]` + aggregate status) applies to both.
+- **Don't delete the "old" single-job batch helpers** (`_gemini_batch_create_sync`, `_extract_batch_*`, `maybe_requeue_stuck_queued_rows`, etc.) — they look dead in `legacy_app.py` but are still called by `backend/scripts/requeue_wait_and_push_remaining_to_gemini_batch.py` (live operational tooling). Only `_build_batch_requests_for_state` was truly unused and removed.
+
+**Suite at commit `1158629`:** **242 tests, all green** — `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` (the `-t .` is mandatory; see gotcha above). This rework = 16 commits this session over `254d1bc` (`ff16411`..`1158629`). Plan/spec on disk (gitignored): `docs/superpowers/{plans,specs}/2026-06-30-gsearch-batch-rearchitecture*`; UI smoke checklist: `docs/superpowers/plans/UI-smoke-checklist-gsearch.md`.
 
 ---
 
 ## ⭐ gsearchFix branch — current state (NEW AGENT START HERE)
 
-**Branch `gsearchFix`: 20 commits over `bbed9f8` (its base), NOT pushed, NOT merged — user's call. Suite 212/212 green** (`cd backend && ../.venv/bin/python -m unittest discover -s tests`). Plan/spec on disk (gitignored): `docs/superpowers/{plans,specs}/2026-06-26-gsearch-rework*`. Detailed change-by-change history is in the dated sections below; this block is the consolidated snapshot.
+**Branch `gsearchFix`: 37 commits over `bbed9f8` (its base), NOT pushed, NOT merged — user's call. Suite 242/242 green** (`cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` — note the mandatory `-t .`). The latest 16 commits are the 2026-06-30 batch re-architecture (see the section above — read it first). Plan/spec on disk (gitignored): `docs/superpowers/{plans,specs}/2026-06-26-gsearch-rework*` and `…/2026-06-30-gsearch-batch-rearchitecture*`. Detailed change-by-change history is in the dated sections below; this block is the consolidated snapshot.
 
 **What gsearch is now.** SerpWow Google **AI Overview** pipeline (`/live/search`, `engine=google`, `include_ai_overview=true`), still RabbitMQ-based. Per row it runs phase queries (`build_selected_phase_queries`), gathers candidate URLs, then an **LLM confidence/selection** step picks the official site **from the candidates only** + scores 0–100. It now produces AI-Mode-parity outputs and tracking. Pipeline taxonomy: **AI Mode** = Google AI Mode via scrape.do (in-process); **gsearch** = SerpWow AI Overview (RabbitMQ); **gmaps** = SerpWow Places.
 

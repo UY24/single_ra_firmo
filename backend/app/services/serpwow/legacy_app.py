@@ -4172,13 +4172,16 @@ async def write_upload_text_artifact(upload_id: str, name: str, text: str, conte
     local_path.write_text(text, encoding="utf-8")
 
 
-def _upload_serpwow_json_sync(upload_id: str, row_index: int, company_name: str, raw_json: str, pipeline: str = "") -> str:
+def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> str:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         raise RuntimeError("S3_BUCKET not configured")
 
-    safe_name = _safe_name(company_name)
-    key = f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/{row_index:05d}_{safe_name}_serpwow.json"
+    # Folder uses the UPLOAD company (one folder per run); the per-row filename
+    # uses the ROW company so each response is identifiable. Per-row raw responses
+    # live under a serpwow_response/ subfolder, apart from the run aggregates.
+    safe_name = _safe_name(row_company_name or upload_company_name)
+    key = f"{_upload_s3_prefix(upload_id, upload_company_name, pipeline)}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -4188,7 +4191,7 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, company_name: str,
     return key
 
 
-async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name: str, raw_json: str, pipeline: str = "") -> tuple[Optional[str], Optional[str]]:
+async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> tuple[Optional[str], Optional[str]]:
     if not raw_json:
         return None, "No SerpWow raw JSON available to upload"
     try:
@@ -4196,9 +4199,10 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, company_name
             _upload_serpwow_json_sync,
             upload_id,
             row_index,
-            company_name,
             raw_json,
             pipeline,
+            upload_company_name,
+            row_company_name,
         )
         return key, None
     except Exception as exc:
@@ -6366,9 +6370,10 @@ async def process_upload_job(job: dict[str, Any]) -> None:
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
             upload_id=upload_id,
             row_index=row_index,
-            company_name=str(job.get("upload_company_name") or company_name),
             raw_json=serpwow_raw_json,
             pipeline=pipeline,
+            upload_company_name=str(job.get("upload_company_name") or company_name),
+            row_company_name=company_name,
         )
 
         result = crawl_response.model_dump()

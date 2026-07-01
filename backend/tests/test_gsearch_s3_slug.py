@@ -4,8 +4,10 @@ Task 7: One S3 folder per run (per-row slug fix).
 Asserts that:
 1. _upload_s3_prefix produces the correct prefix for an upload company name.
 2. _build_row_job_payload carries upload_company_name in the payload.
-3. process_upload_job passes the upload company (not the row company) to
-   upload_serpwow_json_to_s3 as the company_name kwarg.
+3. process_upload_job passes the upload company (folder) AND the row company
+   (filename) to upload_serpwow_json_to_s3.
+4. Per-row raw JSON is keyed under serpwow_response/ with a 6-digit index +
+   the row company name.
 """
 import asyncio
 import unittest
@@ -111,8 +113,10 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
 
         captured = {}
 
-        async def fake_s3_upload(upload_id, row_index, company_name, raw_json, pipeline=""):
-            captured["company_name"] = company_name
+        async def fake_s3_upload(upload_id, row_index, raw_json, pipeline="",
+                                 upload_company_name="", row_company_name=""):
+            captured["upload_company_name"] = upload_company_name
+            captured["row_company_name"] = row_company_name
             return "s3://bucket/key", None
 
         async def fake_update_row_state(upload_id, row_index, **kwargs):
@@ -146,14 +150,44 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
              }):
             asyncio.run(app.process_upload_job(job))
 
-        self.assertIn("company_name", captured,
+        self.assertIn("upload_company_name", captured,
                       "upload_serpwow_json_to_s3 was never called")
+        # Folder uses the UPLOAD company (one folder per run)...
         self.assertEqual(
-            captured["company_name"],
-            "ISI Market Test",
-            f"Expected upload company 'ISI Market Test', got {captured['company_name']!r}. "
-            "process_upload_job is still using the row company for S3 keying.",
+            captured["upload_company_name"], "ISI Market Test",
+            f"Expected upload company for the folder, got {captured['upload_company_name']!r}.",
         )
+        # ...while the per-row filename uses the ROW company.
+        self.assertEqual(
+            captured["row_company_name"], "Row Company LLC",
+            f"Expected row company for the filename, got {captured['row_company_name']!r}.",
+        )
+
+
+class TestSerpwowKeyLayout(unittest.TestCase):
+    """_upload_serpwow_json_sync: per-row raw JSON lands under serpwow_response/
+    with a 6-digit index + the ROW company name, inside the UPLOAD company folder."""
+
+    def test_key_uses_subfolder_rowname_and_6digit_index(self):
+        captured = {}
+
+        class _FakeS3:
+            def put_object(self, **kw):
+                captured.update(kw)
+
+        with mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}, clear=False), \
+             mock.patch.object(app, "get_s3_client", return_value=_FakeS3()):
+            key = app._upload_serpwow_json_sync(
+                "uid123", 1, '{"x": 1}', "gsearch",
+                upload_company_name="ISI Market Test",
+                row_company_name="A M Corporation",
+            )
+
+        self.assertEqual(
+            key,
+            "isi-market-test/gsearch/uid123/serpwow_response/000001_A_M_Corporation_serpwow.json",
+        )
+        self.assertEqual(captured["Key"], key)
 
 
 if __name__ == "__main__":

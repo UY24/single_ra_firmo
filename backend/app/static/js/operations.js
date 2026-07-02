@@ -116,7 +116,8 @@ function uploadHistoryCard(registerCleanup) {
       const rowsDone = ["completed", "completed_with_errors"].includes(String(item.status ?? ""));
       const batch = item.gemini_batch?.status ?? "not_started";
       const batchTerminal = ["not_started", "succeeded", "failed", "skipped"].includes(String(batch));
-      const ready = item.pipeline === "full" ? rowsDone && batchTerminal : rowsDone;
+      const ready = (item.pipeline === "full" || item.pipeline === "gsearch")
+        ? rowsDone && batchTerminal : rowsDone;
       return el("tr", {
         class: "cursor-pointer hover:bg-gray-50/50",
         onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(uploadId)}`; },

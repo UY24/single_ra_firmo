@@ -230,11 +230,11 @@ class TestLegacyUpdateSupabaseRun(unittest.TestCase):
         # New layout: <company>/<pipeline>/<upload_id>/...
         self.assertEqual(
             links["state.json"],
-            "s3://bucket-1/Acme_Inc/gmaps/up-1/state.json",
+            "s3://bucket-1/acme-inc/gmaps/up-1/state.json",
         )
         self.assertEqual(
             links["output.json"],
-            "s3://bucket-1/Acme_Inc/gmaps/up-1/output.json",
+            "s3://bucket-1/acme-inc/gmaps/up-1/output.json",
         )
         # Bare upload_id (no company/pipeline) falls back to the id alone.
         self.assertEqual(bare["state.json"], "s3://bucket-1/up-1/state.json")

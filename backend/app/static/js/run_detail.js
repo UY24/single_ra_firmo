@@ -172,13 +172,16 @@ function progressCard(done, total, running) {
   );
 }
 
-function downloadsCard(ref, available) {
-  const files = available?.length ? available : RESULT_FILES;
-  const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+// Shared "Files" card (View + Download per file). `allFiles` is the full list to
+// list; `available` (optional) is the subset that actually exists — others render
+// disabled. `baseUrl(name)` builds the per-file result URL (download appends
+// "&download=true"). Used by both AI Mode and the SerpWow gsearch detail view.
+function filesCard(allFiles, baseUrl, available) {
+  const files = available?.length ? available : allFiles;
   return el("div", { class: "panel" },
     el("h2", { class: "section-title" }, "Files"),
     el("div", { class: "mt-3 flex flex-col gap-2" },
-      ...RESULT_FILES.map((name) => {
+      ...allFiles.map((name) => {
         const isAvailable = files.includes(name);
         return el("div", { class: "flex items-center gap-2" },
           el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
@@ -195,6 +198,11 @@ function downloadsCard(ref, available) {
       }),
     ),
   );
+}
+
+function downloadsCard(ref, available) {
+  const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+  return filesCard(RESULT_FILES, baseUrl, available);
 }
 
 function rerunFailedCard(ref) {
@@ -269,19 +277,48 @@ function renderAiStatus(root, ref, s) {
 
 function renderLegacyStatus(root, ref, s) {
   const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
+  // gsearch batch mode: rows finish before the Gemini batch. Treat the run as
+  // "done" only once the batch is terminal so the UI doesn't claim completion early.
+  const batchStatus = s.gemini_batch?.status ?? null;
+  const batchTerminal = batchStatus == null
+    || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
+  const gsearchFinalizing = s.pipeline === "gsearch" && rowsDone && !batchTerminal;
   const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
   const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
-  const parts = [
-    headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
-    el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" },
-      statTile("Total rows", fmtNum(s.total_rows)),
-      statTile("Processed", fmtNum(s.processed_rows)),
-      statTile("Succeeded", fmtNum(s.success_rows)),
-      statTile("Failed", fmtNum(s.failed_rows)),
-      statTile("Processing time", fmtDuration(s.processing_seconds_total)),
-      statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
-    ),
+  const tiles = [
+    statTile("Total rows", fmtNum(s.total_rows)),
+    statTile("Processed", fmtNum(s.processed_rows)),
+    statTile("Succeeded", fmtNum(s.success_rows)),
+    statTile("Failed", fmtNum(s.failed_rows)),
+    statTile("Processing time", fmtDuration(s.processing_seconds_total)),
+    statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
   ];
+  const g = s.gsearch;
+  if (g) {
+    tiles.push(
+      statTile("Websites found", fmtNum(g.websites_found)),
+      statTile("Not found", fmtNum(g.websites_not_found)),
+      statTile("Model", g.model ?? "—"),
+      statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
+      statTile("LLM cost", fmtUsd(g.cost?.total_usd)),
+      statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
+      statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
+    );
+    if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
+  }
+  const parts = [
+    gsearchFinalizing
+      ? headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, "running", "finalizing")
+      : headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
+    el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
+  ];
+  const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
+  const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+  // Same Files card component AI Mode uses. gsearch files are written only once the
+  // batch is terminal, so show it only then (avoids View/Download 404s mid-batch).
+  if (s.pipeline === "gsearch" && rowsDone && batchTerminal) {
+    parts.push(filesCard(GSEARCH_FILES, resultUrl));
+  }
   const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;
   if (fileLinks) {
     parts.push(el("div", { class: "panel" },

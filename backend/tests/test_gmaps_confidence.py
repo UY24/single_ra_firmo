@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from app.services.serpwow import legacy_app
 
@@ -74,3 +75,34 @@ class TestGmapsConfidenceMapping(unittest.TestCase):
         self.assertEqual(raw["confidence_score"], 0)
         self.assertEqual(raw["confidence"], "low")
         self.assertIsNone(raw["official_website"])
+
+
+class TestGmapsConfidenceBlock(unittest.TestCase):
+    GM = {"results": [{"title": "Acme Motors", "website": "https://acme-motors.com",
+                       "address": "500 Main Street"}], "request_count": 1}
+
+    def test_heuristic_default(self):
+        block = legacy_app._gmaps_confidence_block(
+            self.GM, "Acme Motors", "500 Main Street", "https://acme-motors.com")
+        self.assertEqual(block["mode"], "heuristic")
+        self.assertEqual(block["raw"]["official_website"], "https://acme-motors.com")
+        self.assertGreaterEqual(block["raw"]["confidence_score"], 60)
+
+    def test_llm_mode_falls_back(self):
+        with mock.patch.dict("os.environ", {"GMAPS_CONFIDENCE_MODE": "llm"}):
+            block = legacy_app._gmaps_confidence_block(
+                self.GM, "Acme Motors", "500 Main Street", "https://acme-motors.com")
+        self.assertEqual(block["mode"], "heuristic (llm-fallback)")
+        self.assertEqual(block["raw"]["official_website"], "https://acme-motors.com")
+
+    def test_fallback_url_not_in_candidates_is_uncorroborated(self):
+        # chosen_url came from extract_gmaps_website, not the scored set
+        block = legacy_app._gmaps_confidence_block(
+            self.GM, "Acme Motors", "500 Main Street", "https://elsewhere.example")
+        self.assertEqual(block["raw"]["official_website"], "https://elsewhere.example")
+        self.assertEqual(block["raw"]["confidence_score"], 40)
+
+    def test_no_url_is_zero(self):
+        block = legacy_app._gmaps_confidence_block(self.GM, "Acme Motors", None, None)
+        self.assertEqual(block["raw"]["confidence_score"], 0)
+        self.assertIsNone(block["raw"]["official_website"])

@@ -1504,6 +1504,35 @@ def _gmaps_confidence_for_entry(entry: Optional[dict[str, Any]]) -> dict[str, An
     }
 
 
+def _gmaps_confidence_block(
+    gmaps_result: dict[str, Any],
+    company_name: str,
+    input_full_address: Optional[str],
+    chosen_url: Optional[str],
+) -> dict[str, Any]:
+    """Confidence block for the chosen gmaps URL. Path selected by
+    GMAPS_CONFIDENCE_MODE (default 'heuristic'). 'llm' is wired but currently
+    falls back to heuristic — the future LLM path (choose_final_website_with_gemini
+    over the gmaps candidates) lands here."""
+    scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
+    entry: Optional[dict[str, Any]] = None
+    if chosen_url:
+        norm = re.sub(r"#.*$", "", str(chosen_url)).strip()
+        entry = next((e for e in scored if e["url"] == norm), None)
+        if entry is None:
+            # Fallback URL (e.g. from extract_gmaps_website) not among scored
+            # candidates — treat as found-but-uncorroborated so we don't overstate.
+            entry = {"url": norm, "name_match": False, "address_match": False,
+                     "address_conflict": False, "organizational_mismatch": False}
+    mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
+    raw = _gmaps_confidence_for_entry(entry)
+    if mode == "llm":
+        print("[gmaps] GMAPS_CONFIDENCE_MODE=llm not yet implemented; "
+              "falling back to heuristic")
+        return {"raw": raw, "mode": "heuristic (llm-fallback)"}
+    return {"raw": raw, "mode": "heuristic"}
+
+
 def is_disallowed_official_url(url: Optional[str]) -> bool:
     if not url:
         return True
@@ -2813,7 +2842,11 @@ async def execute_gmaps_lookup(
         
     gmaps_requests_used = int(gmaps_context.get("request_count", 0) or 0)
     serpwow_cost_usd = calculate_serpwow_cost_usd(gmaps_requests_used)
-    
+
+    confidence_block = _gmaps_confidence_block(
+        gmaps_result, company_name, input_full_address, gmaps_website,
+    )
+
     # Create CrawlResponse
     response = CrawlResponse(
         company_name=company_name,
@@ -2840,6 +2873,7 @@ async def execute_gmaps_lookup(
             "blocked": False,
             "error": gmaps_context.get("error"),
             "gmaps": gmaps_context,
+            "gmaps_confidence": confidence_block,
             "cost_breakdown": {
                 "massive_proxy_cost_usd": 0.0,
                 "serpwow_cost_usd": serpwow_cost_usd,
@@ -2849,7 +2883,7 @@ async def execute_gmaps_lookup(
             }
         }
     )
-    
+
     serpwow_raw_json = json.dumps(gmaps_result, ensure_ascii=True, indent=2)
     return response, serpwow_raw_json
 

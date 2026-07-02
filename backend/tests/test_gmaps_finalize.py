@@ -49,3 +49,52 @@ class TestGmapsFinalize(unittest.TestCase):
                 asyncio.run(legacy_app._finalize_serpwow_outputs("gm1", _state()))
             keys = sorted(c.args[1] for c in up.call_args_list)
             self.assertTrue(all(k.startswith("acme-motors/gmaps/gm1/") for k in keys))
+
+
+def _mixed_state():
+    """A completed_with_errors gmaps upload with one found row (has a
+    gmaps_confidence raw block) and one not-found row (no website, an
+    error, no confidence)."""
+    return {"upload_id": "gm2", "company_name": "Acme Motors", "pipeline": "gmaps",
+            "status": "completed_with_errors",
+            "rows": [
+                {"row_index": 0, "company_name": "Acme Motors", "country": "us",
+                 "status": "completed", "error": None,
+                 "result": {"official_website": "https://acme-motors.com",
+                            "gemini_cost_usd": 0.0,
+                            "context": {"cost_breakdown": {"serpwow_request_count": 1},
+                                        "gmaps_confidence": {"mode": "heuristic", "raw": {
+                                            "official_website": "https://acme-motors.com",
+                                            "confidence_score": 90, "confidence": "high",
+                                            "reason": "name+address"}}}}},
+                {"row_index": 1, "company_name": "Ghost Corp", "country": "us",
+                 "status": "failed", "error": "No Google Maps listing found.",
+                 "result": {"official_website": None,
+                            "gemini_cost_usd": 0.0,
+                            "context": {"cost_breakdown": {"serpwow_request_count": 1}}}},
+            ]}
+
+
+class TestGmapsFinalizeCompletedWithErrors(unittest.TestCase):
+    def test_found_and_not_found_rows_split_correctly(self):
+        with tempfile.TemporaryDirectory() as d:
+            upload_dir = Path(d) / "isi" / "gm2"
+            upload_dir.mkdir(parents=True)
+            with mock.patch.object(legacy_app, "_find_upload_dir", return_value=upload_dir), \
+                 mock.patch.dict("os.environ", {}, clear=False):
+                asyncio.run(legacy_app._finalize_serpwow_outputs("gm2", _mixed_state()))
+
+            with (upload_dir / "found.csv").open() as fh:
+                found_rows = list(csv.DictReader(fh))
+            with (upload_dir / "notFound.csv").open() as fh:
+                not_found_rows = list(csv.DictReader(fh))
+
+            self.assertEqual(len(found_rows), 1)
+            self.assertEqual(found_rows[0]["company_name"], "Acme Motors")
+            self.assertEqual(found_rows[0]["website_url"], "https://acme-motors.com")
+            self.assertEqual(found_rows[0]["confidence"], "90")
+
+            self.assertEqual(len(not_found_rows), 1)
+            self.assertEqual(not_found_rows[0]["company_name"], "Ghost Corp")
+            self.assertEqual(not_found_rows[0]["website_url"], "")
+            self.assertEqual(not_found_rows[0]["error"], "No Google Maps listing found.")

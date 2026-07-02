@@ -1,9 +1,12 @@
-# backend/app/services/serpwow/gsearch_reporting.py
-"""found.csv / notFound.csv / report.json / run.log for the gsearch pipeline.
+# backend/app/services/serpwow/serpwow_reporting.py
+"""found.csv / notFound.csv / report.json / run.log for SerpWow pipelines.
 
-Converts the terminal SerpWow upload ``state["rows"]`` (each row carries a
-CrawlResponse dict under ``result``) into the shared EntityResult schema, then
-writes the same file set AI Mode produces so the Runs UI can view them uniformly.
+Pipeline-agnostic: converts a terminal SerpWow upload ``state["rows"]`` (each row
+carries a CrawlResponse dict under ``result``) into the shared EntityResult
+schema, then writes the same file set AI Mode produces so the Runs UI can view
+them uniformly. Used by both ``gsearch`` (LLM confidence) and ``gmaps``
+(heuristic confidence) — the confidence block is read from whichever context key
+the pipeline populated.
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
     ctx = result.get("context") or {}
-    for key in ("final_url_selection_ai", "gemini_batch_ai"):
+    for key in ("final_url_selection_ai", "gemini_batch_ai", "gmaps_confidence"):
         obj = ctx.get(key)
         if isinstance(obj, dict) and isinstance(obj.get("raw"), dict):
             return obj["raw"]
@@ -53,6 +56,12 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     if raw.get("domain_name_mismatch"):
         flags.append(Flag("domain_name_mismatch",
                           "chosen domain doesn't obviously match the company name — verify"))
+    if raw.get("organizational_mismatch"):
+        flags.append(Flag("organizational_mismatch",
+                          "listing may be a different organization type — verify"))
+    if raw.get("address_conflict"):
+        flags.append(Flag("address_conflict",
+                          "listing address may conflict with the input — verify"))
     for alt in (raw.get("alternatives") or [])[:5]:
         if alt:
             flags.append(Flag("alternative", str(alt)))
@@ -148,7 +157,7 @@ def _csv_row(r: EntityResult) -> dict[str, Any]:
             "attempt_log": r.attempt_log_csv()}
 
 
-def write_gsearch_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
+def write_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
     upload_dir = Path(upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     results = state_to_entity_results(state)
@@ -183,7 +192,7 @@ def write_gsearch_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, 
             log_lines.append(f"[{r.sno}] {r.company_name} ({r.country}) -> not found{tail}")
 
     summary_hdr = [
-        f"# gsearch run {summary.get('upload_id')} — status={summary.get('status')}",
+        f"# {summary.get('pipeline')} run {summary.get('upload_id')} — status={summary.get('status')}",
         f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
         f"not_found={summary.get('websites_not_found')} batch={summary.get('is_batch')} "
         f"model={summary.get('model')}",

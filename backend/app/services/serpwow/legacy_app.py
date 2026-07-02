@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from app.core.config import PROJECT_ROOT
-from app.services.serpwow import gsearch_reporting
+from app.services.serpwow import serpwow_reporting
 
 def load_local_env(env_path: str = ".env") -> None:
     if not os.path.exists(env_path):
@@ -5659,8 +5659,8 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         extra: dict[str, Any] = {}
         if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
-            results = gsearch_reporting.state_to_entity_results(state)
-            summ = gsearch_reporting.build_summary(state, results)
+            results = serpwow_reporting.state_to_entity_results(state)
+            summ = serpwow_reporting.build_summary(state, results)
             extra = {
                 "websites_found": summ["websites_found"],
                 "websites_not_found": summ["websites_not_found"],
@@ -5762,8 +5762,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             extra: dict[str, Any] = {}
             if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
                 try:
-                    gs = gsearch_reporting.build_summary(
-                        state, gsearch_reporting.state_to_entity_results(state))
+                    gs = serpwow_reporting.build_summary(
+                        state, serpwow_reporting.state_to_entity_results(state))
                     tu = gs.get("token_usage") or {}
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
@@ -5792,7 +5792,7 @@ async def _finalize_gsearch_outputs(upload_id: str, state: dict[str, Any]) -> No
     them to S3. Best-effort: logs + swallows everything, never raises."""
     try:
         upload_dir = _find_upload_dir(upload_id)
-        paths = await asyncio.to_thread(gsearch_reporting.write_gsearch_outputs, upload_dir, state)
+        paths = await asyncio.to_thread(serpwow_reporting.write_outputs, upload_dir, state)
     except Exception as exc:
         print(f"[gsearch] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
         return
@@ -7604,8 +7604,8 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     gsearch_block = None
     if (summary.get("pipeline") or PIPELINE_FULL) == PIPELINE_GSEARCH:
         try:
-            gs = gsearch_reporting.build_summary(
-                summary, gsearch_reporting.state_to_entity_results(summary))
+            gs = serpwow_reporting.build_summary(
+                summary, serpwow_reporting.state_to_entity_results(summary))
             gsearch_block = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],

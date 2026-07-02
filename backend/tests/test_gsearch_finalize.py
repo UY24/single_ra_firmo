@@ -34,7 +34,7 @@ class TestFinalizeGsearch(unittest.TestCase):
             upload_dir = Path(d) / "isi" / "up1"; upload_dir.mkdir(parents=True)
             with mock.patch.object(legacy_app, "_find_upload_dir", return_value=upload_dir), \
                  mock.patch.dict("os.environ", {}, clear=False):
-                asyncio.run(legacy_app._finalize_gsearch_outputs("up1", state))
+                asyncio.run(legacy_app._finalize_serpwow_outputs("up1", state))
             with (upload_dir / "found.csv").open() as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["confidence"], "73")
@@ -46,7 +46,7 @@ class TestFinalizeGsearch(unittest.TestCase):
             with mock.patch.object(legacy_app, "_find_upload_dir", return_value=upload_dir), \
                  mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}), \
                  mock.patch("app.core.s3.upload_file") as up:
-                asyncio.run(legacy_app._finalize_gsearch_outputs("up1", _state()))
+                asyncio.run(legacy_app._finalize_serpwow_outputs("up1", _state()))
             self.assertTrue((upload_dir / "found.csv").exists())
             self.assertTrue((upload_dir / "report.json").exists())
             # 4 files mirrored

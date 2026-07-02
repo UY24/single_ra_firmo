@@ -100,7 +100,7 @@ class GsearchBatchDeferralTests(unittest.TestCase):
                 mock.patch.object(la, "update_summary_cache"), \
                 mock.patch.object(la, "build_upload_output_payload", return_value={}), \
                 mock.patch.object(la, "_batch_postprocess_enabled_for", return_value=True), \
-                mock.patch.object(la, "_finalize_gsearch_outputs", new=mock.AsyncMock()) as fin, \
+                mock.patch.object(la, "_finalize_serpwow_outputs", new=mock.AsyncMock()) as fin, \
                 mock.patch.object(la, "_update_supabase_run", return_value=True) as sup, \
                 mock.patch.object(la, "_notify_slack_terminal") as notify_term:
             asyncio.run(la.persist_upload_state("UPB", state))

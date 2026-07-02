@@ -7,7 +7,7 @@ Flow exercised (no real cloud services):
   4. After all rows are terminal, maybe_start_gemini_batch_for_upload triggers
      run_gemini_batch_for_upload with GSEARCH_GEMINI_CHUNK_SIZE=2 → ≥2 chunks.
      Chunk 1 (the second chunk) is patched to JOB_STATE_FAILED.
-  5. persist_upload_state fires _finalize_gsearch_outputs → found.csv / notFound.csv.
+  5. persist_upload_state fires _finalize_serpwow_outputs → found.csv / notFound.csv.
   6. Slack notify_run_complete is patched to capture calls.
   7. _update_supabase_run is patched to capture calls.
   8. Assertions verify all acceptance criteria.

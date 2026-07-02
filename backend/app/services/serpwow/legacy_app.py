@@ -5686,7 +5686,7 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
     names = ["state.json", "output.json"]
-    if pipe == PIPELINE_GSEARCH:
+    if pipe in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _upload_s3_prefix(upload_id, company_name, pipe)
@@ -5743,7 +5743,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         upload_id = str(state.get("upload_id") or "")
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         extra: dict[str, Any] = {}
-        if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
+        if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
             results = serpwow_reporting.state_to_entity_results(state)
             summ = serpwow_reporting.build_summary(state, results)
             extra = {

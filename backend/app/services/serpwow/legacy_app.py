@@ -7686,14 +7686,15 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
 
     state = await maybe_fail_stale_processing_rows(upload_id, state)
     summary = summarize_upload_state(dict(state))
-    # gsearch surfaces a confidence/cost summary (model, batch mode, found counts,
-    # cost, tokens) so the run-detail UI can show the same tiles AI Mode does.
-    gsearch_block = None
-    if (summary.get("pipeline") or PIPELINE_FULL) == PIPELINE_GSEARCH:
+    # SerpWow pipelines (gsearch/gmaps) surface a confidence/cost summary (model,
+    # batch mode, found counts, cost, tokens) so the run-detail UI can show the
+    # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
+    serpwow_summary = None
+    if (summary.get("pipeline") or PIPELINE_FULL) in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
-            gsearch_block = {
+            serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],
                 "model": gs["model"],
@@ -7702,13 +7703,13 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "token_usage": gs["token_usage"],
             }
         except Exception:
-            gsearch_block = None
+            serpwow_summary = None
     return {
         "upload_id": summary["upload_id"],
         "pipeline": summary.get("pipeline") or PIPELINE_FULL,
         "status": summary["status"],
         "gemini_batch": summary.get("gemini_batch"),
-        "gsearch": gsearch_block,
+        "serpwow_summary": serpwow_summary,
         "queue_recovery": summary.get("queue_recovery"),
         "created_at": summary.get("created_at"),
         "updated_at": summary.get("updated_at"),

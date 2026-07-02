@@ -293,17 +293,24 @@ function renderLegacyStatus(root, ref, s) {
     statTile("Processing time", fmtDuration(s.processing_seconds_total)),
     statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
   ];
-  const g = s.gsearch;
+  const g = s.serpwow_summary;
   if (g) {
     tiles.push(
       statTile("Websites found", fmtNum(g.websites_found)),
       statTile("Not found", fmtNum(g.websites_not_found)),
-      statTile("Model", g.model ?? "—"),
-      statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
-      statTile("LLM cost", fmtUsd(g.cost?.total_usd)),
-      statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
-      statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
     );
+    if (g.model) {
+      tiles.push(
+        statTile("Model", g.model),
+        statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
+        statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
+        statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
+      );
+    }
+    tiles.push(statTile(g.model ? "LLM cost" : "SerpWow cost", fmtUsd(g.cost?.total_usd)));
+    if (g.cost?.serpwow_searches != null) {
+      tiles.push(statTile("SerpWow searches", fmtNum(g.cost.serpwow_searches)));
+    }
     if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
   }
   const parts = [
@@ -316,7 +323,7 @@ function renderLegacyStatus(root, ref, s) {
   const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
   // Same Files card component AI Mode uses. gsearch files are written only once the
   // batch is terminal, so show it only then (avoids View/Download 404s mid-batch).
-  if (s.pipeline === "gsearch" && rowsDone && batchTerminal) {
+  if (["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && batchTerminal) {
     parts.push(filesCard(GSEARCH_FILES, resultUrl));
   }
   const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;

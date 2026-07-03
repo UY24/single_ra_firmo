@@ -1515,27 +1515,19 @@ def _gmaps_confidence_block(
     input_full_address: Optional[str],
     chosen_url: Optional[str],
 ) -> dict[str, Any]:
-    """Confidence block for the chosen gmaps URL. Path selected by
-    GMAPS_CONFIDENCE_MODE (default 'heuristic'). 'llm' is wired but currently
-    falls back to heuristic — the future LLM path (choose_final_website_with_gemini
-    over the gmaps candidates) lands here."""
+    """Heuristic confidence block for the chosen gmaps URL. Used for
+    GMAPS_CONFIDENCE_MODE=heuristic and as the per-row LLM-error fallback (the
+    caller overrides ``mode`` in that case). The LLM path lives in
+    execute_gmaps_lookup, which owns the GMAPS_CONFIDENCE_MODE branching."""
     scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
     entry: Optional[dict[str, Any]] = None
     if chosen_url:
         norm = re.sub(r"#.*$", "", str(chosen_url)).strip()
         entry = next((e for e in scored if e["url"] == norm), None)
         if entry is None:
-            # Fallback URL (e.g. from extract_gmaps_website) not among scored
-            # candidates — treat as found-but-uncorroborated so we don't overstate.
             entry = {"url": norm, "name_match": False, "address_match": False,
                      "address_conflict": False, "organizational_mismatch": False}
-    mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
-    raw = _gmaps_confidence_for_entry(entry)
-    if mode == "llm":
-        print("[gmaps] GMAPS_CONFIDENCE_MODE=llm not yet implemented; "
-              "falling back to heuristic")
-        return {"raw": raw, "mode": "heuristic (llm-fallback)"}
-    return {"raw": raw, "mode": "heuristic"}
+    return {"raw": _gmaps_confidence_for_entry(entry), "mode": "heuristic"}
 
 
 def is_disallowed_official_url(url: Optional[str]) -> bool:
@@ -2848,9 +2840,73 @@ async def execute_gmaps_lookup(
     gmaps_requests_used = int(gmaps_context.get("request_count", 0) or 0)
     serpwow_cost_usd = calculate_serpwow_cost_usd(gmaps_requests_used)
 
-    confidence_block = _gmaps_confidence_block(
-        gmaps_result, company_name, input_full_address, gmaps_website,
-    )
+    # Confidence: heuristic by default; LLM when GMAPS_CONFIDENCE_MODE=llm. The LLM
+    # path reuses gsearch's selector + context keys so serpwow_reporting/build_summary
+    # surface confidence/model/tokens/cost with no reporting changes.
+    official_website = gmaps_website
+    gemini_cost_usd = 0.0
+    mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
+    llm_batch = _get_bool_env("GMAPS_LLM_BATCH", False)
+    # Candidate set the LLM selects from (also feeds _build_batch_prompt_for_row).
+    scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
+    candidates = dedupe_candidate_urls([e["url"] for e in scored])
+    confidence_ctx: dict[str, Any] = {}
+
+    if mode == "llm" and candidates and not llm_batch:
+        final_output, final_error, final_model, final_usage = await asyncio.to_thread(
+            choose_final_website_with_gemini,
+            company_name, country, input_industry, input_full_address,
+            candidates, [], None, gmaps_context,
+        )
+        if final_output is not None:
+            confidence_ctx["candidates"] = candidates
+            confidence_ctx["final_url_selection_ai"] = {
+                "provider": "google-gemini", "model": final_model,
+                "used": True, "error": final_error,
+                "usage": final_usage or {}, "raw": final_output,
+            }
+            gemini_cost_usd = calculate_gemini_cost_usd(final_usage)
+            ai_website = final_output.get("official_website")
+            # Accept the LLM's validated in-candidate pick; otherwise keep the Python
+            # best pick (parity with the gsearch worker).
+            if (isinstance(ai_website, str) and ai_website.strip()
+                    and not is_disallowed_official_url(ai_website)):
+                official_website = ai_website.strip()
+        else:
+            # LLM error -> heuristic fallback so the row still has a confidence.
+            confidence_ctx["candidates"] = candidates
+            block = _gmaps_confidence_block(
+                gmaps_result, company_name, input_full_address, gmaps_website)
+            block["mode"] = f"llm (fallback->heuristic: {final_error})"
+            confidence_ctx["gmaps_confidence"] = block
+    elif mode == "llm" and llm_batch:
+        # Batch mode: the finalization Gemini batch decides. Expose candidates for the
+        # batch prompt builder; keep the Python pick + a heuristic placeholder for
+        # pre-batch display (serpwow_reporting prefers gemini_batch_ai once it lands).
+        confidence_ctx["candidates"] = candidates
+        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
+            gmaps_result, company_name, input_full_address, gmaps_website)
+    else:
+        # Heuristic mode (default) — unchanged behavior.
+        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
+            gmaps_result, company_name, input_full_address, gmaps_website)
+
+    context: dict[str, Any] = {
+        "pipeline": PIPELINE_GMAPS,
+        "success": bool(official_website),
+        "used_proxy": False,
+        "blocked": False,
+        "error": gmaps_context.get("error"),
+        "gmaps": gmaps_context,
+        "cost_breakdown": {
+            "massive_proxy_cost_usd": 0.0,
+            "serpwow_cost_usd": serpwow_cost_usd,
+            "gemini_cost_usd": gemini_cost_usd,
+            "total_cost_usd": serpwow_cost_usd + gemini_cost_usd,
+            "serpwow_request_count": gmaps_requests_used,
+        },
+    }
+    context.update(confidence_ctx)
 
     # Create CrawlResponse
     response = CrawlResponse(
@@ -2859,7 +2915,7 @@ async def execute_gmaps_lookup(
         firm_id=firm_id,
         input_industry=input_industry,
         input_full_address=input_full_address,
-        official_website=gmaps_website,
+        official_website=official_website,
         summary=summary,
         address=address,
         phone=phone,
@@ -2869,24 +2925,9 @@ async def execute_gmaps_lookup(
         services=[],
         massive_proxy_cost_usd=0.0,
         serpwow_cost_usd=serpwow_cost_usd,
-        gemini_cost_usd=0.0,
-        total_cost_usd=serpwow_cost_usd,
-        context={
-            "pipeline": PIPELINE_GMAPS,
-            "success": bool(gmaps_website),
-            "used_proxy": False,
-            "blocked": False,
-            "error": gmaps_context.get("error"),
-            "gmaps": gmaps_context,
-            "gmaps_confidence": confidence_block,
-            "cost_breakdown": {
-                "massive_proxy_cost_usd": 0.0,
-                "serpwow_cost_usd": serpwow_cost_usd,
-                "gemini_cost_usd": 0.0,
-                "total_cost_usd": serpwow_cost_usd,
-                "serpwow_request_count": gmaps_requests_used,
-            }
-        }
+        gemini_cost_usd=gemini_cost_usd,
+        total_cost_usd=serpwow_cost_usd + gemini_cost_usd,
+        context=context,
     )
 
     serpwow_raw_json = json.dumps(gmaps_result, ensure_ascii=True, indent=2)

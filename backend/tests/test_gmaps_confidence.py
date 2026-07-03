@@ -88,11 +88,13 @@ class TestGmapsConfidenceBlock(unittest.TestCase):
         self.assertEqual(block["raw"]["official_website"], "https://acme-motors.com")
         self.assertGreaterEqual(block["raw"]["confidence_score"], 60)
 
-    def test_llm_mode_falls_back(self):
+    def test_block_is_heuristic_only_regardless_of_env(self):
+        # _gmaps_confidence_block no longer reads GMAPS_CONFIDENCE_MODE — the executor
+        # owns the llm branch. The block is always the heuristic computation.
         with mock.patch.dict("os.environ", {"GMAPS_CONFIDENCE_MODE": "llm"}):
             block = legacy_app._gmaps_confidence_block(
                 self.GM, "Acme Motors", "500 Main Street", "https://acme-motors.com")
-        self.assertEqual(block["mode"], "heuristic (llm-fallback)")
+        self.assertEqual(block["mode"], "heuristic")
         self.assertEqual(block["raw"]["official_website"], "https://acme-motors.com")
 
     def test_fallback_url_not_in_candidates_is_uncorroborated(self):

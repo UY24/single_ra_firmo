@@ -218,28 +218,33 @@ def _get_bool_env(name: str, default: bool) -> bool:
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     """True when Gemini batch confidence scoring applies to this pipeline.
 
-    full  -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
+    full    -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
+    gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
     """
     pipe = str(pipeline or PIPELINE_FULL)
     if pipe == PIPELINE_GSEARCH:
         return _get_bool_env("GSEARCH_LLM_BATCH", False)
+    if pipe == PIPELINE_GMAPS:
+        mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
+        return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
     if pipe == PIPELINE_FULL:
         return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
-    """gsearch only: True while its Gemini batch hasn't reached a terminal status.
+    """gsearch/gmaps: True while the Gemini batch hasn't reached a terminal status.
 
     Used to DEFER the terminal completion side-effects (Supabase 'completed' sync,
-    Slack ping, output-file finalize) until the batch is done, so a gsearch batch
-    run reports completion once with final numbers — like AI Mode. The `full`
+    Slack ping, output-file finalize) until the batch is done, so a batch run
+    reports completion once with final numbers — like AI Mode. The `full`
     pipeline is intentionally left unchanged.
     """
-    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+    pipe = str(state.get("pipeline") or PIPELINE_FULL)
+    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         return False
-    if not _batch_postprocess_enabled_for(PIPELINE_GSEARCH):
+    if not _batch_postprocess_enabled_for(pipe):
         return False
     gb = state.get("gemini_batch")
     return isinstance(gb, dict) and gb.get("status") in {"waiting_for_rows", "queued", "running"}

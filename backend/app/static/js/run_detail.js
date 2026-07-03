@@ -282,7 +282,7 @@ function renderLegacyStatus(root, ref, s) {
   const batchStatus = s.gemini_batch?.status ?? null;
   const batchTerminal = batchStatus == null
     || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
-  const gsearchFinalizing = s.pipeline === "gsearch" && rowsDone && !batchTerminal;
+  const gsearchFinalizing = ["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && !batchTerminal;
   const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
   const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
   const tiles = [

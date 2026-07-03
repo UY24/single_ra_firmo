@@ -1,6 +1,24 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-02 (gmaps output parity: heuristic confidence, shared reporting, files/Supabase/UI; on branch `gmapsfix`, NOT pushed). Read this first if you're picking up this repo.
+Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GMAPS_CONFIDENCE_MODE=llm; on branch `gmapsfix`, NOT pushed). Read this first if you're picking up this repo.
+
+---
+
+## ⭐ 2026-07-03 — gmaps LLM confidence (per-row + chunked batch)
+
+**What changed (committed on `gmapsfix`, NOT pushed).** `GMAPS_CONFIDENCE_MODE=llm` is now a real code path (previously a stub that always fell back to heuristic). A new `GMAPS_LLM_BATCH` env (default `false`, mirrors `GSEARCH_LLM_BATCH`) picks per-row vs. chunked-batch scoring; it's only consulted when `GMAPS_CONFIDENCE_MODE=llm`. Summary:
+
+1. **Per-row LLM path.** `execute_gmaps_lookup` calls the gsearch selector `choose_final_website_with_gemini` (already gmaps-aware) via `await asyncio.to_thread`, passing the Maps candidate set (`_score_gmaps_candidates` → deduped URLs), empty search-phase evidence, and `gmaps_context`. It writes `context["final_url_selection_ai"]` (provider/model/usage/raw, same shape as gsearch), sets `official_website` to the LLM's validated in-candidate pick or keeps the Python best pick otherwise, and sets `gemini_cost_usd`. A per-row LLM error falls back to the heuristic block (`context["gmaps_confidence"]`, `mode` annotated `"llm (fallback->heuristic: …)"`) so the row always keeps a confidence value.
+
+2. **Chunked batch path (`GMAPS_LLM_BATCH=true`).** Rows keep `pending` after execution; candidates are still exposed via `context["candidates"]` for the batch prompt builder. The existing chunked `run_gemini_batch_for_upload` (File-API JSONL, `GSEARCH_GEMINI_CHUNK_SIZE`/`GSEARCH_GEMINI_MAX_INFLIGHT`) runs at finalization exactly as it does for gsearch and writes `context["gemini_batch_ai"]`. No new batch engine was added — the item builder and prompt (which already read `context["candidates"]` and include `confidence_score`) already handled gmaps rows once fed through.
+
+3. **Gating widened, not duplicated.** `_batch_postprocess_enabled_for(pipeline)` now returns true for `gmaps` when `GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH` (previously gmaps was always `False`). `_batch_postprocess_pending` also now defers gmaps completion the same way it defers gsearch (Supabase `completed` sync, Slack ping, output-file finalize wait for the batch to reach a terminal `gemini_batch.status`). Every downstream site that already routed through these two helpers (row-pending mark, batch seeders, the reconciler, status reconcile) picked up gmaps automatically — no new gate sites were added.
+
+4. **Context-key unification pays off.** Because the gmaps executor now writes the same gsearch-shaped context keys (`candidates`, `final_url_selection_ai` per-row / `gemini_batch_ai` via batch), `serpwow_reporting`, `build_summary`, and the run-detail UI surface model/tokens/LLM-cost for gmaps with **no reporting-code changes** — `_confidence_raw` already read all three keys. The finalizing badge in `run_detail.js` (`gsearchFinalizing`/`batchTerminal`) now covers gmaps batch runs too.
+
+5. **`_gmaps_confidence_block` is heuristic-only now.** The executor owns the `GMAPS_CONFIDENCE_MODE` branch (per-row LLM / batch LLM / heuristic); the helper itself no longer has an `"llm"` seam, keeping the async LLM call out of the sync helper.
+
+**⚠️ NOT live-verified end-to-end** (needs a real `GEMINI_API_KEY` + `SERPWOW_API_KEY`): a full gmaps run in both `GMAPS_LLM_BATCH=false` and `=true` modes confirming the LLM pick lands in `official_website`, cost/tokens surface correctly, and the batch path reaches a terminal `gemini_batch.status` and finalizes once. **Restart both the server and the worker** to pick up `GMAPS_CONFIDENCE_MODE=llm` / `GMAPS_LLM_BATCH` and any other new env.
 
 ---
 

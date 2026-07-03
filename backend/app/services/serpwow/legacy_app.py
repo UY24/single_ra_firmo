@@ -5888,10 +5888,11 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
         if status == "failed":
             notify.notify_run_failed(error=state.get("error") or "run failed", **common)
         else:  # completed | completed_with_errors
-            # gsearch tracks SerpWow searches + Gemini tokens/cost — surface them in
-            # the ping like AI Mode does. Other SerpWow pipelines have none, so omit.
+            # gsearch and gmaps both track SerpWow searches + Gemini tokens/cost via
+            # the same serpwow_reporting.build_summary — surface them in the ping like
+            # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
+            if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
                 try:
                     gs = serpwow_reporting.build_summary(
                         state, serpwow_reporting.state_to_entity_results(state))
@@ -6776,6 +6777,11 @@ async def reconcile_stuck_gsearch_rows() -> None:
     upload still non-terminal, any row stuck in queued/processing past
     GSEARCH_ROW_STALE_TIMEOUT_SEC is re-published up to GSEARCH_ROW_MAX_REQUEUE times,
     then FORCE-FAILED so the completion barrier can always resolve. Best-effort.
+
+    Also covers gmaps uploads, but ONLY when gmaps batch mode is enabled
+    (GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH) — a stuck row there blocks
+    maybe_start_gemini_batch_for_upload from ever starting since it waits for all
+    rows to be terminal. Per-row/heuristic gmaps has no such barrier and is skipped.
     """
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return
@@ -6794,7 +6800,12 @@ async def reconcile_stuck_gsearch_rows() -> None:
         for state in states:
             if not isinstance(state, dict):
                 continue
-            if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+            _rec_pipe = str(state.get("pipeline") or PIPELINE_FULL)
+            # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
+            # only in batch mode, where a stuck row blocks the finalization batch from
+            # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
+            if not (_rec_pipe == PIPELINE_GSEARCH
+                    or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
                 continue

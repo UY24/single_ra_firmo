@@ -1,6 +1,65 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-06-30 (gsearch batch re-architecture: chunked File-API batch, terminalization reconciler, USD cost reporting, one S3 folder; on branch `gsearchFix`, NOT pushed). Read this first if you're picking up this repo.
+Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GMAPS_CONFIDENCE_MODE=llm, + final-review hardening; on branch `gmapsfix`, NOT pushed. **One UI task is PENDING/unimplemented — see "Current state & next task" below.**). Read this first if you're picking up this repo.
+
+---
+
+## ⭐ 2026-07-03 — gmaps LLM confidence (per-row + chunked batch)
+
+**What changed (committed on `gmapsfix`, NOT pushed).** `GMAPS_CONFIDENCE_MODE=llm` is now a real code path (previously a stub that always fell back to heuristic). A new `GMAPS_LLM_BATCH` env (default `false`, mirrors `GSEARCH_LLM_BATCH`) picks per-row vs. chunked-batch scoring; it's only consulted when `GMAPS_CONFIDENCE_MODE=llm`. Summary:
+
+1. **Per-row LLM path.** `execute_gmaps_lookup` calls the gsearch selector `choose_final_website_with_gemini` (already gmaps-aware) via `await asyncio.to_thread`, passing the Maps candidate set (`_score_gmaps_candidates` → deduped URLs), empty search-phase evidence, and `gmaps_context`. It writes `context["final_url_selection_ai"]` (provider/model/usage/raw, same shape as gsearch), sets `official_website` to the LLM's validated in-candidate pick or keeps the Python best pick otherwise, and sets `gemini_cost_usd`. A per-row LLM error falls back to the heuristic block (`context["gmaps_confidence"]`, `mode` annotated `"llm (fallback->heuristic: …)"`) so the row always keeps a confidence value.
+
+2. **Chunked batch path (`GMAPS_LLM_BATCH=true`).** Rows keep `pending` after execution; candidates are still exposed via `context["candidates"]` for the batch prompt builder. The existing chunked `run_gemini_batch_for_upload` (File-API JSONL, `GSEARCH_GEMINI_CHUNK_SIZE`/`GSEARCH_GEMINI_MAX_INFLIGHT`) runs at finalization exactly as it does for gsearch and writes `context["gemini_batch_ai"]`. No new batch engine was added — the item builder and prompt (which already read `context["candidates"]` and include `confidence_score`) already handled gmaps rows once fed through.
+
+3. **Gating widened, not duplicated.** `_batch_postprocess_enabled_for(pipeline)` now returns true for `gmaps` when `GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH` (previously gmaps was always `False`). `_batch_postprocess_pending` also now defers gmaps completion the same way it defers gsearch (Supabase `completed` sync, Slack ping, output-file finalize wait for the batch to reach a terminal `gemini_batch.status`). Every downstream site that already routed through these two helpers (row-pending mark, batch seeders, the reconciler, status reconcile) picked up gmaps automatically — no new gate sites were added.
+
+4. **Context-key unification pays off.** Because the gmaps executor now writes the same gsearch-shaped context keys (`candidates`, `final_url_selection_ai` per-row / `gemini_batch_ai` via batch), `serpwow_reporting`, `build_summary`, and the run-detail UI surface model/tokens/LLM-cost for gmaps with **no reporting-code changes** — `_confidence_raw` already read all three keys. The finalizing badge in `run_detail.js` (`gsearchFinalizing`/`batchTerminal`) now covers gmaps batch runs too.
+
+5. **`_gmaps_confidence_block` is heuristic-only now.** The executor owns the `GMAPS_CONFIDENCE_MODE` branch (per-row LLM / batch LLM / heuristic); the helper itself no longer has an `"llm"` seam, keeping the async LLM call out of the sync helper.
+
+6. **Final whole-branch review hardening (commit `422c592`).** The opus final review returned "ready to merge with fixes"; the fixes landed: (a) **`reconcile_stuck_gsearch_rows` now also terminalizes gmaps uploads in batch mode** — its guard is `gsearch OR (gmaps AND _batch_postprocess_enabled_for(gmaps))`. This closes a real hang: a gmaps batch run only starts its Gemini batch once ALL rows are terminal, so a row lost mid-flight (worker crash / dropped message) would otherwise block the batch forever; per-row/heuristic gmaps is deliberately still skipped (no such barrier). (b) **`_notify_slack_terminal` now carries gmaps searches/tokens/cost** (was gsearch-only). (c) New `tests/test_gmaps_batch_flow.py` drives the shared batch helpers (`_build_batch_items_for_state` → `_apply_batch_parsed_to_row` → `serpwow_reporting`) on a gmaps state and empirically confirms the "no new batch engine" reuse claim. A stray stale doc line was fixed in `6664c37`.
+
+**⚠️ NOT live-verified end-to-end** (needs a real `GEMINI_API_KEY` + `SERPWOW_API_KEY`): a full gmaps run in both `GMAPS_LLM_BATCH=false` and `=true` modes confirming the LLM pick lands in `official_website`, cost/tokens surface correctly, and the batch path reaches a terminal `gemini_batch.status` and finalizes once — ideally with a deliberately-stalled row to exercise the reconciler fix (6a). **Restart both the server and the worker** to pick up `GMAPS_CONFIDENCE_MODE=llm` / `GMAPS_LLM_BATCH` and any other new env.
+
+**Test suite:** 289 tests, all green — `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` (the `-t .` is mandatory). Two accepted minors: `_score_gmaps_candidates` is computed twice on the heuristic/batch/fallback branches (harmless, pure fn); the Gemini batch job `display_name` label reads `gsearch-{id}-chunk{n}` for gmaps batches too (cosmetic label only).
+
+---
+
+## ⭐ Current state & next task (READ THIS — there is unfinished work)
+
+**Branch `gmapsfix`, NOT pushed / NOT merged (user's call).** It carries, in order: the 2026-07-02 gmaps output-parity feature, then the 2026-07-03 gmaps LLM-confidence feature (+ its final-review fixes). Both were built via the subagent-driven-development flow; per-task + final reviews are clean; suite 289/289. Plan/spec/ledger on disk (gitignored): `docs/superpowers/plans/2026-07-0{2,3}-gmaps-*.md`, `docs/superpowers/specs/2026-07-0{2,3}-gmaps-*.md`, `.superpowers/sdd/progress.md`.
+
+**⏳ PENDING — run-detail UI redesign for the SerpWow view (NOT started; design agreed in-session, no code written).** The user flagged that the SerpWow run-detail view (`renderLegacyStatus` in `backend/app/static/js/run_detail.js`, used by BOTH gsearch and gmaps) is cluttered/redundant and wants it cleaned up + made consistent, plus an explicit LLM-vs-heuristic / batch-on-off indicator for gmaps. The agreed design (approve with the user before coding — the brainstorming HARD-GATE was not formally closed):
+
+- **Remove the redundancy.** Today `renderLegacyStatus` renders 5 panels with heavy overlap: (1) header, (2) stat-tiles grid, (3) the **Files card** (found.csv/notFound.csv/report.json/run.log — View/Download), (4) an **"Artifacts" panel** re-listing the same files as `s3://…` copy-cells, (5) a filler "row-level detail via API" note + a **"SerpWow upload snapshot" `<dl>`** that repeats Total/Processed/Success/Failed/time/avg (already in the tiles) and a "Storage" row that joins the file links a third time. Delete panels (4) and (5) entirely — every field they show lives in the header/tiles/Files card; the `s3://` paths remain in `report.json` + the API.
+- **Dedupe tiles.** Drop the `Succeeded`/`Failed` tiles — for gsearch/gmaps "success" == "website found", so `Websites found`/`Not found` (from `serpwow_summary`) is the single source. Keep Total/Processed/time/avg + SerpWow searches/cost + (LLM only) Input/Output tokens/LLM cost.
+- **gmaps mode chips (the user's explicit ask).** In the header show `Confidence: LLM | Heuristic` always, and `Batch: On | Off` only when LLM (batch is meaningless in heuristic mode), plus a `Model` chip when LLM. Apply the same chips to gsearch for consistency.
+- **Files card** stays as the single file surface for both pipelines at terminal status; fold the Download JSON/XLSX buttons into it. Net layout: header(+chips) → one tiles grid → Files card — which also matches AI Mode's `renderAiStatus` structure (header → tiles → `downloadsCard`), so all three run types look consistent.
+- **One tiny backend add:** give `serpwow_summary` (built in `serpwow_reporting.build_summary`, surfaced by `GET /uploads/{id}/status`) an explicit `confidence_mode` field (`"llm"` when a model was used, else `"heuristic"`) so the chip is testable rather than the UI guessing from `model` presence. `is_batch` already exists.
+- **Open question left with the user at pause:** confirmed removing the `s3://` "Artifacts" panel and the duplicate Succeeded/Failed tiles is OK (recommended). Re-confirm before implementing, then run it through writing-plans → subagent-driven-development (or implement directly + `/code-review`, it's a small single-file change + one backend line). `run_detail.js` has an `el()` gotcha: it sets every attr via `setAttribute`, so guard conditional `href`/`disabled` with the spread pattern (see the existing `filesCard`).
+
+**Conventions (unchanged):** never add a `Co-Authored-By: Claude` trailer; never `git push` or query prod Supabase without explicit user OK; tests are offline unittest with mandatory `-t .`; `docs/` is gitignored.
+
+---
+
+## ⭐ 2026-07-02 — gmaps output parity
+
+**What changed (committed on `gmapsfix`, NOT pushed).** gmaps (SerpWow Places) now has output parity with gsearch: confidence scoring, found/notFound/report/run.log files, S3 mirroring, Supabase counters, and the run-detail UI. Summary:
+
+1. **Heuristic gmaps confidence.** `_score_gmaps_candidates` scores each Google-Maps candidate on name/address match signals (`name_match`, `address_match`, `address_conflict`, `organizational_mismatch`); `_gmaps_confidence_for_entry` maps those signals to a 0–100 confidence; `_gmaps_confidence_block` wraps the result as `{raw, mode}` and is stored in `context["gmaps_confidence"]`. All three live in `backend/app/services/serpwow/legacy_app.py`. No LLM call is involved in heuristic mode.
+
+2. **`GMAPS_CONFIDENCE_MODE` seam (env, default `heuristic`).** `"llm"` is wired but **not yet implemented** — it logs `[gmaps] GMAPS_CONFIDENCE_MODE=llm not yet implemented; falling back to heuristic` and falls back to the heuristic path. No real LLM call is made for gmaps confidence today regardless of this setting.
+
+3. **Reporting generalized.** `gsearch_reporting.py` was renamed to pipeline-agnostic `serpwow_reporting.py` (public API: `state_to_entity_results`, `build_summary`, `write_outputs` — was `write_gsearch_outputs`). For gmaps rows, confidence is read from `context["gmaps_confidence"]["raw"]`; for gsearch, from `final_url_selection_ai`/`gemini_batch_ai` as before. gsearch output is byte-identical to before the rename.
+
+4. **gmaps now writes files at terminal status.** `_finalize_serpwow_outputs` (in `legacy_app.py`) calls `serpwow_reporting.write_outputs` to produce `found.csv` / `notFound.csv` / `report.json` / `run.log` next to `state.json`/`output.json`, best-effort mirrored to S3 under `<company-slug>/gmaps/<upload_id>/…`. It's invoked from `persist_upload_state` for `pipeline in {gsearch, gmaps}` at terminal status (`completed`/`completed_with_errors`), gated by the same batch-pending check gsearch uses (always `False` for gmaps — see point 6).
+
+5. **Supabase + file links.** The terminal Supabase `runs` row update now includes `websites_found`/`websites_not_found`/`cost`/`token_usage` for gmaps (previously gsearch-only). `_upload_file_links` advertises the same four files for gmaps. The existing `GET /uploads/{id}/result?file=` endpoint needed **no change** — its allowlist (`_GSEARCH_RESULT_FILES`) is filename-based and gmaps writes the same names.
+
+6. **`/status` + UI.** `GET /uploads/{id}/status` now exposes a `serpwow_summary` block (renamed from the old `gsearch`-only field) for **both** gsearch and gmaps. `run_detail.js` shows Websites-found/Not-found + SerpWow-cost/searches tiles and a Files card for gmaps too; the Model/Batch-mode/token tiles are suppressed when `serpwow_summary.model` is absent, which is always true for gmaps since it has no LLM step (no batch, no reconciler, no deferred completion — `batch_pending` is always false for gmaps, so finalize fires on the terminal snapshot).
+
+**⚠️ NOT live-verified end-to-end** (needs a real `SERPWOW_API_KEY` run): a full gmaps upload confirming the heuristic confidence values look sane, the four output files land on disk + S3, Supabase counts match, and the run-detail Files card/tiles render correctly in a browser. **Restart both the server and the worker** to pick up `GMAPS_CONFIDENCE_MODE` and any other new env.
 
 ---
 

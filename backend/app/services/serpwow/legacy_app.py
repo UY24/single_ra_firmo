@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from app.core.config import PROJECT_ROOT
-from app.services.serpwow import gsearch_reporting
+from app.services.serpwow import serpwow_reporting
 
 def load_local_env(env_path: str = ".env") -> None:
     if not os.path.exists(env_path):
@@ -218,28 +218,33 @@ def _get_bool_env(name: str, default: bool) -> bool:
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     """True when Gemini batch confidence scoring applies to this pipeline.
 
-    full  -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
+    full    -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
+    gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
     """
     pipe = str(pipeline or PIPELINE_FULL)
     if pipe == PIPELINE_GSEARCH:
         return _get_bool_env("GSEARCH_LLM_BATCH", False)
+    if pipe == PIPELINE_GMAPS:
+        mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
+        return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
     if pipe == PIPELINE_FULL:
         return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
-    """gsearch only: True while its Gemini batch hasn't reached a terminal status.
+    """gsearch/gmaps: True while the Gemini batch hasn't reached a terminal status.
 
     Used to DEFER the terminal completion side-effects (Supabase 'completed' sync,
-    Slack ping, output-file finalize) until the batch is done, so a gsearch batch
-    run reports completion once with final numbers — like AI Mode. The `full`
+    Slack ping, output-file finalize) until the batch is done, so a batch run
+    reports completion once with final numbers — like AI Mode. The `full`
     pipeline is intentionally left unchanged.
     """
-    if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+    pipe = str(state.get("pipeline") or PIPELINE_FULL)
+    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         return False
-    if not _batch_postprocess_enabled_for(PIPELINE_GSEARCH):
+    if not _batch_postprocess_enabled_for(pipe):
         return False
     gb = state.get("gemini_batch")
     return isinstance(gb, dict) and gb.get("status") in {"waiting_for_rows", "queued", "running"}
@@ -1372,14 +1377,17 @@ def _extract_address_numbers(value: str) -> list[str]:
     return numbers
 
 
-def _select_best_gmaps_website(
+def _score_gmaps_candidates(
     gmaps_result: dict[str, Any],
     company_name: str,
     input_full_address: Optional[str],
-) -> Optional[str]:
+) -> list[dict[str, Any]]:
+    """Score every Google-Maps result that carries a website and expose the
+    boolean signals used for heuristic confidence. Arithmetic matches the
+    original _select_best_gmaps_website exactly (pure function)."""
     results = (gmaps_result or {}).get("results") or []
     if not isinstance(results, list):
-        return None
+        return []
 
     company_tokens = _meaningful_company_tokens(company_name)
     input_address = (input_full_address or "").strip()
@@ -1387,9 +1395,12 @@ def _select_best_gmaps_website(
     address_numbers = _extract_address_numbers(input_address) if input_address else []
     company_text = re.sub(r"[^a-z0-9]+", " ", (company_name or "").lower()).strip()
 
-    best_url: Optional[str] = None
-    best_score = float("-inf")
+    organizational_terms = (
+        "chamber", "embassy", "consular", "center", "centre", "ministry",
+        "association", "council", "university", "college", "school", "hospital",
+    )
 
+    scored: list[dict[str, Any]] = []
     for idx, item in enumerate(results):
         if not isinstance(item, dict):
             continue
@@ -1408,49 +1419,115 @@ def _select_best_gmaps_website(
         category_norm = re.sub(r"[^a-z0-9]+", " ", category.lower()).strip()
         address_norm = _normalize_address_match_text(address)
 
-        score = 0.0
-
-        if company_tokens:
-            score += sum(2.0 for token in company_tokens if token in title_norm)
-
-        if address_norm and address_numbers:
-            score += sum(3.0 for number in address_numbers if re.search(rf"\b{re.escape(number)}\b", address_norm))
-
-        if address_norm and address_markers:
-            score += sum(2.0 for marker in address_markers if _marker_matches_candidate(marker, address_norm))
-
+        name_hits = sum(1 for token in company_tokens if token in title_norm) if company_tokens else 0
+        number_hits = (sum(1 for number in address_numbers
+                           if re.search(rf"\b{re.escape(number)}\b", address_norm))
+                       if (address_norm and address_numbers) else 0)
+        marker_hits = (sum(1 for marker in address_markers
+                           if _marker_matches_candidate(marker, address_norm))
+                       if (address_norm and address_markers) else 0)
+        aligned: Optional[bool] = None
         if input_address and address:
-            if _is_address_aligned(input_address, address):
-                score += 2.0
-            else:
-                score -= 2.0
-
-        organizational_terms = (
-            "chamber",
-            "embassy",
-            "consular",
-            "center",
-            "centre",
-            "ministry",
-            "association",
-            "council",
-            "university",
-            "college",
-            "school",
-            "hospital",
+            aligned = _is_address_aligned(input_address, address)
+        org_mismatch = (
+            any(term in f"{title_norm} {category_norm}" for term in organizational_terms)
+            and not any(term in company_text for term in organizational_terms)
         )
-        if any(term in f"{title_norm} {category_norm}" for term in organizational_terms) and not any(
-            term in company_text for term in organizational_terms
-        ):
-            score -= 4.0
 
+        score = 0.0
+        score += name_hits * 2.0
+        score += number_hits * 3.0
+        score += marker_hits * 2.0
+        if aligned is True:
+            score += 2.0
+        elif aligned is False:
+            score -= 2.0
+        if org_mismatch:
+            score -= 4.0
         score -= (idx * 0.01)
 
-        if score > best_score:
-            best_score = score
-            best_url = candidate_url
+        scored.append({
+            "url": candidate_url,
+            "score": score,
+            "name_match": name_hits > 0,
+            "address_match": (number_hits > 0 or marker_hits > 0 or aligned is True),
+            "address_conflict": aligned is False,
+            "organizational_mismatch": org_mismatch,
+            "idx": idx,
+        })
+    return scored
 
-    return best_url
+
+def _select_best_gmaps_website(
+    gmaps_result: dict[str, Any],
+    company_name: str,
+    input_full_address: Optional[str],
+) -> Optional[str]:
+    scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
+    if not scored:
+        return None
+    # max() returns the FIRST element with the top score; the idx tiebreaker
+    # (-0.01*idx) already orders ties by original position — identical to the
+    # original strict-greater loop.
+    best = max(scored, key=lambda e: e["score"])
+    return best["url"]
+
+
+def _gmaps_confidence_for_entry(entry: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Map a scored gmaps candidate (or None) to a heuristic confidence 'raw'
+    block matching the shape serpwow_reporting reads."""
+    if not entry or not entry.get("url"):
+        return {
+            "official_website": None, "confidence_score": 0, "confidence": "low",
+            "reason": "No Google Maps listing with a usable website matched.",
+            "name_match": False, "address_match": False,
+            "address_conflict": False, "organizational_mismatch": False,
+        }
+    name = bool(entry.get("name_match"))
+    addr = bool(entry.get("address_match"))
+    if name and addr:
+        score, reason = 90, "Google Maps listing matched the company name and address."
+    elif name:
+        score, reason = 70, "Google Maps listing matched the company name."
+    elif addr:
+        score, reason = 60, "Google Maps listing matched the address."
+    else:
+        score, reason = 40, "Google Maps listing found but neither name nor address corroborated it."
+    if entry.get("address_conflict"):
+        score -= 15
+        reason += " Address appears to conflict with the input."
+    if entry.get("organizational_mismatch"):
+        score -= 20
+        reason += " Listing looks like a different organization type."
+    score = max(0, min(100, score))
+    band = "high" if score >= 80 else "medium" if score >= 50 else "low"
+    return {
+        "official_website": entry["url"], "confidence_score": score, "confidence": band,
+        "reason": reason, "name_match": name, "address_match": addr,
+        "address_conflict": bool(entry.get("address_conflict")),
+        "organizational_mismatch": bool(entry.get("organizational_mismatch")),
+    }
+
+
+def _gmaps_confidence_block(
+    gmaps_result: dict[str, Any],
+    company_name: str,
+    input_full_address: Optional[str],
+    chosen_url: Optional[str],
+) -> dict[str, Any]:
+    """Heuristic confidence block for the chosen gmaps URL. Used for
+    GMAPS_CONFIDENCE_MODE=heuristic and as the per-row LLM-error fallback (the
+    caller overrides ``mode`` in that case). The LLM path lives in
+    execute_gmaps_lookup, which owns the GMAPS_CONFIDENCE_MODE branching."""
+    scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
+    entry: Optional[dict[str, Any]] = None
+    if chosen_url:
+        norm = re.sub(r"#.*$", "", str(chosen_url)).strip()
+        entry = next((e for e in scored if e["url"] == norm), None)
+        if entry is None:
+            entry = {"url": norm, "name_match": False, "address_match": False,
+                     "address_conflict": False, "organizational_mismatch": False}
+    return {"raw": _gmaps_confidence_for_entry(entry), "mode": "heuristic"}
 
 
 def is_disallowed_official_url(url: Optional[str]) -> bool:
@@ -2762,7 +2839,75 @@ async def execute_gmaps_lookup(
         
     gmaps_requests_used = int(gmaps_context.get("request_count", 0) or 0)
     serpwow_cost_usd = calculate_serpwow_cost_usd(gmaps_requests_used)
-    
+
+    # Confidence: heuristic by default; LLM when GMAPS_CONFIDENCE_MODE=llm. The LLM
+    # path reuses gsearch's selector + context keys so serpwow_reporting/build_summary
+    # surface confidence/model/tokens/cost with no reporting changes.
+    official_website = gmaps_website
+    gemini_cost_usd = 0.0
+    mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
+    llm_batch = _get_bool_env("GMAPS_LLM_BATCH", False)
+    # Candidate set the LLM selects from (also feeds _build_batch_prompt_for_row).
+    scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
+    candidates = dedupe_candidate_urls([e["url"] for e in scored])
+    confidence_ctx: dict[str, Any] = {}
+
+    if mode == "llm" and candidates and not llm_batch:
+        final_output, final_error, final_model, final_usage = await asyncio.to_thread(
+            choose_final_website_with_gemini,
+            company_name, country, input_industry, input_full_address,
+            candidates, [], None, gmaps_context,
+        )
+        if final_output is not None:
+            confidence_ctx["candidates"] = candidates
+            confidence_ctx["final_url_selection_ai"] = {
+                "provider": "google-gemini", "model": final_model,
+                "used": True, "error": final_error,
+                "usage": final_usage or {}, "raw": final_output,
+            }
+            gemini_cost_usd = calculate_gemini_cost_usd(final_usage)
+            ai_website = final_output.get("official_website")
+            # Accept the LLM's validated in-candidate pick; otherwise keep the Python
+            # best pick (parity with the gsearch worker).
+            if (isinstance(ai_website, str) and ai_website.strip()
+                    and not is_disallowed_official_url(ai_website)):
+                official_website = ai_website.strip()
+        else:
+            # LLM error -> heuristic fallback so the row still has a confidence.
+            confidence_ctx["candidates"] = candidates
+            block = _gmaps_confidence_block(
+                gmaps_result, company_name, input_full_address, gmaps_website)
+            block["mode"] = f"llm (fallback->heuristic: {final_error})"
+            confidence_ctx["gmaps_confidence"] = block
+    elif mode == "llm" and llm_batch:
+        # Batch mode: the finalization Gemini batch decides. Expose candidates for the
+        # batch prompt builder; keep the Python pick + a heuristic placeholder for
+        # pre-batch display (serpwow_reporting prefers gemini_batch_ai once it lands).
+        confidence_ctx["candidates"] = candidates
+        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
+            gmaps_result, company_name, input_full_address, gmaps_website)
+    else:
+        # Heuristic mode (default) — unchanged behavior.
+        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
+            gmaps_result, company_name, input_full_address, gmaps_website)
+
+    context: dict[str, Any] = {
+        "pipeline": PIPELINE_GMAPS,
+        "success": bool(official_website),
+        "used_proxy": False,
+        "blocked": False,
+        "error": gmaps_context.get("error"),
+        "gmaps": gmaps_context,
+        "cost_breakdown": {
+            "massive_proxy_cost_usd": 0.0,
+            "serpwow_cost_usd": serpwow_cost_usd,
+            "gemini_cost_usd": gemini_cost_usd,
+            "total_cost_usd": serpwow_cost_usd + gemini_cost_usd,
+            "serpwow_request_count": gmaps_requests_used,
+        },
+    }
+    context.update(confidence_ctx)
+
     # Create CrawlResponse
     response = CrawlResponse(
         company_name=company_name,
@@ -2770,7 +2915,7 @@ async def execute_gmaps_lookup(
         firm_id=firm_id,
         input_industry=input_industry,
         input_full_address=input_full_address,
-        official_website=gmaps_website,
+        official_website=official_website,
         summary=summary,
         address=address,
         phone=phone,
@@ -2780,25 +2925,11 @@ async def execute_gmaps_lookup(
         services=[],
         massive_proxy_cost_usd=0.0,
         serpwow_cost_usd=serpwow_cost_usd,
-        gemini_cost_usd=0.0,
-        total_cost_usd=serpwow_cost_usd,
-        context={
-            "pipeline": PIPELINE_GMAPS,
-            "success": bool(gmaps_website),
-            "used_proxy": False,
-            "blocked": False,
-            "error": gmaps_context.get("error"),
-            "gmaps": gmaps_context,
-            "cost_breakdown": {
-                "massive_proxy_cost_usd": 0.0,
-                "serpwow_cost_usd": serpwow_cost_usd,
-                "gemini_cost_usd": 0.0,
-                "total_cost_usd": serpwow_cost_usd,
-                "serpwow_request_count": gmaps_requests_used,
-            }
-        }
+        gemini_cost_usd=gemini_cost_usd,
+        total_cost_usd=serpwow_cost_usd + gemini_cost_usd,
+        context=context,
     )
-    
+
     serpwow_raw_json = json.dumps(gmaps_result, ensure_ascii=True, indent=2)
     return response, serpwow_raw_json
 
@@ -5601,7 +5732,7 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
     names = ["state.json", "output.json"]
-    if pipe == PIPELINE_GSEARCH:
+    if pipe in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _upload_s3_prefix(upload_id, company_name, pipe)
@@ -5658,9 +5789,9 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         upload_id = str(state.get("upload_id") or "")
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         extra: dict[str, Any] = {}
-        if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
-            results = gsearch_reporting.state_to_entity_results(state)
-            summ = gsearch_reporting.build_summary(state, results)
+        if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+            results = serpwow_reporting.state_to_entity_results(state)
+            summ = serpwow_reporting.build_summary(state, results)
             extra = {
                 "websites_found": summ["websites_found"],
                 "websites_not_found": summ["websites_not_found"],
@@ -5757,13 +5888,14 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
         if status == "failed":
             notify.notify_run_failed(error=state.get("error") or "run failed", **common)
         else:  # completed | completed_with_errors
-            # gsearch tracks SerpWow searches + Gemini tokens/cost — surface them in
-            # the ping like AI Mode does. Other SerpWow pipelines have none, so omit.
+            # gsearch and gmaps both track SerpWow searches + Gemini tokens/cost via
+            # the same serpwow_reporting.build_summary — surface them in the ping like
+            # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            if str(state.get("pipeline") or "") == PIPELINE_GSEARCH:
+            if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
                 try:
-                    gs = gsearch_reporting.build_summary(
-                        state, gsearch_reporting.state_to_entity_results(state))
+                    gs = serpwow_reporting.build_summary(
+                        state, serpwow_reporting.state_to_entity_results(state))
                     tu = gs.get("token_usage") or {}
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
@@ -5787,24 +5919,26 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
               f"(worker unaffected): {type(exc).__name__}: {exc}")
 
 
-async def _finalize_gsearch_outputs(upload_id: str, state: dict[str, Any]) -> None:
-    """Write found/notFound/report/run.log for a terminal gsearch upload and mirror
-    them to S3. Best-effort: logs + swallows everything, never raises."""
+async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> None:
+    """Write found/notFound/report/run.log for a terminal SerpWow upload
+    (gsearch or gmaps) and mirror them to S3. Best-effort: logs + swallows
+    everything, never raises."""
     try:
         upload_dir = _find_upload_dir(upload_id)
-        paths = await asyncio.to_thread(gsearch_reporting.write_gsearch_outputs, upload_dir, state)
+        paths = await asyncio.to_thread(serpwow_reporting.write_outputs, upload_dir, state)
     except Exception as exc:
-        print(f"[gsearch] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
+        print(f"[serpwow] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
         return
     if not os.getenv("S3_BUCKET"):
         return
     from app.core import s3 as core_s3
-    prefix = _upload_s3_prefix(upload_id, str(state.get("company_name") or ""), PIPELINE_GSEARCH)
+    pipeline = str(state.get("pipeline") or PIPELINE_GSEARCH)
+    prefix = _upload_s3_prefix(upload_id, str(state.get("company_name") or ""), pipeline)
     for name, path in paths.items():
         try:
             await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")
         except Exception as exc:
-            print(f"[gsearch] S3 mirror failed for {name} ({upload_id}): {type(exc).__name__}: {exc}")
+            print(f"[serpwow] S3 mirror failed for {name} ({upload_id}): {type(exc).__name__}: {exc}")
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
@@ -5846,8 +5980,8 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     if state["status"] in {"completed", "completed_with_errors"}:
         combined = build_upload_output_payload(state)
         await write_upload_artifact(upload_id, "output", combined)
-    if (not batch_pending) and state.get("pipeline") == PIPELINE_GSEARCH and state["status"] in {"completed", "completed_with_errors"}:
-        await _finalize_gsearch_outputs(upload_id, state)
+    if (not batch_pending) and state.get("pipeline") in {PIPELINE_GSEARCH, PIPELINE_GMAPS} and state["status"] in {"completed", "completed_with_errors"}:
+        await _finalize_serpwow_outputs(upload_id, state)
     await maybe_start_gemini_batch_for_upload(upload_id, state)
 
 
@@ -6643,6 +6777,11 @@ async def reconcile_stuck_gsearch_rows() -> None:
     upload still non-terminal, any row stuck in queued/processing past
     GSEARCH_ROW_STALE_TIMEOUT_SEC is re-published up to GSEARCH_ROW_MAX_REQUEUE times,
     then FORCE-FAILED so the completion barrier can always resolve. Best-effort.
+
+    Also covers gmaps uploads, but ONLY when gmaps batch mode is enabled
+    (GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH) — a stuck row there blocks
+    maybe_start_gemini_batch_for_upload from ever starting since it waits for all
+    rows to be terminal. Per-row/heuristic gmaps has no such barrier and is skipped.
     """
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return
@@ -6661,7 +6800,12 @@ async def reconcile_stuck_gsearch_rows() -> None:
         for state in states:
             if not isinstance(state, dict):
                 continue
-            if str(state.get("pipeline") or PIPELINE_FULL) != PIPELINE_GSEARCH:
+            _rec_pipe = str(state.get("pipeline") or PIPELINE_FULL)
+            # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
+            # only in batch mode, where a stuck row blocks the finalization batch from
+            # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
+            if not (_rec_pipe == PIPELINE_GSEARCH
+                    or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
                 continue
@@ -7599,14 +7743,15 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
 
     state = await maybe_fail_stale_processing_rows(upload_id, state)
     summary = summarize_upload_state(dict(state))
-    # gsearch surfaces a confidence/cost summary (model, batch mode, found counts,
-    # cost, tokens) so the run-detail UI can show the same tiles AI Mode does.
-    gsearch_block = None
-    if (summary.get("pipeline") or PIPELINE_FULL) == PIPELINE_GSEARCH:
+    # SerpWow pipelines (gsearch/gmaps) surface a confidence/cost summary (model,
+    # batch mode, found counts, cost, tokens) so the run-detail UI can show the
+    # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
+    serpwow_summary = None
+    if (summary.get("pipeline") or PIPELINE_FULL) in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         try:
-            gs = gsearch_reporting.build_summary(
-                summary, gsearch_reporting.state_to_entity_results(summary))
-            gsearch_block = {
+            gs = serpwow_reporting.build_summary(
+                summary, serpwow_reporting.state_to_entity_results(summary))
+            serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],
                 "model": gs["model"],
@@ -7615,13 +7760,13 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "token_usage": gs["token_usage"],
             }
         except Exception:
-            gsearch_block = None
+            serpwow_summary = None
     return {
         "upload_id": summary["upload_id"],
         "pipeline": summary.get("pipeline") or PIPELINE_FULL,
         "status": summary["status"],
         "gemini_batch": summary.get("gemini_batch"),
-        "gsearch": gsearch_block,
+        "serpwow_summary": serpwow_summary,
         "queue_recovery": summary.get("queue_recovery"),
         "created_at": summary.get("created_at"),
         "updated_at": summary.get("updated_at"),

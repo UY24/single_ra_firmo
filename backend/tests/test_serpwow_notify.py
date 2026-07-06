@@ -66,7 +66,8 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertAlmostEqual(kw["cost_usd"], 0.00125, places=6)
 
     def test_non_gsearch_omits_search_token_cost(self):
-        state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "gmaps",
+        # `full` has no serpwow_reporting-style cost/token tracking -> omitted.
+        state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "full",
                  "status": "completed", "total_rows": 2, "success_rows": 2, "failed_rows": 0}
         with mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed"):
@@ -75,6 +76,35 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertNotIn("searches", kw)
         self.assertNotIn("tokens", kw)
         self.assertNotIn("cost_usd", kw)
+
+    def test_gmaps_includes_searches_tokens_cost(self):
+        # gmaps now has real serpwow_searches/tokens/cost (LLM batch/per-row
+        # confidence mode) -> the Slack ping must surface them like gsearch does.
+        state = {
+            "upload_id": "UP5", "company_name": "Acme Inc", "pipeline": "gmaps",
+            "status": "completed", "total_rows": 1, "success_rows": 1, "failed_rows": 0,
+            "processing_seconds_total": 5.0,
+            "rows": [{"row_index": 0, "company_name": "Acme", "country": "us",
+                      "status": "completed", "error": None, "result": {
+                          "official_website": "https://acme.com", "gemini_cost_usd": 0.0001,
+                          "context": {"cost_breakdown": {"serpwow_request_count": 2},
+                                      "gemini_batch_ai": {"usage": {
+                                          "promptTokenCount": 30, "candidatesTokenCount": 6},
+                                          "raw": {"official_website": "https://acme.com",
+                                                  "confidence_score": 75}}}}}],
+        }
+        with mock.patch("app.core.notify.notify_run_complete") as done, \
+                mock.patch("app.core.notify.notify_run_failed"), \
+                mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}, clear=False):
+            la._notify_slack_terminal(state)
+        kw = done.call_args.kwargs
+        self.assertEqual(kw["search_label"], "SerpWow searches")
+        self.assertEqual(kw["searches"], 2)
+        self.assertEqual(kw["tokens"], 36)
+        self.assertEqual(kw["input_tokens"], 30)
+        self.assertEqual(kw["output_tokens"], 6)
+        # total_usd = LLM (0.0001) + SerpWow (2 * 0.00035 = 0.0007)
+        self.assertAlmostEqual(kw["cost_usd"], 0.0008, places=6)
 
     def test_never_raises(self):
         with mock.patch("app.core.notify.notify_run_complete",
@@ -100,7 +130,7 @@ class GsearchBatchDeferralTests(unittest.TestCase):
                 mock.patch.object(la, "update_summary_cache"), \
                 mock.patch.object(la, "build_upload_output_payload", return_value={}), \
                 mock.patch.object(la, "_batch_postprocess_enabled_for", return_value=True), \
-                mock.patch.object(la, "_finalize_gsearch_outputs", new=mock.AsyncMock()) as fin, \
+                mock.patch.object(la, "_finalize_serpwow_outputs", new=mock.AsyncMock()) as fin, \
                 mock.patch.object(la, "_update_supabase_run", return_value=True) as sup, \
                 mock.patch.object(la, "_notify_slack_terminal") as notify_term:
             asyncio.run(la.persist_upload_state("UPB", state))

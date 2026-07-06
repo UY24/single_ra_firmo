@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
+boto3
+pika
+aio-pika
+redis
+aiohttp
+python-dotenv
+pyyaml
+duckdb
+httpx
+msgspec
+supabase

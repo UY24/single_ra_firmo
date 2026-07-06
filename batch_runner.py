@@ -1,7 +1,14 @@
 import argparse
 import asyncio
+import os
+import sys
 
-import app
+# Allow importing the backend package when executing from the repo root.
+BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend")
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+from app.services.serpwow import legacy_app as app
 
 
 async def main() -> None:

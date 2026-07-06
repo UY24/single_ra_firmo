@@ -1,0 +1,79 @@
+// backend/app/static/js/ui.js — shared UI helpers (cards, badges, table cells, dates).
+import { el } from "./api.js";
+
+export function copyText(text) {
+  if (!text || text === "-" || text === "—") return;
+  navigator.clipboard.writeText(text).catch(() => {});
+}
+
+export function copyCell(text) {
+  if (!text || text === "-" || text === "—") {
+    return el("span", { class: "font-mono text-xs text-slate-500" }, "—");
+  }
+  const span = el("span", {
+    class: "block max-w-[22rem] truncate font-mono text-xs text-slate-400 cursor-pointer hover:text-slate-200 transition-colors",
+    title: `${text}\n(click to copy)`,
+  }, text);
+  span.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    copyText(text);
+    span.classList.add("text-emerald-400");
+    span.classList.remove("text-slate-400", "text-slate-200");
+    setTimeout(() => {
+      span.classList.remove("text-emerald-400");
+      span.classList.add("text-slate-400");
+    }, 1000);
+  });
+  return span;
+}
+
+export function statusBadge(status) {
+  return el("span", { class: "status-badge", "data-status": status ?? "" }, status ?? "—");
+}
+
+export function errorCard(message) {
+  if (/supabase/i.test(message)) {
+    return el("div", { class: "callout callout-amber" },
+      el("p", { class: "text-sm font-semibold" }, "Supabase not configured / unreachable"),
+      el("p", { class: "mt-1 text-sm" }, message),
+      el("p", { class: "mt-3 text-xs opacity-80" },
+        "In .env, SUPABASE_URL must be the bare REST URL (https://<project-ref>.supabase.co), not the :5432/postgres connection string. Then restart the server."),
+    );
+  }
+  return el("div", { class: "callout callout-red" },
+    el("p", { class: "text-sm font-semibold" }, "Something went wrong"),
+    el("p", { class: "mt-1 text-sm" }, message),
+  );
+}
+
+export const loadingCard = () =>
+  el("div", { class: "panel panel-tight" },
+    el("p", { class: "section-copy" }, "Loading..."));
+
+export const head = (label, extra = "") =>
+  el("th", { class: `px-4 py-3 text-left uppercase ${extra}` }, label);
+
+export const cell = (content, extra = "") =>
+  el("td", { class: `px-4 py-3 text-sm ${extra}` }, content);
+
+// fmtDuration(95) → "1m 35s"; fmtDuration(42) → "42s"
+export const fmtDuration = (s) => {
+  if (s == null) return "—";
+  const total = Math.round(Number(s));
+  if (Number.isNaN(total)) return "—";
+  const m = Math.floor(total / 60), sec = total % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+};
+
+// shortDate(iso)                      → "Jun 11, 02:30 PM" (with time)
+// shortDate(iso, { withTime: false }) → "Jun 11, 2026"     (date only)
+export const shortDate = (iso, { withTime = true } = {}) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return withTime
+    ? d.toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+    : d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+};

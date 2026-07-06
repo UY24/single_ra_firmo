@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GMAPS_CONFIDENCE_MODE=llm; on branch `gmapsfix`, NOT pushed). Read this first if you're picking up this repo.
+Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GMAPS_CONFIDENCE_MODE=llm, + final-review hardening; on branch `gmapsfix`, NOT pushed. **One UI task is PENDING/unimplemented — see "Current state & next task" below.**). Read this first if you're picking up this repo.
 
 ---
 
@@ -18,7 +18,28 @@ Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GM
 
 5. **`_gmaps_confidence_block` is heuristic-only now.** The executor owns the `GMAPS_CONFIDENCE_MODE` branch (per-row LLM / batch LLM / heuristic); the helper itself no longer has an `"llm"` seam, keeping the async LLM call out of the sync helper.
 
-**⚠️ NOT live-verified end-to-end** (needs a real `GEMINI_API_KEY` + `SERPWOW_API_KEY`): a full gmaps run in both `GMAPS_LLM_BATCH=false` and `=true` modes confirming the LLM pick lands in `official_website`, cost/tokens surface correctly, and the batch path reaches a terminal `gemini_batch.status` and finalizes once. **Restart both the server and the worker** to pick up `GMAPS_CONFIDENCE_MODE=llm` / `GMAPS_LLM_BATCH` and any other new env.
+6. **Final whole-branch review hardening (commit `422c592`).** The opus final review returned "ready to merge with fixes"; the fixes landed: (a) **`reconcile_stuck_gsearch_rows` now also terminalizes gmaps uploads in batch mode** — its guard is `gsearch OR (gmaps AND _batch_postprocess_enabled_for(gmaps))`. This closes a real hang: a gmaps batch run only starts its Gemini batch once ALL rows are terminal, so a row lost mid-flight (worker crash / dropped message) would otherwise block the batch forever; per-row/heuristic gmaps is deliberately still skipped (no such barrier). (b) **`_notify_slack_terminal` now carries gmaps searches/tokens/cost** (was gsearch-only). (c) New `tests/test_gmaps_batch_flow.py` drives the shared batch helpers (`_build_batch_items_for_state` → `_apply_batch_parsed_to_row` → `serpwow_reporting`) on a gmaps state and empirically confirms the "no new batch engine" reuse claim. A stray stale doc line was fixed in `6664c37`.
+
+**⚠️ NOT live-verified end-to-end** (needs a real `GEMINI_API_KEY` + `SERPWOW_API_KEY`): a full gmaps run in both `GMAPS_LLM_BATCH=false` and `=true` modes confirming the LLM pick lands in `official_website`, cost/tokens surface correctly, and the batch path reaches a terminal `gemini_batch.status` and finalizes once — ideally with a deliberately-stalled row to exercise the reconciler fix (6a). **Restart both the server and the worker** to pick up `GMAPS_CONFIDENCE_MODE=llm` / `GMAPS_LLM_BATCH` and any other new env.
+
+**Test suite:** 289 tests, all green — `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` (the `-t .` is mandatory). Two accepted minors: `_score_gmaps_candidates` is computed twice on the heuristic/batch/fallback branches (harmless, pure fn); the Gemini batch job `display_name` label reads `gsearch-{id}-chunk{n}` for gmaps batches too (cosmetic label only).
+
+---
+
+## ⭐ Current state & next task (READ THIS — there is unfinished work)
+
+**Branch `gmapsfix`, NOT pushed / NOT merged (user's call).** It carries, in order: the 2026-07-02 gmaps output-parity feature, then the 2026-07-03 gmaps LLM-confidence feature (+ its final-review fixes). Both were built via the subagent-driven-development flow; per-task + final reviews are clean; suite 289/289. Plan/spec/ledger on disk (gitignored): `docs/superpowers/plans/2026-07-0{2,3}-gmaps-*.md`, `docs/superpowers/specs/2026-07-0{2,3}-gmaps-*.md`, `.superpowers/sdd/progress.md`.
+
+**⏳ PENDING — run-detail UI redesign for the SerpWow view (NOT started; design agreed in-session, no code written).** The user flagged that the SerpWow run-detail view (`renderLegacyStatus` in `backend/app/static/js/run_detail.js`, used by BOTH gsearch and gmaps) is cluttered/redundant and wants it cleaned up + made consistent, plus an explicit LLM-vs-heuristic / batch-on-off indicator for gmaps. The agreed design (approve with the user before coding — the brainstorming HARD-GATE was not formally closed):
+
+- **Remove the redundancy.** Today `renderLegacyStatus` renders 5 panels with heavy overlap: (1) header, (2) stat-tiles grid, (3) the **Files card** (found.csv/notFound.csv/report.json/run.log — View/Download), (4) an **"Artifacts" panel** re-listing the same files as `s3://…` copy-cells, (5) a filler "row-level detail via API" note + a **"SerpWow upload snapshot" `<dl>`** that repeats Total/Processed/Success/Failed/time/avg (already in the tiles) and a "Storage" row that joins the file links a third time. Delete panels (4) and (5) entirely — every field they show lives in the header/tiles/Files card; the `s3://` paths remain in `report.json` + the API.
+- **Dedupe tiles.** Drop the `Succeeded`/`Failed` tiles — for gsearch/gmaps "success" == "website found", so `Websites found`/`Not found` (from `serpwow_summary`) is the single source. Keep Total/Processed/time/avg + SerpWow searches/cost + (LLM only) Input/Output tokens/LLM cost.
+- **gmaps mode chips (the user's explicit ask).** In the header show `Confidence: LLM | Heuristic` always, and `Batch: On | Off` only when LLM (batch is meaningless in heuristic mode), plus a `Model` chip when LLM. Apply the same chips to gsearch for consistency.
+- **Files card** stays as the single file surface for both pipelines at terminal status; fold the Download JSON/XLSX buttons into it. Net layout: header(+chips) → one tiles grid → Files card — which also matches AI Mode's `renderAiStatus` structure (header → tiles → `downloadsCard`), so all three run types look consistent.
+- **One tiny backend add:** give `serpwow_summary` (built in `serpwow_reporting.build_summary`, surfaced by `GET /uploads/{id}/status`) an explicit `confidence_mode` field (`"llm"` when a model was used, else `"heuristic"`) so the chip is testable rather than the UI guessing from `model` presence. `is_batch` already exists.
+- **Open question left with the user at pause:** confirmed removing the `s3://` "Artifacts" panel and the duplicate Succeeded/Failed tiles is OK (recommended). Re-confirm before implementing, then run it through writing-plans → subagent-driven-development (or implement directly + `/code-review`, it's a small single-file change + one backend line). `run_detail.js` has an `el()` gotcha: it sets every attr via `setAttribute`, so guard conditional `href`/`disabled` with the spread pattern (see the existing `filesCard`).
+
+**Conventions (unchanged):** never add a `Co-Authored-By: Claude` trailer; never `git push` or query prod Supabase without explicit user OK; tests are offline unittest with mandatory `-t .`; `docs/` is gitignored.
 
 ---
 

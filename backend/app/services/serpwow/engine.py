@@ -44,6 +44,7 @@ from pydantic import BaseModel
 from app.core.config import PROJECT_ROOT
 from app.services.common.env import get_float_env, get_int_env, get_bool_env
 from app.services.common.text import slugify_company
+from app.services.serpwow import serpwow_client
 from app.services.serpwow import serpwow_reporting
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
@@ -3002,6 +3003,9 @@ async def startup_event() -> None:
 
     search_fetch_concurrency = max(1, _get_int_env("SEARCH_FETCH_CONCURRENCY", 2))
     search_fetch_semaphore = asyncio.Semaphore(search_fetch_concurrency)
+    # run_serpwow_search lives in serpwow_client and reads its own module's
+    # global — publish the semaphore there too (engine's copy kept for compat).
+    serpwow_client.search_fetch_semaphore = search_fetch_semaphore
 
     try:
         await init_rabbitmq()

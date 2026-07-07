@@ -7,6 +7,7 @@ import httpx
 import json
 import re
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from app.services.serpwow.schemas import CrawlResponse
 from app.services.common.env import (

@@ -2,6 +2,7 @@
 """SerpWow HTTP client + official-website / candidate extraction from responses."""
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -13,6 +14,10 @@ from app.services.serpwow.geo import _country_to_gl
 from app.services.serpwow.url_utils import is_disallowed_official_url
 
 SERPWOW_API_URL = "https://api.serpwow.com/live/search"
+
+# Set by engine.startup_event() (API and worker both go through it); when set,
+# caps concurrent SerpWow HTTP fetches. None means no throttling.
+search_fetch_semaphore: Optional[asyncio.Semaphore] = None
 
 def _extract_official_website_from_serpwow(data: dict[str, Any]) -> Optional[str]:
     knowledge_graph = data.get("knowledge_graph")

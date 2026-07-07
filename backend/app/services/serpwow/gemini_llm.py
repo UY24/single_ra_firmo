@@ -12,6 +12,8 @@ from urllib.request import Request, urlopen
 from app.services.serpwow.url_utils import (
     _normalize_url_for_compare,
     _official_website_looks_plausible,
+    is_disallowed_official_url,
+    url_matches_domain,
 )
 
 def _parse_json_from_text(raw_text: str) -> Optional[dict[str, Any]]:
@@ -710,3 +712,146 @@ def choose_final_website_with_gemini(
         return normalized, None, model, usage_metadata
 
     return None, (last_error or "Gemini model resolution failed"), configured_model, None
+
+
+def build_relationship_prompt(
+    x_name: str,
+    y_name: str,
+    city: str,
+    country: str,
+    candidates: list[str],
+    ai_overview_texts: list[str],
+    search_attempts: list[dict[str, Any]],
+    phase4_hit: bool,
+) -> str:
+    """Prompt for the relationship pipeline (spec §4). Shared by the per-row
+    call (choose_relationship_and_website) and the Gemini-batch item builder so
+    both modes judge with identical instructions."""
+    input_obj = {
+        "company_x": x_name, "company_y_ocr": y_name,
+        "city": city or None, "country": country or None,
+        "company_y_appears_on_company_x_site": bool(phase4_hit),
+    }
+    return (
+        "You verify FINANCIAL relationships between companies and identify official websites.\n"
+        "company_x is an investment firm; company_y_ocr is OCR text extracted from a logo on\n"
+        "company_x's portfolio page — it may be garbled, truncated, or contain noise around\n"
+        "the real company name (e.g. 'YUZU SPARKLINGWE SANZO POMELO' contains 'SANZO').\n"
+        "Return strict JSON only with this schema:\n"
+        "{\n"
+        '  "relationship_status": "confirmed"|"not_confirmed"|"unclear",\n'
+        '  "relationship_summary": string,\n'
+        '  "official_website": string|null,\n'
+        '  "confidence_score": number,\n'
+        '  "reason": string,\n'
+        '  "extra_flags": [string]\n'
+        "}\n"
+        "Rules:\n"
+        "- relationship_status is about a FINANCIAL relationship only (investment, portfolio\n"
+        "  company, funding round, acquisition, fund backing). Mere similarity or co-mention\n"
+        "  without financial context is NOT a relationship.\n"
+        "- 'confirmed' requires explicit supporting evidence in the provided material.\n"
+        "- official_website must be company_y's site, chosen from Candidate URLs ONLY.\n"
+        "  Never invent a URL. Never return company_x's own website.\n"
+        "- Set official_website to null unless relationship_status is 'confirmed'.\n"
+        "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
+        "- confidence_score is 0-100 for the overall answer (relationship + URL).\n"
+        "- relationship_summary: 1-2 sentences quoting what the evidence says.\n"
+        "- extra_flags: optional short slugs like \"company_closed\" (evidence says company\n"
+        "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
+        f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
+        f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
+        f"AI Overview evidence: {json.dumps(list(ai_overview_texts or []), ensure_ascii=True)[:12000]}\n\n"
+        f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
+    )
+
+
+def choose_relationship_and_website(
+    x_name: str,
+    y_name: str,
+    city: str,
+    country: str,
+    candidates: list[str],
+    ai_overview_texts: list[str],
+    search_attempts: list[dict[str, Any]],
+    phase4_hit: bool,
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
+    """Per-pair relationship verdict + URL pick. Returns (parsed, error, model, usage)
+    following choose_final_website_with_gemini's convention. Validation of the parsed
+    output (candidate-set, X-domain, the confirmed-gate) lives in
+    apply_relationship_gate — callers MUST run it; this function only calls the model."""
+    configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    ordered_models: list[str] = []
+    for model_name in (configured_model, "gemini-2.5-flash-lite"):
+        if model_name and model_name not in ordered_models:
+            ordered_models.append(model_name)
+    prompt = build_relationship_prompt(
+        x_name, y_name, city, country, candidates,
+        ai_overview_texts, search_attempts, phase4_hit)
+    last_error: Optional[str] = None
+    for model in ordered_models:
+        text, usage, error = _gemini_generate_content_json(model, prompt)
+        if error:
+            last_error = error
+            continue
+        parsed = _parse_json_from_text(text or "")
+        if parsed is None:
+            last_error = "Gemini returned non-JSON output for relationship prompt."
+            continue
+        return parsed, None, model, usage
+    return None, last_error or "Gemini relationship call failed.", None, None
+
+
+_VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}
+
+
+def apply_relationship_gate(
+    parsed: dict[str, Any],
+    candidates: list[str],
+    x_domain: str,
+) -> tuple[Optional[str], str, list[dict[str, str]]]:
+    """Code-enforced validation of a relationship LLM output (spec §4 rules 1-4).
+
+    Returns (gated_url, relationship_status, gate_flags). gated_url is non-None
+    ONLY when status == "confirmed" AND the URL is in the candidate set AND not
+    disallowed AND not on Company X's own domain. A URL that exists but fails
+    the gate is preserved in a flag so the evidence isn't lost.
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    status = str(parsed.get("relationship_status") or "").strip().lower()
+    if status not in _VALID_REL_STATUSES:
+        status = "unclear"
+    flags: list[dict[str, str]] = []
+
+    raw_url = parsed.get("official_website")
+    url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None
+
+    if url is not None:
+        normalized_candidates = {
+            _normalize_url_for_compare(c) for c in (candidates or []) if str(c or "").strip()
+        }
+        normalized_candidates.discard("")
+        if _normalize_url_for_compare(url) not in normalized_candidates:
+            flags.append({"flag": "llm_url_out_of_candidates",
+                          "why": f"LLM returned {url} which is not in the candidate set"})
+            url = None
+    if url is not None and is_disallowed_official_url(url):
+        flags.append({"flag": "disallowed_url_dropped",
+                      "why": f"{url} is a directory/social/file URL"})
+        url = None
+    if url is not None and url_matches_domain(url, x_domain):
+        flags.append({"flag": "x_domain_candidate_dropped",
+                      "why": f"{url} is Company X's own site, never Y's"})
+        url = None
+
+    if status != "confirmed" and url is not None:
+        flag_name = ("relationship_unclear" if status == "unclear"
+                     else "url_found_no_relationship")
+        flags.append({"flag": flag_name,
+                      "why": f"candidate URL {url} found but relationship is {status}"})
+        url = None
+    elif status == "unclear":
+        flags.append({"flag": "relationship_unclear",
+                      "why": "evidence neither confirms nor rules out a financial relationship"})
+
+    return url, status, flags

@@ -7,7 +7,7 @@ that a gmaps batch row is reported exactly like a gsearch batch row.
 """
 import unittest
 
-from app.services.serpwow import legacy_app
+from app.services.serpwow import engine as legacy_app
 from app.services.serpwow import serpwow_reporting
 
 

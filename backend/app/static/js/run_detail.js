@@ -8,7 +8,7 @@
 // completed/completed_with_errors/failed and is always stopped by the router
 // via the cleanup function this view returns).
 import { api, el, fmtUsd, fmtNum, pollStatus } from "./api.js";
-import { errorCard, loadingCard, statusBadge, fmtDuration, shortDate, copyCell } from "./ui.js";
+import { errorCard, loadingCard, statusBadge, fmtDuration } from "./ui.js";
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 
@@ -130,27 +130,34 @@ function statTile(label, value) {
   );
 }
 
-function summaryPair(label, value) {
-  const text = value == null || value === "" ? "-" : String(value);
-  return el("div", { class: "panel-muted p-3" },
-    el("dt", { class: "view-kicker" }, label),
-    el("dd", { class: "mt-1 truncate text-sm font-semibold text-slate-50", title: text }, text),
+// Small metadata pill (e.g. "Confidence LLM"). `value` may be null to render a
+// label-only chip; callers filter those out.
+function chip(label, value) {
+  return el("span", {
+    class: "inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-800/60 px-2.5 py-0.5 text-[11px] font-medium",
+  },
+    el("span", { class: "text-slate-500" }, label),
+    el("span", { class: "text-slate-200" }, String(value)),
   );
 }
 
-function headerCard(title, subtitle, status, phase) {
+function headerCard(title, subtitle, status, phase, chips) {
   const bits = [statusBadge(status)];
   if (status === "running" && phase) {
     bits.push(el("span", {
       class: "status-badge",
     }, phase));
   }
+  const left = el("div", {},
+    el("p", { class: "text-base font-semibold text-slate-50" }, title),
+    el("p", { class: "mt-0.5 section-copy" }, subtitle),
+  );
+  if (chips && chips.length) {
+    left.appendChild(el("div", { class: "mt-2 flex flex-wrap items-center gap-1.5" }, ...chips));
+  }
   return el("div", { class: "panel" },
     el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
-      el("div", {},
-        el("p", { class: "text-base font-semibold text-slate-50" }, title),
-        el("p", { class: "mt-0.5 section-copy" }, subtitle),
-      ),
+      left,
       el("div", { class: "flex items-center gap-2" }, ...bits),
     ),
   );
@@ -175,28 +182,38 @@ function progressCard(done, total, running) {
 // Shared "Files" card (View + Download per file). `allFiles` is the full list to
 // list; `available` (optional) is the subset that actually exists — others render
 // disabled. `baseUrl(name)` builds the per-file result URL (download appends
-// "&download=true"). Used by both AI Mode and the SerpWow gsearch detail view.
-function filesCard(allFiles, baseUrl, available) {
+// "&download=true"). `extras` (optional) are download-only rows {name, href} for
+// files served by a different endpoint (e.g. the full output.json/xlsx). Used by
+// both AI Mode and the SerpWow gsearch/gmaps detail view.
+function filesCard(allFiles, baseUrl, available, extras) {
   const files = available?.length ? available : allFiles;
+  const rows = allFiles.map((name) => {
+    const isAvailable = files.includes(name);
+    return el("div", { class: "flex items-center gap-2" },
+      el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
+      el("button", {
+        class: "btn-ghost min-h-0 px-3 py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
+        ...(isAvailable ? {} : { disabled: "" }),
+        onclick: () => viewFile(baseUrl(name), name, `${baseUrl(name)}&download=true`),
+      }, "View"),
+      el("a", {
+        class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
+        ...(isAvailable ? { href: `${baseUrl(name)}&download=true`, download: name } : {}),
+      }, "Download"),
+    );
+  });
+  for (const ex of extras ?? []) {
+    rows.push(el("div", { class: "flex items-center gap-2" },
+      el("span", { class: "w-40 shrink-0 font-mono text-xs text-slate-300" }, ex.name),
+      el("a", {
+        class: "btn-ghost min-h-0 px-3 py-1 text-xs",
+        href: ex.href, download: ex.name,
+      }, "Download"),
+    ));
+  }
   return el("div", { class: "panel" },
     el("h2", { class: "section-title" }, "Files"),
-    el("div", { class: "mt-3 flex flex-col gap-2" },
-      ...allFiles.map((name) => {
-        const isAvailable = files.includes(name);
-        return el("div", { class: "flex items-center gap-2" },
-          el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
-          el("button", {
-            class: "btn-ghost min-h-0 px-3 py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
-            ...(isAvailable ? {} : { disabled: "" }),
-            onclick: () => viewFile(baseUrl(name), name, `${baseUrl(name)}&download=true`),
-          }, "View"),
-          el("a", {
-            class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
-            ...(isAvailable ? { href: `${baseUrl(name)}&download=true`, download: name } : {}),
-          }, "Download"),
-        );
-      }),
-    ),
+    el("div", { class: "mt-3 flex flex-col gap-2" }, ...rows),
   );
 }
 
@@ -277,32 +294,41 @@ function renderAiStatus(root, ref, s) {
 
 function renderLegacyStatus(root, ref, s) {
   const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
-  // gsearch batch mode: rows finish before the Gemini batch. Treat the run as
+  // gsearch/gmaps batch mode: rows finish before the Gemini batch. Treat the run as
   // "done" only once the batch is terminal so the UI doesn't claim completion early.
   const batchStatus = s.gemini_batch?.status ?? null;
   const batchTerminal = batchStatus == null
     || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
-  const gsearchFinalizing = ["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && !batchTerminal;
-  const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
-  const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
+  const isSerp = ["gsearch", "gmaps"].includes(s.pipeline);
+  const finalizing = isSerp && rowsDone && !batchTerminal;
+  const g = s.serpwow_summary;
+
+  // Header chips: confidence mode always (gsearch/gmaps); batch + model only when LLM
+  // (batch is meaningless in heuristic mode). Non-serpwow pipelines get no chips.
+  const chips = [];
+  if (g?.confidence_mode) {
+    chips.push(chip("Confidence", g.confidence_mode === "llm" ? "LLM" : "Heuristic"));
+    if (g.confidence_mode === "llm") {
+      chips.push(chip("Batch", g.is_batch ? "On" : "Off"));
+      if (g.model) chips.push(chip("Model", g.model));
+    }
+  }
+
+  // One tiles grid, no duplicates. Succeeded/Failed dropped for gsearch/gmaps — there
+  // "success" == "website found", already shown by Websites found / Not found.
   const tiles = [
     statTile("Total rows", fmtNum(s.total_rows)),
     statTile("Processed", fmtNum(s.processed_rows)),
-    statTile("Succeeded", fmtNum(s.success_rows)),
-    statTile("Failed", fmtNum(s.failed_rows)),
     statTile("Processing time", fmtDuration(s.processing_seconds_total)),
     statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
   ];
-  const g = s.serpwow_summary;
   if (g) {
     tiles.push(
       statTile("Websites found", fmtNum(g.websites_found)),
       statTile("Not found", fmtNum(g.websites_not_found)),
     );
-    if (g.model) {
+    if (g.confidence_mode === "llm") {
       tiles.push(
-        statTile("Model", g.model),
-        statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
         statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
         statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
       );
@@ -312,65 +338,33 @@ function renderLegacyStatus(root, ref, s) {
       tiles.push(statTile("SerpWow searches", fmtNum(g.cost.serpwow_searches)));
     }
     if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
+  } else {
+    // full / url_discovery / firmographics: no confidence summary — keep the classic counts.
+    tiles.push(
+      statTile("Succeeded", fmtNum(s.success_rows)),
+      statTile("Failed", fmtNum(s.failed_rows)),
+    );
   }
+
   const parts = [
-    gsearchFinalizing
-      ? headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, "running", "finalizing")
-      : headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
+    headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (SerpWow pipeline)`,
+      finalizing ? "running" : s.status, finalizing ? "finalizing" : null, chips),
     el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
   ];
-  const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
-  const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-  // Same Files card component AI Mode uses. gsearch files are written only once the
-  // batch is terminal, so show it only then (avoids View/Download 404s mid-batch).
-  if (["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && batchTerminal) {
-    parts.push(filesCard(GSEARCH_FILES, resultUrl));
+
+  // Single file surface: result files (gsearch/gmaps) + output.json/xlsx (all pipelines),
+  // shown once the run is terminal (and, for batch runs, once the batch is terminal too —
+  // result files aren't written until then, so View/Download would 404).
+  if (rowsDone) {
+    const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+    const resultFiles = (isSerp && batchTerminal)
+      ? ["found.csv", "notFound.csv", "report.json", "run.log"] : [];
+    const extras = [
+      { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
+      { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
+    ];
+    parts.push(filesCard(resultFiles, resultUrl, undefined, extras));
   }
-  const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;
-  if (fileLinks) {
-    parts.push(el("div", { class: "panel" },
-      el("h2", { class: "section-title" }, "Artifacts"),
-      el("div", { class: "mt-3 grid grid-cols-1 gap-3 md:grid-cols-2" },
-        ...Object.entries(fileLinks).map(([name, path]) =>
-          el("div", { class: "panel-muted p-3" },
-            el("p", { class: "view-kicker" }, name),
-            copyCell(String(path)),
-          )),
-      ),
-    ));
-  }
-  parts.push(el("div", { class: "panel" },
-    el("p", { class: "text-xs text-slate-400" },
-      `SerpWow pipeline run - row-level detail and outputs are available via the API status endpoint at /uploads/${ref}/status.`),
-  ));
-  parts.push(el("div", { class: "panel" },
-    el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
-      el("div", {},
-        el("p", { class: "view-kicker" }, "Run summary"),
-        el("h2", { class: "mt-1 section-title" }, "SerpWow upload snapshot"),
-      ),
-      el("div", { class: "flex flex-wrap gap-2" },
-        rowsDone
-          ? el("a", { class: "btn-ghost min-h-0 px-3 py-1.5 text-xs", href: outputJson }, "Download JSON")
-          : el("span", { class: "text-xs text-slate-500" }, "Downloads available after completion"),
-        rowsDone
-          ? el("a", { class: "btn-ghost min-h-0 px-3 py-1.5 text-xs", href: outputXlsx }, "Download XLSX")
-          : "",
-      ),
-    ),
-    el("dl", { class: "mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4" },
-      summaryPair("Mode", s.pipeline ?? "-"),
-      summaryPair("Status", s.status ?? "-"),
-      summaryPair("Total", fmtNum(s.total_rows)),
-      summaryPair("Processed", fmtNum(s.processed_rows)),
-      summaryPair("Success", fmtNum(s.success_rows)),
-      summaryPair("Failed", fmtNum(s.failed_rows)),
-      summaryPair("Time total", fmtDuration(s.processing_seconds_total)),
-      summaryPair("Avg / row", fmtDuration(s.processing_seconds_avg)),
-      summaryPair("Updated", shortDate(s.updated_at)),
-      summaryPair("Storage", fileLinks ? Object.values(fileLinks).join(" | ") : "-"),
-    ),
-  ));
   root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
 }
 

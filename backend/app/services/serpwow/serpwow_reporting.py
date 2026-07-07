@@ -142,6 +142,10 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "websites_found": found,
         "websites_not_found": len(results) - found,
         "model": model,
+        # "llm" when a confidence model actually ran (gsearch always; gmaps only when
+        # GMAPS_CONFIDENCE_MODE=llm), else "heuristic" (gmaps default). Lets the UI show
+        # the confidence chip without guessing from model presence.
+        "confidence_mode": "llm" if model else "heuristic",
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},

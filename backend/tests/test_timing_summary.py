@@ -5,8 +5,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-from app.services.serpwow import legacy_app as app_module
-from app.services.serpwow.legacy_app import (
+from app.services.serpwow import engine as app_module
+from app.services.serpwow.engine import (
     build_upload_output_payload,
     build_processing_timing_summary,
     gmaps_details,
@@ -128,7 +128,7 @@ class StandaloneEndpointTimingTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"SERPWOW_API_KEY": "test-key"}), patch.dict(
             sys.modules,
-            {"app.services.serpwow.gmaps": fake_gmaps, "aiohttp": fake_aiohttp},
+            {"app.services.serpwow.gmaps_client": fake_gmaps, "aiohttp": fake_aiohttp},
         ):
             discover = asyncio.run(gmaps_discover("Example Inc", country="US"))
             details = asyncio.run(gmaps_details("cid-1"))

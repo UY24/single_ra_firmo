@@ -1,13 +1,17 @@
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app
+from app.services.serpwow import engine as legacy_app
+# The Gemini HTTP seam + choose_final_website_with_gemini now live in gemini_llm;
+# choose_final resolves _gemini_generate_content_json in gemini_llm's namespace, so the
+# mock must patch it there (legacy_app re-exports it for backward-compatible calls).
+from app.services.serpwow import gemini_llm
 
 
 class TestChooseFinalWebsite(unittest.TestCase):
     def _patch_gemini(self, text):
         return mock.patch.object(
-            legacy_app, "_gemini_generate_content_json",
+            gemini_llm, "_gemini_generate_content_json",
             return_value=(text, {"promptTokenCount": 100, "candidatesTokenCount": 20}, None),
         )
 
@@ -57,7 +61,7 @@ class TestChooseFinalWebsite(unittest.TestCase):
         self.assertEqual(out["confidence_score"], 100)
 
     def test_non_json_handled(self):
-        with mock.patch.object(legacy_app, "_gemini_generate_content_json",
+        with mock.patch.object(gemini_llm, "_gemini_generate_content_json",
                                return_value=("not json", {}, None)):
             out, err, model, usage = legacy_app.choose_final_website_with_gemini(
                 "Acme", "us", "", "", ["https://acme.com"], [], None, {})

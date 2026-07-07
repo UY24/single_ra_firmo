@@ -2,15 +2,10 @@
 """Run directories under ai_mode_results/<company_slug>/<run_id>/ (spec §6)."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from app.core.config import AI_MODE_RESULTS_DIR
-
-
-def slugify_company(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "unnamed"
+from app.services.common.text import slugify_company  # re-exported for callers/tests
 
 
 def run_dir_for(company_name: str, run_id: str) -> Path:

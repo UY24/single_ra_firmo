@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app as app
+from app.services.serpwow import engine as app
 
 
 def _completed_row(idx, candidate="https://c%d.com"):

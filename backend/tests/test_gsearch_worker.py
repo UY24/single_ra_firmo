@@ -2,7 +2,10 @@ import asyncio
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app
+from app.services.serpwow import engine as legacy_app
+# execute_gsearch_lookup_for_worker now lives in modes.gsearch and resolves
+# run_serpwow_search / choose_final_website_with_gemini in that module's namespace.
+from app.services.serpwow.modes import gsearch as gsearch_mode
 
 
 def _fake_serpwow(query, country=None, client=None):
@@ -22,8 +25,8 @@ class TestGsearchWorker(unittest.TestCase):
         confidence_raw = {"official_website": "https://acme-motors.com",
                           "confidence_score": 91, "confidence": "high",
                           "reason": "match", "evidence": [], "alternatives": []}
-        with mock.patch.object(legacy_app, "run_serpwow_search", _fake_serpwow), \
-             mock.patch.object(legacy_app, "choose_final_website_with_gemini",
+        with mock.patch.object(gsearch_mode, "run_serpwow_search", _fake_serpwow), \
+             mock.patch.object(gsearch_mode, "choose_final_website_with_gemini",
                                return_value=(confidence_raw, None, "gemini-2.5-flash-lite",
                                              {"promptTokenCount": 50, "candidatesTokenCount": 10})), \
              mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false",
@@ -38,8 +41,8 @@ class TestGsearchWorker(unittest.TestCase):
         self.assertGreater(resp.gemini_cost_usd, 0.0)
 
     def test_batch_mode_skips_per_row_llm(self):
-        with mock.patch.object(legacy_app, "run_serpwow_search", _fake_serpwow), \
-             mock.patch.object(legacy_app, "choose_final_website_with_gemini") as chooser, \
+        with mock.patch.object(gsearch_mode, "run_serpwow_search", _fake_serpwow), \
+             mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
              mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}):
             resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
                 company_name="Acme Motors", country="us", phase="phase1"))

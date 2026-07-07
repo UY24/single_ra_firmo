@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 load_dotenv()
 
-from app.services.serpwow import legacy_app as app
+from app.services.serpwow import engine as app
 
 async def main():
     upload_id = "d6584620-0e3d-46e9-8c7a-3ca06db5b087"

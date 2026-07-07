@@ -3,7 +3,7 @@ import asyncio
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app as la
+from app.services.serpwow import engine as la
 
 
 class NotifyTerminalRoutingTests(unittest.TestCase):

@@ -13,7 +13,7 @@ import asyncio
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app as app
+from app.services.serpwow import engine as app
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ async def _fake_gsearch(company_name, country, firm_id=None, input_industry=None
                         input_full_address=None, debug_upload_id=None, debug_row_index=None,
                         phase="all"):
     """Minimal async stub for execute_gsearch_lookup_for_worker."""
-    from app.services.serpwow.legacy_app import CrawlResponse
+    from app.services.serpwow.engine import CrawlResponse
 
     resp = CrawlResponse(
         official_website="https://row-company.com",

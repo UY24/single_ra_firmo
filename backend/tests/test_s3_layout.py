@@ -1,7 +1,7 @@
 """Offline tests for the SerpWow per-company/per-pipeline S3 key layout."""
 import unittest
 
-from app.services.serpwow import legacy_app as la
+from app.services.serpwow import engine as la
 
 
 class UploadS3PrefixTests(unittest.TestCase):

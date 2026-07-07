@@ -31,7 +31,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest import mock
 
-from app.services.serpwow import legacy_app as app
+from app.services.serpwow import engine as app
 from app.core import notify as notify_module
 
 
@@ -102,7 +102,7 @@ def _make_state(upload_id: str, rows: list) -> dict:
 
 def _fake_gsearch_response(company_name: str, country: str, has_website: bool = True):
     """Return a CrawlResponse-like coroutine for a gsearch worker call."""
-    from app.services.serpwow.legacy_app import CrawlResponse
+    from app.services.serpwow.engine import CrawlResponse
     url = f"https://example-{company_name.lower().replace(' ', '-')}.com" if has_website else None
     result = CrawlResponse(
         company_name=company_name,

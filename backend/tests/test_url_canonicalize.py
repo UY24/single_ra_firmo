@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.serpwow.legacy_app import canonicalize_official_url, dedupe_candidate_urls
+from app.services.serpwow.engine import canonicalize_official_url, dedupe_candidate_urls
 
 
 class TestCanonicalize(unittest.TestCase):

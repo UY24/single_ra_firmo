@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from unittest import mock
 
-from app.services.serpwow import legacy_app as app
+from app.services.serpwow import engine as app
 
 
 def _chunked_running_state(age_seconds: int = 300) -> dict:

@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest import mock
 
-from app.services.serpwow.legacy_app import calculate_serpwow_cost_usd
+from app.services.serpwow.engine import calculate_serpwow_cost_usd
 
 
 class TestSerpWowCostFn(unittest.TestCase):

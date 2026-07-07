@@ -1,6 +1,18 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-03 (gmaps LLM confidence: per-row + chunked batch, real GMAPS_CONFIDENCE_MODE=llm, + final-review hardening; on branch `gmapsfix`, NOT pushed. **One UI task is PENDING/unimplemented — see "Current state & next task" below.**). Read this first if you're picking up this repo.
+Last updated: 2026-07-07 (run-detail UI cleanup + SerpWow `legacy_app.py`→`engine.py` decomposition; NOT committed — user commits). Read this first if you're picking up this repo.
+
+---
+
+## ⭐ 2026-07-07 — run-detail UI cleanup + SerpWow engine decomposition (NOT committed)
+
+**Two things landed this session (all offline tests green: 290/290; nothing committed — user commits).**
+
+**1. Run-detail UI cleanup** (`backend/app/static/js/run_detail.js`, `renderLegacyStatus` — the PENDING task from the 2026-07-03 note below, now DONE). Layout is now header(+chips) → one tiles grid → Files card, matching AI Mode's `renderAiStatus`. Header **chips**: `Confidence: LLM|Heuristic` always; `Batch: On|Off` + `Model` only when LLM. Dropped the duplicate Succeeded/Failed tiles for gsearch/gmaps (Websites found/Not found is the single source). **Deleted** the `s3://` "Artifacts" panel, the "SerpWow upload snapshot" `<dl>`, and the API-filler note. The Files card is the single file surface (result files + `output.json`/`output.xlsx` folded in); non-gsearch/gmaps pipelines keep their counts + downloads. Backend: `serpwow_reporting.build_summary` gained `confidence_mode` (`"llm"` when a model ran, else `"heuristic"`), surfaced in the `/uploads/{id}/status` `serpwow_summary` block. Verified by rendering the real module through a DOM stub across gmaps-heuristic / gsearch-LLM-finalizing / gsearch-completed / full scenarios + `node --check`.
+
+**2. SerpWow `legacy_app.py` → `engine.py` decomposition.** The ~8.3k-line monolith was split into focused modules and renamed to `engine.py` (8,334 → 4,134 lines, −50%). Strategy: move function bodies into sibling modules, re-import them into `engine.py` so `engine.<name>` still resolves (tests/scripts unchanged except where a mocked callee moved). New modules under `services/serpwow/`: `constants`, `schemas`, `row_logging`, `geo`, `cost`, `url_utils`, `address`, `query_builders`, `gmaps_scoring`, `serpwow_client`, `gemini_llm`, `csv_input`, `xlsx_export`. **Per-mode row executors** now live in `services/serpwow/modes/{gsearch,gmaps,firmographics,full,common}.py` (the agreed provider→modes layout — adding a new SerpWow agent = a new `modes/*.py` + a re-import line). Cross-provider helpers shared with AI Mode are in `services/common/` (`text.slugify_company`, `env.get_*_env`). The old standalone `serpwow/gmaps.py` was renamed `gmaps_client.py` to disambiguate from `modes/gmaps.py`. The `legacy_app` import name was replaced everywhere (`from ...serpwow import engine as legacy_app` preserves call sites); `main.py`/`worker.py`/scripts updated.
+  - **Test edits** (only where a mocked callee moved with its caller): `test_gsearch_confidence.py` patches the Gemini seam at `gemini_llm`; `test_gmaps_llm.py` at `modes.gmaps`; `test_gsearch_worker.py` at `modes.gsearch`.
+  - **Deliberately NOT extracted** (cohesive engine core, coupled via shared state/locks): the FastAPI app + endpoints + RabbitMQ worker + upload/state/persist + S3 store + Gemini-batch driver + Supabase/Slack — all still in `engine.py`. Spec/plan on disk (gitignored): `docs/superpowers/{specs,plans}/2026-07-06-serpwow-*`.
 
 ---
 

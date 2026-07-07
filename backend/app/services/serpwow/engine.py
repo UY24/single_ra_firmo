@@ -133,6 +133,9 @@ from app.services.serpwow.constants import (
     PIPELINE_FIRMOGRAPHICS,
     PIPELINE_GMAPS,
     PIPELINE_GSEARCH,
+    PIPELINE_RELATIONSHIP,
+    REPORTING_PIPELINES,
+    REL_ERROR_NOT_CONFIRMED,
 )
 from app.services.serpwow.schemas import CrawlRequest, FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
@@ -213,7 +216,7 @@ s3_client = None
 
 # Pipeline id constants live in constants.py; re-imported at the top of this module.
 
-_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "report.json", "run.log",
+_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log",
                          "output.json", "state.json"}
 
 
@@ -291,6 +294,8 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     if pipe == PIPELINE_GMAPS:
         mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
         return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
+    if pipe == PIPELINE_RELATIONSHIP:
+        return _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
     if pipe == PIPELINE_FULL:
         return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
@@ -305,7 +310,7 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     pipeline is intentionally left unchanged.
     """
     pipe = str(state.get("pipeline") or PIPELINE_FULL)
-    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}:
         return False
     if not _batch_postprocess_enabled_for(pipe):
         return False
@@ -1792,8 +1797,10 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
     names = ["state.json", "output.json"]
-    if pipe in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+    if pipe in REPORTING_PIPELINES:
         names += ["found.csv", "notFound.csv", "report.json", "run.log"]
+    if pipe == PIPELINE_RELATIONSHIP:
+        names += ["skipped.csv"]
     if bucket:
         prefix = _upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -1849,7 +1856,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         upload_id = str(state.get("upload_id") or "")
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         extra: dict[str, Any] = {}
-        if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+        if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
             results = serpwow_reporting.state_to_entity_results(state)
             summ = serpwow_reporting.build_summary(state, results)
             extra = {
@@ -1952,7 +1959,7 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             # the same serpwow_reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            if str(state.get("pipeline") or "") in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+            if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
                 try:
                     gs = serpwow_reporting.build_summary(
                         state, serpwow_reporting.state_to_entity_results(state))
@@ -2040,7 +2047,7 @@ async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
     if state["status"] in {"completed", "completed_with_errors"}:
         combined = build_upload_output_payload(state)
         await write_upload_artifact(upload_id, "output", combined)
-    if (not batch_pending) and state.get("pipeline") in {PIPELINE_GSEARCH, PIPELINE_GMAPS} and state["status"] in {"completed", "completed_with_errors"}:
+    if (not batch_pending) and state.get("pipeline") in REPORTING_PIPELINES and state["status"] in {"completed", "completed_with_errors"}:
         await _finalize_serpwow_outputs(upload_id, state)
     await maybe_start_gemini_batch_for_upload(upload_id, state)
 
@@ -2864,7 +2871,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
             # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
             # only in batch mode, where a stuck row blocks the finalization batch from
             # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
-            if not (_rec_pipe == PIPELINE_GSEARCH
+            if not (_rec_pipe in {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}
                     or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
@@ -3810,7 +3817,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     # batch mode, found counts, cost, tokens) so the run-detail UI can show the
     # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
     serpwow_summary = None
-    if (summary.get("pipeline") or PIPELINE_FULL) in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+    if (summary.get("pipeline") or PIPELINE_FULL) in REPORTING_PIPELINES:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))

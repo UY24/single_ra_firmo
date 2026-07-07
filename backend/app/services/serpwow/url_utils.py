@@ -222,3 +222,38 @@ def _normalize_website_input(value: str) -> str:
     path = parsed.path if parsed.netloc else ""
     normalized = f"{parsed.scheme or 'https'}://{host}{path}"
     return normalized.rstrip("/")
+
+
+def x_domain_from_input_url(input_url: str) -> str:
+    """Registrable-ish host of Company X's portfolio page (spec §3.1).
+
+    Used to hard-blacklist X's own site from Y's candidate URLs — the probe's
+    worst failure mode was returning X's website as Y's. Returns "" when the
+    input is blank or unparseable (no scheme -> no netloc).
+    """
+    value = str(input_url or "").strip()
+    if not value:
+        return ""
+    try:
+        host = (urlparse(value).netloc or "").strip().lower()
+    except ValueError:
+        return ""
+    host = host.split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host if "." in host else ""
+
+
+def url_matches_domain(url: str, domain: str) -> bool:
+    """True when url's host equals `domain` or is a subdomain of it."""
+    dom = str(domain or "").strip().lower()
+    if not dom:
+        return False
+    try:
+        host = (urlparse(str(url or "").strip()).netloc or "").strip().lower()
+    except ValueError:
+        return False
+    host = host.split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host == dom or host.endswith("." + dom)

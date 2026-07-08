@@ -149,6 +149,9 @@ from app.services.serpwow.modes.common import (
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
+from app.services.serpwow.modes.relationship import (
+    execute_relationship_lookup_for_worker,
+)
 from app.services.serpwow.modes.gmaps import execute_gmaps_lookup
 from app.services.serpwow.modes.firmographics import execute_firmographic_extraction
 from app.services.serpwow.modes.full import execute_company_lookup
@@ -2556,6 +2559,16 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 debug_row_index=row_index,
                 phase=phase_value,
             )
+        elif pipeline == PIPELINE_RELATIONSHIP:
+            crawl_response, serpwow_raw_json = await execute_relationship_lookup_for_worker(
+                y_name=company_name,
+                x_name=str(job.get("x_name") or ""),
+                input_url=str(job.get("input_url") or ""),
+                city=str(job.get("city") or ""),
+                country=country,
+                debug_upload_id=upload_id,
+                debug_row_index=row_index,
+            )
         else:
             crawl_response, serpwow_raw_json = await execute_company_lookup(
                 company_name=company_name,
@@ -2593,16 +2606,19 @@ async def process_upload_job(job: dict[str, Any]) -> None:
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
         batch_postprocess_enabled = _batch_postprocess_enabled_for(str(job.get("pipeline") or PIPELINE_FULL))
+        _row_ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
+        _llm_skipped = bool(_row_ctx.get("skip_llm"))
+        _ctx_row_error = str(_row_ctx.get("row_error") or "").strip() or None
         if is_successful:
             row_status = "completed"
             row_error = None
-        elif batch_postprocess_enabled:
+        elif batch_postprocess_enabled and not _llm_skipped:
             # Keep rows non-failed while batch post-processing is still expected to decide.
             row_status = "completed"
             row_error = "Pending Gemini batch post-processing decision."
         else:
             row_status = "failed"
-            row_error = "Official website not found; target blocked/unreachable or no valid result."
+            row_error = _ctx_row_error or "Official website not found; target blocked/unreachable or no valid result."
 
         await update_row_state(
             upload_id,
@@ -3126,7 +3142,9 @@ async def _create_upload_with_rows(
     *,
     company_id: str,
     company_name: str = "",
+    extra_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    _PAIR_EXTRA_KEYS = ("x_name", "input_url", "city", "source_row_indices")
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
 
@@ -3214,10 +3232,13 @@ async def _create_upload_with_rows(
                 "s3_html_key": None,
                 "s3_serpwow_json_key": None,
                 "result": None,
+                **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row},
             }
             for row in parsed_rows
         ],
     }
+    if extra_state:
+        state.update(extra_state)
     if _batch_postprocess_enabled_for(pipeline):
         state["gemini_batch"] = {
             "status": "waiting_for_rows",
@@ -3245,6 +3266,7 @@ async def _create_upload_with_rows(
             "phase": phase,
             "uploaded_at": _now_iso(),
             "upload_company_name": company_name,
+            **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row and k != "source_row_indices"},
         }
         try:
             await publish_job(job)
@@ -3366,6 +3388,64 @@ async def create_gsearch_upload(
     return await _create_upload_with_rows(
         file, parsed_rows, PIPELINE_GSEARCH, phase=phase, company_id=company_id, company_name=company_name
     )
+
+
+@app.post("/uploads/relationship")
+async def create_relationship_upload(
+    file: UploadFile = File(...),
+    company_id: str = Form(...),
+    company_name: str = Form(""),
+) -> dict[str, Any]:
+    from app.services.serpwow.relationship_csv import (
+        InvalidRelationshipCSV,
+        parse_relationship_csv,
+    )
+
+    # The relationship gate REQUIRES the LLM (no heuristic mode) and SerpWow —
+    # fail fast at upload time like AI Mode does, instead of failing every row.
+    for env_key in ("GEMINI_API_KEY", "SERPWOW_API_KEY"):
+        if not os.getenv(env_key, "").strip():
+            raise HTTPException(status_code=400,
+                                detail=f"{env_key} is not configured — required for the relationship pipeline.")
+
+    raw = await file.read()
+    try:
+        parsed = parse_relationship_csv(raw)
+    except InvalidRelationshipCSV as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not parsed["pairs"]:
+        raise HTTPException(status_code=400,
+                            detail="No searchable rows — every Company_Name_Y is blank.")
+
+    parsed_rows = [
+        {
+            "row_index": p["pair_index"],
+            "company_name": p["y_name"],
+            "country": p["country"],
+            "firm_id": "", "industry": "", "full_address": "", "official_website": "",
+            "x_name": p["x_name"],
+            "input_url": p["input_url"],
+            "city": p["city"],
+            "source_row_indices": p["source_row_indices"],
+        }
+        for p in parsed["pairs"]
+    ]
+    response = await _create_upload_with_rows(
+        file, parsed_rows, PIPELINE_RELATIONSHIP,
+        company_id=company_id, company_name=company_name,
+        extra_state={
+            "relationship": {
+                "header": parsed["header"],
+                "original_rows": parsed["original_rows"],
+                "blank_row_indices": parsed["blank_row_indices"],
+                "blank_rows": len(parsed["blank_row_indices"]),
+                "row_count_original": len(parsed["original_rows"]),
+            }
+        },
+    )
+    response["blank_rows"] = len(parsed["blank_row_indices"])
+    response["unique_pairs"] = len(parsed["pairs"])
+    return response
 
 
 @app.post("/uploads/{upload_id}/retry-failed-rows")
@@ -3496,7 +3576,7 @@ async def uploads_list(
     pipeline_value = None
     if pipeline:
         candidate = str(pipeline).strip().lower()
-        if candidate in {PIPELINE_FULL, PIPELINE_URL_DISCOVERY, PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH}:
+        if candidate in {PIPELINE_FULL, PIPELINE_URL_DISCOVERY, PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}:
             pipeline_value = candidate
     items = await list_upload_summaries(limit, pipeline=pipeline_value)
     return {"count": len(items), "uploads": items}

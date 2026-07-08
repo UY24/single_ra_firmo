@@ -25,6 +25,12 @@ const _FIRMO_COLS = [
   { name: "industry",         req: false, hint: "input_industry" },
   { name: "full_address",     req: false, hint: "address, fulladdress, input_full_address" },
 ];
+const _REL_COLS = [
+  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR text ok)" },
+  { name: "Company_Name_X", req: false, hint: "the firm whose page was scraped" },
+  { name: "Input_URL",      req: false, hint: "X's portfolio page (anchors the search)" },
+  { name: "city / country", req: false, hint: "optional location context" },
+];
 
 const PIPELINES = [
   { key: "ai_bulk", label: "AI Mode 1 - Bulk", endpoint: "/uploads/ai-mode", ai: true,
@@ -35,6 +41,8 @@ const PIPELINES = [
     desc: "Fast SerpWow Maps discovery for local business signals.", csvCols: _SW_COLS },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
+  { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",
+    desc: "Verifies an X↔Y financial relationship and returns Y's website only when confirmed.", csvCols: _REL_COLS },
   { key: "full", label: "Upload Console", endpoint: "/uploads",
     desc: "Discovery, crawl, extraction, and post-processing in one run.", csvCols: _SW_COLS },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
@@ -115,6 +123,13 @@ function csvSchemaPanel(pipeline) {
     el("p", { class: "mt-2 text-xs text-slate-600" },
       "* required · hover any column to see accepted header aliases"),
   );
+}
+
+async function countCsvRows(file) {
+  const text = await file.text();
+  const lines = text.split(/\r\n|\r|\n/).filter((line) => line.trim().length > 0);
+  // First line is the header row for relationship uploads.
+  return Math.max(0, lines.length - 1);
 }
 
 function tableShell(table) {
@@ -293,10 +308,20 @@ export async function render(root) {
       refresh();
       if (!state.file) { previewArea.replaceChildren(); return; }
       previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
-      const fd = new FormData();
-      fd.append("file", state.file);
+      const p = state.pipeline;
+      // The /uploads/preview endpoint requires company_name/country headers
+      // (parse_entities_csv); relationship CSVs use a different header shape
+      // (Company_Name_Y / Company_Name_X / Input_URL), so skip the server
+      // preview for it and just count rows client-side instead.
+      const useServerPreview = !p || p.ai || p.key !== "relationship";
       try {
-        state.preview = await api("/uploads/preview", { method: "POST", body: fd });
+        if (useServerPreview) {
+          const fd = new FormData();
+          fd.append("file", state.file);
+          state.preview = await api("/uploads/preview", { method: "POST", body: fd });
+        } else {
+          state.preview = { total_rows: await countCsvRows(state.file) };
+        }
         previewArea.replaceChildren(previewTables(state.preview));
       } catch (e) {
         previewArea.replaceChildren(redCallout(e.message));

@@ -73,6 +73,7 @@ const inputCls = "control w-full px-3 py-2 text-sm";
 const actionBtnCls = "btn-ghost min-h-0 px-2.5 py-1 text-xs disabled:opacity-50";
 
 const HISTORY_PIPELINES = [
+  { key: "relationship", label: "Relationship" },
   { key: "gmaps", label: "Google Maps" },
   { key: "gsearch", label: "Google Search" },
   { key: "full", label: "Full" },
@@ -116,7 +117,7 @@ function uploadHistoryCard(registerCleanup) {
       const rowsDone = ["completed", "completed_with_errors"].includes(String(item.status ?? ""));
       const batch = item.gemini_batch?.status ?? "not_started";
       const batchTerminal = ["not_started", "succeeded", "failed", "skipped"].includes(String(batch));
-      const ready = (item.pipeline === "full" || item.pipeline === "gsearch")
+      const ready = ["full", "gsearch", "relationship"].includes(item.pipeline)
         ? rowsDone && batchTerminal : rowsDone;
       return el("tr", {
         class: "cursor-pointer hover:bg-gray-50/50",

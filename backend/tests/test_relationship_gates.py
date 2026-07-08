@@ -42,6 +42,17 @@ class TestRelationshipGates(unittest.TestCase):
         for name in ("found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"):
             self.assertIn(name, links)
 
+    def test_status_summary_passthrough_keys(self):
+        # the /status endpoint copies these keys from build_summary when present
+        from app.services.serpwow import serpwow_reporting
+        state = {"upload_id": "u", "pipeline": "relationship", "status": "completed",
+                 "relationship": {"header": [], "original_rows": [{}], "blank_row_indices": [],
+                                  "blank_rows": 0, "row_count_original": 1},
+                 "rows": []}
+        summ = serpwow_reporting.build_summary(state, [])
+        for key in ("blank_rows", "searchable_rows", "unique_pairs", "relationship_breakdown"):
+            self.assertIn(key, summ)
+
 
 if __name__ == "__main__":
     unittest.main()

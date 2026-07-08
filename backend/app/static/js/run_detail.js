@@ -299,7 +299,7 @@ function renderLegacyStatus(root, ref, s) {
   const batchStatus = s.gemini_batch?.status ?? null;
   const batchTerminal = batchStatus == null
     || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
-  const isSerp = ["gsearch", "gmaps"].includes(s.pipeline);
+  const isSerp = ["gsearch", "gmaps", "relationship"].includes(s.pipeline);
   const finalizing = isSerp && rowsDone && !batchTerminal;
   const g = s.serpwow_summary;
 
@@ -338,6 +338,16 @@ function renderLegacyStatus(root, ref, s) {
       tiles.push(statTile("SerpWow searches", fmtNum(g.cost.serpwow_searches)));
     }
     if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
+    if (s.pipeline === "relationship") {
+      tiles.push(
+        statTile("Original rows", fmtNum(g.total_rows_original ?? g.searchable_rows + g.blank_rows)),
+        statTile("Blank (skipped)", fmtNum(g.blank_rows)),
+        statTile("Unique pairs", fmtNum(g.unique_pairs)),
+      );
+      const rb = g.relationship_breakdown;
+      if (rb) tiles.push(statTile("Confirmed / Unclear",
+        `${fmtNum(rb.confirmed)} / ${fmtNum(rb.unclear)}`));
+    }
   } else {
     // full / url_discovery / firmographics: no confidence summary — keep the classic counts.
     tiles.push(
@@ -358,7 +368,10 @@ function renderLegacyStatus(root, ref, s) {
   if (rowsDone) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
     const resultFiles = (isSerp && batchTerminal)
-      ? ["found.csv", "notFound.csv", "report.json", "run.log"] : [];
+      ? (s.pipeline === "relationship"
+          ? ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"]
+          : ["found.csv", "notFound.csv", "report.json", "run.log"])
+      : [];
     const extras = [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },

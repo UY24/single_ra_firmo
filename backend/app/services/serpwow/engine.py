@@ -884,6 +884,20 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
+    _ctx_probe = ((row.get("result") or {}).get("context")
+                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
+    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
+        from app.services.serpwow.gemini_llm import build_relationship_prompt
+        return build_relationship_prompt(
+            x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
+            y_name=str(row.get("company_name") or ""),
+            city=str(row.get("city") or ""),
+            country=str(row.get("country") or ""),
+            candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
+            ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
+            search_attempts=list(_ctx_probe.get("search_attempts") or []),
+            phase4_hit=bool(_ctx_probe.get("phase4_hit")),
+        )
     input_obj = {
         "company_name": row.get("company_name"),
         "country": row.get("country"),
@@ -1285,6 +1299,12 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
     for row in state.get("rows", []):
         if not isinstance(row, dict) or row.get("status") not in {"completed", "failed"}:
             continue
+        ctx = ((row.get("result") or {}).get("context")
+               if isinstance((row.get("result") or {}).get("context"), dict) else {})
+        if ctx.get("skip_llm"):
+            # relationship short-circuit rows (no evidence / no X) were already
+            # finalized by the worker — never seed them into the batch.
+            continue
         row_index = int(row.get("row_index", 0) or 0)
         key = f"row-{row_index}"
         prompt = _build_batch_prompt_for_row(row)
@@ -1302,6 +1322,10 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
     """Apply one parsed Gemini result onto a row. Returns 'completed' or 'failed'.
     Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
+    _ctx_probe = ((row.get("result") or {}).get("context")
+                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
+    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
+        return _apply_relationship_batch_parsed_to_row(row, parsed, row_usage, batch_model)
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
     row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
@@ -1342,6 +1366,61 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
         return "completed"
     row["status"] = "failed"
     row["error"] = "Official website not found after Gemini batch post-processing."
+    return "failed"
+
+
+def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
+                                            row_usage: dict[str, Any], batch_model: str) -> str:
+    """Relationship variant of _apply_batch_parsed_to_row: the LLM's
+    relationship_status GATES the URL (spec §4). Returns 'completed'/'failed'."""
+    from app.services.serpwow.gemini_llm import apply_relationship_gate
+
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
+    updated_gemini = round(_as_float(result.get("gemini_cost_usd"), 0.0) + row_batch_cost_usd, 8)
+    updated_total = round(_as_float(result.get("total_cost_usd"), 0.0) + row_batch_cost_usd, 8)
+
+    candidates = [c for c in (context.get("candidates") or []) if isinstance(c, str)]
+    x_domain = str(context.get("x_domain") or "")
+    gated_url, status, gate_flags = apply_relationship_gate(
+        parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
+
+    relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
+        "status": "pending", "summary": "", "verified_pair": "", "flags": []}
+    relationship["status"] = status
+    relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
+    rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
+    rel_flags.extend(gate_flags)
+    for extra in (parsed or {}).get("extra_flags") or []:
+        if isinstance(extra, str) and extra.strip():
+            rel_flags.append({"flag": extra.strip(), "why": "reported by LLM"})
+    relationship["flags"] = rel_flags
+    context["relationship"] = relationship
+
+    result["official_website"] = gated_url
+    result["gemini_cost_usd"] = updated_gemini
+    result["total_cost_usd"] = updated_total
+    cb = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
+    cb["gemini_batch_cost_usd"] = round(_as_float(cb.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd, 8)
+    cb["gemini_cost_usd"] = updated_gemini
+    cb["total_cost_usd"] = updated_total
+    context["cost_breakdown"] = cb
+    context["gemini_batch_ai"] = {"provider": "google-gemini-batch", "model": batch_model,
+                                  "used": True, "usage": row_usage,
+                                  "cost_usd": row_batch_cost_usd,
+                                  "raw": parsed, "error": None}
+    context["success"] = bool(gated_url)
+    result["context"] = context
+    row["result"] = result
+
+    if gated_url:
+        row["status"] = "completed"
+        row["error"] = None
+        return "completed"
+    row["status"] = "failed"
+    row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
+                    else "Relationship confirmed but no valid candidate URL survived validation.")
     return "failed"
 
 

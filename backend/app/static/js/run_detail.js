@@ -316,9 +316,12 @@ function renderLegacyStatus(root, ref, s) {
 
   // One tiles grid, no duplicates. Succeeded/Failed dropped for gsearch/gmaps — there
   // "success" == "website found", already shown by Websites found / Not found.
+  // relationship: "Total rows" = ORIGINAL CSV rows (state's own total_rows counts
+  // deduped pairs, i.e. queue progress) and found/not-found/skipped are row-level too.
+  const isRel = s.pipeline === "relationship";
   const tiles = [
-    statTile("Total rows", fmtNum(s.total_rows)),
-    statTile("Processed", fmtNum(s.processed_rows)),
+    statTile("Total rows", fmtNum(isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows)),
+    statTile(isRel ? "Pairs processed" : "Processed", fmtNum(s.processed_rows)),
     statTile("Processing time", fmtDuration(s.processing_seconds_total)),
     statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
   ];
@@ -326,6 +329,7 @@ function renderLegacyStatus(root, ref, s) {
     tiles.push(
       statTile("Websites found", fmtNum(g.websites_found)),
       statTile("Not found", fmtNum(g.websites_not_found)),
+      ...(isRel ? [statTile("Skipped (blank Y)", fmtNum(g.blank_rows))] : []),
     );
     if (g.confidence_mode === "llm") {
       tiles.push(
@@ -338,12 +342,8 @@ function renderLegacyStatus(root, ref, s) {
       tiles.push(statTile("SerpWow searches", fmtNum(g.cost.serpwow_searches)));
     }
     if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
-    if (s.pipeline === "relationship") {
-      tiles.push(
-        statTile("Original rows", fmtNum(g.total_rows_original ?? g.searchable_rows + g.blank_rows)),
-        statTile("Blank (skipped)", fmtNum(g.blank_rows)),
-        statTile("Unique pairs", fmtNum(g.unique_pairs)),
-      );
+    if (isRel) {
+      tiles.push(statTile("Unique pairs", fmtNum(g.unique_pairs)));
       const rb = g.relationship_breakdown;
       if (rb) tiles.push(statTile("Confirmed / Unclear",
         `${fmtNum(rb.confirmed)} / ${fmtNum(rb.unclear)}`));

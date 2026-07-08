@@ -67,6 +67,7 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             self.assertEqual(job["x_name"], "eastlinkcap")
             self.assertEqual(job["input_url"], "https://www.eastlinkcap.com/p")
             self.assertEqual(job["pipeline"], "relationship")
+            self.assertNotIn("source_row_indices", job)
         finally:
             for p in patches:
                 p.stop()
@@ -107,6 +108,52 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
         finally:
             for p in patches:
                 p.stop()
+
+
+class TestRetryFailedRowsCarriesPairFields(unittest.TestCase):
+    """Regression: a retried relationship row must carry x_name/input_url/city
+    (dropped previously) so it doesn't hit the not-has_x short-circuit again,
+    but must NOT carry source_row_indices (fan-out bookkeeping, not a job field)."""
+
+    def setUp(self):
+        self.client = TestClient(engine.app)
+
+    def _state(self):
+        return {
+            "upload_id": "u-retry-1",
+            "company_name": "Acme",
+            "pipeline": "relationship",
+            "phase": "all",
+            "rows": [
+                {
+                    "row_index": 1,
+                    "company_name": "Modal",
+                    "country": "",
+                    "status": "failed",
+                    "error": "no_company_x",
+                    "x_name": "eastlinkcap",
+                    "input_url": "https://www.eastlinkcap.com/p",
+                    "city": "Boston",
+                    "source_row_indices": [1, 2],
+                }
+            ],
+        }
+
+    def test_retry_republishes_pair_fields_without_source_row_indices(self):
+        state = self._state()
+        with patch.object(engine, "rabbitmq_exchange", MagicMock()), \
+             patch.object(engine, "get_upload_state", AsyncMock(return_value=state)), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "persist_upload_state", AsyncMock()), \
+             patch.object(engine, "publish_job", AsyncMock()) as pub:
+            resp = self.client.post("/uploads/u-retry-1/retry-failed-rows")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(pub.await_count, 1)
+        job = pub.call_args[0][0]
+        self.assertEqual(job["x_name"], "eastlinkcap")
+        self.assertEqual(job["input_url"], "https://www.eastlinkcap.com/p")
+        self.assertEqual(job["city"], "Boston")
+        self.assertNotIn("source_row_indices", job)
 
 
 class TestWorkerDispatchAndPendingMark(unittest.TestCase):

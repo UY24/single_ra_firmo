@@ -22,6 +22,7 @@ from app.services.common.env import (
 )
 from app.services.serpwow.constants import (
     PIPELINE_RELATIONSHIP,
+    REL_ERROR_CONFIRMED_URL_INVALID,
     REL_ERROR_NO_EVIDENCE,
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
@@ -192,7 +193,7 @@ async def execute_relationship_lookup_for_worker(
         }
         if official_website is None:
             row_error = REL_ERROR_NOT_CONFIRMED if status != "confirmed" else (
-                "Relationship confirmed but no valid candidate URL survived validation.")
+                REL_ERROR_CONFIRMED_URL_INVALID)
     # batch_mode with evidence: leave verdict to the finalization batch.
 
     summary_text = (

@@ -135,6 +135,7 @@ from app.services.serpwow.constants import (
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
     REPORTING_PIPELINES,
+    REL_ERROR_CONFIRMED_URL_INVALID,
     REL_ERROR_NOT_CONFIRMED,
 )
 from app.services.serpwow.schemas import CrawlRequest, FirmographicsRequest, CrawlResponse
@@ -1420,7 +1421,7 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
         return "completed"
     row["status"] = "failed"
     row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
-                    else "Relationship confirmed but no valid candidate URL survived validation.")
+                    else REL_ERROR_CONFIRMED_URL_INVALID)
     return "failed"
 
 
@@ -1570,11 +1571,14 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 total_cand += int(usage.get("candidatesTokenCount", 0) or 0)
                 _apply_batch_parsed_to_row(row, parsed, usage, batch_model)
             # Rows in a failed chunk never got a parsed result -> finalize them not-found.
+            _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
                 if isinstance(row, dict) and row.get("status") == "completed" \
                         and not str((row.get("result") or {}).get("official_website") or "").strip():
                     row["status"] = "failed"
-                    row["error"] = row.get("error") or "Official website not found after Gemini batch post-processing."
+                    current_error = row.get("error")
+                    if not current_error or current_error == _pending_sentinel:
+                        row["error"] = "Official website not found after Gemini batch post-processing."
             n_ok = sum(1 for r in results if r["status"] == "succeeded")
             n_fail = sum(1 for r in results if r["status"] != "succeeded")
             agg = "succeeded" if n_fail == 0 else ("failed" if n_ok == 0 else "completed_with_errors")
@@ -1938,6 +1942,8 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         upload_id = str(state.get("upload_id") or "")
         file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
         extra: dict[str, Any] = {}
+        success_count = state.get("success_rows")
+        failed_count = state.get("failed_rows")
         if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
             results = serpwow_reporting.state_to_entity_results(state)
             summ = serpwow_reporting.build_summary(state, results)
@@ -1947,11 +1953,18 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
                 "cost": summ["cost"],
                 "token_usage": summ["token_usage"],
             }
+            if state.get("relationship"):
+                # relationship state counters are PAIR-level, but websites_found/
+                # not_found are ORIGINAL-ROW-level (fan-out) — override so Supabase
+                # counts match the CSVs (found.csv/notFound.csv) instead of pairs.
+                success_count = summ["websites_found"]
+                failed_count = summ["websites_not_found"]
+                extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
-            success_count=state.get("success_rows"),
-            failed_count=state.get("failed_rows"),
+            success_count=success_count,
+            failed_count=failed_count,
             duration_seconds=state.get("processing_seconds_total"),
             file_links=file_links,
             finished_at=_now_iso(),
@@ -2027,11 +2040,18 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
 
         status = str(state.get("status") or "")
         pipeline = notify.pipeline_label(state.get("pipeline") or PIPELINE_FULL)
+        # relationship state counters/total_rows are PAIR-level; the Slack ping
+        # should match the CSVs the user downloads (ORIGINAL-ROW-level), so use
+        # the original row count when this is a relationship upload.
+        relationship_meta = state.get("relationship")
+        total_rows = state.get("total_rows")
+        if isinstance(relationship_meta, dict):
+            total_rows = relationship_meta.get("row_count_original", total_rows)
         common = {
             "pipeline": pipeline,
             "company": state.get("company_name"),
             "run_ref": str(state.get("upload_id") or ""),
-            "total_rows": state.get("total_rows"),
+            "total_rows": total_rows,
             "duration_seconds": state.get("processing_seconds_total"),
         }
         if status == "failed":
@@ -2041,6 +2061,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             # the same serpwow_reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
+            success = state.get("success_rows")
+            failed = state.get("failed_rows")
             if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
                 try:
                     gs = serpwow_reporting.build_summary(
@@ -2054,12 +2076,15 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
                     }
+                    if isinstance(relationship_meta, dict):
+                        success = gs["websites_found"]
+                        failed = gs["websites_not_found"]
                 except Exception:
                     extra = {}
             notify.notify_run_complete(
                 status=status,
-                success=state.get("success_rows"),
-                failed=state.get("failed_rows"),
+                success=success,
+                failed=failed,
                 **common,
                 **extra,
             )
@@ -3222,6 +3247,7 @@ async def _create_upload_with_rows(
     company_id: str,
     company_name: str = "",
     extra_state: Optional[dict[str, Any]] = None,
+    run_total_rows: Optional[int] = None,
 ) -> dict[str, Any]:
     _PAIR_EXTRA_KEYS = ("x_name", "input_url", "city", "source_row_indices")
     if not file.filename.lower().endswith(".csv"):
@@ -3279,7 +3305,7 @@ async def _create_upload_with_rows(
         company_id=company_id,
         pipeline=pipeline,
         run_ref=upload_id,
-        total_rows=len(parsed_rows),
+        total_rows=(run_total_rows if run_total_rows is not None else len(parsed_rows)),
     )
     state = {
         "upload_id": upload_id,
@@ -3512,6 +3538,7 @@ async def create_relationship_upload(
     response = await _create_upload_with_rows(
         file, parsed_rows, PIPELINE_RELATIONSHIP,
         company_id=company_id, company_name=company_name,
+        run_total_rows=len(parsed["original_rows"]),
         extra_state={
             "relationship": {
                 "header": parsed["header"],
@@ -3590,6 +3617,7 @@ async def retry_failed_rows(
                     "phase": phase,
                     "uploaded_at": _now_iso(),
                     "upload_company_name": str(state.get("company_name") or ""),
+                    **{k: row[k] for k in ("x_name", "input_url", "city") if k in row},
                 }
             )
 

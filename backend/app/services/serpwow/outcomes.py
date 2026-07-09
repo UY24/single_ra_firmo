@@ -81,9 +81,12 @@ def categorize_http_error(status_code: Optional[int], exc_repr: str) -> str:
 def classify_exception(exc: BaseException, *, default_source: str) -> OutcomeInfo:
     exc_repr = f"{type(exc).__name__}: {exc}"
     status = getattr(exc, "status_code", None)
+    # A raised exception may carry an explicit source override (e.g. a relationship
+    # per-pair Gemini failure tags itself SRC_GEMINI before raising to stay retryable).
+    source = getattr(exc, "error_source", None) or default_source
     return OutcomeInfo(
         outcome=OUTCOME_ERROR,
-        error_source=default_source,
+        error_source=source,
         error_category=categorize_http_error(status, exc_repr),
         error_detail=exc_repr,
     )
@@ -123,6 +126,14 @@ def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
     # Known business "not found" sentinels (e.g. relationship not-confirmed / no-evidence)
     if ctx_row_error and ctx_row_error.strip() in NOT_FOUND_SENTINELS:
         return OutcomeInfo(OUTCOME_NOT_FOUND, degraded_search=degraded)
+    # Per-row LLM (Gemini) selection failure. The LLM only runs when candidates existed
+    # (i.e. SerpWow phases succeeded), so a genuine failure here takes precedence over
+    # the all-phases-errored check below.
+    llm_error = ((result or {}).get("context") or {}).get("llm_error")
+    if llm_error:
+        return OutcomeInfo(OUTCOME_ERROR, SRC_GEMINI,
+                           categorize_http_error(None, str(llm_error)),
+                           error_detail=str(llm_error), degraded_search=degraded)
     # "We couldn't look": phases ran and every one errored -> a real SerpWow error.
     if total > 0 and succeeded == 0:
         return OutcomeInfo(OUTCOME_ERROR, SRC_SERPWOW,

@@ -3,13 +3,16 @@ from app.services.serpwow import outcomes as o
 from app.services.serpwow.constants import REL_ERROR_NOT_CONFIRMED, REL_ERROR_NO_EVIDENCE
 
 
-def _result(official=None, phases=None):
+def _result(official=None, phases=None, llm_error=None):
     fr = []
     for p in (phases or []):
         fr.append({"phase": p.get("phase", "x"), "success": p.get("used", False),
                    "error": p.get("error"), "status_code": p.get("status_code"),
                    "error_category": p.get("error_category")})
-    return {"official_website": official, "context": {"formatted_results": fr}}
+    ctx = {"formatted_results": fr}
+    if llm_error is not None:
+        ctx["llm_error"] = llm_error
+    return {"official_website": official, "context": ctx}
 
 
 class TestOutcomeInfo(unittest.TestCase):
@@ -56,6 +59,16 @@ class TestClassifyException(unittest.TestCase):
         self.assertEqual(info.error_category, o.CAT_INTERNAL)
         self.assertIn("bug", info.error_detail)
 
+    def test_error_source_override_from_exc_attr(self):
+        exc = RuntimeError("relationship LLM error: boom")
+        exc.error_source = o.SRC_GEMINI
+        info = o.classify_exception(exc, default_source=o.SRC_SERVER)
+        self.assertEqual(info.error_source, o.SRC_GEMINI)
+
+    def test_error_source_falls_back_to_default_without_attr(self):
+        info = o.classify_exception(RuntimeError("boom"), default_source=o.SRC_SERVER)
+        self.assertEqual(info.error_source, o.SRC_SERVER)
+
 
 class TestClassifyFinalizedRow(unittest.TestCase):
     def test_found(self):
@@ -92,4 +105,20 @@ class TestClassifyFinalizedRow(unittest.TestCase):
         # nothing errored, nothing searched, no website -> conservative not_found
         info = o.classify_finalized_row(_result(official=None), pipeline="gsearch",
                                         ctx_row_error=None, skip_llm=False)
+        self.assertEqual(info.outcome, o.OUTCOME_NOT_FOUND)
+
+    def test_per_row_llm_error_is_error_gemini(self):
+        # A phase succeeded (candidates existed) but the per-row Gemini selection
+        # call failed -> error/gemini, not not_found.
+        r = _result(official=None, phases=[{"used": True}],
+                    llm_error="Gemini HTTPError: 429")
+        info = o.classify_finalized_row(r, pipeline="gsearch", ctx_row_error=None, skip_llm=False)
+        self.assertEqual((info.outcome, info.error_source, info.error_category),
+                         (o.OUTCOME_ERROR, o.SRC_GEMINI, o.CAT_RATE_LIMIT))
+        self.assertIn("429", info.error_detail)
+
+    def test_succeeded_phase_no_llm_error_is_not_found(self):
+        # CONTROL: same as above but no llm_error -> unchanged not_found.
+        r = _result(official=None, phases=[{"used": True}])
+        info = o.classify_finalized_row(r, pipeline="gsearch", ctx_row_error=None, skip_llm=False)
         self.assertEqual(info.outcome, o.OUTCOME_NOT_FOUND)

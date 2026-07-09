@@ -180,6 +180,7 @@ async def execute_gsearch_lookup_for_worker(
         "usage": {}, "raw": None,
     }
     gemini_cost = 0.0
+    llm_error_for_row: Optional[str] = None
     batch_mode = _get_bool_env("GSEARCH_LLM_BATCH", False)
     enable_final = _get_bool_env("ENABLE_FINAL_URL_GEMINI", True)
     if not batch_mode and enable_final and candidates:
@@ -188,6 +189,11 @@ async def execute_gsearch_lookup_for_worker(
             company_name, country, input_industry, input_full_address,
             candidates, search_attempts, first_raw, {},
         )
+        # A genuine Gemini failure (no parsed output + an error) -> flag the row as an
+        # error/gemini outcome. A benign "picked nothing" (final_output not None) or an
+        # uninvoked LLM must NOT set this.
+        if final_output is None and final_error:
+            llm_error_for_row = final_error
         final_url_selection_ai = {
             "provider": "google-gemini", "model": final_model,
             "used": final_output is not None, "error": final_error,
@@ -241,6 +247,7 @@ async def execute_gsearch_lookup_for_worker(
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,
+            **({"llm_error": llm_error_for_row} if llm_error_for_row else {}),
             "cost_breakdown": {
                 "massive_proxy_cost_usd": 0.0,
                 "serpwow_cost_usd": serpwow_cost,

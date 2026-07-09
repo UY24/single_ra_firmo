@@ -23,6 +23,23 @@ class TestErrorReporting(unittest.TestCase):
         self.assertEqual(summary["error_breakdown"]["by_source"], {"serpwow": 1})
         self.assertEqual(summary["error_breakdown"]["by_category"], {"rate_limit": 1})
 
+    def test_interrupted_row_without_explicit_outcome_counts_as_errored(self):
+        # A user-stop / redelivery-drop / stale row is status="failed" with NO explicit
+        # outcome. build_summary must derive it as errored (matching the state summary),
+        # so the breakdown reconciles: found+not_found+errored == len(rows).
+        state = {"pipeline": "gsearch", "upload_id": "u1", "rows": [
+            _row("A", "completed", o.OUTCOME_FOUND, website="https://a.com"),
+            _row("B", "completed", o.OUTCOME_NOT_FOUND),
+            {"company_name": "C", "country": "US", "status": "failed", "outcome": None,
+             "error": "Stopped by user.",
+             "result": {"official_website": None, "context": {}}},
+        ]}
+        results = rep.state_to_entity_results(state)
+        summary = rep.build_summary(state, results)
+        bd = summary["outcome_breakdown"]
+        self.assertEqual(bd["errored"], 1)
+        self.assertEqual(bd["found"] + bd["not_found"] + bd["errored"], len(state["rows"]))
+
     def test_notfound_row_still_in_notfound_csv(self):
         state = {"pipeline": "gsearch", "upload_id": "u1", "rows": [
             _row("B", "completed", o.OUTCOME_NOT_FOUND)]}

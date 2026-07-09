@@ -160,6 +160,23 @@ def _build_cost(llm_usd: float, serpwow_searches: int) -> dict[str, Any]:
     }
 
 
+def _derive_outcome(row: dict[str, Any]) -> Any:
+    """Outcome for one row, mirroring engine.summarize_upload_state._outcome_of so the
+    report.json / Supabase / Slack breakdown reconciles with the state summary:
+    explicit ``outcome`` wins; else completed -> found if official_website else not_found;
+    else failed -> error (covers user-stop / redelivery-drop / stale rows that carry no
+    explicit outcome); else uncounted."""
+    oc = row.get("outcome")
+    if oc:
+        return oc
+    if row.get("status") == "completed":
+        result_obj = row.get("result") if isinstance(row.get("result"), dict) else {}
+        return "found" if result_obj.get("official_website") else "not_found"
+    if row.get("status") == "failed":
+        return "error"
+    return None
+
+
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
@@ -215,7 +232,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     by_source: dict[str, int] = {}
     by_category: dict[str, int] = {}
     for row in state.get("rows", []):
-        oc = (row or {}).get("outcome")
+        oc = _derive_outcome(row or {})
         if oc == "found":
             outcome_breakdown["found"] += 1
         elif oc == "not_found":

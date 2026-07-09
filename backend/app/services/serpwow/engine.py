@@ -1844,6 +1844,33 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     state["processed_rows"] = processed
     state["success_rows"] = success
     state["failed_rows"] = failed
+
+    def _outcome_of(r: dict[str, Any]) -> Optional[str]:
+        oc = r.get("outcome")
+        if oc:
+            return oc
+        # Derive for rows without an explicit outcome (out-of-scope pipelines,
+        # or peripheral status="failed" paths like user-stop/redelivery-drop).
+        if r.get("status") == "completed":
+            result_obj = r.get("result") if isinstance(r.get("result"), dict) else {}
+            return _outcomes.OUTCOME_FOUND if result_obj.get("official_website") else _outcomes.OUTCOME_NOT_FOUND
+        if r.get("status") == "failed":
+            return _outcomes.OUTCOME_ERROR
+        return None
+
+    outcome_counts = {"found": 0, "not_found": 0, "errored": 0}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        oc = _outcome_of(r)
+        if oc == _outcomes.OUTCOME_FOUND:
+            outcome_counts["found"] += 1
+        elif oc == _outcomes.OUTCOME_NOT_FOUND:
+            outcome_counts["not_found"] += 1
+        elif oc == _outcomes.OUTCOME_ERROR:
+            outcome_counts["errored"] += 1
+    state["outcome_counts"] = outcome_counts
+
     state.update(build_processing_timing_summary(rows))
     state["updated_at"] = _now_iso()
     return state
@@ -1875,6 +1902,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
     failed_rows: list[dict[str, Any]] = []
     error_counts: dict[str, int] = {}
     search_attempt_error_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
     no_official_website_failed = 0
     sample_failed: list[dict[str, Any]] = []
 
@@ -1891,6 +1920,13 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 
         normalized_error = _normalize_failure_error(str(row.get("error") or ""))
         error_counts[normalized_error] = int(error_counts.get(normalized_error, 0) or 0) + 1
+
+        error_source = row.get("error_source")
+        if error_source:
+            source_counts[str(error_source)] = int(source_counts.get(str(error_source), 0) or 0) + 1
+        error_category = row.get("error_category")
+        if error_category:
+            category_counts[str(error_category)] = int(category_counts.get(str(error_category), 0) or 0) + 1
 
         context_obj = result_obj.get("context") if isinstance(result_obj.get("context"), dict) else {}
         attempts = context_obj.get("search_attempts") if isinstance(context_obj.get("search_attempts"), list) else []
@@ -1914,9 +1950,9 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
                 }
             )
 
-    def _sort_counts(counts: dict[str, int], top_n: int = 20) -> list[dict[str, Any]]:
+    def _sort_counts(counts: dict[str, int], top_n: int = 20, key_name: str = "reason") -> list[dict[str, Any]]:
         items = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
-        return [{"reason": k, "count": v} for k, v in items[:top_n]]
+        return [{key_name: k, "count": v} for k, v in items[:top_n]]
 
     return {
         "upload_id": state.get("upload_id"),
@@ -1928,6 +1964,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
         "failed_missing_official_website": no_official_website_failed,
         "error_buckets": _sort_counts(error_counts),
         "search_attempt_error_buckets": _sort_counts(search_attempt_error_counts),
+        "by_source": _sort_counts(source_counts, key_name="source"),
+        "by_category": _sort_counts(category_counts, key_name="category"),
         "sample_failed_rows": sample_failed,
     }
 

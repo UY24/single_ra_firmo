@@ -125,13 +125,6 @@ function csvSchemaPanel(pipeline) {
   );
 }
 
-async function countCsvRows(file) {
-  const text = await file.text();
-  const lines = text.split(/\r\n|\r|\n/).filter((line) => line.trim().length > 0);
-  // First line is the header row for relationship uploads.
-  return Math.max(0, lines.length - 1);
-}
-
 function tableShell(table) {
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll" }, table));
@@ -143,6 +136,14 @@ function previewTables(preview) {
       el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.total_rows)),
       " rows detected."),
   ];
+  // Relationship preview: surface the search plan (pairs/blanks) up front.
+  if (preview.unique_pairs != null) {
+    parts.push(el("p", { class: "section-copy" },
+      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.unique_pairs)),
+      " unique (X, Y) pairs will be searched · ",
+      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.blank_rows)),
+      " blank rows skipped."));
+  }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));
   if (preview.positional) {
@@ -167,13 +168,14 @@ function previewTables(preview) {
 
   const sample = preview.sample_rows ?? [];
   if (sample.length) {
+    const sampleCols = preview.sample_columns ?? SAMPLE_COLS;
     parts.push(tableShell(
       el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
         el("thead", {},
-          el("tr", {}, ...SAMPLE_COLS.map((c) => head(c)))),
+          el("tr", {}, ...sampleCols.map((c) => head(c)))),
         el("tbody", { class: "divide-y divide-gray-100" },
           ...sample.map((row) =>
-            el("tr", {}, ...SAMPLE_COLS.map((c) =>
+            el("tr", {}, ...sampleCols.map((c) =>
               cell(row[c] == null || row[c] === "" ? "-" : String(row[c]))))),
         ),
       ),
@@ -309,19 +311,15 @@ export async function render(root) {
       if (!state.file) { previewArea.replaceChildren(); return; }
       previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
       const p = state.pipeline;
-      // The /uploads/preview endpoint requires company_name/country headers
-      // (parse_entities_csv); relationship CSVs use a different header shape
-      // (Company_Name_Y / Company_Name_X / Input_URL), so skip the server
-      // preview for it and just count rows client-side instead.
-      const useServerPreview = !p || p.ai || p.key !== "relationship";
+      // relationship CSVs have their own header shape (Company_Name_Y /
+      // Company_Name_X / Input_URL), so they get their own dry-run preview
+      // endpoint; everything else uses the shared /uploads/preview.
+      const previewEndpoint = (p && !p.ai && p.key === "relationship")
+        ? "/uploads/relationship/preview" : "/uploads/preview";
       try {
-        if (useServerPreview) {
-          const fd = new FormData();
-          fd.append("file", state.file);
-          state.preview = await api("/uploads/preview", { method: "POST", body: fd });
-        } else {
-          state.preview = { total_rows: await countCsvRows(state.file) };
-        }
+        const fd = new FormData();
+        fd.append("file", state.file);
+        state.preview = await api(previewEndpoint, { method: "POST", body: fd });
         previewArea.replaceChildren(previewTables(state.preview));
       } catch (e) {
         previewArea.replaceChildren(redCallout(e.message));

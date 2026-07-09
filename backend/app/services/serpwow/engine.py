@@ -3499,6 +3499,59 @@ async def create_gsearch_upload(
     )
 
 
+@app.post("/uploads/relationship/preview")
+async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Dry-run parse for the New Run preview: header mapping, blank/dedupe
+    counts, and a sample of the pairs that would actually be searched.
+    Costs nothing — no state, no queue, no Supabase."""
+    from app.services.serpwow.relationship_csv import (
+        InvalidRelationshipCSV,
+        parse_relationship_csv,
+    )
+
+    raw = await file.read()
+    try:
+        parsed = parse_relationship_csv(raw)
+    except InvalidRelationshipCSV as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    pairs = parsed["pairs"]
+    total = len(parsed["original_rows"])
+    blank = len(parsed["blank_row_indices"])
+    duplicates = (total - blank) - len(pairs)
+    warnings: list[str] = []
+    if blank:
+        warnings.append(
+            f"{blank} row(s) have a blank Company_Name_Y — skipped for free (they land in skipped.csv)."
+        )
+    if duplicates > 0:
+        warnings.append(
+            f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
+        )
+    if not pairs:
+        warnings.append("No searchable rows — every Company_Name_Y is blank; the upload would be rejected.")
+
+    return {
+        "total_rows": total,
+        "blank_rows": blank,
+        "unique_pairs": len(pairs),
+        "warnings": warnings,
+        "columns_detected": parsed["columns_detected"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country", "csv_rows"],
+        "sample_rows": [
+            {
+                "company_name_x": p["x_name"],
+                "company_name_y": p["y_name"],
+                "input_url": p["input_url"],
+                "city": p["city"],
+                "country": p["country"],
+                "csv_rows": len(p["source_row_indices"]),
+            }
+            for p in pairs[:5]
+        ],
+    }
+
+
 @app.post("/uploads/relationship")
 async def create_relationship_upload(
     file: UploadFile = File(...),

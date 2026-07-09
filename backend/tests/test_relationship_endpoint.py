@@ -230,3 +230,45 @@ class TestWorkerDispatchAndPendingMark(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRelationshipPreviewEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(engine.app)
+
+    def _preview(self, csv_bytes=CSV):
+        return self.client.post(
+            "/uploads/relationship/preview",
+            files={"file": ("rel.csv", io.BytesIO(csv_bytes), "text/csv")},
+        )
+
+    def test_preview_counts_columns_and_sample(self):
+        resp = self._preview()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["total_rows"], 3)
+        self.assertEqual(body["blank_rows"], 1)
+        self.assertEqual(body["unique_pairs"], 1)
+        self.assertEqual(body["columns_detected"]["company_name_y"], "Company_Name_Y")
+        self.assertEqual(body["columns_detected"]["input_url"], "Input_URL")
+        self.assertIsNone(body["columns_detected"]["city"])
+        self.assertEqual(len(body["sample_rows"]), 1)
+        sample = body["sample_rows"][0]
+        self.assertEqual(sample["company_name_x"], "eastlinkcap")
+        self.assertEqual(sample["company_name_y"], "Modal")
+        self.assertEqual(sample["csv_rows"], 2)
+        self.assertEqual(body["sample_columns"][0], "company_name_x")
+        # one blank warning + one duplicate warning
+        self.assertEqual(len(body["warnings"]), 2)
+
+    def test_preview_missing_x_column_is_400(self):
+        resp = self._preview(b"Company_Name_Y,Other\nSanzo,z\n")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Company_Name_X", resp.json()["detail"])
+
+    def test_preview_all_blank_warns_but_200(self):
+        resp = self._preview(b"Company_Name_X,Company_Name_Y\nm25vc,\n")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["unique_pairs"], 0)
+        self.assertTrue(any("No searchable rows" in w for w in body["warnings"]))

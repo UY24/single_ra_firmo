@@ -110,4 +110,13 @@ def parse_relationship_csv(raw: bytes) -> dict:
         "original_rows": original_rows,
         "blank_row_indices": blank_row_indices,
         "pairs": pairs,
+        # Which actual CSV headers matched each logical field (None when the
+        # optional column is absent) — surfaced by the upload-preview endpoint.
+        "columns_detected": {
+            "company_name_y": y_col,
+            "company_name_x": x_col,
+            "input_url": url_col,
+            "city": city_col,
+            "country": country_col,
+        },
     }

@@ -11,6 +11,7 @@ import httpx
 
 from app.services.common.env import get_float_env as _get_float_env
 from app.services.serpwow.geo import _country_to_gl
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.url_utils import is_disallowed_official_url
 
 SERPWOW_API_URL = "https://api.serpwow.com/live/search"
@@ -182,6 +183,7 @@ async def run_serpwow_search(
             "search_url": None,
             "raw_response": None,
             "error": "SERPWOW_API_KEY is not configured",
+            "error_category": "auth",
         }
 
     params = {
@@ -206,16 +208,21 @@ async def run_serpwow_search(
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        status = None
+        resp_local = locals().get("response")
+        if resp_local is not None:
+            status = getattr(resp_local, "status_code", None)
         return {
             "provider": "serpwow",
             "used": False,
             "query": query,
             "official_website": None,
             "candidates": [],
-            "status_code": None,
+            "status_code": status,
             "search_url": None,
             "raw_response": None,
             "error": str(exc),
+            "error_category": categorize_http_error(status, f"{type(exc).__name__}: {exc}"),
         }
 
     request_info = data.get("request_info", {}) if isinstance(data, dict) else {}
@@ -235,4 +242,5 @@ async def run_serpwow_search(
         "search_url": request_info.get("search_url") if isinstance(request_info, dict) else None,
         "raw_response": data,
         "error": "Ambiguous entity in AI overview; continuing search." if ambiguity_detected else None,
+        "error_category": None,
     }

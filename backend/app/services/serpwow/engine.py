@@ -117,6 +117,7 @@ from app.services.serpwow.serpwow_client import (
     _is_listing_or_profile_result,
     _extract_official_website_candidates_from_serpwow,
 )
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.gemini_llm import (
     _parse_json_from_text,
     _gemini_generate_content_json,
@@ -4468,19 +4469,23 @@ async def gsearch_discover(
                 "search_url": None,
                 "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {str(raw_result)}",
+                "error_category": categorize_http_error(
+                    None, f"{type(raw_result).__name__}: {raw_result}"),
             }
-        
+
         attempt_cands = raw_result.get("candidates") or []
         for cand in attempt_cands:
             if cand and cand not in seen_candidates and not is_disallowed_official_url(cand):
                 seen_candidates.add(cand)
                 candidates.append(cand)
-                
+
         formatted_results.append({
             "phase": label,
             "query": query,
             "success": bool(raw_result.get("used")),
             "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_result.get("raw_response"),
         })

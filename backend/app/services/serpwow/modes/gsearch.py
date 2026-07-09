@@ -28,6 +28,7 @@ from app.services.serpwow.cost import (
 from app.services.serpwow.gemini_llm import (
     choose_final_website_with_gemini,
 )
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.query_builders import (
     _company_name_variants,
     _extract_phase5_pivots_from_serpwow,
@@ -135,6 +136,8 @@ async def execute_gsearch_lookup_for_worker(
                 "search_url": None,
                 "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {str(raw_result)}",
+                "error_category": categorize_http_error(
+                    None, f"{type(raw_result).__name__}: {raw_result}"),
             }
 
         serpwow_cost += 0.02
@@ -149,6 +152,8 @@ async def execute_gsearch_lookup_for_worker(
             "query": query,
             "success": bool(raw_result.get("used")),
             "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_result.get("raw_response"),
         })

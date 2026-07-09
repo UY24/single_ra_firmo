@@ -66,5 +66,31 @@ class TestErrorDump(unittest.TestCase):
             self.assertEqual(data["phases"][1]["status_code"], 200)
 
 
+    def test_degraded_found_row_is_dumped_as_gemini(self):
+        # A degraded-found row (outcome=found, context.llm_error set) is a row with a
+        # technical problem worth debugging: it must also land in errors/, tagged
+        # error_source=gemini, while recording its actual outcome (found).
+        with tempfile.TemporaryDirectory() as d:
+            rows = [
+                {"row_index": 5, "company_name": "Degraded Co", "status": "completed",
+                 "outcome": o.OUTCOME_FOUND, "degraded_search": True,
+                 "result": {"official_website": "https://x.com",
+                            "context": {"llm_error": "Gemini HTTPError: 429",
+                                        "formatted_results": [
+                                            {"phase": "p1", "success": True, "error": None,
+                                             "status_code": 200, "error_category": None}]}}},
+                {"row_index": 6, "company_name": "Plain Found", "status": "completed",
+                 "outcome": o.OUTCOME_FOUND,
+                 "result": {"official_website": "https://y.com", "context": {}}},
+            ]
+            paths = engine._write_error_dumps(Path(d), {"rows": rows})
+            self.assertEqual(len(paths), 1)
+            data = json.loads(list(paths.values())[0].read_text())
+            self.assertEqual(data["error_source"], o.SRC_GEMINI)
+            self.assertEqual(data["error_category"], o.CAT_RATE_LIMIT)
+            self.assertEqual(data["error_detail"], "Gemini HTTPError: 429")
+            self.assertEqual(data["outcome"], o.OUTCOME_FOUND)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,30 @@ class TestGsearchWorker(unittest.TestCase):
         self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 91)
         self.assertGreater(resp.gemini_cost_usd, 0.0)
 
+    def test_per_row_gemini_failure_produces_degraded_found(self):
+        # PRODUCER-level test: the real gsearch worker, when the per-row Gemini
+        # selection genuinely fails (output=None + error), must STILL emit a website
+        # (the raw first candidate fallback) AND record context["llm_error"]. Feeding
+        # that result to the classifier must yield found + degraded_search (not error).
+        from app.services.serpwow import outcomes as o
+        with mock.patch.object(gsearch_mode, "run_serpwow_search", _fake_serpwow), \
+             mock.patch.object(gsearch_mode, "choose_final_website_with_gemini",
+                               return_value=(None, "Gemini HTTPError: 429",
+                                             "gemini-2.5-flash-lite", None)), \
+             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false",
+                                            "ENABLE_FINAL_URL_GEMINI": "true",
+                                            "GEMINI_API_KEY": "k"}):
+            resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
+                company_name="Acme Motors", country="us", phase="phase1"))
+        # Candidate fallback keeps the row found despite the Gemini failure.
+        self.assertEqual(resp.official_website, "https://acme-motors.com")
+        self.assertEqual(resp.context["llm_error"], "Gemini HTTPError: 429")
+        info = o.classify_finalized_row(
+            {"official_website": resp.official_website, "context": resp.context},
+            pipeline="gsearch", ctx_row_error=None, skip_llm=False)
+        self.assertEqual(info.outcome, o.OUTCOME_FOUND)
+        self.assertTrue(info.degraded_search)
+
     def test_batch_mode_skips_per_row_llm(self):
         with mock.patch.object(gsearch_mode, "run_serpwow_search", _fake_serpwow), \
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \

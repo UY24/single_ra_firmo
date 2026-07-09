@@ -107,15 +107,22 @@ class TestClassifyFinalizedRow(unittest.TestCase):
                                         ctx_row_error=None, skip_llm=False)
         self.assertEqual(info.outcome, o.OUTCOME_NOT_FOUND)
 
-    def test_per_row_llm_error_is_error_gemini(self):
-        # A phase succeeded (candidates existed) but the per-row Gemini selection
-        # call failed -> error/gemini, not not_found.
-        r = _result(official=None, phases=[{"used": True}],
+    def test_found_with_llm_error_is_degraded_found(self):
+        # gsearch falls back to the raw first candidate as official_website, so a
+        # per-row Gemini selection failure still yields a FOUND row -- but it must
+        # be marked degraded so the LLM failure is visible (no error, no retry).
+        r = _result(official="https://x.com", phases=[{"used": True}],
                     llm_error="Gemini HTTPError: 429")
         info = o.classify_finalized_row(r, pipeline="gsearch", ctx_row_error=None, skip_llm=False)
-        self.assertEqual((info.outcome, info.error_source, info.error_category),
-                         (o.OUTCOME_ERROR, o.SRC_GEMINI, o.CAT_RATE_LIMIT))
-        self.assertIn("429", info.error_detail)
+        self.assertEqual(info.outcome, o.OUTCOME_FOUND)
+        self.assertTrue(info.degraded_search)
+
+    def test_found_without_llm_error_is_not_degraded(self):
+        # CONTROL: a found row with no Gemini failure is not degraded.
+        r = _result(official="https://x.com", phases=[{"used": True}])
+        info = o.classify_finalized_row(r, pipeline="gsearch", ctx_row_error=None, skip_llm=False)
+        self.assertEqual(info.outcome, o.OUTCOME_FOUND)
+        self.assertFalse(info.degraded_search)
 
     def test_succeeded_phase_no_llm_error_is_not_found(self):
         # CONTROL: same as above but no llm_error -> unchanged not_found.

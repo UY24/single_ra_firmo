@@ -122,18 +122,15 @@ def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
     total, succeeded, errored, dominant_cat, first_detail = _phase_stats(result or {})
     degraded = bool(succeeded and errored)
     if official:
-        return OutcomeInfo(OUTCOME_FOUND, degraded_search=degraded)
+        # gsearch falls back to the raw first candidate as official_website, so a
+        # per-row Gemini SELECTION failure still yields a found row (no retry, no
+        # SerpWow re-bill). Surface that failure by marking the row degraded -- the
+        # llm_selection_failed flag + errors/ dump carry the detail.
+        degraded_search = degraded or bool(((result or {}).get("context") or {}).get("llm_error"))
+        return OutcomeInfo(OUTCOME_FOUND, degraded_search=degraded_search)
     # Known business "not found" sentinels (e.g. relationship not-confirmed / no-evidence)
     if ctx_row_error and ctx_row_error.strip() in NOT_FOUND_SENTINELS:
         return OutcomeInfo(OUTCOME_NOT_FOUND, degraded_search=degraded)
-    # Per-row LLM (Gemini) selection failure. The LLM only runs when candidates existed
-    # (i.e. SerpWow phases succeeded), so a genuine failure here takes precedence over
-    # the all-phases-errored check below.
-    llm_error = ((result or {}).get("context") or {}).get("llm_error")
-    if llm_error:
-        return OutcomeInfo(OUTCOME_ERROR, SRC_GEMINI,
-                           categorize_http_error(None, str(llm_error)),
-                           error_detail=str(llm_error), degraded_search=degraded)
     # "We couldn't look": phases ran and every one errored -> a real SerpWow error.
     if total > 0 and succeeded == 0:
         return OutcomeInfo(OUTCOME_ERROR, SRC_SERPWOW,

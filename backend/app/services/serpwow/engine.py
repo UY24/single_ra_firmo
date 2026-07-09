@@ -466,21 +466,28 @@ def _safe_name(value: str) -> str:
 
 
 def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
-    """Write a per-row debugging JSON for every row with outcome=="error".
+    """Write a per-row debugging JSON for every row with a technical problem worth
+    debugging: hard errors (outcome=="error") AND degraded-found rows (a found row
+    whose per-row Gemini selection failed, carrying context.llm_error).
 
     Pure disk, sync, best-effort by design of its caller (this function itself
     raises on genuine I/O failure, but the caller wraps it). Returns
-    {filename: path} for the files actually written; rows that are not errors
-    produce no file.
+    {filename: path} for the files actually written; other rows produce no file.
     """
     paths: dict[str, Path] = {}
     rows = state.get("rows") or []
     for row in rows:
-        if not isinstance(row, dict) or row.get("outcome") != _outcomes.OUTCOME_ERROR:
+        if not isinstance(row, dict):
+            continue
+        is_hard_error = row.get("outcome") == _outcomes.OUTCOME_ERROR
+        ctx = (row.get("result") or {}).get("context") or {}
+        llm_error = ctx.get("llm_error")
+        # A degraded-found row: not a hard error, but a real Gemini selection failure.
+        is_degraded_found = (not is_hard_error) and bool(llm_error)
+        if not is_hard_error and not is_degraded_found:
             continue
         row_index = row.get("row_index")
         company_name = str(row.get("company_name") or "")
-        ctx = (row.get("result") or {}).get("context") or {}
         formatted_results = ctx.get("formatted_results") if isinstance(ctx.get("formatted_results"), list) else []
         phases = [
             {
@@ -494,15 +501,29 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
             if isinstance(fr, dict)
         ]
         http_status = phases[0]["status_code"] if phases else None
-        data = {
-            "row_index": row_index,
-            "company_name": company_name,
-            "error_source": row.get("error_source"),
-            "error_category": row.get("error_category"),
-            "error_detail": row.get("error"),
-            "http_status": http_status,
-            "phases": phases,
-        }
+        if is_degraded_found:
+            data = {
+                "row_index": row_index,
+                "company_name": company_name,
+                "error_source": _outcomes.SRC_GEMINI,
+                "error_category": _outcomes.categorize_http_error(None, str(llm_error)),
+                "error_detail": str(llm_error),
+                "http_status": http_status,
+                # Record the row's ACTUAL outcome so a reader sees this is a
+                # degraded-found (candidate fallback), not a hard error.
+                "outcome": row.get("outcome"),
+                "phases": phases,
+            }
+        else:
+            data = {
+                "row_index": row_index,
+                "company_name": company_name,
+                "error_source": row.get("error_source"),
+                "error_category": row.get("error_category"),
+                "error_detail": row.get("error"),
+                "http_status": http_status,
+                "phases": phases,
+            }
         errors_dir = Path(upload_dir) / "errors"
         errors_dir.mkdir(parents=True, exist_ok=True)
         idx = row_index if isinstance(row_index, int) else 0

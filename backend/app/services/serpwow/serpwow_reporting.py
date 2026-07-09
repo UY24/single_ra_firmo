@@ -68,6 +68,11 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     for alt in (raw.get("alternatives") or [])[:5]:
         if alt:
             flags.append(Flag("alternative", str(alt)))
+    # A per-row Gemini selection failure that fell back to the raw candidate: the row
+    # is still found (degraded), but make the failure visible in the report.
+    llm_error = ctx.get("llm_error")
+    if llm_error:
+        flags.append(Flag("llm_selection_failed", str(llm_error)))
 
     attempts: list[AttemptLogEntry] = []
     for fr in ctx.get("formatted_results") or []:

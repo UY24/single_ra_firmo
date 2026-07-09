@@ -40,6 +40,21 @@ class TestErrorReporting(unittest.TestCase):
         self.assertEqual(bd["errored"], 1)
         self.assertEqual(bd["found"] + bd["not_found"] + bd["errored"], len(state["rows"]))
 
+    def test_degraded_found_llm_error_flag_and_degraded_in_report(self):
+        # A degraded-found row: official_website set (candidate fallback), but the
+        # per-row Gemini selection failed (context.llm_error). Its EntityResult must
+        # carry a llm_selection_failed flag and degraded_search=True in the report.
+        row = {"company_name": "A", "country": "US", "status": "completed",
+               "outcome": o.OUTCOME_FOUND, "degraded_search": True,
+               "result": {"official_website": "https://a.com",
+                          "context": {"llm_error": "Gemini HTTPError: 429"}}}
+        er = rep.row_to_entity_result(row, 1)
+        d = er.to_report_dict()
+        self.assertTrue(d["degraded_search"])
+        flags = {f["flag"]: f["why"] for f in d["flags"]}
+        self.assertIn("llm_selection_failed", flags)
+        self.assertIn("429", flags["llm_selection_failed"])
+
     def test_notfound_row_still_in_notfound_csv(self):
         state = {"pipeline": "gsearch", "upload_id": "u1", "rows": [
             _row("B", "completed", o.OUTCOME_NOT_FOUND)]}

@@ -32,9 +32,11 @@ def _state():
 def _state_three_way_outcomes():
     """1 found / 1 not_found (business, no error) / 1 errored (real failure).
 
-    Old mapping (success_rows/failed_rows) would conflate not_found + errored
-    into failed_count==2. The new mapping must report success_count==1 (found)
-    and failed_count==1 (errored only)."""
+    This synthetic state omits the legacy success_rows/failed_rows keys, so the
+    pre-Task-8 code left success_count/failed_count at None for the gsearch path
+    (the old code only overrode them inside the relationship branch). The new
+    mapping must report success_count==1 (found) and failed_count==1 (errored
+    only), driven off summary["outcome_breakdown"]."""
     return {"upload_id": "up2", "company_name": "Acme", "pipeline": "gsearch",
             "status": "completed_with_errors", "run_db_id": "abc2",
             "processing_seconds_total": 3.0,

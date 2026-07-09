@@ -88,6 +88,9 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
         flags=flags,
         attempt_log=attempts,
         error=row.get("error"),
+        error_source=row.get("error_source"),
+        error_category=row.get("error_category"),
+        degraded_search=bool(row.get("degraded_search")),
     )
 
 
@@ -204,6 +207,28 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "cost": _build_cost(llm_usd, serpwow_searches),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
+    # Outcome/error breakdown, aggregated straight off state["rows"] by each row's
+    # outcome/error_source/error_category. For relationship this is pair-level (one
+    # entry per unique X,Y pair row), not fanned out to original CSV rows — the
+    # breakdown is a diagnostic, so pair-level is acceptable and simpler.
+    outcome_breakdown = {"found": 0, "not_found": 0, "errored": 0}
+    by_source: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    for row in state.get("rows", []):
+        oc = (row or {}).get("outcome")
+        if oc == "found":
+            outcome_breakdown["found"] += 1
+        elif oc == "not_found":
+            outcome_breakdown["not_found"] += 1
+        elif oc == "error":
+            outcome_breakdown["errored"] += 1
+            if row.get("error_source"):
+                by_source[row["error_source"]] = by_source.get(row["error_source"], 0) + 1
+            if row.get("error_category"):
+                by_category[row["error_category"]] = by_category.get(row["error_category"], 0) + 1
+    summary["outcome_breakdown"] = outcome_breakdown
+    summary["error_breakdown"] = {"by_source": by_source, "by_category": by_category}
+
     meta = state.get("relationship") if isinstance(state.get("relationship"), dict) else None
     if meta is not None:
         breakdown = {"confirmed": 0, "not_confirmed": 0, "unclear": 0}

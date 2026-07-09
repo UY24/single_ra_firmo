@@ -195,8 +195,9 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "model": model,
         # "llm" when a confidence model actually ran (gsearch always; gmaps only when
         # GMAPS_CONFIDENCE_MODE=llm), else "heuristic" (gmaps default). Lets the UI show
-        # the confidence chip without guessing from model presence.
-        "confidence_mode": "llm" if model else "heuristic",
+        # the confidence chip without guessing from model presence. relationship is
+        # ALWAYS LLM by design (the gate needs it), even mid-run before a model ran.
+        "confidence_mode": "llm" if (model or str(state.get("pipeline") or "") == "relationship") else "heuristic",
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},

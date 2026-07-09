@@ -362,6 +362,39 @@ function renderLegacyStatus(root, ref, s) {
     el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
   ];
 
+  // Stop button while the run is still doing work (rows in flight, or the
+  // Gemini batch still running). Remaining rows are marked failed; retryable
+  // later via "Retry failed rows".
+  if (!rowsDone || finalizing) {
+    const stopMsg = el("div", { class: "mt-3" });
+    const stopBtn = el("button", {
+      class: "btn-secondary min-h-0 px-3 py-1.5 text-xs text-red-600 disabled:opacity-50",
+      onclick: async () => {
+        if (!window.confirm(
+          "Stop this run? Rows not yet processed are marked failed "
+          + "(you can retry them later); a running Gemini batch is cancelled.")) return;
+        stopBtn.disabled = true;
+        try {
+          const res = await api(`/uploads/${encodeURIComponent(ref)}/stop`, { method: "POST" });
+          stopMsg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
+            `Stopped: ${fmtNum(res.stopped_rows)} row(s) halted`
+            + `${res.batch_cancelled ? ", batch cancelled" : ""}. Reloading...`));
+          setTimeout(() => { window.location.reload(); }, 700);
+        } catch (e) {
+          stopBtn.disabled = false;
+          stopMsg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+        }
+      },
+    }, "Stop run");
+    parts.push(el("div", { class: "panel" },
+      el("h2", { class: "section-title" }, "Stop"),
+      el("p", { class: "mt-1 text-xs text-slate-400" },
+        "Halts remaining work: unprocessed rows are marked failed (retryable via "
+        + "Retry failed rows), a running Gemini batch is cancelled, and the run "
+        + "finalizes with whatever finished."),
+      el("div", { class: "mt-3" }, stopBtn), stopMsg));
+  }
+
   // Single file surface: result files (gsearch/gmaps) + output.json/xlsx (all pipelines),
   // shown once the run is terminal (and, for batch runs, once the batch is terminal too —
   // result files aren't written until then, so View/Download would 404).

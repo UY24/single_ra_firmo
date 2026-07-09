@@ -1610,6 +1610,10 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
 async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
     if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
         return
+    if state.get("stopped_by_user_at"):
+        # /uploads/{id}/stop terminalizes the upload; don't launch a batch for it.
+        # A subsequent retry-failed-rows clears the marker and re-enables this.
+        return
     if state.get("status") not in {"completed", "completed_with_errors"}:
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
@@ -3585,6 +3589,9 @@ async def retry_failed_rows(
 
         pipeline = str(state.get("pipeline") or PIPELINE_FULL)
         phase = str(state.get("phase") or "all")
+        # Retrying a stopped upload re-opens it: clear the stop marker so the
+        # batch post-process can run again once the retried rows finish.
+        state.pop("stopped_by_user_at", None)
         failed_rows = [
             row for row in (state.get("rows") or [])
             if isinstance(row, dict) and row.get("status") in {"failed", "queued", "processing"}
@@ -3672,6 +3679,89 @@ async def retry_failed_rows(
         "retry_row_indexes": retried_row_indexes,
         "status_url": f"/uploads/{upload_id}/status",
         "failure_analysis_url": f"/uploads/{upload_id}/failure-analysis",
+    }
+
+
+@app.post("/uploads/{upload_id}/stop")
+async def stop_upload(upload_id: str) -> dict[str, Any]:
+    """Stop a running SerpWow upload: mark all non-terminal rows failed (queued
+    RabbitMQ messages are then dropped by the worker's idempotency guard) and
+    best-effort cancel a pending/running Gemini batch. The upload terminalizes
+    on this persist, so outputs/Supabase/Slack fire with whatever was done."""
+    _pending_sentinel = "Pending Gemini batch post-processing decision."
+    async with get_upload_lock(upload_id):
+        try:
+            state = await read_upload_artifact(upload_id, "state")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Upload ID not found") from exc
+        except Exception as exc:
+            if "NoSuchKey" in str(exc):
+                raise HTTPException(status_code=404, detail="Upload ID not found") from exc
+            raise
+
+        gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+        batch_active = gb.get("status") in {"waiting_for_rows", "queued", "running"}
+        rows_active = any(
+            isinstance(r, dict) and r.get("status") in {"queued", "processing"}
+            for r in state.get("rows") or []
+        )
+        if not rows_active and not batch_active:
+            raise HTTPException(status_code=409, detail="Upload is already terminal — nothing to stop.")
+
+        now = _now_iso()
+        stopped_rows = 0
+        for row in state.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("status") in {"queued", "processing"}:
+                row["status"] = "failed"
+                row["error"] = "Stopped by user."
+                row["status_updated_at"] = now
+                stopped_rows += 1
+            elif (row.get("status") == "completed"
+                    and row.get("error") == _pending_sentinel
+                    and not str((row.get("result") or {}).get("official_website") or "").strip()):
+                # Row was parked waiting for the (now-cancelled) batch decision.
+                row["status"] = "failed"
+                row["error"] = "Stopped by user before Gemini batch decision."
+                row["status_updated_at"] = now
+                stopped_rows += 1
+
+        batch_cancelled = False
+        if batch_active:
+            job_names = [str(c.get("job_name") or "") for c in (gb.get("chunks") or [])
+                         if isinstance(c, dict) and c.get("job_name")]
+            legacy_job = str(gb.get("job_name") or "").strip()
+            if legacy_job:
+                job_names.append(legacy_job)
+            for job_name in job_names:
+                try:
+                    await asyncio.to_thread(_gemini_batch_cancel_sync, job_name)
+                except Exception as exc:
+                    _log_gemini_batch(upload_id, f"stop: cancel {job_name} failed (non-fatal): {exc!r}")
+            state["gemini_batch"] = {**gb, "status": "failed", "completed_at": now,
+                                     "error": "Stopped by user."}
+            batch_cancelled = True
+
+        # Marker consulted by maybe_start_gemini_batch_for_upload so the terminal
+        # persist below doesn't immediately (re)start a batch for a stopped run.
+        state["stopped_by_user_at"] = now
+        await persist_upload_state(upload_id, state)
+        final_status = str(state.get("status") or "")
+
+    _log_row_stage(
+        "upload.stop",
+        f"stopped_rows={stopped_rows} batch_cancelled={batch_cancelled} final_status={final_status}",
+        upload_id=upload_id,
+        row_index=None,
+        level="WARN",
+    )
+    return {
+        "upload_id": upload_id,
+        "stopped_rows": stopped_rows,
+        "batch_cancelled": batch_cancelled,
+        "status": final_status,
+        "status_url": f"/uploads/{upload_id}/status",
     }
 
 

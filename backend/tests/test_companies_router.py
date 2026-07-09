@@ -186,12 +186,16 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
 
 class TestBuildRunUpdate(unittest.TestCase):
     def test_maps_summary_to_run_fields(self):
+        # New taxonomy: 8 found, 2 genuine not_found, 1 errored (a gemini failure).
+        # success_count = found, failed_count = errored — NOT not_found + llm_errors.
         summary = {
-            "status": "completed",
+            "status": "completed_with_errors",
             "websites_found": 8,
-            "websites_not_found": 2,
-            "llm_errors": 1,
-            "failed_request_count": 0,
+            "websites_not_found": 3,  # includes the errored (url-less) entity
+            "llm_errors": 0,
+            "failed_request_count": 0,  # a per-entity LLM omission is not a failed *request*
+            "outcome_breakdown": {"found": 8, "not_found": 2, "errored": 1},
+            "error_breakdown": {"by_source": {"gemini": 1}, "by_category": {"internal": 1}},
             "token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
             "batch_duration_seconds": 12.5,
             "completed_at": "2026-06-11T00:00:00+00:00",
@@ -199,11 +203,11 @@ class TestBuildRunUpdate(unittest.TestCase):
         }
         links = {"found.csv": "/runs/x/found.csv"}
         update = _build_run_update(summary, links)
-        self.assertEqual(update["status"], "completed")
-        self.assertEqual(update["success_count"], 8)
-        self.assertEqual(update["failed_count"], 3)  # not_found + llm_errors
+        self.assertEqual(update["status"], "completed_with_errors")
+        self.assertEqual(update["success_count"], 8)  # found
+        self.assertEqual(update["failed_count"], 1)  # errored (NOT not_found + llm_errors == 3)
         self.assertEqual(update["websites_found"], 8)
-        self.assertEqual(update["websites_not_found"], 2)
+        self.assertEqual(update["websites_not_found"], 3)
         self.assertEqual(update["token_usage"]["total_tokens"], 15)
         self.assertEqual(update["duration_seconds"], 12.5)
         self.assertEqual(update["file_links"], links)

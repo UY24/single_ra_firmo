@@ -119,9 +119,11 @@ class TestRelationshipOriginalRowLevelCounts(unittest.TestCase):
                   "success_rows": 1, "failed_rows": 1, "processing_seconds_total": 1.0,
                   "rows": [
                       {"company_name": "A", "country": "us", "status": "completed", "error": None,
+                       "outcome": "found",
                        "result": {"official_website": "https://a.com",
                                   "context": {"cost_breakdown": {"serpwow_request_count": 1}}}},
                       {"company_name": "B", "country": "us", "status": "failed", "error": "x",
+                       "outcome": "error",
                        "result": {"official_website": None,
                                   "context": {"cost_breakdown": {"serpwow_request_count": 1}}}},
                   ]}
@@ -129,7 +131,9 @@ class TestRelationshipOriginalRowLevelCounts(unittest.TestCase):
         with patch("app.services.companies.get_company_service", return_value=svc), \
              patch.object(engine, "_upload_file_links", return_value={}):
             engine._update_supabase_run(state)
-        # gsearch has no "relationship" block -> untouched pass-through counters.
+        # gsearch has no "relationship" block -> no total_rows override, but
+        # success/failed still follow the found/errored outcome_breakdown (Task 8),
+        # not a pass-through of state's success_rows/failed_rows.
         self.assertEqual(svc.kwargs["success_count"], 1)
         self.assertEqual(svc.kwargs["failed_count"], 1)
         self.assertNotIn("total_rows", svc.kwargs)

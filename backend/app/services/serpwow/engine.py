@@ -2092,12 +2092,29 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
                 "cost": summ["cost"],
                 "token_usage": summ["token_usage"],
             }
+            # success/failed now follow the 3-way row outcome (found/not_found/
+            # errored) instead of the old 2-way success/failed split: a business
+            # not_found row (no website, but no error) no longer counts as failed
+            # — only a genuine per-row error does.
+            ob = summ.get("outcome_breakdown") or {}
+            success_count = ob.get("found", summ["websites_found"])
+            failed_count = ob.get("errored", 0)
             if state.get("relationship"):
-                # relationship state counters are PAIR-level, but websites_found/
-                # not_found are ORIGINAL-ROW-level (fan-out) — override so Supabase
-                # counts match the CSVs (found.csv/notFound.csv) instead of pairs.
+                # relationship state/outcome counters are PAIR-level, but the CSVs
+                # (found.csv/notFound.csv) and this Supabase row are ORIGINAL-ROW-
+                # level (fan-out) — override with the already-fanned equivalents
+                # instead of the pair-level outcome_breakdown above. success=found:
+                # summ["websites_found"] already counts fanned rows with a website
+                # (== outcome "found"). failed=errored: a genuine per-pair error
+                # (row["outcome"] == "error", a raised LLM/search exception) fanned
+                # to its original rows — NOT a not-confirmed relationship gate,
+                # which is a business not_found, not a failure.
                 success_count = summ["websites_found"]
-                failed_count = summ["websites_not_found"]
+                failed_count = sum(
+                    len(r.get("source_row_indices") or [])
+                    for r in state.get("rows", [])
+                    if isinstance(r, dict) and r.get("outcome") == _outcomes.OUTCOME_ERROR
+                )
                 extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,

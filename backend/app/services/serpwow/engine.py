@@ -465,6 +465,54 @@ def _safe_name(value: str) -> str:
     return text.strip("_") or "item"
 
 
+def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
+    """Write a per-row debugging JSON for every row with outcome=="error".
+
+    Pure disk, sync, best-effort by design of its caller (this function itself
+    raises on genuine I/O failure, but the caller wraps it). Returns
+    {filename: path} for the files actually written; rows that are not errors
+    produce no file.
+    """
+    paths: dict[str, Path] = {}
+    rows = state.get("rows") or []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("outcome") != _outcomes.OUTCOME_ERROR:
+            continue
+        row_index = row.get("row_index")
+        company_name = str(row.get("company_name") or "")
+        ctx = (row.get("result") or {}).get("context") or {}
+        formatted_results = ctx.get("formatted_results") if isinstance(ctx.get("formatted_results"), list) else []
+        phases = [
+            {
+                "phase": fr.get("phase"),
+                "used": fr.get("success"),
+                "error": fr.get("error"),
+                "status_code": fr.get("status_code"),
+                "error_category": fr.get("error_category"),
+            }
+            for fr in formatted_results
+            if isinstance(fr, dict)
+        ]
+        http_status = phases[0]["status_code"] if phases else None
+        data = {
+            "row_index": row_index,
+            "company_name": company_name,
+            "error_source": row.get("error_source"),
+            "error_category": row.get("error_category"),
+            "error_detail": row.get("error"),
+            "http_status": http_status,
+            "phases": phases,
+        }
+        errors_dir = Path(upload_dir) / "errors"
+        errors_dir.mkdir(parents=True, exist_ok=True)
+        idx = row_index if isinstance(row_index, int) else 0
+        name = f"{idx:06d}_{_safe_name(company_name)}_error.json"
+        path = errors_dir / name
+        _write_json(path, data)
+        paths[name] = path
+    return paths
+
+
 # SerpWow HTTP client + response extraction (run_serpwow_search,
 # _extract_official_website_from_serpwow, candidates, ambiguity, listing checks)
 # live in serpwow_client.py; re-imported at the top.
@@ -2194,6 +2242,11 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
     except Exception as exc:
         print(f"[serpwow] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
         return
+    try:
+        error_paths = await asyncio.to_thread(_write_error_dumps, upload_dir, state)
+    except Exception as exc:
+        print(f"[serpwow] error-dump failed for {upload_id}: {type(exc).__name__}: {exc}")
+        error_paths = {}
     if not os.getenv("S3_BUCKET"):
         return
     from app.core import s3 as core_s3
@@ -2204,6 +2257,11 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
             await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")
         except Exception as exc:
             print(f"[serpwow] S3 mirror failed for {name} ({upload_id}): {type(exc).__name__}: {exc}")
+    for name, path in error_paths.items():
+        try:
+            await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/errors/{name}")
+        except Exception as exc:
+            print(f"[serpwow] S3 mirror failed for errors/{name} ({upload_id}): {type(exc).__name__}: {exc}")
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:

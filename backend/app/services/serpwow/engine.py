@@ -1322,8 +1322,9 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
 
 def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
                                row_usage: dict[str, Any], batch_model: str) -> str:
-    """Apply one parsed Gemini result onto a row. Returns 'completed' or 'failed'.
-    Mirrors the existing single-job mapping (candidate-set guard via
+    """Apply one parsed Gemini result onto a row. Always returns 'completed' now:
+    a batch-decided no-website row is a business not_found (outcome=not_found), not
+    an error. Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
     _ctx_probe = ((row.get("result") or {}).get("context")
                   if isinstance((row.get("result") or {}).get("context"), dict) else {})
@@ -1381,7 +1382,9 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
 def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
                                             row_usage: dict[str, Any], batch_model: str) -> str:
     """Relationship variant of _apply_batch_parsed_to_row: the LLM's
-    relationship_status GATES the URL (spec §4). Returns 'completed'/'failed'."""
+    relationship_status GATES the URL (spec §4). Always returns 'completed' now:
+    a not-confirmed / confirmed-but-invalid gate is a business not_found
+    (outcome=not_found), not an error."""
     from app.services.serpwow.gemini_llm import apply_relationship_gate
 
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
@@ -1591,13 +1594,19 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 total_prompt += int(usage.get("promptTokenCount", 0) or 0)
                 total_cand += int(usage.get("candidatesTokenCount", 0) or 0)
                 _apply_batch_parsed_to_row(row, parsed, usage, batch_model)
-            # Rows whose chunk never produced a parsed decision for them (the chunk
+            # Rows that WERE seeded into the batch (i.e. present in chunk_id_by_ridx,
+            # which is built from the exact same items as _build_batch_items_for_state)
+            # but whose chunk never produced a parsed decision for them (the chunk
             # failed outright, or the row's key was simply missing from an otherwise
             # successful chunk's response) never reached _apply_batch_parsed_to_row
             # above -> that's a genuine Gemini batch error, not a business not-found.
             # Rows that DID get a parsed dict were already fully decided (found or
             # not_found, both now status="completed") by the loop above and must not
             # be re-touched here, even though not_found rows also have no website.
+            # Rows NEVER seeded into the batch (skip_llm relationship no-X/no-evidence
+            # short-circuits, already finalized not_found/completed by the worker; or
+            # non-terminal rows) are absent from chunk_id_by_ridx -> must NOT be touched,
+            # else an unrelated row going through the batch would corrupt them to error.
             results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
@@ -1606,6 +1615,8 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 if str((row.get("result") or {}).get("official_website") or "").strip():
                     continue
                 ridx = int(row.get("row_index", 0) or 0)
+                if ridx not in chunk_id_by_ridx:
+                    continue  # never a batch item (skip_llm short-circuit / non-terminal)
                 if isinstance(parsed_all.get(ridx), dict):
                     continue  # already decided (found/not_found) above
                 chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}

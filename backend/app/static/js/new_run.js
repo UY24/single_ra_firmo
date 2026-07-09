@@ -26,10 +26,10 @@ const _FIRMO_COLS = [
   { name: "full_address",     req: false, hint: "address, fulladdress, input_full_address" },
 ];
 const _REL_COLS = [
-  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR text ok)" },
-  { name: "Company_Name_X", req: false, hint: "the firm whose page was scraped" },
-  { name: "Input_URL",      req: false, hint: "X's portfolio page (anchors the search)" },
-  { name: "city / country", req: false, hint: "optional location context" },
+  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR text ok; blank rows -> skipped.csv)" },
+  { name: "Company_Name_X", req: true,  hint: "the investor firm — the relationship is verified against it" },
+  { name: "Input_URL",      req: false, hint: "Company X's page URL; its domain powers the site:<X-domain> phase + blocks X's own site from results" },
+  { name: "city / country", req: false, hint: "added to the plain \"Y official website\" phase" },
 ];
 
 const PIPELINES = [

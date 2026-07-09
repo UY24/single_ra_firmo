@@ -57,6 +57,12 @@ class TestParseRelationshipCSV(unittest.TestCase):
         with self.assertRaises(InvalidRelationshipCSV):
             parse_relationship_csv(raw)
 
+    def test_missing_x_column_raises(self):
+        raw = "Company_Name_Y,Whatever\nSanzo,zzz\n".encode()
+        with self.assertRaises(InvalidRelationshipCSV) as ctx:
+            parse_relationship_csv(raw)
+        self.assertIn("Company_Name_X", str(ctx.exception))
+
     def test_empty_file_raises(self):
         with self.assertRaises(InvalidRelationshipCSV):
             parse_relationship_csv(b"")

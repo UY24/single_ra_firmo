@@ -55,6 +55,14 @@ def parse_relationship_csv(raw: bytes) -> dict:
             f"(accepted aliases: {', '.join(_Y_ALIASES)}). Found: {header}"
         )
     x_col = _find_column(normalized, _X_ALIASES)
+    if x_col is None:
+        # The relationship verdict is judged against X — without the column the
+        # whole file would short-circuit to not_confirmed, which is never what
+        # the user meant. Individual blank X cells are still tolerated per-row.
+        raise InvalidRelationshipCSV(
+            "Missing required column Company_Name_X "
+            f"(accepted aliases: {', '.join(_X_ALIASES)}). Found: {header}"
+        )
     url_col = _find_column(normalized, _URL_ALIASES)
     city_col = _find_column(normalized, _CITY_ALIASES)
     country_col = _find_column(normalized, _COUNTRY_ALIASES)

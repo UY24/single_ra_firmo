@@ -1,14 +1,27 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-08 (NEW `relationship` pipeline — COMPLETE on branch `relationshipMode`, final review clean, ready to merge; the user will merge it into `revampCode` themselves). Read this first if you're picking up this repo.
+Last updated: 2026-07-09 (`relationship` pipeline MERGED into `revampCode` by the user, plus 2026-07-09 follow-ups: Stop button, real upload preview, X-column required, tile cleanup). Read this first if you're picking up this repo.
 
 ---
 
-## ⭐ 2026-07-08 — NEW `relationship` pipeline (branch `relationshipMode`, 11 commits `03f28ba..4491a44` over base `79b5ec5`, NOT pushed — user merges into `revampCode`)
+## ⭐ 2026-07-09 — relationship follow-ups + generic Stop (on `revampCode`, 4 commits `91090a3..99eef3c`)
+
+The user merged `relationshipMode` into `revampCode` (PRs #5/#6); these landed directly on `revampCode` afterwards. Suite **359/359**.
+
+1. **`91090a3` — run-detail headline tiles for relationship**: Total rows (ORIGINAL CSV count — `s.total_rows` is pair-level for this pipeline), Websites found, Not found, **Skipped (blank Y)**; "Processed" is labelled "Pairs processed". Secondary tiles (Unique pairs, Confirmed/Unclear, tokens/cost) unchanged.
+2. **`1cade1d` — `Company_Name_X` column is now REQUIRED** (parser raises → upload/preview 400 when the column is missing; blank X *cells* per-row are still tolerated → notFound with `no_company_x`). New Run column hints rewritten (X = "the investor firm — the relationship is verified against it"; Input_URL hint explains the `site:<X-domain>` phase + X-site blacklist).
+3. **`d8eb445` — NEW generic `POST /uploads/{upload_id}/stop`** (all SerpWow pipelines) + a "Stop run" panel on run-detail while rows are in flight or the batch is finalizing. Semantics: queued/processing rows → `failed "Stopped by user."` (queued RabbitMQ messages are then dropped by the worker's existing idempotency guard — the queue is NOT purged); rows parked on the batch-pending sentinel → force-failed; running Gemini batch chunks cancelled best-effort (`_gemini_batch_cancel_sync`) and `gemini_batch.status="failed"`; the run terminalizes on that persist (files/Supabase/Slack fire once). Guards: `state["stopped_by_user_at"]` blocks `maybe_start_gemini_batch_for_upload` from relaunching the batch; **`retry-failed-rows` clears the marker** (retry re-opens a stopped run). 409 when already terminal. Same commit: `build_summary.confidence_mode` is now `"llm"` for relationship ALWAYS (was model-presence-derived → mid-run runs mislabeled "Heuristic" and hid the Batch/token chips). Tests: `tests/test_stop_upload.py`.
+4. **`99eef3c` — real New Run preview for relationship**: new dry-run `POST /uploads/relationship/preview` (same parser as upload, zero cost) returning `{total_rows, blank_rows, unique_pairs, warnings, columns_detected, sample_columns, sample_rows(first 5 pairs incl. csv_rows per pair)}`; `parse_relationship_csv` return dict gained `columns_detected`. `new_run.js` routes relationship to it (was a bare client-side row count), `previewTables` renders the pairs/blanks line + honors `preview.sample_columns` (fallback `SAMPLE_COLS` — other pipelines unchanged); the `countCsvRows` helper was removed. Header mistakes now 400 at preview time.
+
+**⚠️ NOT live-verified (offline tests only — restart server+worker to load, then check):** the Stop flow against a real in-flight run (incl. a mid-batch stop) and the preview endpoint in a browser. Untracked at repo root: `smallrel100.csv` (user's next test file).
+
+---
+
+## ⭐ 2026-07-08 — NEW `relationship` pipeline (built on branch `relationshipMode`, 11 commits `03f28ba..4491a44` over base `79b5ec5`; since MERGED into `revampCode` via PRs #5/#6)
 
 **Status: DONE.** Built via subagent-driven development (per-task spec+quality reviews all approved), final whole-branch review (opus) found 2 Important cross-task bugs, fixed in `4491a44`, re-review verdict: **ready to merge**. Suite **350/350** (`cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`). Both LLM modes live-verified e2e. Nothing left to build; next agent should NOT re-open this unless the user asks.
 
-**What it is.** A 6th SerpWow pipeline: upload an OCR-results CSV (`Company_Name_Y` required; `Company_Name_X`, `Input_URL`, `city`/`country` optional; all other columns passed through), and per unique (X, Y) pair it verifies a **financial relationship** between X (the investment firm whose portfolio page was scraped) and Y (noisy OCR of a portfolio-company logo) — and **only when the relationship is confirmed** emits Y's official website with confidence 0–100, flags, and full evidence context. Spec/plan (gitignored): `docs/superpowers/{specs,plans}/2026-07-07-relationship-mode*`.
+**What it is.** A 6th SerpWow pipeline: upload an OCR-results CSV (`Company_Name_Y` required; `Company_Name_X` required since `1cade1d` — see the 2026-07-09 section; `Input_URL`, `city`/`country` optional; all other columns passed through), and per unique (X, Y) pair it verifies a **financial relationship** between X (the investment firm whose portfolio page was scraped) and Y (noisy OCR of a portfolio-company logo) — and **only when the relationship is confirmed** emits Y's official website with confidence 0–100, flags, and full evidence context. Spec/plan (gitignored): `docs/superpowers/{specs,plans}/2026-07-07-relationship-mode*`.
 
 **How it works.**
 - Upload (`POST /uploads/relationship`, requires `company_id`; 400 on missing `GEMINI_API_KEY`/`SERPWOW_API_KEY`, missing Y column, or all-blank CSV): blank-Y rows are skipped free (→ `skipped.csv`), searchable rows dedupe to unique (X,Y) pairs (`relationship_csv.py`), one RabbitMQ job per pair. State rows carry `x_name`/`input_url`/`city`/`source_row_indices`; `state["relationship"]` holds the original rows/header for output fan-out.

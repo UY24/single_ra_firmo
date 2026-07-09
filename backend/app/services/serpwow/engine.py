@@ -1366,10 +1366,16 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
             parsed["domain_name_mismatch"] = True
         row["status"] = "completed"
         row["error"] = None
+        row["outcome"] = _outcomes.OUTCOME_FOUND
+        row["error_source"] = None
+        row["error_category"] = None
         return "completed"
-    row["status"] = "failed"
-    row["error"] = "Official website not found after Gemini batch post-processing."
-    return "failed"
+    row["status"] = "completed"
+    row["error"] = _outcomes.BATCH_NOT_FOUND
+    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
+    row["error_source"] = None
+    row["error_category"] = None
+    return "completed"
 
 
 def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
@@ -1420,11 +1426,17 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     if gated_url:
         row["status"] = "completed"
         row["error"] = None
+        row["outcome"] = _outcomes.OUTCOME_FOUND
+        row["error_source"] = None
+        row["error_category"] = None
         return "completed"
-    row["status"] = "failed"
+    row["status"] = "completed"
     row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
                     else REL_ERROR_CONFIRMED_URL_INVALID)
-    return "failed"
+    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
+    row["error_source"] = None
+    row["error_category"] = None
+    return "completed"
 
 
 async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
@@ -1520,7 +1532,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                                      "chunks": existing_chunks, "error": None}
             await persist_upload_state(upload_id, state)
 
-        items, _ = _build_batch_items_for_state(state)
+        items, row_index_by_key = _build_batch_items_for_state(state)
         if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
@@ -1534,6 +1546,13 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         chunk_size = max(1, _get_int_env("GSEARCH_GEMINI_CHUNK_SIZE", 5000))
         max_inflight = max(1, _get_int_env("GSEARCH_GEMINI_MAX_INFLIGHT", 5))
         chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+        # Row -> owning chunk id, so a chunk failure can be traced back to its rows below.
+        chunk_id_by_ridx: dict[int, int] = {}
+        for _cid, _chunk_items in enumerate(chunks):
+            for _key, _ in _chunk_items:
+                _ridx = row_index_by_key.get(_key)
+                if _ridx is not None:
+                    chunk_id_by_ridx[_ridx] = _cid
         prior = {int(c.get("chunk_id")): str(c.get("job_name") or "")
                  for c in (existing_chunks or []) if isinstance(c, dict) and c.get("chunk_id") is not None}
         _log_gemini_batch(upload_id, f"chunking total_rows={len(items)} chunk_size={chunk_size} "
@@ -1572,15 +1591,32 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 total_prompt += int(usage.get("promptTokenCount", 0) or 0)
                 total_cand += int(usage.get("candidatesTokenCount", 0) or 0)
                 _apply_batch_parsed_to_row(row, parsed, usage, batch_model)
-            # Rows in a failed chunk never got a parsed result -> finalize them not-found.
+            # Rows whose chunk never produced a parsed decision for them (the chunk
+            # failed outright, or the row's key was simply missing from an otherwise
+            # successful chunk's response) never reached _apply_batch_parsed_to_row
+            # above -> that's a genuine Gemini batch error, not a business not-found.
+            # Rows that DID get a parsed dict were already fully decided (found or
+            # not_found, both now status="completed") by the loop above and must not
+            # be re-touched here, even though not_found rows also have no website.
+            results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
-                if isinstance(row, dict) and row.get("status") == "completed" \
-                        and not str((row.get("result") or {}).get("official_website") or "").strip():
-                    row["status"] = "failed"
-                    current_error = row.get("error")
-                    if not current_error or current_error == _pending_sentinel:
-                        row["error"] = "Official website not found after Gemini batch post-processing."
+                if not isinstance(row, dict) or row.get("status") != "completed":
+                    continue
+                if str((row.get("result") or {}).get("official_website") or "").strip():
+                    continue
+                ridx = int(row.get("row_index", 0) or 0)
+                if isinstance(parsed_all.get(ridx), dict):
+                    continue  # already decided (found/not_found) above
+                chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}
+                chunk_error = str(chunk_result.get("error") or "gemini batch chunk failed")
+                row["status"] = "failed"
+                row["outcome"] = _outcomes.OUTCOME_ERROR
+                row["error_source"] = _outcomes.SRC_GEMINI
+                row["error_category"] = _outcomes.categorize_http_error(None, chunk_error)
+                current_error = row.get("error")
+                if not current_error or current_error == _pending_sentinel:
+                    row["error"] = f"Gemini batch chunk failed: {chunk_error}"
             n_ok = sum(1 for r in results if r["status"] == "succeeded")
             n_fail = sum(1 for r in results if r["status"] != "succeeded")
             agg = "succeeded" if n_fail == 0 else ("failed" if n_ok == 0 else "completed_with_errors")
@@ -3074,6 +3110,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
                         except Exception as exc:
                             row["status"] = "failed"
                             row["error"] = f"Queue recovery publish failed: {exc}"
+                            row["outcome"] = _outcomes.OUTCOME_ERROR
+                            row["error_source"] = _outcomes.SRC_SERVER
+                            row["error_category"] = _outcomes.CAT_TIMEOUT
                             failed += 1
                     else:
                         row["status"] = "failed"
@@ -3083,6 +3122,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
                             f"Row terminalized by reconciler after {attempts} requeue(s) "
                             f"(stale > {int(stale_sec)}s)."
                         )
+                        row["outcome"] = _outcomes.OUTCOME_ERROR
+                        row["error_source"] = _outcomes.SRC_SERVER
+                        row["error_category"] = _outcomes.CAT_TIMEOUT
                         failed += 1
                 await persist_upload_state(upload_id, latest)
                 _log_row_stage(

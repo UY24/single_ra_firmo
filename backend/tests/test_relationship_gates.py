@@ -215,13 +215,21 @@ class TestRelationshipOriginalRowLevelCounts(unittest.TestCase):
         self.assertEqual(svc.kwargs["websites_not_found"], 2)  # 1 not-confirmed + 1 error row
 
     def test_notify_slack_terminal_uses_original_row_counts(self):
+        # Task 9: relationship is a REPORTING_PIPELINES member, so the Slack ping
+        # now carries the found/not_found/errored trio instead of success/failed.
+        # found/not_found still use ORIGINAL-ROW-level counts (websites_found/
+        # websites_not_found), matching the CSVs the user downloads; errored is
+        # pair-level (diagnostic only) off outcome_breakdown.
         state = _relationship_state_one_pair_two_sources()
         with patch("app.core.notify.notify_run_complete") as notify_complete:
             engine._notify_slack_terminal(state)
         notify_complete.assert_called_once()
         kwargs = notify_complete.call_args.kwargs
-        self.assertEqual(kwargs["success"], 2)
-        self.assertEqual(kwargs["failed"], 0)
+        self.assertEqual(kwargs["found"], 2)
+        self.assertEqual(kwargs["not_found"], 0)
+        self.assertEqual(kwargs["errored"], 0)
+        self.assertNotIn("success", kwargs)
+        self.assertNotIn("failed", kwargs)
         self.assertEqual(kwargs["total_rows"], 2)
 
 

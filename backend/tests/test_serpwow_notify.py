@@ -10,9 +10,24 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
     """_notify_slack_terminal maps upload state -> the right notify call."""
 
     def test_completed_with_errors_routes_to_complete(self):
+        # gmaps is a REPORTING_PIPELINES member, so the ping now carries the
+        # found/not_found/errored trio (off outcome_breakdown) instead of the
+        # old binary success/failed — and success/failed are no longer passed
+        # at all for in-scope pipelines.
         state = {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gmaps",
-                 "status": "completed_with_errors", "total_rows": 100,
-                 "success_rows": 90, "failed_rows": 10}
+                 "status": "completed_with_errors", "total_rows": 3,
+                 "rows": [
+                     {"company_name": "A", "country": "us", "status": "completed",
+                      "error": None, "outcome": "found",
+                      "result": {"official_website": "https://a.com", "context": {}}},
+                     {"company_name": "B", "country": "us", "status": "completed",
+                      "error": "no site", "outcome": "not_found",
+                      "result": {"official_website": None, "context": {}}},
+                     {"company_name": "C", "country": "us", "status": "failed",
+                      "error": "SerpWow request timed out", "outcome": "error",
+                      "error_source": "serpwow", "error_category": "timeout",
+                      "result": {"official_website": None, "context": {}}},
+                 ]}
         with mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed") as failed:
             la._notify_slack_terminal(state)
@@ -22,9 +37,13 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["company"], "Acme Inc")
         self.assertEqual(kw["run_ref"], "UP1")
         self.assertEqual(kw["status"], "completed_with_errors")
-        self.assertEqual(kw["success"], 90)
-        self.assertEqual(kw["failed"], 10)
-        self.assertEqual(kw["total_rows"], 100)
+        self.assertEqual(kw["found"], 1)
+        self.assertEqual(kw["not_found"], 1)
+        self.assertEqual(kw["errored"], 1)
+        self.assertEqual(kw["error_sources"], {"serpwow": 1})
+        self.assertNotIn("success", kw)
+        self.assertNotIn("failed", kw)
+        self.assertEqual(kw["total_rows"], 3)
 
     def test_failed_routes_to_failed(self):
         state = {"upload_id": "UP2", "company_name": "Acme Inc", "pipeline": "full",
@@ -44,7 +63,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
             "status": "completed", "total_rows": 1, "success_rows": 1, "failed_rows": 0,
             "processing_seconds_total": 12.0,
             "rows": [{"row_index": 0, "company_name": "ISI", "country": "us",
-                      "status": "completed", "error": None, "result": {
+                      "status": "completed", "error": None, "outcome": "found", "result": {
                           "official_website": "https://isi.com", "gemini_cost_usd": 0.0002,
                           "context": {"cost_breakdown": {"serpwow_request_count": 3},
                                       "final_url_selection_ai": {"usage": {
@@ -64,6 +83,12 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["output_tokens"], 8)
         # total_usd now includes both LLM (0.0002) + SerpWow (3 * 0.00035 = 0.00105)
         self.assertAlmostEqual(kw["cost_usd"], 0.00125, places=6)
+        # gsearch is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
+        self.assertEqual(kw["found"], 1)
+        self.assertEqual(kw["not_found"], 0)
+        self.assertEqual(kw["errored"], 0)
+        self.assertNotIn("success", kw)
+        self.assertNotIn("failed", kw)
 
     def test_non_gsearch_omits_search_token_cost(self):
         # `full` has no serpwow_reporting-style cost/token tracking -> omitted.
@@ -76,6 +101,11 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertNotIn("searches", kw)
         self.assertNotIn("tokens", kw)
         self.assertNotIn("cost_usd", kw)
+        # `full` is not a REPORTING_PIPELINES member -> keeps the old success/failed pair.
+        self.assertEqual(kw["success"], 2)
+        self.assertEqual(kw["failed"], 0)
+        self.assertNotIn("found", kw)
+        self.assertNotIn("errored", kw)
 
     def test_gmaps_includes_searches_tokens_cost(self):
         # gmaps now has real serpwow_searches/tokens/cost (LLM batch/per-row
@@ -85,7 +115,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
             "status": "completed", "total_rows": 1, "success_rows": 1, "failed_rows": 0,
             "processing_seconds_total": 5.0,
             "rows": [{"row_index": 0, "company_name": "Acme", "country": "us",
-                      "status": "completed", "error": None, "result": {
+                      "status": "completed", "error": None, "outcome": "found", "result": {
                           "official_website": "https://acme.com", "gemini_cost_usd": 0.0001,
                           "context": {"cost_breakdown": {"serpwow_request_count": 2},
                                       "gemini_batch_ai": {"usage": {
@@ -105,6 +135,12 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["output_tokens"], 6)
         # total_usd = LLM (0.0001) + SerpWow (2 * 0.00035 = 0.0007)
         self.assertAlmostEqual(kw["cost_usd"], 0.0008, places=6)
+        # gmaps is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
+        self.assertEqual(kw["found"], 1)
+        self.assertEqual(kw["not_found"], 0)
+        self.assertEqual(kw["errored"], 0)
+        self.assertNotIn("success", kw)
+        self.assertNotIn("failed", kw)
 
     def test_never_raises(self):
         with mock.patch("app.core.notify.notify_run_complete",

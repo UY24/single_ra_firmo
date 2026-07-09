@@ -2217,13 +2217,30 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             # the same serpwow_reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            success = state.get("success_rows")
-            failed = state.get("failed_rows")
-            if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
+            is_reporting = str(state.get("pipeline") or "") in REPORTING_PIPELINES
+            if is_reporting:
                 try:
                     gs = serpwow_reporting.build_summary(
                         state, serpwow_reporting.state_to_entity_results(state))
                     tu = gs.get("token_usage") or {}
+                    ob = gs.get("outcome_breakdown") or {}
+                    eb = gs.get("error_breakdown") or {}
+                    # 3-way outcome trio replaces the old success/failed pair for
+                    # in-scope pipelines: found/not_found/errored instead of a
+                    # binary success/failed that couldn't distinguish "no website
+                    # found" from "the row errored out".
+                    found = ob.get("found")
+                    not_found = ob.get("not_found")
+                    errored = ob.get("errored")
+                    if isinstance(relationship_meta, dict):
+                        # relationship's outcome_breakdown is PAIR-level (see the
+                        # total_rows override above); the found/not_found headline
+                        # should match the CSVs the user downloads (ORIGINAL-ROW
+                        # level), so keep using websites_found/websites_not_found
+                        # for those two. errored stays pair-level — it's a
+                        # diagnostic count, not something fanned out to rows.
+                        found = gs["websites_found"]
+                        not_found = gs["websites_not_found"]
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
                         "search_label": "SerpWow searches",
@@ -2231,16 +2248,20 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
+                        "found": found,
+                        "not_found": not_found,
+                        "errored": errored,
+                        "error_sources": eb.get("by_source") or {},
                     }
-                    if isinstance(relationship_meta, dict):
-                        success = gs["websites_found"]
-                        failed = gs["websites_not_found"]
                 except Exception:
                     extra = {}
+                    is_reporting = False
             notify.notify_run_complete(
                 status=status,
-                success=success,
-                failed=failed,
+                **({} if is_reporting else {
+                    "success": state.get("success_rows"),
+                    "failed": state.get("failed_rows"),
+                }),
                 **common,
                 **extra,
             )

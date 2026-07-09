@@ -117,6 +117,7 @@ from app.services.serpwow.serpwow_client import (
     _is_listing_or_profile_result,
     _extract_official_website_candidates_from_serpwow,
 )
+from app.services.serpwow import outcomes as _outcomes
 from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.gemini_llm import (
     _parse_json_from_text,
@@ -2249,6 +2250,10 @@ async def update_row_state(
     result: Optional[dict[str, Any]] = None,
     s3_html_key: Optional[str] = None,
     s3_serpwow_json_key: Optional[str] = None,
+    outcome: Optional[str] = None,
+    error_source: Optional[str] = None,
+    error_category: Optional[str] = None,
+    degraded_search: Optional[bool] = None,
 ) -> None:
     async with get_upload_lock(upload_id):
         try:
@@ -2282,6 +2287,14 @@ async def update_row_state(
             row["s3_html_key"] = s3_html_key
         if s3_serpwow_json_key is not None:
             row["s3_serpwow_json_key"] = s3_serpwow_json_key
+        if outcome is not None:
+            row["outcome"] = outcome
+        if error_source is not None:
+            row["error_source"] = error_source
+        if error_category is not None:
+            row["error_category"] = error_category
+        if degraded_search is not None:
+            row["degraded_search"] = degraded_search
         await persist_upload_state(upload_id, state)
 
 
@@ -2587,6 +2600,20 @@ async def publish_job(job: dict[str, Any]) -> None:
     )
 
 
+def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
+    """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
+    legacy binary: found->completed, everything-else->failed (no not_found remap)."""
+    ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
+    info = _outcomes.classify_finalized_row(
+        result, pipeline=pipeline,
+        ctx_row_error=(str(ctx.get("row_error")).strip() or None) if ctx.get("row_error") else None,
+        skip_llm=bool(ctx.get("skip_llm")))
+    if pipeline in REPORTING_PIPELINES:
+        return info, info.row_status
+    # Out of scope: legacy behavior — only 'found' is completed.
+    return info, ("completed" if info.outcome == _outcomes.OUTCOME_FOUND else "failed")
+
+
 async def process_upload_job(job: dict[str, Any]) -> None:
     upload_id = str(job["upload_id"])
     row_index = int(job["row_index"])
@@ -2714,20 +2741,20 @@ async def process_upload_job(job: dict[str, Any]) -> None:
 
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
-        batch_postprocess_enabled = _batch_postprocess_enabled_for(str(job.get("pipeline") or PIPELINE_FULL))
+        batch_postprocess_enabled = _batch_postprocess_enabled_for(pipeline)
         _row_ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
         _llm_skipped = bool(_row_ctx.get("skip_llm"))
-        _ctx_row_error = str(_row_ctx.get("row_error") or "").strip() or None
-        if is_successful:
-            row_status = "completed"
-            row_error = None
-        elif batch_postprocess_enabled and not _llm_skipped:
-            # Keep rows non-failed while batch post-processing is still expected to decide.
+        info, row_status = _finalize_row_outcome(
+            result, pipeline=pipeline, batch_postprocess_enabled=batch_postprocess_enabled)
+        if (not is_successful) and batch_postprocess_enabled and not _llm_skipped:
+            # Batch will decide later — keep the row non-terminal-error meanwhile.
             row_status = "completed"
             row_error = "Pending Gemini batch post-processing decision."
+            info = _outcomes.OutcomeInfo(_outcomes.OUTCOME_NOT_FOUND)  # provisional
         else:
-            row_status = "failed"
-            row_error = _ctx_row_error or "Official website not found; target blocked/unreachable or no valid result."
+            row_error = info.error_detail if info.outcome == _outcomes.OUTCOME_ERROR else (
+                None if info.outcome == _outcomes.OUTCOME_FOUND
+                else (_row_ctx.get("row_error") or _outcomes.GENERIC_NOT_FOUND))
 
         await update_row_state(
             upload_id,
@@ -2737,6 +2764,10 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             result=result,
             s3_html_key=s3_serpwow_json_key,
             s3_serpwow_json_key=s3_serpwow_json_key,
+            outcome=info.outcome,
+            error_source=info.error_source,
+            error_category=info.error_category,
+            degraded_search=info.degraded_search,
         )
         elapsed_sec = asyncio.get_event_loop().time() - started_monotonic
         _log_row_stage(
@@ -2753,8 +2784,13 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             level="INFO" if is_successful else "WARN",
         )
     except Exception as exc:
+        info = _outcomes.classify_exception(exc, default_source=_outcomes.SRC_SERVER)
         try:
-            await update_row_state(upload_id, row_index, status="failed", error=str(exc))
+            await update_row_state(
+                upload_id, row_index, status="failed", error=info.error_detail,
+                outcome=info.outcome, error_source=info.error_source,
+                error_category=info.error_category,
+            )
         except Exception:
             # Preserve original exception for nack/requeue decision below.
             pass

@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.services.serpwow import engine
+from app.services.serpwow import outcomes as o
 from app.services.serpwow.constants import REL_ERROR_NOT_CONFIRMED
 
 
@@ -70,27 +71,36 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertEqual(ctx["gemini_batch_ai"]["raw"], parsed)
         self.assertIsNone(row["error"])
 
-    def test_not_confirmed_fails_row_with_relationship_error(self):
+    def test_not_confirmed_completes_row_as_not_found_with_relationship_error(self):
+        # "Not confirmed" is a valid business outcome (no relationship evidence),
+        # not a technical error -> status="completed", outcome="not_found" (Task 4).
         row = _rel_row()
         parsed = {"relationship_status": "not_confirmed",
                   "relationship_summary": "No relation found.",
                   "official_website": "https://modal.com/",
                   "confidence_score": 30, "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
-        self.assertEqual(status, "failed")
+        self.assertEqual(status, "completed")
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["outcome"], o.OUTCOME_NOT_FOUND)
+        self.assertIsNone(row["error_source"])
+        self.assertIsNone(row["error_category"])
         self.assertIsNone(row["result"]["official_website"])
         self.assertEqual(row["error"], REL_ERROR_NOT_CONFIRMED)
         flags = row["result"]["context"]["relationship"]["flags"]
         self.assertTrue(any(f["flag"] == "url_found_no_relationship" for f in flags))
 
     def test_x_domain_pick_is_rejected(self):
+        # Confirmed-but-invalid (X's own domain) is also a valid not_found, not an error.
         row = _rel_row(candidates=("https://www.eastlinkcap.com/team",))
         parsed = {"relationship_status": "confirmed",
                   "official_website": "https://www.eastlinkcap.com/team",
                   "relationship_summary": "s", "confidence_score": 80,
                   "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
-        self.assertEqual(status, "failed")
+        self.assertEqual(status, "completed")
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["outcome"], o.OUTCOME_NOT_FOUND)
         self.assertIsNone(row["result"]["official_website"])
 
 

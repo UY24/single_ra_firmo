@@ -28,6 +28,7 @@ from app.services.serpwow.cost import (
 from app.services.serpwow.gemini_llm import (
     choose_final_website_with_gemini,
 )
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.query_builders import (
     _company_name_variants,
     _extract_phase5_pivots_from_serpwow,
@@ -135,6 +136,8 @@ async def execute_gsearch_lookup_for_worker(
                 "search_url": None,
                 "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {str(raw_result)}",
+                "error_category": categorize_http_error(
+                    None, f"{type(raw_result).__name__}: {raw_result}"),
             }
 
         serpwow_cost += 0.02
@@ -149,6 +152,8 @@ async def execute_gsearch_lookup_for_worker(
             "query": query,
             "success": bool(raw_result.get("used")),
             "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_result.get("raw_response"),
         })
@@ -175,6 +180,7 @@ async def execute_gsearch_lookup_for_worker(
         "usage": {}, "raw": None,
     }
     gemini_cost = 0.0
+    llm_error_for_row: Optional[str] = None
     batch_mode = _get_bool_env("GSEARCH_LLM_BATCH", False)
     enable_final = _get_bool_env("ENABLE_FINAL_URL_GEMINI", True)
     if not batch_mode and enable_final and candidates:
@@ -183,6 +189,11 @@ async def execute_gsearch_lookup_for_worker(
             company_name, country, input_industry, input_full_address,
             candidates, search_attempts, first_raw, {},
         )
+        # A genuine Gemini failure (no parsed output + an error) -> flag the row as an
+        # error/gemini outcome. A benign "picked nothing" (final_output not None) or an
+        # uninvoked LLM must NOT set this.
+        if final_output is None and final_error:
+            llm_error_for_row = final_error
         final_url_selection_ai = {
             "provider": "google-gemini", "model": final_model,
             "used": final_output is not None, "error": final_error,
@@ -236,6 +247,7 @@ async def execute_gsearch_lookup_for_worker(
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,
+            **({"llm_error": llm_error_for_row} if llm_error_for_row else {}),
             "cost_breakdown": {
                 "massive_proxy_cost_usd": 0.0,
                 "serpwow_cost_usd": serpwow_cost,

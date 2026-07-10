@@ -117,6 +117,7 @@ def _post(text: str, blocks: list[dict] | None = None) -> bool:
 
 def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, status: str,
                         found: int | None = None, not_found: int | None = None,
+                        errored: int | None = None, error_sources: dict | None = None,
                         success: int | None = None, failed: int | None = None,
                         total_rows: int | None = None, searches: int | None = None,
                         search_label: str = "Searches",
@@ -141,7 +142,10 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         flavor = "🎉 Smooth sailing — all wrapped up!"
 
     fields: list[dict] = []
-    if found is not None or not_found is not None:
+    if errored is not None:
+        fields.append(_field("🎯 Outcome",
+            f"*{found or 0:,}* found\n*{not_found or 0:,}* not found\n*{errored:,}* errored"))
+    elif found is not None or not_found is not None:
         fields.append(_field("🎯 Outcome", f"*{found or 0:,}* found\n*{not_found or 0:,}* not found"))
     else:
         fields.append(_field("🎯 Outcome", f"*{success or 0:,}* succeeded\n*{failed or 0:,}* failed"))
@@ -162,6 +166,9 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         fields.append(_field("⏱️ Duration", dur))
     if isinstance(llm_errors, int) and llm_errors > 0:
         fields.append(_field("🚑 LLM errors", f"{llm_errors:,}"))
+    if error_sources:
+        top = ", ".join(f"{v} {k}" for k, v in sorted(error_sources.items(), key=lambda kv: -kv[1]))
+        fields.append(_field("⚠️ Errors", top))
 
     blocks = [
         _header(headline),
@@ -170,7 +177,9 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         _fields_block(fields),
         _context(f"🆔 Run ref: `{run_ref}`"),
     ]
-    if found is not None or not_found is not None:
+    if errored is not None:
+        summary = f"{found or 0:,} found / {not_found or 0:,} not found / {errored:,} errored"
+    elif found is not None or not_found is not None:
         summary = f"{found or 0:,} found / {not_found or 0:,} not found"
     else:
         summary = f"{success or 0:,} succeeded / {failed or 0:,} failed"

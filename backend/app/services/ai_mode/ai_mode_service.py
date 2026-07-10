@@ -47,6 +47,11 @@ from app.services.ai_mode.models import TokenUsage, utc_now_iso
 from app.services.ai_mode.run_reporting import write_outputs
 from app.services.ai_mode.scrapedo_client import ScrapeDoClient
 from app.services.ai_mode.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
+from app.services.serpwow.outcomes import (
+    SRC_GEMINI,
+    SRC_SCRAPEDO,
+    categorize_http_error,
+)
 
 ALLOWED_RESULT_FILES = {
     "final_report.json",
@@ -306,6 +311,53 @@ def _scrapedo_failed_request_count(records: list[dict]) -> int:
     return sum(1 for record in records if isinstance(record, dict) and _scrapedo_request_failed(record))
 
 
+def classify_ai_mode_outcomes(results: list[EntityResult]) -> tuple[dict, dict]:
+    """Bucket finalized entities into found / not_found / error (SerpWow parity).
+
+    Per-entity rule (evaluated in this order, so every entity lands in exactly
+    one bucket -> ``found + not_found + errored == len(results)``):
+      * ``website_url`` present            -> ``found``
+      * genuine error (see below)          -> ``errored`` (attributed to a source)
+      * otherwise (looked, found nothing)  -> ``not_found``
+
+    An entity is a genuine error when it carries ``error_source`` (tagged in
+    Phase 3: scrape.do batch failure -> ``scrapedo``; whole-batch LLM failure ->
+    ``gemini``) OR it carries a plain ``error`` with no source. The latter is the
+    "missing from LLM response" case (the entity was submitted and scraped OK but
+    the LLM omitted a verdict for it): a genuine ``gemini`` failure that today only
+    inflates ``websites_not_found``. It is tagged in place here so it is counted as
+    an error and never mislabeled ``not_found``. ``not_found`` therefore only ever
+    holds entities with neither a URL nor any error.
+
+    Returns ``(outcome_breakdown, error_breakdown)`` where
+    ``outcome_breakdown = {found, not_found, errored}`` and
+    ``error_breakdown = {"by_source": {...}, "by_category": {...}}``.
+    Mutates errored EntityResults' ``error_source``/``error_category`` so
+    ``final_report.json`` carries them.
+    """
+    found = not_found = errored = 0
+    by_source: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    for r in results:
+        if r.website_url:
+            found += 1
+            continue
+        if not (r.error_source or r.error):
+            not_found += 1
+            continue
+        # Genuine error. Attribute an untagged per-entity failure to Gemini.
+        if not r.error_source:
+            r.error_source = SRC_GEMINI
+            r.error_category = r.error_category or categorize_http_error(None, r.error or "")
+        errored += 1
+        by_source[r.error_source] = by_source.get(r.error_source, 0) + 1
+        if r.error_category:
+            by_category[r.error_category] = by_category.get(r.error_category, 0) + 1
+    outcome_breakdown = {"found": found, "not_found": not_found, "errored": errored}
+    error_breakdown = {"by_source": by_source, "by_category": by_category}
+    return outcome_breakdown, error_breakdown
+
+
 def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
     """Reflect request-level failures from a LEGACY report.json in the UI status.
 
@@ -399,12 +451,17 @@ def _build_run_update(summary: dict, file_links: dict[str, str]) -> dict:
     """Map an AI-mode terminal summary onto the Supabase ``runs`` row fields."""
     websites_found = summary.get("websites_found") or 0
     websites_not_found = summary.get("websites_not_found") or 0
-    llm_errors = summary.get("llm_errors") or 0
     failed_request_count = summary.get("failed_request_count") or 0
+    # 3-way taxonomy: success = found, failed = genuine errors (NOT not_found).
+    # Falls back to the found/errored derivation for legacy summaries missing the
+    # breakdown (found -> websites_found; errored -> failed_request_count).
+    outcome = summary.get("outcome_breakdown") or {}
+    found = outcome.get("found", websites_found)
+    errored = outcome.get("errored", failed_request_count)
     return {
         "status": summary.get("status"),
-        "success_count": websites_found,
-        "failed_count": websites_not_found + llm_errors,
+        "success_count": found,
+        "failed_count": errored,
         "websites_found": websites_found,
         "websites_not_found": websites_not_found,
         "token_usage": summary.get("token_usage"),
@@ -800,7 +857,10 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         llm_error_by_index: dict[int, str | None] = {}
         llm_seconds_by_index: dict[int, float] = {}
 
-        def _error_results(rec: dict, message: str) -> list[EntityResult]:
+        def _error_results(
+            rec: dict, message: str,
+            *, source: str | None = None, category: str | None = None,
+        ) -> list[EntityResult]:
             return [
                 EntityResult(
                     company_name=entity.company_name,
@@ -808,6 +868,8 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     sno=entity.sno,
                     company_local_name=entity.company_local_name,
                     error=message,
+                    error_source=source,
+                    error_category=category,
                 )
                 for entity in rec["group"]
             ]
@@ -963,14 +1025,18 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                         else f"LLM error: {c.get('error')}"
                     )
                     llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    batch_results_by_index[idx] = _error_results(
+                        rec, msg, source=SRC_GEMINI,
+                        category=categorize_http_error(None, msg))
                     llm_errors += len(rec["group"])
                     continue
                 parsed_array = parse_json_array_from_text(c["text"])
                 if parsed_array is None:
                     msg = sanitize_secret_text("LLM error: could not parse JSON array from batch output")
                     llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    batch_results_by_index[idx] = _error_results(
+                        rec, msg, source=SRC_GEMINI,
+                        category=categorize_http_error(None, msg))
                     llm_errors += len(rec["group"])
                     continue
                 usage_total = usage_total + parse_gemini_usage(c.get("usage"))
@@ -999,7 +1065,9 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     if parsed_array is None:
                         msg = "LLM error: response was not a JSON array"
                         llm_error_by_index[idx] = msg
-                        batch_results_by_index[idx] = _error_results(rec, msg)
+                        batch_results_by_index[idx] = _error_results(
+                            rec, msg, source=SRC_GEMINI,
+                            category=categorize_http_error(None, msg))
                         llm_errors += len(rec["group"])
                     else:
                         batch_results_by_index[idx] = parse_cleanup_response(
@@ -1010,7 +1078,9 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     secs = time.perf_counter() - t0
                     msg = sanitize_secret_text(f"LLM error: {exc}")
                     llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(rec, msg)
+                    batch_results_by_index[idx] = _error_results(
+                        rec, msg, source=SRC_GEMINI,
+                        category=categorize_http_error(None, msg))
                     llm_errors += len(rec["group"])
                 llm_seconds_by_index[idx] = secs
                 llm_seconds_total += secs
@@ -1024,7 +1094,11 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         for rec in ordered:
             idx = rec["request_index"]
             if rec["payload"] is None:
-                results.extend(_error_results(rec, f"scrape.do error: {rec['error']}"))
+                results.extend(_error_results(
+                    rec, f"scrape.do error: {rec['error']}",
+                    source=SRC_SCRAPEDO,
+                    category=categorize_http_error(None, rec["error"] or ""),
+                ))
                 _ai_log(
                     run_id,
                     run_dir,
@@ -1089,7 +1163,15 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         failed_request_count = _failed_request_count(per_request_records)
         websites_found = sum(1 for r in results if r.website_url)
         websites_not_found = len(results) - websites_found
-        run_status = "completed_with_errors" if failed_request_count else "completed"
+        # 3-way outcome taxonomy (SerpWow parity): found / not_found / error.
+        # Tags error_source/error_category on errored EntityResults in place, so
+        # final_report.json carries them (Task 6 wired to_report_dict).
+        outcome_breakdown, error_breakdown = classify_ai_mode_outcomes(results)
+        errored = outcome_breakdown["errored"]
+        # completed_with_errors iff there are genuine errors (a run with only
+        # not_found rows is a clean `completed`). `errored` is a superset of
+        # `failed_request_count` (it also counts per-entity LLM omissions).
+        run_status = "completed_with_errors" if errored else "completed"
 
         # Per-run cost (Task 15): LLM tokens priced via env rates + scrape.do
         # per-request credits from response headers (env-rate estimate fallback).
@@ -1120,6 +1202,8 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             "llm_errors": llm_errors,
             "websites_found": websites_found,
             "websites_not_found": websites_not_found,
+            "outcome_breakdown": outcome_breakdown,
+            "error_breakdown": error_breakdown,
             "scrapedo_request_count": len(per_request_records),
             "failed_request_count": failed_request_count,
             "scrapedo_failed_requests": _scrapedo_failed_request_count(per_request_records),
@@ -1164,6 +1248,8 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         status["scrapedo_failed_requests"] = _scrapedo_failed_request_count(per_request_records)
         status["websites_found"] = websites_found
         status["websites_not_found"] = websites_not_found
+        status["outcome_breakdown"] = outcome_breakdown
+        status["error_breakdown"] = error_breakdown
         status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
         status["llm_seconds_total"] = round(llm_seconds_total, 3)
         status["batch_duration_seconds"] = round(total_wall, 3)
@@ -1221,8 +1307,10 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 company=status.get("company_name"),
                 run_ref=run_id,
                 status=status["status"],
-                found=status.get("websites_found"),
-                not_found=status.get("websites_not_found"),
+                found=outcome_breakdown["found"],
+                not_found=outcome_breakdown["not_found"],
+                errored=outcome_breakdown["errored"],
+                error_sources=error_breakdown["by_source"] or None,
                 total_rows=status.get("total_rows"),
                 searches=_cost.get("scrapedo_searches"),
                 search_label="Scrape.do searches",

@@ -68,6 +68,11 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     for alt in (raw.get("alternatives") or [])[:5]:
         if alt:
             flags.append(Flag("alternative", str(alt)))
+    # A per-row Gemini selection failure that fell back to the raw candidate: the row
+    # is still found (degraded), but make the failure visible in the report.
+    llm_error = ctx.get("llm_error")
+    if llm_error:
+        flags.append(Flag("llm_selection_failed", str(llm_error)))
 
     attempts: list[AttemptLogEntry] = []
     for fr in ctx.get("formatted_results") or []:
@@ -88,6 +93,9 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
         flags=flags,
         attempt_log=attempts,
         error=row.get("error"),
+        error_source=row.get("error_source"),
+        error_category=row.get("error_category"),
+        degraded_search=bool(row.get("degraded_search")),
     )
 
 
@@ -157,6 +165,23 @@ def _build_cost(llm_usd: float, serpwow_searches: int) -> dict[str, Any]:
     }
 
 
+def _derive_outcome(row: dict[str, Any]) -> Any:
+    """Outcome for one row, mirroring engine.summarize_upload_state._outcome_of so the
+    report.json / Supabase / Slack breakdown reconciles with the state summary:
+    explicit ``outcome`` wins; else completed -> found if official_website else not_found;
+    else failed -> error (covers user-stop / redelivery-drop / stale rows that carry no
+    explicit outcome); else uncounted."""
+    oc = row.get("outcome")
+    if oc:
+        return oc
+    if row.get("status") == "completed":
+        result_obj = row.get("result") if isinstance(row.get("result"), dict) else {}
+        return "found" if result_obj.get("official_website") else "not_found"
+    if row.get("status") == "failed":
+        return "error"
+    return None
+
+
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
@@ -204,6 +229,28 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "cost": _build_cost(llm_usd, serpwow_searches),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
+    # Outcome/error breakdown, aggregated straight off state["rows"] by each row's
+    # outcome/error_source/error_category. For relationship this is pair-level (one
+    # entry per unique X,Y pair row), not fanned out to original CSV rows — the
+    # breakdown is a diagnostic, so pair-level is acceptable and simpler.
+    outcome_breakdown = {"found": 0, "not_found": 0, "errored": 0}
+    by_source: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    for row in state.get("rows", []):
+        oc = _derive_outcome(row or {})
+        if oc == "found":
+            outcome_breakdown["found"] += 1
+        elif oc == "not_found":
+            outcome_breakdown["not_found"] += 1
+        elif oc == "error":
+            outcome_breakdown["errored"] += 1
+            if row.get("error_source"):
+                by_source[row["error_source"]] = by_source.get(row["error_source"], 0) + 1
+            if row.get("error_category"):
+                by_category[row["error_category"]] = by_category.get(row["error_category"], 0) + 1
+    summary["outcome_breakdown"] = outcome_breakdown
+    summary["error_breakdown"] = {"by_source": by_source, "by_category": by_category}
+
     meta = state.get("relationship") if isinstance(state.get("relationship"), dict) else None
     if meta is not None:
         breakdown = {"confirmed": 0, "not_confirmed": 0, "unclear": 0}

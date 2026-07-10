@@ -454,14 +454,21 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(not_found_count, supabase_not_found,
                          f"notFound.csv rows ({not_found_count}) != supabase websites_not_found ({supabase_not_found})")
 
-        # Slack: success == success_rows, failed == failed_rows in final state.
+        # Slack (Task 9): gsearch is a REPORTING_PIPELINES member, so the ping now
+        # carries the found/not_found/errored trio off build_summary's
+        # outcome_breakdown -- not the old success/failed pair.
         slack_payload = self.slack_calls[0]
-        slack_success = slack_payload.get("success")
-        slack_failed = slack_payload.get("failed")
-        self.assertEqual(slack_success, final_state.get("success_rows"),
-                         "Slack success count must match state.success_rows")
-        self.assertEqual(slack_failed, final_state.get("failed_rows"),
-                         "Slack failed count must match state.failed_rows")
+        self.assertNotIn("success", slack_payload)
+        self.assertNotIn("failed", slack_payload)
+        slack_found = slack_payload.get("found")
+        slack_not_found = slack_payload.get("not_found")
+        slack_errored = slack_payload.get("errored")
+        self.assertEqual(slack_found, summary["outcome_breakdown"]["found"],
+                         "Slack found count must match outcome_breakdown['found']")
+        self.assertEqual(slack_not_found, summary["outcome_breakdown"]["not_found"],
+                         "Slack not_found count must match outcome_breakdown['not_found']")
+        self.assertEqual(slack_errored, summary["outcome_breakdown"]["errored"],
+                         "Slack errored count must match outcome_breakdown['errored']")
 
         # Cross-check: found_count == slack_success doesn't hold directly because
         # success_rows counts rows with status=completed (which includes "pending batch"

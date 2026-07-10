@@ -210,22 +210,29 @@ class TestWorkerDispatchAndPendingMark(unittest.TestCase):
         self.assertIn("Pending Gemini batch", final.kwargs["error"])
 
     def test_batch_mode_fails_skip_llm_rows_immediately(self):
+        # relationship is a REPORTING_PIPELINES member: a business "not found" sentinel
+        # (skip_llm short-circuits the batch-pending branch) remaps to completed/not_found,
+        # not the legacy binary "failed".
         from app.services.serpwow.constants import REL_ERROR_NO_EVIDENCE
         exe, urs = self._run_job(
             self._crawl(None, skip_llm=True, row_error=REL_ERROR_NO_EVIDENCE),
             {"RELATIONSHIP_LLM_BATCH": "true"})
         final = urs.call_args_list[-1]
-        self.assertEqual(final.kwargs["status"], "failed")
+        self.assertEqual(final.kwargs["status"], "completed")
         self.assertEqual(final.kwargs["error"], REL_ERROR_NO_EVIDENCE)
+        self.assertEqual(final.kwargs["outcome"], "not_found")
 
     def test_per_row_mode_uses_context_row_error(self):
+        # Same gated remap: not-confirmed relationship is a not_found outcome, and
+        # relationship is in scope for the remap -> row status is completed, not failed.
         from app.services.serpwow.constants import REL_ERROR_NOT_CONFIRMED
         exe, urs = self._run_job(
             self._crawl(None, row_error=REL_ERROR_NOT_CONFIRMED),
             {"RELATIONSHIP_LLM_BATCH": "false"})
         final = urs.call_args_list[-1]
-        self.assertEqual(final.kwargs["status"], "failed")
+        self.assertEqual(final.kwargs["status"], "completed")
         self.assertEqual(final.kwargs["error"], REL_ERROR_NOT_CONFIRMED)
+        self.assertEqual(final.kwargs["outcome"], "not_found")
 
 
 if __name__ == "__main__":

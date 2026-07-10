@@ -32,6 +32,7 @@ from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     choose_relationship_and_website,
 )
+from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
 from app.services.serpwow.query_builders import build_relationship_phase_queries
 from app.services.serpwow.schemas import CrawlResponse
 from app.services.serpwow.serpwow_client import run_serpwow_search
@@ -97,6 +98,8 @@ async def execute_relationship_lookup_for_worker(
                 "official_website": None, "candidates": [], "status_code": None,
                 "search_url": None, "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {raw_result}",
+                "error_category": categorize_http_error(
+                    None, f"{type(raw_result).__name__}: {raw_result}"),
             }
         serpwow_cost += 0.02
         raw_response = raw_result.get("raw_response")
@@ -123,6 +126,8 @@ async def execute_relationship_lookup_for_worker(
             "phase": label, "query": query,
             "success": bool(raw_result.get("used")),
             "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_response,
         })
@@ -175,7 +180,11 @@ async def execute_relationship_lookup_for_worker(
             deduped, ai_overview_texts, search_attempts, phase4_hit)
         if parsed is None:
             # LLM failure: the gate cannot be guessed — fail the row (retryable).
-            raise RuntimeError(f"relationship LLM error: {error}")
+            # Tag the source so the worker's classify_exception attributes it to
+            # gemini, not the default server source.
+            err = RuntimeError(f"relationship LLM error: {error}")
+            err.error_source = SRC_GEMINI
+            raise err
         gated_url, status, gate_flags = apply_relationship_gate(parsed, deduped, x_domain)
         gemini_cost = calculate_gemini_cost_usd(usage)
         official_website = gated_url

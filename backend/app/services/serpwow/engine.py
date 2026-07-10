@@ -117,6 +117,8 @@ from app.services.serpwow.serpwow_client import (
     _is_listing_or_profile_result,
     _extract_official_website_candidates_from_serpwow,
 )
+from app.services.serpwow import outcomes as _outcomes
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.gemini_llm import (
     _parse_json_from_text,
     _gemini_generate_content_json,
@@ -461,6 +463,75 @@ def _company_slug(value: str) -> str:
 def _safe_name(value: str) -> str:
     text = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip())
     return text.strip("_") or "item"
+
+
+def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
+    """Write a per-row debugging JSON for every row with a technical problem worth
+    debugging: hard errors (outcome=="error") AND degraded-found rows (a found row
+    whose per-row Gemini selection failed, carrying context.llm_error).
+
+    Pure disk, sync, best-effort by design of its caller (this function itself
+    raises on genuine I/O failure, but the caller wraps it). Returns
+    {filename: path} for the files actually written; other rows produce no file.
+    """
+    paths: dict[str, Path] = {}
+    rows = state.get("rows") or []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        is_hard_error = row.get("outcome") == _outcomes.OUTCOME_ERROR
+        ctx = (row.get("result") or {}).get("context") or {}
+        llm_error = ctx.get("llm_error")
+        # A degraded-found row: not a hard error, but a real Gemini selection failure.
+        is_degraded_found = (not is_hard_error) and bool(llm_error)
+        if not is_hard_error and not is_degraded_found:
+            continue
+        row_index = row.get("row_index")
+        company_name = str(row.get("company_name") or "")
+        formatted_results = ctx.get("formatted_results") if isinstance(ctx.get("formatted_results"), list) else []
+        phases = [
+            {
+                "phase": fr.get("phase"),
+                "used": fr.get("success"),
+                "error": fr.get("error"),
+                "status_code": fr.get("status_code"),
+                "error_category": fr.get("error_category"),
+            }
+            for fr in formatted_results
+            if isinstance(fr, dict)
+        ]
+        http_status = phases[0]["status_code"] if phases else None
+        if is_degraded_found:
+            data = {
+                "row_index": row_index,
+                "company_name": company_name,
+                "error_source": _outcomes.SRC_GEMINI,
+                "error_category": _outcomes.categorize_http_error(None, str(llm_error)),
+                "error_detail": str(llm_error),
+                "http_status": http_status,
+                # Record the row's ACTUAL outcome so a reader sees this is a
+                # degraded-found (candidate fallback), not a hard error.
+                "outcome": row.get("outcome"),
+                "phases": phases,
+            }
+        else:
+            data = {
+                "row_index": row_index,
+                "company_name": company_name,
+                "error_source": row.get("error_source"),
+                "error_category": row.get("error_category"),
+                "error_detail": row.get("error"),
+                "http_status": http_status,
+                "phases": phases,
+            }
+        errors_dir = Path(upload_dir) / "errors"
+        errors_dir.mkdir(parents=True, exist_ok=True)
+        idx = row_index if isinstance(row_index, int) else 0
+        name = f"{idx:06d}_{_safe_name(company_name)}_error.json"
+        path = errors_dir / name
+        _write_json(path, data)
+        paths[name] = path
+    return paths
 
 
 # SerpWow HTTP client + response extraction (run_serpwow_search,
@@ -1320,8 +1391,9 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
 
 def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
                                row_usage: dict[str, Any], batch_model: str) -> str:
-    """Apply one parsed Gemini result onto a row. Returns 'completed' or 'failed'.
-    Mirrors the existing single-job mapping (candidate-set guard via
+    """Apply one parsed Gemini result onto a row. Always returns 'completed' now:
+    a batch-decided no-website row is a business not_found (outcome=not_found), not
+    an error. Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
     _ctx_probe = ((row.get("result") or {}).get("context")
                   if isinstance((row.get("result") or {}).get("context"), dict) else {})
@@ -1364,16 +1436,24 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
             parsed["domain_name_mismatch"] = True
         row["status"] = "completed"
         row["error"] = None
+        row["outcome"] = _outcomes.OUTCOME_FOUND
+        row["error_source"] = None
+        row["error_category"] = None
         return "completed"
-    row["status"] = "failed"
-    row["error"] = "Official website not found after Gemini batch post-processing."
-    return "failed"
+    row["status"] = "completed"
+    row["error"] = _outcomes.BATCH_NOT_FOUND
+    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
+    row["error_source"] = None
+    row["error_category"] = None
+    return "completed"
 
 
 def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
                                             row_usage: dict[str, Any], batch_model: str) -> str:
     """Relationship variant of _apply_batch_parsed_to_row: the LLM's
-    relationship_status GATES the URL (spec §4). Returns 'completed'/'failed'."""
+    relationship_status GATES the URL (spec §4). Always returns 'completed' now:
+    a not-confirmed / confirmed-but-invalid gate is a business not_found
+    (outcome=not_found), not an error."""
     from app.services.serpwow.gemini_llm import apply_relationship_gate
 
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
@@ -1418,11 +1498,17 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     if gated_url:
         row["status"] = "completed"
         row["error"] = None
+        row["outcome"] = _outcomes.OUTCOME_FOUND
+        row["error_source"] = None
+        row["error_category"] = None
         return "completed"
-    row["status"] = "failed"
+    row["status"] = "completed"
     row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
                     else REL_ERROR_CONFIRMED_URL_INVALID)
-    return "failed"
+    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
+    row["error_source"] = None
+    row["error_category"] = None
+    return "completed"
 
 
 async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
@@ -1518,7 +1604,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                                      "chunks": existing_chunks, "error": None}
             await persist_upload_state(upload_id, state)
 
-        items, _ = _build_batch_items_for_state(state)
+        items, row_index_by_key = _build_batch_items_for_state(state)
         if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
@@ -1532,6 +1618,13 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         chunk_size = max(1, _get_int_env("GSEARCH_GEMINI_CHUNK_SIZE", 5000))
         max_inflight = max(1, _get_int_env("GSEARCH_GEMINI_MAX_INFLIGHT", 5))
         chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+        # Row -> owning chunk id, so a chunk failure can be traced back to its rows below.
+        chunk_id_by_ridx: dict[int, int] = {}
+        for _cid, _chunk_items in enumerate(chunks):
+            for _key, _ in _chunk_items:
+                _ridx = row_index_by_key.get(_key)
+                if _ridx is not None:
+                    chunk_id_by_ridx[_ridx] = _cid
         prior = {int(c.get("chunk_id")): str(c.get("job_name") or "")
                  for c in (existing_chunks or []) if isinstance(c, dict) and c.get("chunk_id") is not None}
         _log_gemini_batch(upload_id, f"chunking total_rows={len(items)} chunk_size={chunk_size} "
@@ -1570,15 +1663,40 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 total_prompt += int(usage.get("promptTokenCount", 0) or 0)
                 total_cand += int(usage.get("candidatesTokenCount", 0) or 0)
                 _apply_batch_parsed_to_row(row, parsed, usage, batch_model)
-            # Rows in a failed chunk never got a parsed result -> finalize them not-found.
+            # Rows that WERE seeded into the batch (i.e. present in chunk_id_by_ridx,
+            # which is built from the exact same items as _build_batch_items_for_state)
+            # but whose chunk never produced a parsed decision for them (the chunk
+            # failed outright, or the row's key was simply missing from an otherwise
+            # successful chunk's response) never reached _apply_batch_parsed_to_row
+            # above -> that's a genuine Gemini batch error, not a business not-found.
+            # Rows that DID get a parsed dict were already fully decided (found or
+            # not_found, both now status="completed") by the loop above and must not
+            # be re-touched here, even though not_found rows also have no website.
+            # Rows NEVER seeded into the batch (skip_llm relationship no-X/no-evidence
+            # short-circuits, already finalized not_found/completed by the worker; or
+            # non-terminal rows) are absent from chunk_id_by_ridx -> must NOT be touched,
+            # else an unrelated row going through the batch would corrupt them to error.
+            results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
-                if isinstance(row, dict) and row.get("status") == "completed" \
-                        and not str((row.get("result") or {}).get("official_website") or "").strip():
-                    row["status"] = "failed"
-                    current_error = row.get("error")
-                    if not current_error or current_error == _pending_sentinel:
-                        row["error"] = "Official website not found after Gemini batch post-processing."
+                if not isinstance(row, dict) or row.get("status") != "completed":
+                    continue
+                if str((row.get("result") or {}).get("official_website") or "").strip():
+                    continue
+                ridx = int(row.get("row_index", 0) or 0)
+                if ridx not in chunk_id_by_ridx:
+                    continue  # never a batch item (skip_llm short-circuit / non-terminal)
+                if isinstance(parsed_all.get(ridx), dict):
+                    continue  # already decided (found/not_found) above
+                chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}
+                chunk_error = str(chunk_result.get("error") or "gemini batch chunk failed")
+                row["status"] = "failed"
+                row["outcome"] = _outcomes.OUTCOME_ERROR
+                row["error_source"] = _outcomes.SRC_GEMINI
+                row["error_category"] = _outcomes.categorize_http_error(None, chunk_error)
+                current_error = row.get("error")
+                if not current_error or current_error == _pending_sentinel:
+                    row["error"] = f"Gemini batch chunk failed: {chunk_error}"
             n_ok = sum(1 for r in results if r["status"] == "succeeded")
             n_fail = sum(1 for r in results if r["status"] != "succeeded")
             agg = "succeeded" if n_fail == 0 else ("failed" if n_ok == 0 else "completed_with_errors")
@@ -1795,6 +1913,33 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     state["processed_rows"] = processed
     state["success_rows"] = success
     state["failed_rows"] = failed
+
+    def _outcome_of(r: dict[str, Any]) -> Optional[str]:
+        oc = r.get("outcome")
+        if oc:
+            return oc
+        # Derive for rows without an explicit outcome (out-of-scope pipelines,
+        # or peripheral status="failed" paths like user-stop/redelivery-drop).
+        if r.get("status") == "completed":
+            result_obj = r.get("result") if isinstance(r.get("result"), dict) else {}
+            return _outcomes.OUTCOME_FOUND if result_obj.get("official_website") else _outcomes.OUTCOME_NOT_FOUND
+        if r.get("status") == "failed":
+            return _outcomes.OUTCOME_ERROR
+        return None
+
+    outcome_counts = {"found": 0, "not_found": 0, "errored": 0}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        oc = _outcome_of(r)
+        if oc == _outcomes.OUTCOME_FOUND:
+            outcome_counts["found"] += 1
+        elif oc == _outcomes.OUTCOME_NOT_FOUND:
+            outcome_counts["not_found"] += 1
+        elif oc == _outcomes.OUTCOME_ERROR:
+            outcome_counts["errored"] += 1
+    state["outcome_counts"] = outcome_counts
+
     state.update(build_processing_timing_summary(rows))
     state["updated_at"] = _now_iso()
     return state
@@ -1826,6 +1971,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
     failed_rows: list[dict[str, Any]] = []
     error_counts: dict[str, int] = {}
     search_attempt_error_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
     no_official_website_failed = 0
     sample_failed: list[dict[str, Any]] = []
 
@@ -1842,6 +1989,13 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 
         normalized_error = _normalize_failure_error(str(row.get("error") or ""))
         error_counts[normalized_error] = int(error_counts.get(normalized_error, 0) or 0) + 1
+
+        error_source = row.get("error_source")
+        if error_source:
+            source_counts[str(error_source)] = int(source_counts.get(str(error_source), 0) or 0) + 1
+        error_category = row.get("error_category")
+        if error_category:
+            category_counts[str(error_category)] = int(category_counts.get(str(error_category), 0) or 0) + 1
 
         context_obj = result_obj.get("context") if isinstance(result_obj.get("context"), dict) else {}
         attempts = context_obj.get("search_attempts") if isinstance(context_obj.get("search_attempts"), list) else []
@@ -1865,9 +2019,9 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
                 }
             )
 
-    def _sort_counts(counts: dict[str, int], top_n: int = 20) -> list[dict[str, Any]]:
+    def _sort_counts(counts: dict[str, int], top_n: int = 20, key_name: str = "reason") -> list[dict[str, Any]]:
         items = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
-        return [{"reason": k, "count": v} for k, v in items[:top_n]]
+        return [{key_name: k, "count": v} for k, v in items[:top_n]]
 
     return {
         "upload_id": state.get("upload_id"),
@@ -1879,6 +2033,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
         "failed_missing_official_website": no_official_website_failed,
         "error_buckets": _sort_counts(error_counts),
         "search_attempt_error_buckets": _sort_counts(search_attempt_error_counts),
+        "by_source": _sort_counts(source_counts, key_name="source"),
+        "by_category": _sort_counts(category_counts, key_name="category"),
         "sample_failed_rows": sample_failed,
     }
 
@@ -1957,12 +2113,29 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
                 "cost": summ["cost"],
                 "token_usage": summ["token_usage"],
             }
+            # success/failed now follow the 3-way row outcome (found/not_found/
+            # errored) instead of the old 2-way success/failed split: a business
+            # not_found row (no website, but no error) no longer counts as failed
+            # — only a genuine per-row error does.
+            ob = summ.get("outcome_breakdown") or {}
+            success_count = ob.get("found", summ["websites_found"])
+            failed_count = ob.get("errored", 0)
             if state.get("relationship"):
-                # relationship state counters are PAIR-level, but websites_found/
-                # not_found are ORIGINAL-ROW-level (fan-out) — override so Supabase
-                # counts match the CSVs (found.csv/notFound.csv) instead of pairs.
+                # relationship state/outcome counters are PAIR-level, but the CSVs
+                # (found.csv/notFound.csv) and this Supabase row are ORIGINAL-ROW-
+                # level (fan-out) — override with the already-fanned equivalents
+                # instead of the pair-level outcome_breakdown above. success=found:
+                # summ["websites_found"] already counts fanned rows with a website
+                # (== outcome "found"). failed=errored: a genuine per-pair error
+                # (row["outcome"] == "error", a raised LLM/search exception) fanned
+                # to its original rows — NOT a not-confirmed relationship gate,
+                # which is a business not_found, not a failure.
                 success_count = summ["websites_found"]
-                failed_count = summ["websites_not_found"]
+                failed_count = sum(
+                    len(r.get("source_row_indices") or [])
+                    for r in state.get("rows", [])
+                    if isinstance(r, dict) and r.get("outcome") == _outcomes.OUTCOME_ERROR
+                )
                 extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
@@ -2065,13 +2238,30 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             # the same serpwow_reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            success = state.get("success_rows")
-            failed = state.get("failed_rows")
-            if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
+            is_reporting = str(state.get("pipeline") or "") in REPORTING_PIPELINES
+            if is_reporting:
                 try:
                     gs = serpwow_reporting.build_summary(
                         state, serpwow_reporting.state_to_entity_results(state))
                     tu = gs.get("token_usage") or {}
+                    ob = gs.get("outcome_breakdown") or {}
+                    eb = gs.get("error_breakdown") or {}
+                    # 3-way outcome trio replaces the old success/failed pair for
+                    # in-scope pipelines: found/not_found/errored instead of a
+                    # binary success/failed that couldn't distinguish "no website
+                    # found" from "the row errored out".
+                    found = ob.get("found")
+                    not_found = ob.get("not_found")
+                    errored = ob.get("errored")
+                    if isinstance(relationship_meta, dict):
+                        # relationship's outcome_breakdown is PAIR-level (see the
+                        # total_rows override above); the found/not_found headline
+                        # should match the CSVs the user downloads (ORIGINAL-ROW
+                        # level), so keep using websites_found/websites_not_found
+                        # for those two. errored stays pair-level — it's a
+                        # diagnostic count, not something fanned out to rows.
+                        found = gs["websites_found"]
+                        not_found = gs["websites_not_found"]
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
                         "search_label": "SerpWow searches",
@@ -2079,16 +2269,20 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
+                        "found": found,
+                        "not_found": not_found,
+                        "errored": errored,
+                        "error_sources": eb.get("by_source") or {},
                     }
-                    if isinstance(relationship_meta, dict):
-                        success = gs["websites_found"]
-                        failed = gs["websites_not_found"]
                 except Exception:
                     extra = {}
+                    is_reporting = False
             notify.notify_run_complete(
                 status=status,
-                success=success,
-                failed=failed,
+                **({} if is_reporting else {
+                    "success": state.get("success_rows"),
+                    "failed": state.get("failed_rows"),
+                }),
                 **common,
                 **extra,
             )
@@ -2107,6 +2301,11 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
     except Exception as exc:
         print(f"[serpwow] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
         return
+    try:
+        error_paths = await asyncio.to_thread(_write_error_dumps, upload_dir, state)
+    except Exception as exc:
+        print(f"[serpwow] error-dump failed for {upload_id}: {type(exc).__name__}: {exc}")
+        error_paths = {}
     if not os.getenv("S3_BUCKET"):
         return
     from app.core import s3 as core_s3
@@ -2117,6 +2316,11 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
             await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")
         except Exception as exc:
             print(f"[serpwow] S3 mirror failed for {name} ({upload_id}): {type(exc).__name__}: {exc}")
+    for name, path in error_paths.items():
+        try:
+            await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/errors/{name}")
+        except Exception as exc:
+            print(f"[serpwow] S3 mirror failed for errors/{name} ({upload_id}): {type(exc).__name__}: {exc}")
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
@@ -2248,6 +2452,10 @@ async def update_row_state(
     result: Optional[dict[str, Any]] = None,
     s3_html_key: Optional[str] = None,
     s3_serpwow_json_key: Optional[str] = None,
+    outcome: Optional[str] = None,
+    error_source: Optional[str] = None,
+    error_category: Optional[str] = None,
+    degraded_search: Optional[bool] = None,
 ) -> None:
     async with get_upload_lock(upload_id):
         try:
@@ -2281,6 +2489,14 @@ async def update_row_state(
             row["s3_html_key"] = s3_html_key
         if s3_serpwow_json_key is not None:
             row["s3_serpwow_json_key"] = s3_serpwow_json_key
+        if outcome is not None:
+            row["outcome"] = outcome
+        if error_source is not None:
+            row["error_source"] = error_source
+        if error_category is not None:
+            row["error_category"] = error_category
+        if degraded_search is not None:
+            row["degraded_search"] = degraded_search
         await persist_upload_state(upload_id, state)
 
 
@@ -2586,6 +2802,20 @@ async def publish_job(job: dict[str, Any]) -> None:
     )
 
 
+def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
+    """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
+    legacy binary: found->completed, everything-else->failed (no not_found remap)."""
+    ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
+    info = _outcomes.classify_finalized_row(
+        result, pipeline=pipeline,
+        ctx_row_error=(str(ctx.get("row_error")).strip() or None) if ctx.get("row_error") else None,
+        skip_llm=bool(ctx.get("skip_llm")))
+    if pipeline in REPORTING_PIPELINES:
+        return info, info.row_status
+    # Out of scope: legacy behavior — only 'found' is completed.
+    return info, ("completed" if info.outcome == _outcomes.OUTCOME_FOUND else "failed")
+
+
 async def process_upload_job(job: dict[str, Any]) -> None:
     upload_id = str(job["upload_id"])
     row_index = int(job["row_index"])
@@ -2713,20 +2943,20 @@ async def process_upload_job(job: dict[str, Any]) -> None:
 
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
-        batch_postprocess_enabled = _batch_postprocess_enabled_for(str(job.get("pipeline") or PIPELINE_FULL))
+        batch_postprocess_enabled = _batch_postprocess_enabled_for(pipeline)
         _row_ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
         _llm_skipped = bool(_row_ctx.get("skip_llm"))
-        _ctx_row_error = str(_row_ctx.get("row_error") or "").strip() or None
-        if is_successful:
-            row_status = "completed"
-            row_error = None
-        elif batch_postprocess_enabled and not _llm_skipped:
-            # Keep rows non-failed while batch post-processing is still expected to decide.
+        info, row_status = _finalize_row_outcome(
+            result, pipeline=pipeline, batch_postprocess_enabled=batch_postprocess_enabled)
+        if (not is_successful) and batch_postprocess_enabled and not _llm_skipped:
+            # Batch will decide later — keep the row non-terminal-error meanwhile.
             row_status = "completed"
             row_error = "Pending Gemini batch post-processing decision."
+            info = _outcomes.OutcomeInfo(_outcomes.OUTCOME_NOT_FOUND)  # provisional
         else:
-            row_status = "failed"
-            row_error = _ctx_row_error or "Official website not found; target blocked/unreachable or no valid result."
+            row_error = info.error_detail if info.outcome == _outcomes.OUTCOME_ERROR else (
+                None if info.outcome == _outcomes.OUTCOME_FOUND
+                else (_row_ctx.get("row_error") or _outcomes.GENERIC_NOT_FOUND))
 
         await update_row_state(
             upload_id,
@@ -2736,6 +2966,10 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             result=result,
             s3_html_key=s3_serpwow_json_key,
             s3_serpwow_json_key=s3_serpwow_json_key,
+            outcome=info.outcome,
+            error_source=info.error_source,
+            error_category=info.error_category,
+            degraded_search=info.degraded_search,
         )
         elapsed_sec = asyncio.get_event_loop().time() - started_monotonic
         _log_row_stage(
@@ -2752,8 +2986,13 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             level="INFO" if is_successful else "WARN",
         )
     except Exception as exc:
+        info = _outcomes.classify_exception(exc, default_source=_outcomes.SRC_SERVER)
         try:
-            await update_row_state(upload_id, row_index, status="failed", error=str(exc))
+            await update_row_state(
+                upload_id, row_index, status="failed", error=info.error_detail,
+                outcome=info.outcome, error_source=info.error_source,
+                error_category=info.error_category,
+            )
         except Exception:
             # Preserve original exception for nack/requeue decision below.
             pass
@@ -3037,6 +3276,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
                         except Exception as exc:
                             row["status"] = "failed"
                             row["error"] = f"Queue recovery publish failed: {exc}"
+                            row["outcome"] = _outcomes.OUTCOME_ERROR
+                            row["error_source"] = _outcomes.SRC_SERVER
+                            row["error_category"] = _outcomes.CAT_TIMEOUT
                             failed += 1
                     else:
                         row["status"] = "failed"
@@ -3046,6 +3288,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
                             f"Row terminalized by reconciler after {attempts} requeue(s) "
                             f"(stale > {int(stale_sec)}s)."
                         )
+                        row["outcome"] = _outcomes.OUTCOME_ERROR
+                        row["error_source"] = _outcomes.SRC_SERVER
+                        row["error_category"] = _outcomes.CAT_TIMEOUT
                         failed += 1
                 await persist_upload_state(upload_id, latest)
                 _log_row_stage(
@@ -4468,19 +4713,23 @@ async def gsearch_discover(
                 "search_url": None,
                 "raw_response": None,
                 "error": f"{type(raw_result).__name__}: {str(raw_result)}",
+                "error_category": categorize_http_error(
+                    None, f"{type(raw_result).__name__}: {raw_result}"),
             }
-        
+
         attempt_cands = raw_result.get("candidates") or []
         for cand in attempt_cands:
             if cand and cand not in seen_candidates and not is_disallowed_official_url(cand):
                 seen_candidates.add(cand)
                 candidates.append(cand)
-                
+
         formatted_results.append({
             "phase": label,
             "query": query,
             "success": bool(raw_result.get("used")),
             "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
             "raw_response": raw_result.get("raw_response"),
         })

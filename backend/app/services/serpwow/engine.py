@@ -4459,29 +4459,89 @@ async def batch_job_get_status_by_name(job_name: str = Query(..., min_length=1))
     }
 
 
+async def _sync_batch_job_action_local_state(
+    upload_id: str,
+    job_name: str,
+    action: str,
+) -> bool:
+    """Best-effort reconciliation after a destructive by-name remote action."""
+    async with get_upload_lock(upload_id):
+        try:
+            state = await read_upload_artifact(upload_id, "state")
+            batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+            chunks = batch.get("chunks") if isinstance(batch.get("chunks"), list) else []
+            top_matches = str(batch.get("job_name") or "").strip() == job_name
+            matching_chunks = [
+                chunk for chunk in chunks
+                if isinstance(chunk, dict)
+                and str(chunk.get("job_name") or "").strip() == job_name
+            ]
+            if not top_matches and not matching_chunks:
+                return False
+
+            if action == "cancel":
+                batch["status"] = "cancel_requested"
+                for chunk in matching_chunks:
+                    chunk["status"] = "cancel_requested"
+            elif action == "delete":
+                deletion_error = "Remote batch deleted by user"
+                batch["status"] = "failed"
+                batch["completed_at"] = _now_iso()
+                batch["error"] = deletion_error
+                if top_matches:
+                    batch.pop("job_name", None)
+                for chunk in matching_chunks:
+                    chunk.pop("job_name", None)
+                    chunk["status"] = "failed"
+                    chunk["error"] = deletion_error
+            else:
+                return False
+
+            state["gemini_batch"] = batch
+            await persist_upload_state(upload_id, state)
+            return True
+        except (FileNotFoundError, KeyError):
+            return False
+        except Exception as exc:
+            print(f"[batch-manager] local {action} sync failed for {upload_id}: {exc!r}")
+            return False
+
+
 @app.post("/batch/jobs/cancel")
-async def batch_job_cancel_by_name(job_name: str = Query(..., min_length=1)) -> dict[str, Any]:
+async def batch_job_cancel_by_name(
+    job_name: str = Query(..., min_length=1),
+    upload_id: Optional[str] = Query(None),
+) -> dict[str, Any]:
     try:
         cancel_resp = await asyncio.to_thread(_gemini_batch_cancel_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
+    local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
+        str(upload_id), job_name, "cancel")
     return {
         "job_name": job_name,
         "status": "cancel_requested",
         "response": cancel_resp,
+        "local_state_updated": local_state_updated,
     }
 
 
 @app.post("/batch/jobs/delete")
-async def batch_job_delete_by_name(job_name: str = Query(..., min_length=1)) -> dict[str, Any]:
+async def batch_job_delete_by_name(
+    job_name: str = Query(..., min_length=1),
+    upload_id: Optional[str] = Query(None),
+) -> dict[str, Any]:
     try:
         delete_resp = await asyncio.to_thread(_gemini_batch_delete_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch delete failed: {str(exc)}") from exc
+    local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
+        str(upload_id), job_name, "delete")
     return {
         "job_name": job_name,
         "status": "deleted",
         "response": delete_resp,
+        "local_state_updated": local_state_updated,
     }
 
 

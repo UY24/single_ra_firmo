@@ -431,12 +431,39 @@ def _upload_s3_prefix(upload_id: str, company_name: str = "", pipeline: str = ""
     return upload_id
 
 
+def _remember_s3_run_prefix(upload_id: str, prefix: str) -> None:
+    value = str(prefix or "").strip()
+    if not value or "\n" in value or "\r" in value:
+        return
+    _s3_run_prefix_cache[upload_id] = value
+    try:
+        (_find_upload_dir(upload_id) / ".s3_prefix").write_text(
+            value, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _restore_s3_run_prefix(upload_id: str) -> Optional[str]:
+    cached = str(_s3_run_prefix_cache.get(upload_id) or "").strip()
+    if cached and "\n" not in cached and "\r" not in cached:
+        return cached
+    try:
+        restored = (_find_upload_dir(upload_id) / ".s3_prefix").read_text(
+            encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not restored or "\n" in restored or "\r" in restored:
+        return None
+    _s3_run_prefix_cache[upload_id] = restored
+    return restored
+
+
 def _resolved_upload_s3_prefix(
     upload_id: str,
     company_name: str = "",
     pipeline: str = "",
 ) -> str:
-    return _s3_run_prefix_cache.get(upload_id) or _upload_s3_prefix(
+    return _restore_s3_run_prefix(upload_id) or _upload_s3_prefix(
         upload_id, company_name, pipeline)
 
 
@@ -799,14 +826,12 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
     if use_s3:
         company_name = str(data.get("company_name") or "")
         pipeline = str(data.get("pipeline") or PIPELINE_FULL)
-        default_key = (
+        key = (
             _state_s3_key(upload_id, company_name, pipeline)
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
-        default_prefix, suffix = default_key.rsplit("/", 1)
-        run_prefix = _s3_run_prefix_cache.setdefault(upload_id, default_prefix)
-        key = f"{run_prefix}/{suffix}"
+        _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
 
         async def _write_s3_background():
             max_retries = 5
@@ -833,6 +858,20 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         try:
             data = json.loads(local_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                if name == "state" and os.getenv("S3_BUCKET"):
+                    run_prefix = _restore_s3_run_prefix(upload_id)
+                    if run_prefix is None:
+                        try:
+                            state_key = await asyncio.to_thread(
+                                _find_s3_upload_key_sync,
+                                upload_id,
+                                "state.json",
+                            )
+                        except Exception:
+                            state_key = None
+                        if state_key:
+                            _remember_s3_run_prefix(
+                                upload_id, state_key.rsplit("/", 1)[0])
                 return data
         except Exception:
             pass
@@ -845,7 +884,7 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         if key is None:
             raise FileNotFoundError(f"upload {upload_id!r} not found in S3")
         data = await asyncio.to_thread(_read_json_from_s3_sync, key)
-        _s3_run_prefix_cache[upload_id] = key.rsplit("/", 1)[0]
+        _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
         # Cache it locally so subsequent reads are instant
         try:
             _write_json(local_path, data)
@@ -2124,7 +2163,7 @@ async def _available_reporting_files(
     missing = [name for name in expected if name not in available]
     if not missing:
         return available
-    cached_prefix = _s3_run_prefix_cache.get(upload_id)
+    cached_prefix = _restore_s3_run_prefix(upload_id)
     normalized_prefix = _upload_s3_prefix(upload_id, company_name, pipeline)
     run_prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipeline)
     present_in_s3 = await asyncio.to_thread(
@@ -2137,7 +2176,7 @@ async def _available_reporting_files(
             _find_s3_upload_key_sync, upload_id, "state.json")
         if legacy_state_key:
             actual_prefix = legacy_state_key.rsplit("/", 1)[0]
-            _s3_run_prefix_cache[upload_id] = actual_prefix
+            _remember_s3_run_prefix(upload_id, actual_prefix)
             if actual_prefix != normalized_prefix:
                 present_in_s3 = await asyncio.to_thread(
                     _list_available_reporting_files_s3_sync,

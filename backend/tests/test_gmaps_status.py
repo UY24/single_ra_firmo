@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,8 +115,10 @@ class TestGmapsStatusBlock(unittest.TestCase):
 
         state = {"company_name": "Acme Inc", "pipeline": "gmaps"}
         write_s3 = mock.Mock()
-        with mock.patch.object(legacy_app, "_state_file",
-                               return_value=Path("/tmp/unused-state.json")), \
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(legacy_app, "_state_file",
+                               return_value=Path(td) / "state.json"), \
+             mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "_write_json"), \
              mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
              mock.patch.object(legacy_app.asyncio, "create_task",
@@ -139,8 +142,10 @@ class TestGmapsStatusBlock(unittest.TestCase):
         legacy_app._s3_run_prefix_cache["gm1"] = "ISI_Market_Test/gmaps/gm1"
         state = {"company_name": "ISI Market Test", "pipeline": "gmaps"}
         write_s3 = mock.Mock()
-        with mock.patch.object(legacy_app, "_output_file",
-                               return_value=Path("/tmp/unused-output.json")), \
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(legacy_app, "_output_file",
+                               return_value=Path(td) / "output.json"), \
+             mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "_write_json"), \
              mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
              mock.patch.object(legacy_app.asyncio, "create_task",
@@ -164,6 +169,117 @@ class TestGmapsStatusBlock(unittest.TestCase):
                          "s3://bucket/ISI_Market_Test/gmaps/gm1/state.json")
         self.assertEqual(links["run.log"],
                          "s3://bucket/ISI_Market_Test/gmaps/gm1/run.log")
+
+    def test_restart_restores_legacy_sidecar_without_suffix_scan(self):
+        legacy_app._s3_run_prefix_cache.clear()
+        scheduled = []
+
+        def capture_task(coro):
+            scheduled.append(coro)
+            return mock.Mock()
+
+        state = {"upload_id": "gm1", "company_name": "ISI Market Test",
+                 "pipeline": "gmaps"}
+        resolve = mock.Mock()
+        write_s3 = mock.Mock()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            state_path = run_dir / "state.json"
+            state_path.write_text(json.dumps(state))
+            (run_dir / ".s3_prefix").write_text("ISI_Market_Test/gmaps/gm1")
+            with mock.patch.object(legacy_app, "_state_file", return_value=state_path), \
+                 mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
+                 mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
+                 mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
+                 mock.patch.object(legacy_app.asyncio, "create_task",
+                                   side_effect=capture_task), \
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                restored = asyncio.run(
+                    legacy_app.read_upload_artifact("gm1", "state"))
+                asyncio.run(
+                    legacy_app.write_upload_artifact("gm1", "state", restored))
+                asyncio.run(scheduled.pop())
+
+        self.assertEqual(restored, state)
+        self.assertNotIn("s3_prefix", restored)
+        resolve.assert_not_called()
+        write_s3.assert_called_once_with(
+            "ISI_Market_Test/gmaps/gm1/state.json", state)
+
+    def test_restart_resolves_legacy_prefix_once_and_persists_sidecar(self):
+        legacy_app._s3_run_prefix_cache.clear()
+        scheduled = []
+
+        def capture_task(coro):
+            scheduled.append(coro)
+            return mock.Mock()
+
+        state = {"upload_id": "gm1", "company_name": "ISI Market Test",
+                 "pipeline": "gmaps"}
+        legacy_key = "ISI_Market_Test/gmaps/gm1/state.json"
+        resolve = mock.Mock(return_value=legacy_key)
+        write_s3 = mock.Mock()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            state_path = run_dir / "state.json"
+            sidecar = run_dir / ".s3_prefix"
+            state_path.write_text(json.dumps(state))
+            with mock.patch.object(legacy_app, "_state_file", return_value=state_path), \
+                 mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
+                 mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
+                 mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
+                 mock.patch.object(legacy_app.asyncio, "create_task",
+                                   side_effect=capture_task), \
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                restored = asyncio.run(
+                    legacy_app.read_upload_artifact("gm1", "state"))
+                self.assertTrue(sidecar.exists())
+                self.assertEqual(sidecar.read_text(), "ISI_Market_Test/gmaps/gm1")
+
+                legacy_app._s3_run_prefix_cache.clear()
+                asyncio.run(
+                    legacy_app.write_upload_artifact("gm1", "state", restored))
+                asyncio.run(scheduled.pop())
+
+                legacy_app._s3_run_prefix_cache.clear()
+                reread = asyncio.run(
+                    legacy_app.read_upload_artifact("gm1", "state"))
+
+        self.assertEqual(reread, state)
+        self.assertEqual(resolve.call_count, 1)
+        write_s3.assert_called_once_with(legacy_key, state)
+
+    def test_new_s3_write_persists_normalized_prefix_sidecar(self):
+        legacy_app._s3_run_prefix_cache.clear()
+        scheduled = []
+
+        def capture_task(coro):
+            scheduled.append(coro)
+            return mock.Mock()
+
+        state = {"upload_id": "new1", "company_name": "Acme Inc",
+                 "pipeline": "gmaps"}
+        write_s3 = mock.Mock()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            state_path = run_dir / "state.json"
+            with mock.patch.object(legacy_app, "_state_file", return_value=state_path), \
+                 mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
+                 mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
+                 mock.patch.object(legacy_app.asyncio, "create_task",
+                                   side_effect=capture_task), \
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                asyncio.run(
+                    legacy_app.write_upload_artifact("new1", "state", state))
+                asyncio.run(scheduled.pop())
+            self.assertTrue((run_dir / ".s3_prefix").exists())
+            sidecar_value = (run_dir / ".s3_prefix").read_text()
+            persisted_state = json.loads(state_path.read_text())
+
+        self.assertEqual(sidecar_value, "acme-inc/gmaps/new1")
+        self.assertEqual(persisted_state, state)
+        write_s3.assert_called_once_with(
+            "acme-inc/gmaps/new1/state.json", state)
 
     def test_cached_current_prefix_lists_once_without_suffix_scan(self):
         class FakeS3:
@@ -194,6 +310,7 @@ class TestGmapsStatusBlock(unittest.TestCase):
         legacy_key = "ISI_Market_Test/gmaps/gm1/state.json"
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(legacy_app, "_state_file", return_value=Path(td) / "state.json"), \
+             mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "_find_s3_upload_key_sync", return_value=legacy_key), \
              mock.patch.object(legacy_app, "_read_json_from_s3_sync", return_value={"upload_id": "gm1"}), \
              mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):

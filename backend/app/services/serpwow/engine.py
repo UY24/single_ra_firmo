@@ -5014,11 +5014,21 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
-            available_files = await _available_reporting_files(
-                upload_id,
-                str(summary.get("company_name") or ""),
-                str(summary.get("pipeline") or PIPELINE_FULL),
-            )
+            upload_terminal = summary.get("status") in {
+                "completed", "completed_with_errors", "failed",
+            }
+            batch = summary.get("gemini_batch")
+            batch_settled = not isinstance(batch, dict) or batch.get("status") in {
+                "succeeded", "completed_with_errors", "failed", "cancelled",
+                "skipped", "not_started",
+            }
+            available_files = []
+            if upload_terminal and batch_settled:
+                available_files = await _available_reporting_files(
+                    upload_id,
+                    str(summary.get("company_name") or ""),
+                    str(summary.get("pipeline") or PIPELINE_FULL),
+                )
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],

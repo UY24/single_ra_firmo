@@ -202,6 +202,8 @@ async function completedGsearchLlm() {
     },
   });
   assertOutcomeFirst(root, "4 of 4");
+  assert(byClass(root, "outcome-label")[0]?.textContent === "Websites found",
+    "reporting pipeline lost its website-specific outcome label");
   assert(root.textContent.includes("100%"), "gsearch percentage missing");
   assert(labelValue(root, "Not found") === "0" && labelValue(root, "Errors") === "0", "gsearch secondary outcomes wrong");
   for (const text of ["12s", "3s", "100", "20", "succeeded", "gemini-test", "$0.0300", "4 searches"]) {
@@ -374,10 +376,18 @@ async function legacyCompatibility() {
   const { root } = await renderStatus("legacy", {
     pipeline: "full", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
     success_rows: 5, failed_rows: 2, processing_seconds_total: 14, processing_seconds_avg: 2,
+    updated_at: "2026-07-12T10:30:00Z",
   });
   assertOutcomeFirst(root, "5 of 7");
+  assert(byClass(root, "outcome-label")[0]?.textContent === "Succeeded",
+    "non-reporting pipeline must describe generic successes, not websites");
   assert(labelValue(root, "Not found") == null, "non-reporting pipeline invented Not found");
   assert(labelValue(root, "Failed") === "2", "legacy failed rows must use Failed label");
+  const title = byClass(root, "detail-title")[0]?.textContent;
+  const subtitle = byClass(root, "detail-subtitle")[0]?.textContent;
+  assert(title === "Upload Console", "legacy header exposed raw pipeline code or upload reference");
+  assert(subtitle?.includes("Run legacy") && subtitle.includes("Updated") && subtitle.includes("Jul"),
+    "legacy header omitted the human-readable run context timestamp");
   assert(byClass(root, "files-section").length === 1, "legacy terminal files missing");
 }
 

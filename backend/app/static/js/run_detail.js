@@ -13,6 +13,7 @@ import {
   loadingCard,
   metricItem,
   sectionHeading,
+  shortDate,
   statusBadge,
   fmtDuration,
 } from "./ui.js";
@@ -24,6 +25,21 @@ const BATCH_TERMINAL_STATUSES = new Set([
   "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
 ]);
 const STOPPABLE_BATCH_STATUSES = new Set(["waiting_for_rows", "queued", "running"]);
+const PIPELINE_LABELS = {
+  ai_bulk: "Google AI (Bulk)",
+  ai_deep: "Google AI (Deep)",
+  gmaps: "Google Maps",
+  gsearch: "Google Search",
+  relationship: "Financial Relationship",
+  full: "Upload Console",
+  firmographics: "Firmographics",
+  url_discovery: "URL Discovery",
+};
+
+function pipelineLabel(pipeline) {
+  const key = String(pipeline ?? "");
+  return PIPELINE_LABELS[key] ?? (key || "Run");
+}
 
 function deriveLegacyRunState(s) {
   const status = String(s?.status ?? "");
@@ -284,6 +300,7 @@ function outcomeSummary({
   total,
   skipped = null,
   failureLabel = "Errors",
+  primaryLabel = "Websites found",
 }) {
   const safeFound = safeCount(found);
   const safeNotFound = notFound == null ? null : safeCount(notFound);
@@ -298,7 +315,7 @@ function outcomeSummary({
   if (safeSkipped != null) secondary.push(metricItem("Skipped", fmtNum(safeSkipped), "warning"));
   return el("section", { class: "outcome-summary", "aria-label": "Run outcome" },
     el("div", { class: "outcome-primary" },
-      el("p", { class: "outcome-label" }, "Websites found"),
+      el("p", { class: "outcome-label" }, primaryLabel),
       el("div", { class: "outcome-result" },
         el("span", { class: "outcome-value" }, hasDenominator
           ? `${fmtNum(safeFound)} of ${fmtNum(safeTotal)}`
@@ -624,8 +641,13 @@ function renderLegacyStatus(root, ref, s) {
     { label: "Unique pairs", value: isRel && g?.unique_pairs != null ? fmtNum(g.unique_pairs) : null },
   ];
 
+  const timestamp = s.updated_at ?? s.created_at;
+  const timestampLabel = s.updated_at ? "Updated" : "Created";
+  const context = [`Run ${ref}`];
+  if (timestamp) context.push(`${timestampLabel} ${shortDate(timestamp)}`);
+
   const parts = [
-    headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (SerpWow pipeline)`,
+    headerCard(pipelineLabel(s.pipeline), context.join(" · "),
       runState.finalizing ? "running" : s.status,
       runState.finalizing ? "finalizing" : null, chips),
     outcomeSummary({
@@ -635,6 +657,7 @@ function renderLegacyStatus(root, ref, s) {
       total,
       skipped: isRel ? g?.blank_rows ?? 0 : null,
       failureLabel: g ? "Errors" : "Failed",
+      primaryLabel: g ? "Websites found" : "Succeeded",
     }),
     executionStrip(execution),
   ];

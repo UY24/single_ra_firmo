@@ -47,6 +47,52 @@ class TestGmapsStatusBlock(unittest.TestCase):
         self.assertEqual(resp["serpwow_summary"]["available_files"],
                          ["found.csv", "report.json"])
 
+    def test_running_status_does_not_scan_reporting_files(self):
+        state = _state()
+        state["status"] = "running"
+        state["rows"][0]["status"] = "processing"
+        available = mock.AsyncMock(return_value=["run.log"])
+        with mock.patch.object(legacy_app, "get_upload_state",
+                               new=mock.AsyncMock(return_value=state)), \
+             mock.patch.object(legacy_app, "maybe_reconcile_gemini_batch_status",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "maybe_fail_stale_processing_rows",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "_available_reporting_files", new=available):
+            resp = asyncio.run(legacy_app.upload_status("gm1"))
+        available.assert_not_awaited()
+        self.assertEqual(resp["serpwow_summary"]["available_files"], [])
+
+    def test_terminal_rows_with_running_batch_do_not_scan_reporting_files(self):
+        state = _state()
+        state["gemini_batch"] = {"status": "running"}
+        available = mock.AsyncMock(return_value=["run.log"])
+        with mock.patch.object(legacy_app, "get_upload_state",
+                               new=mock.AsyncMock(return_value=state)), \
+             mock.patch.object(legacy_app, "maybe_reconcile_gemini_batch_status",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "maybe_fail_stale_processing_rows",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "_available_reporting_files", new=available):
+            resp = asyncio.run(legacy_app.upload_status("gm1"))
+        available.assert_not_awaited()
+        self.assertEqual(resp["serpwow_summary"]["available_files"], [])
+
+    def test_terminal_status_with_settled_batch_scans_reporting_files(self):
+        state = _state()
+        state["gemini_batch"] = {"status": "succeeded"}
+        available = mock.AsyncMock(return_value=["run.log"])
+        with mock.patch.object(legacy_app, "get_upload_state",
+                               new=mock.AsyncMock(return_value=state)), \
+             mock.patch.object(legacy_app, "maybe_reconcile_gemini_batch_status",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "maybe_fail_stale_processing_rows",
+                               new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+             mock.patch.object(legacy_app, "_available_reporting_files", new=available):
+            resp = asyncio.run(legacy_app.upload_status("gm1"))
+        available.assert_awaited_once_with("gm1", "Acme", "gmaps")
+        self.assertEqual(resp["serpwow_summary"]["available_files"], ["run.log"])
+
     def test_status_checks_s3_for_missing_reporting_files(self):
         class FakeS3:
             def __init__(self):

@@ -229,11 +229,75 @@ textarea:focus-visible {
 }
 
 .outcome-summary {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1.35fr) minmax(18rem, 1fr);
+  align-items: stretch;
+  gap: 1.25rem;
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   border-radius: 0.5rem;
   background: var(--panel-strong);
-  padding: 1rem;
+  padding: 1.15rem 1.25rem;
+}
+
+.outcome-primary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.outcome-label {
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.outcome-result {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-top: 0.3rem;
+}
+
+.outcome-value {
+  color: var(--text);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+
+.outcome-rate {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9rem;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
+.outcome-secondary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6rem, 1fr));
+  align-items: center;
+  margin: 0;
+  border-left: 1px solid var(--border);
+}
+
+.outcome-secondary .metric-item {
+  padding-block: 0.65rem;
+  border-left: 1px solid var(--border);
+}
+
+.outcome-secondary .metric-item:first-child {
+  border-left: 0;
+}
+
+.outcome-secondary .metric-value {
+  font-size: 1.15rem;
 }
 
 .metric-group,
@@ -312,6 +376,103 @@ textarea:focus-visible {
   color: var(--subtle);
   font-size: 0.75rem;
   line-height: 1.45;
+}
+
+/* Run detail — outcome first, followed by open execution and detail dividers. */
+.detail-header {
+  display: flex;
+  padding: 0 0 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-header > div {
+  width: 100%;
+}
+
+.detail-section {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-section .section-heading {
+  padding: 0.9rem 0;
+}
+
+.detail-section-body {
+  padding: 1rem 0;
+}
+
+.detail-action {
+  color: var(--muted);
+}
+
+.detail-action .section-title {
+  color: var(--muted);
+}
+
+.progress-section {
+  padding: 1rem 0;
+}
+
+.relationship-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.file-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: minmax(10rem, 1fr) auto;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.7rem 0;
+}
+
+.file-row + .file-row {
+  border-top: 1px solid var(--border);
+}
+
+.file-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.modal-surface {
+  background: var(--panel);
+  border-color: var(--border-strong) !important;
+  color: var(--text);
+}
+
+.modal-surface .data-table {
+  min-width: max-content;
+}
+
+.modal-surface .data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--panel-strong) !important;
+}
+
+.code-block {
+  margin: 0;
+  background: var(--panel-soft);
+  color: #cbd5e1;
+  font-variant-ligatures: none;
+  tab-size: 2;
 }
 
 .section-title {
@@ -889,7 +1050,7 @@ tbody tr:hover {
   color: var(--muted);
 }
 
-/* Cost breakdown card — LLM / SerpWow / Total, total emphasized. */
+/* Cost breakdown — LLM / search provider / total, with total emphasized. */
 .cost-card {
   display: flex;
   flex-wrap: wrap;
@@ -1251,6 +1412,57 @@ tbody tr:hover {
     gap: 1rem;
   }
 
+  .detail-header > div,
+  .detail-header > div > div {
+    align-items: flex-start;
+  }
+
+  .outcome-summary {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+    padding: 1rem;
+  }
+
+  .outcome-secondary {
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .outcome-secondary .metric-item {
+    padding: 0.85rem 0.65rem 0;
+  }
+
+  .outcome-secondary .metric-item:first-child {
+    padding-left: 0;
+  }
+
+  .file-row {
+    grid-template-columns: 1fr;
+    gap: 0.65rem;
+  }
+
+  .file-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-content: stretch;
+  }
+
+  .cost-card {
+    align-items: flex-start;
+    gap: 1rem 1.5rem;
+  }
+
+  .cost-item--total {
+    width: 100%;
+    margin-left: 0;
+    padding-top: 0.85rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .modal-surface {
+    height: min(88vh, 48rem) !important;
+  }
+
   .core-view {
     gap: 1.25rem;
   }
@@ -1296,6 +1508,21 @@ tbody tr:hover {
 
   .metric-item {
     padding: 0.875rem 0;
+  }
+
+  .outcome-secondary {
+    grid-template-columns: 1fr;
+  }
+
+  .outcome-secondary .metric-item,
+  .outcome-secondary .metric-item:first-child {
+    padding: 0.75rem 0;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .outcome-secondary .metric-item:first-child {
+    border-top: 0;
   }
 
   .empty-state {

@@ -57,6 +57,19 @@ class TestUiShell(unittest.TestCase):
             ".metric-item--danger",
             ".metric-item--info",
             ".metric-detail",
+            ".detail-header",
+            ".outcome-primary",
+            ".outcome-value",
+            ".outcome-rate",
+            ".outcome-secondary",
+            ".detail-section",
+            ".detail-section-body",
+            ".relationship-verdict",
+            ".file-list",
+            ".file-row",
+            ".file-actions",
+            ".modal-surface",
+            ".code-block",
             ".empty-state",
             "font-variant-numeric: tabular-nums",
             "grid-template-columns: repeat(4, minmax(0, 1fr))",
@@ -111,6 +124,16 @@ class TestUiShell(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_run_detail_dom_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["node", "tests/run_detail_dom_contract.mjs"],
+            cwd=backend_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_core_views_use_midnight_ledger_hierarchy(self):
         markers = {
             "/static/js/dashboard.js": ("pageIntro", "company-summary", "Recent runs"),
@@ -131,6 +154,19 @@ class TestUiShell(unittest.TestCase):
             "pipeline-option",
             "launch-summary",
             "aria-current",
+        ):
+            self.assertIn(marker, res.text)
+
+    def test_run_detail_is_outcome_first(self):
+        res = self.client.get("/static/js/run_detail.js")
+        self.assertEqual(res.status_code, 200)
+        for marker in (
+            "outcomeSummary",
+            "executionStrip",
+            "filesSection",
+            "Websites found",
+            "Not found",
+            "Errors",
         ):
             self.assertIn(marker, res.text)
 

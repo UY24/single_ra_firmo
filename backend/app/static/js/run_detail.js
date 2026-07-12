@@ -55,18 +55,83 @@ function deriveLegacyRunState(s) {
 
 // ── inline file viewer modal ──────────────────────────────────────────────────
 let _modal = null;
+let _fileRequestToken = 0;
+let _reloadTimer = null;
+
+function _scheduleReload() {
+  if (_reloadTimer != null) clearTimeout(_reloadTimer);
+  _reloadTimer = setTimeout(() => {
+    _reloadTimer = null;
+    window.location.reload();
+  }, 700);
+}
+
+function _clearReloadTimer() {
+  if (_reloadTimer == null) return;
+  clearTimeout(_reloadTimer);
+  _reloadTimer = null;
+}
+
+function _invalidateFileRequest() {
+  _fileRequestToken += 1;
+  if (_modal?.controller) _modal.controller.abort();
+  if (_modal) {
+    _modal.controller = null;
+    _modal.requestToken = _fileRequestToken;
+  }
+}
+
+function closeFileModal() {
+  if (!_modal) return;
+  _invalidateFileRequest();
+  _modal.overlay.classList.add("hidden");
+  const { main, mainState, previousFocus } = _modal;
+  if (main && mainState) {
+    main.inert = mainState.inert;
+    if (mainState.hadInertAttribute) main.setAttribute("inert", "");
+    else main.removeAttribute("inert");
+    if (mainState.ariaHidden == null) main.removeAttribute("aria-hidden");
+    else main.setAttribute("aria-hidden", mainState.ariaHidden);
+  }
+  _modal.main = null;
+  _modal.mainState = null;
+  _modal.previousFocus = null;
+  if (previousFocus?.focus) previousFocus.focus();
+}
+
+function _handleModalKeydown(event) {
+  if (!_modal || _modal.overlay.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeFileModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const first = _modal.dlBtn;
+  const last = _modal.closeBtn;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 function _ensureModal() {
   if (_modal) return _modal;
-  const title = el("span", { class: "truncate text-sm font-semibold text-slate-50" });
+  const title = el("span", {
+    id: "run-file-modal-title",
+    class: "truncate text-sm font-semibold text-slate-50",
+  });
   const dlBtn = el("a", {
     class: "btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
     target: "_blank",
   }, "Download");
   const closeBtn = el("button", {
     class: "btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
-    onclick: () => overlay.classList.add("hidden"),
-  }, "✕ Close");
+    onclick: closeFileModal,
+  }, "Close");
   const pre = el("pre", {
     class: "code-block flex-1 overflow-auto whitespace-pre-wrap break-words p-4 text-xs leading-5 text-slate-300 font-mono",
   });
@@ -76,9 +141,15 @@ function _ensureModal() {
   const body = el("div", { class: "flex flex-col overflow-hidden" }, loadingMsg);
   const overlay = el("div", {
     class: "file-modal hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4",
-    onclick: (e) => { if (e.target === overlay) overlay.classList.add("hidden"); },
+    onclick: (e) => { if (e.target === overlay) closeFileModal(); },
+    onkeydown: _handleModalKeydown,
   },
-    el("div", { class: "modal-surface flex flex-col w-full max-w-4xl h-[80vh] rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden" },
+    el("div", {
+      class: "modal-surface flex flex-col w-full max-w-4xl h-[80vh] rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": "run-file-modal-title",
+    },
       el("div", { class: "flex items-center gap-3 border-b border-slate-700 px-4 py-3 shrink-0" },
         title, dlBtn, closeBtn,
       ),
@@ -86,8 +157,36 @@ function _ensureModal() {
     ),
   );
   document.body.appendChild(overlay);
-  _modal = { overlay, title, dlBtn, pre, loadingMsg, body };
+  _modal = {
+    overlay, title, dlBtn, closeBtn, pre, loadingMsg, body,
+    controller: null, requestToken: 0, main: null, mainState: null, previousFocus: null,
+  };
   return _modal;
+}
+
+function openFileModal(filename, downloadUrl) {
+  const m = _ensureModal();
+  const wasClosed = m.overlay.classList.contains("hidden");
+  if (wasClosed) {
+    m.previousFocus = document.activeElement;
+    m.main = document.querySelector("main");
+    if (m.main) {
+      m.mainState = {
+        inert: Boolean(m.main.inert),
+        hadInertAttribute: m.main.hasAttribute("inert"),
+        ariaHidden: m.main.getAttribute("aria-hidden"),
+      };
+      m.main.inert = true;
+      m.main.setAttribute("inert", "");
+      m.main.setAttribute("aria-hidden", "true");
+    }
+  }
+  m.title.textContent = filename;
+  m.dlBtn.href = downloadUrl;
+  m.body.replaceChildren(m.loadingMsg);
+  m.overlay.classList.remove("hidden");
+  m.closeBtn.focus();
+  return m;
 }
 
 // RFC-4180-ish parser: handles quoted fields, "" escapes, and embedded
@@ -141,15 +240,21 @@ function csvTable(text) {
 }
 
 async function viewFile(url, filename, downloadUrl) {
-  const m = _ensureModal();
-  m.title.textContent = filename;
-  m.dlBtn.href = downloadUrl;
-  m.body.replaceChildren(m.loadingMsg);
-  m.overlay.classList.remove("hidden");
+  const m = openFileModal(filename, downloadUrl);
+  if (m.controller) m.controller.abort();
+  const controller = typeof AbortController === "undefined" ? null : new AbortController();
+  const requestToken = ++_fileRequestToken;
+  m.controller = controller;
+  m.requestToken = requestToken;
+  const isCurrent = () => m.requestToken === requestToken
+    && m.controller === controller
+    && !m.overlay.classList.contains("hidden");
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, controller ? { signal: controller.signal } : {});
+    if (!isCurrent()) return;
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const text = await res.text();
+    if (!isCurrent()) return;
     if (/\.csv$/i.test(filename)) {
       m.body.replaceChildren(csvTable(text));
     } else {
@@ -157,9 +262,12 @@ async function viewFile(url, filename, downloadUrl) {
       m.body.replaceChildren(m.pre);
     }
   } catch (e) {
+    if (!isCurrent() || e?.name === "AbortError") return;
     m.body.replaceChildren(
-      el("p", { class: "p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),
+      el("p", { class: "detail-error p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),
     );
+  } finally {
+    if (m.requestToken === requestToken && m.controller === controller) m.controller = null;
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,8 +385,8 @@ function headerCard(title, subtitle, status, phase, chips) {
     }, phase));
   }
   const left = el("div", {},
-    el("p", { class: "text-base font-semibold text-slate-50" }, title),
-    el("p", { class: "mt-0.5 section-copy" }, subtitle),
+    el("p", { class: "detail-title text-base font-semibold text-slate-50" }, title),
+    el("p", { class: "detail-subtitle mt-0.5 section-copy" }, subtitle),
   );
   if (chips && chips.length) {
     left.appendChild(el("div", { class: "mt-2 flex flex-wrap items-center gap-1.5" }, ...chips));
@@ -293,7 +401,11 @@ function headerCard(title, subtitle, status, phase, chips) {
 
 function progressSection(done, total, running) {
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  return el("section", { class: "detail-section progress-section" },
+  return el("div", {
+    class: "detail-section progress-section",
+    role: "group",
+    "aria-label": "Batch progress",
+  },
     el("div", { class: "flex items-center justify-between text-sm" },
       el("span", { class: "section-copy" }, "Batches"),
       el("span", { class: "font-semibold text-slate-50" }, `${fmtNum(done)} / ${fmtNum(total)}`),
@@ -366,7 +478,7 @@ function rerunFailedSection(ref) {
         await api(`/uploads/ai-mode/${encodeURIComponent(ref)}/resume`, { method: "POST" });
         msg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
           "Rerun started. Reloading..."));
-        setTimeout(() => { window.location.reload(); }, 700);
+        _scheduleReload();
       } catch (e) {
         btn.disabled = false; // 404/409 → inline detail
         msg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
@@ -440,14 +552,14 @@ function renderAiStatus(root, ref, s) {
   if ((s.warnings ?? []).length) parts.push(warningsNote(s.warnings));
   if (s.error) {
     parts.push(el("div", { class: "callout callout-red" },
-      el("p", { class: "text-sm" }, s.error)));
+      el("p", { class: "detail-error text-sm" }, s.error)));
   }
   if (s.cost) {
     parts.push(costSection({ confidence_mode: "llm", model: s.model, cost: s.cost }, {
       providerLabel: "Scrape.do",
       providerCostKey: null,
       searchKey: "scrapedo_searches",
-      llmCostKey: "total_usd",
+      llmCostKey: s.cost?.llm_usd != null ? "llm_usd" : "total_usd",
       totalCostKey: null,
     }));
   }
@@ -527,7 +639,7 @@ function renderLegacyStatus(root, ref, s) {
   if ((s.warnings ?? []).length) parts.push(warningsNote(s.warnings));
   if (s.error) {
     parts.push(el("div", { class: "callout callout-red" },
-      el("p", { class: "text-sm" }, s.error)));
+      el("p", { class: "detail-error text-sm" }, s.error)));
   }
   if (g) parts.push(costSection(g));
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
@@ -549,7 +661,7 @@ function renderLegacyStatus(root, ref, s) {
           stopMsg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
             `Stopped: ${fmtNum(res.stopped_rows)} row(s) halted`
             + `${res.batch_cancelled ? ", batch cancelled" : ""}. Reloading...`));
-          setTimeout(() => { window.location.reload(); }, 700);
+          _scheduleReload();
         } catch (e) {
           stopBtn.disabled = false;
           stopMsg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
@@ -625,5 +737,9 @@ export async function render(root, params) {
   }
 
   // The router invokes this before the next view renders — stops the poller.
-  return () => { if (stop) stop(); };
+  return () => {
+    if (stop) stop();
+    _clearReloadTimer();
+    closeFileModal();
+  };
 }

@@ -17,16 +17,24 @@ class Element {
     this.childNodes = [];
     this.listeners = {};
     this.disabled = false;
+    this.inert = false;
     this.classList = new ClassList(this);
   }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
     if (name === "class") this.className = String(value);
     if (name === "disabled") this.disabled = true;
+    if (name === "inert") this.inert = true;
   }
   getAttribute(name) {
     if (name === "class") return this.className || null;
     return this.attributes[name] ?? null;
+  }
+  hasAttribute(name) { return this.getAttribute(name) != null; }
+  removeAttribute(name) {
+    delete this.attributes[name];
+    if (name === "disabled") this.disabled = false;
+    if (name === "inert") this.inert = false;
   }
   addEventListener(name, listener) { this.listeners[name] = listener; }
   append(...children) { this.childNodes.push(...children); }
@@ -37,15 +45,22 @@ class Element {
     return this.childNodes.map((child) => child instanceof Element ? child.textContent : String(child)).join("");
   }
   set textContent(value) { this.childNodes = [String(value)]; }
+  focus() { document.activeElement = this; }
+  dispatch(name, event = {}) {
+    return this.listeners[name]?.({ target: this, preventDefault() {}, ...event });
+  }
   async click() {
     if (this.disabled) return;
     return this.listeners.click?.({ target: this, preventDefault() {} });
   }
 }
 
+let currentMain = null;
 globalThis.document = {
   body: new Element("body"),
+  activeElement: null,
   createElement: (tag) => new Element(tag),
+  querySelector: (selector) => selector === "main" ? currentMain : null,
 };
 globalThis.window = {
   confirm: () => true,
@@ -55,6 +70,9 @@ let timers = [];
 globalThis.setTimeout = (callback) => {
   timers.push(callback);
   return timers.length;
+};
+globalThis.clearTimeout = (id) => {
+  if (Number.isInteger(id) && id > 0) timers[id - 1] = null;
 };
 
 const [{ render }, { pollStatus }] = await Promise.all([
@@ -82,6 +100,12 @@ function response(payload, status = 200) {
     json: async () => payload,
     text: async () => String(payload),
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 let requests = [];
@@ -119,6 +143,7 @@ async function renderStatus(ref, status, { ai = false } = {}) {
     throw new Error(`Unexpected fetch: ${path}`);
   };
   const root = new Element("main");
+  currentMain = root;
   const cleanup = await render(root, { runRef: ref });
   await settle();
   return { root, cleanup };
@@ -142,6 +167,7 @@ async function renderLegacySequence(ref, statuses) {
     throw new Error(`Unexpected fetch: ${path}`);
   };
   const root = new Element("main");
+  currentMain = root;
   const cleanup = await render(root, { runRef: ref });
   await settle();
   return { root, cleanup };
@@ -196,6 +222,7 @@ async function completedGsearchLlm() {
     "absent SerpWow result file View must be disabled");
   assert(unavailableLog?.children[1]?.children[1]?.getAttribute("href") == null,
     "absent SerpWow result file Download must not have an href");
+  await byText(document.body, "button", "Close").click();
 }
 
 async function completedGmapsHeuristic() {
@@ -348,7 +375,8 @@ function aiPayload(status, errors = 0) {
     batches_done: 2, batches_total: 2, batch_duration_seconds: 18,
     token_usage: { prompt_tokens: 120, completion_tokens: 30 }, model: "gemini-ai", is_batch: true,
     scrapedo_request_count: 5, failed_request_count: 0,
-    cost: { scrapedo_searches: 5, total_usd: 0.4 }, available_files: ["found.csv", "run.log"],
+    cost: { scrapedo_searches: 5, llm_usd: 0.2, total_usd: 0.4 },
+    available_files: ["found.csv", "run.log"],
   };
 }
 
@@ -358,6 +386,12 @@ async function completedAiMode() {
   for (const text of ["18s", "120", "30", "gemini-ai", "Yes", "Batches", "found.csv"]) {
     assert(root.textContent.includes(text), `AI Mode detail missing ${text}`);
   }
+  const progress = byClass(root, "progress-section")[0];
+  assert(progress?.getAttribute("role") === "group"
+    && progress.getAttribute("aria-label") === "Batch progress",
+  "batch progress semantics missing");
+  const llmCost = byClass(root, "cost-item").find((item) => item.children[0]?.textContent === "LLM");
+  assert(llmCost?.children[1]?.textContent === "$0.2000", "AI cost did not prefer explicit llm_usd");
   const unavailable = byClass(root, "file-row").find((row) => row.textContent.includes("final_report.json"));
   assert(unavailable?.children[1]?.children[0]?.disabled, "unavailable AI file View must be disabled");
   assert(unavailable?.children[1]?.children[1]?.getAttribute("href") == null,
@@ -432,6 +466,92 @@ async function customPollTerminalPredicate() {
   assert(updates.length === 2 && timers.length === 0, "custom terminal predicate did not stop polling");
 }
 
+async function accessibleModalLifecycleAndRace() {
+  const ref = "modal-run";
+  const { root, cleanup } = await renderStatus(ref, {
+    pipeline: "gsearch", status: "completed", total_rows: 2, processed_rows: 2,
+    success_rows: 2, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "llm", is_batch: false,
+      outcome_breakdown: { found: 2, not_found: 0, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} },
+      websites_found: 2, websites_not_found: 0,
+      available_files: ["found.csv", "run.log"], cost: {},
+    },
+  });
+  root.setAttribute("aria-hidden", "false");
+  const rows = byClass(root, "file-row");
+  const foundView = rows.find((row) => row.textContent.includes("found.csv")).children[1].children[0];
+  const logView = rows.find((row) => row.textContent.includes("run.log")).children[1].children[0];
+  foundView.focus();
+
+  const first = deferred();
+  const second = deferred();
+  const third = deferred();
+  const fourth = deferred();
+  const signals = [];
+  let fileRequest = 0;
+  globalThis.fetch = (_path, options = {}) => {
+    signals.push(options.signal);
+    fileRequest += 1;
+    return [first.promise, second.promise, third.promise, fourth.promise][fileRequest - 1];
+  };
+
+  const firstLoad = foundView.click();
+  const surface = byClass(document.body, "modal-surface")[0];
+  const overlay = byClass(document.body, "file-modal")[0];
+  const title = surface.children[0].children[0];
+  const download = surface.children[0].children[1];
+  const close = surface.children[0].children[2];
+  assert(surface.getAttribute("role") === "dialog", "file viewer missing dialog role");
+  assert(surface.getAttribute("aria-modal") === "true", "file viewer missing aria-modal");
+  assert(surface.getAttribute("aria-labelledby") === title.getAttribute("id"),
+    "file viewer title association missing");
+  assert(title.textContent === "found.csv", "file viewer title was not set before fetch");
+  assert(root.inert && root.getAttribute("aria-hidden") === "true", "file viewer did not isolate main");
+  assert(document.activeElement === close, "file viewer did not focus Close");
+
+  overlay.dispatch("keydown", { key: "Tab", shiftKey: false });
+  assert(document.activeElement === download, "Tab did not wrap from last to first modal control");
+  overlay.dispatch("keydown", { key: "Tab", shiftKey: true });
+  assert(document.activeElement === close, "Shift+Tab did not wrap from first to last modal control");
+
+  overlay.dispatch("keydown", { key: "Escape" });
+  assert(overlay.classList.contains("hidden"), "Escape did not close file viewer");
+  assert(!root.inert && root.getAttribute("aria-hidden") === "false", "Escape did not restore main state");
+  assert(document.activeElement === foundView, "Escape did not restore prior focus");
+  assert(signals[0]?.aborted, "closing did not abort the active file request");
+  first.resolve(response("ignored after close"));
+  await firstLoad;
+  assert(!document.body.textContent.includes("Failed to load"), "aborted request rendered an error");
+
+  foundView.focus();
+  const staleLoad = foundView.click();
+  const currentLoad = logView.click();
+  third.resolve(response("second response"));
+  await currentLoad;
+  second.resolve(response("first response"));
+  await staleLoad;
+  assert(title.textContent === "run.log", "stale request overwrote newer filename");
+  assert(surface.textContent.includes("second response") && !surface.textContent.includes("first response"),
+    "stale request overwrote newer file body");
+  assert(signals[1]?.aborted, "opening a second file did not abort the first request");
+
+  overlay.dispatch("click", { target: overlay });
+  assert(overlay.classList.contains("hidden"), "backdrop click did not close file viewer");
+  assert(document.activeElement === foundView, "backdrop close did not restore original focus");
+
+  const routeLoad = foundView.click();
+  assert(!overlay.classList.contains("hidden"), "file viewer did not reopen");
+  cleanup();
+  assert(overlay.classList.contains("hidden"), "route cleanup did not close file viewer");
+  assert(!root.inert && root.getAttribute("aria-hidden") === "false",
+    "route cleanup did not restore main state");
+  assert(signals[3]?.aborted, "route cleanup did not abort pending file request");
+  // fetch intentionally remains pending; cleanup must make it unable to update the UI.
+  void routeLoad;
+}
+
 await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
@@ -446,3 +566,4 @@ await completedAiMode();
 await erroredAiMode();
 await queuedAiFilesAndLegacyOutcome();
 await unknownTotalAndLongModel();
+await accessibleModalLifecycleAndRace();

@@ -248,7 +248,7 @@ textarea:focus-visible {
 }
 
 .outcome-label {
-  color: var(--accent);
+  color: var(--muted);
   font-size: 0.75rem;
   font-weight: 750;
   letter-spacing: 0.06em;
@@ -298,6 +298,10 @@ textarea:focus-visible {
 
 .outcome-secondary .metric-value {
   font-size: 1.15rem;
+}
+
+.outcome-secondary .metric-label {
+  color: var(--muted);
 }
 
 .metric-group,
@@ -387,6 +391,12 @@ textarea:focus-visible {
 
 .detail-header > div {
   width: 100%;
+}
+
+.detail-title,
+.detail-subtitle,
+.detail-error {
+  overflow-wrap: anywhere;
 }
 
 .detail-section {

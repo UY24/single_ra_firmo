@@ -448,15 +448,26 @@ async function erroredAiMode() {
 }
 
 async function queuedAiFiles() {
-  const payload = aiPayload("queued", 0);
-  payload.entities_processed = 1;
-  payload.websites_found = 1;
-  payload.websites_not_found = 0;
-  payload.outcome_breakdown = { found: 1, not_found: 0, errored: 0 };
-  payload.available_files = ["input.csv"];
+  const payload = {
+    run_id: "queued-ai", status: "queued", mode: "bulk", mode_label: "AI Mode Bulk",
+    company_id: "co-1", company_name: "AI Co", columns_detected: ["company_name"],
+    warnings: [], total_rows: 6, batch_size: 20,
+    llm_provider: "gemini", llm_model: "gemini-2.5-flash-lite",
+    batches_total: 0, batches_done: 0, entities_processed: 0,
+    entities_without_scrape_data: 0, llm_errors: 0,
+    websites_found: 0, websites_not_found: 0,
+    failed_request_count: 0, scrapedo_request_count: 0, scrapedo_failed_requests: 0,
+    scrapedo_seconds_total: 0.0, llm_seconds_total: 0.0,
+    token_usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    error: null, available_files: ["input.csv"],
+  };
   const { root } = await renderStatus("queued-ai", payload, { ai: true });
+  assertOutcomeFirst(root, "0 of 6");
   assert(labelValue(root, "Not found") === "0", "queued AI not-found count is not production-real");
   assert(labelValue(root, "Errors") === "0", "queued AI error count is not production-real");
+  assert(!byClass(root, "pill").some((pill) => pill.children[0]?.textContent === "Model"),
+    "queued AI initial status invented a runtime model chip");
+  assert(!byClass(root, "cost-section").length, "queued AI initial status invented a cost section");
   const files = byClass(root, "files-section")[0];
   assert(files, "queued AI run must retain file availability surface");
   assert(byClass(files, "file-row").length === 5, "queued AI file rows missing");

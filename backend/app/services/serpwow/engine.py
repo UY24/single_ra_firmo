@@ -210,6 +210,7 @@ gemini_batch_reconciler_stop: Optional[asyncio.Event] = None
 upload_active_rows: dict[str, set[int]] = {}
 upload_active_rows_lock = asyncio.Lock()
 upload_summaries_cache: dict[str, dict[str, Any]] = {}
+_s3_run_prefix_cache: dict[str, str] = {}
 gemini_batch_list_cache: list[dict[str, Any]] = []
 gemini_batch_list_cache_fetched_at: float = 0.0
 gemini_batch_list_error_cooldown_until: float = 0.0
@@ -832,6 +833,7 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         if key is None:
             raise FileNotFoundError(f"upload {upload_id!r} not found in S3")
         data = await asyncio.to_thread(_read_json_from_s3_sync, key)
+        _s3_run_prefix_cache[upload_id] = key.rsplit("/", 1)[0]
         # Cache it locally so subsequent reads are instant
         try:
             _write_json(local_path, data)
@@ -2067,15 +2069,13 @@ def _reporting_result_names(pipeline: str) -> list[str]:
 
 
 def _list_available_reporting_files_s3_sync(
-    upload_id: str,
-    company_name: str,
-    pipeline: str,
+    run_prefix: str,
     expected: list[str],
 ) -> set[str]:
     bucket = os.getenv("S3_BUCKET")
     if not bucket or not expected:
         return set()
-    prefix = f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/"
+    prefix = f"{run_prefix.rstrip('/')}/"
     try:
         response = get_s3_client().list_objects_v2(
             Bucket=bucket,
@@ -2108,13 +2108,26 @@ async def _available_reporting_files(
         return available
 
     missing = [name for name in expected if name not in available]
+    cached_prefix = _s3_run_prefix_cache.get(upload_id)
+    normalized_prefix = _upload_s3_prefix(upload_id, company_name, pipeline)
+    run_prefix = cached_prefix or normalized_prefix
     present_in_s3 = await asyncio.to_thread(
         _list_available_reporting_files_s3_sync,
-        upload_id,
-        company_name,
-        pipeline,
+        run_prefix,
         missing,
     )
+    if not present_in_s3 and cached_prefix is None:
+        legacy_state_key = await asyncio.to_thread(
+            _find_s3_upload_key_sync, upload_id, "state.json")
+        if legacy_state_key:
+            actual_prefix = legacy_state_key.rsplit("/", 1)[0]
+            _s3_run_prefix_cache[upload_id] = actual_prefix
+            if actual_prefix != normalized_prefix:
+                present_in_s3 = await asyncio.to_thread(
+                    _list_available_reporting_files_s3_sync,
+                    actual_prefix,
+                    missing,
+                )
     return [name for name in expected if name in available or name in present_in_s3]
 
 

@@ -19,6 +19,9 @@ def _state():
 
 
 class TestGmapsStatusBlock(unittest.TestCase):
+    def tearDown(self):
+        getattr(legacy_app, "_s3_run_prefix_cache", {}).clear()
+
     def test_status_has_serpwow_summary_for_gmaps(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td)
@@ -98,3 +101,52 @@ class TestGmapsStatusBlock(unittest.TestCase):
         self.assertEqual(resp["serpwow_summary"]["available_files"],
                          ["found.csv", "notFound.csv", "report.json", "run.log"])
         s3.list_objects_v2.assert_not_called()
+
+    def test_reading_legacy_s3_state_caches_actual_run_prefix(self):
+        legacy_key = "ISI_Market_Test/gmaps/gm1/state.json"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(legacy_app, "_state_file", return_value=Path(td) / "state.json"), \
+             mock.patch.object(legacy_app, "_find_s3_upload_key_sync", return_value=legacy_key), \
+             mock.patch.object(legacy_app, "_read_json_from_s3_sync", return_value={"upload_id": "gm1"}), \
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+            asyncio.run(legacy_app.read_upload_artifact("gm1", "state"))
+        self.assertEqual(legacy_app._s3_run_prefix_cache["gm1"],
+                         "ISI_Market_Test/gmaps/gm1")
+
+    def test_legacy_s3_prefix_resolution_is_cached_after_first_availability_check(self):
+        class LegacyS3:
+            def __init__(self):
+                self.calls = []
+
+            def list_objects_v2(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs["Prefix"] == "ISI_Market_Test/gmaps/gm1/":
+                    return {"Contents": [
+                        {"Key": "ISI_Market_Test/gmaps/gm1/found.csv"},
+                        {"Key": "ISI_Market_Test/gmaps/gm1/run.log"},
+                    ]}
+                return {"Contents": []}
+
+        s3 = LegacyS3()
+        resolve = mock.Mock(return_value="ISI_Market_Test/gmaps/gm1/state.json")
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
+             mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
+             mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+            first = asyncio.run(legacy_app._available_reporting_files(
+                "gm1", "ISI Market Test", "gmaps"))
+            first_calls = list(s3.calls)
+            second = asyncio.run(legacy_app._available_reporting_files(
+                "gm1", "ISI Market Test", "gmaps"))
+
+        self.assertEqual(first, ["found.csv", "run.log"])
+        self.assertEqual(second, first)
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual([call["Prefix"] for call in first_calls], [
+            "isi-market-test/gmaps/gm1/",
+            "ISI_Market_Test/gmaps/gm1/",
+        ])
+        self.assertEqual(len(s3.calls), 3)
+        self.assertEqual(s3.calls[-1]["Prefix"], "ISI_Market_Test/gmaps/gm1/")
+        self.assertTrue(all(call["Delimiter"] == "/" for call in s3.calls))

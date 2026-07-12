@@ -125,11 +125,11 @@ function _ensureModal() {
     class: "truncate text-sm font-semibold text-slate-50",
   });
   const dlBtn = el("a", {
-    class: "btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
+    class: "file-modal-action btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
     target: "_blank",
   }, "Download");
   const closeBtn = el("button", {
-    class: "btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
+    class: "file-modal-action btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
     onclick: closeFileModal,
   }, "Close");
   const pre = el("pre", {

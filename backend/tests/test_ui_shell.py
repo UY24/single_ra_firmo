@@ -1,6 +1,7 @@
 # backend/tests/test_ui_shell.py
 """Task 18: /app shell + /static mounting (offline; no Supabase needed)."""
 from pathlib import Path
+import re
 import subprocess
 import unittest
 
@@ -207,6 +208,34 @@ class TestUiShell(unittest.TestCase):
         css = self.client.get("/static/css/app.css")
         self.assertEqual(css.status_code, 200)
         self.assertIn("@media (max-width: 768px)", css.text)
+
+    def test_mobile_modal_actions_keep_intrinsic_width(self):
+        js = self.client.get("/static/js/run_detail.js")
+        self.assertEqual(js.status_code, 200)
+        self.assertGreaterEqual(js.text.count("file-modal-action"), 2)
+
+        css = self.client.get("/static/css/app.css")
+        self.assertEqual(css.status_code, 200)
+        self.assertRegex(
+            css.text,
+            re.compile(
+                r"@media \(max-width: 767px\).*?"
+                r"\.file-modal \.file-modal-action\s*\{[^}]*"
+                r"width:\s*auto;[^}]*flex:\s*0 0 auto;",
+                re.DOTALL,
+            ),
+        )
+
+    def test_storage_copy_controls_are_accessible_buttons(self):
+        ui = self.client.get("/static/js/ui.js")
+        self.assertEqual(ui.status_code, 200)
+        self.assertIn('el("button"', ui.text)
+        self.assertIn('"aria-label": `Copy storage path:', ui.text)
+        self.assertIn('class: "copy-control', ui.text)
+
+        css = self.client.get("/static/css/app.css")
+        self.assertEqual(css.status_code, 200)
+        self.assertIn(".copy-control", css.text)
 
     def test_shell_script_has_accessible_drawer_state(self):
         res = self.client.get("/static/js/main.js")

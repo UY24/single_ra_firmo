@@ -597,6 +597,30 @@ input[type="file"]::file-selector-button {
   color: var(--muted);
 }
 
+.copy-control {
+  display: block;
+  max-width: 22rem;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copy-control:hover {
+  color: var(--text);
+}
+
+.copy-control.is-copied {
+  color: var(--accent);
+}
+
 .btn-danger {
   border: 1px solid color-mix(in srgb, var(--red) 48%, transparent);
   background: color-mix(in srgb, var(--red) 18%, transparent);
@@ -1746,6 +1770,11 @@ tbody tr:hover {
   .btn-warning,
   .btn-danger {
     width: 100%;
+  }
+
+  .file-modal .file-modal-action {
+    width: auto;
+    flex: 0 0 auto;
   }
 
   .control-grid,

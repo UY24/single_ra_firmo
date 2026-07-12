@@ -38,6 +38,7 @@ globalThis.document = {
 };
 
 const {
+  copyCell,
   emptyState,
   errorCard,
   metricItem,
@@ -105,3 +106,14 @@ assert(supabaseError.textContent.includes("SUPABASE_URL"), "Supabase guidance mi
 const genericError = errorCard("Request failed");
 assert(genericError.getAttribute("role") === "alert", "generic error missing alert role");
 assert(genericError.children[0].textContent === "Something went wrong", "generic error heading changed");
+
+const copy = copyCell("s3://bucket/run/state.json");
+assert(copy.tagName === "BUTTON", "copyCell must use a keyboard-operable button");
+assert(copy.getAttribute("type") === "button", "copyCell button must not submit surrounding forms");
+assert(copy.getAttribute("aria-label") === "Copy storage path: s3://bucket/run/state.json",
+  "copyCell accessible name must identify its storage path");
+assert(copy.listeners.click, "copyCell button lost its copy handler");
+assert(hasClass(copy, "copy-control"), "copyCell semantic styling hook missing");
+
+const emptyCopy = copyCell("—");
+assert(emptyCopy.tagName === "SPAN", "empty copyCell placeholder must remain non-interactive");

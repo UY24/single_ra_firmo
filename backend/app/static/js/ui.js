@@ -10,21 +10,21 @@ export function copyCell(text) {
   if (!text || text === "-" || text === "—") {
     return el("span", { class: "font-mono text-xs text-slate-500" }, "—");
   }
-  const span = el("span", {
-    class: "block max-w-[22rem] truncate font-mono text-xs text-slate-400 cursor-pointer hover:text-slate-200 transition-colors",
+  const button = el("button", {
+    type: "button",
+    class: "copy-control",
+    "aria-label": `Copy storage path: ${text}`,
     title: `${text}\n(click to copy)`,
   }, text);
-  span.addEventListener("click", (ev) => {
+  button.addEventListener("click", (ev) => {
     ev.stopPropagation();
     copyText(text);
-    span.classList.add("text-emerald-400");
-    span.classList.remove("text-slate-400", "text-slate-200");
+    button.classList.add("is-copied");
     setTimeout(() => {
-      span.classList.remove("text-emerald-400");
-      span.classList.add("text-slate-400");
+      button.classList.remove("is-copied");
     }, 1000);
   });
-  return span;
+  return button;
 }
 
 export function statusBadge(status) {

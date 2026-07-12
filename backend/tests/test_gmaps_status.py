@@ -126,6 +126,28 @@ class TestGmapsStatusBlock(unittest.TestCase):
                          "acme-inc/gmaps/up-1")
         self.assertEqual(len(scheduled), 1)
 
+    def test_normal_s3_write_retains_resolved_legacy_run_prefix(self):
+        scheduled = []
+
+        def capture_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return mock.Mock()
+
+        legacy_app._s3_run_prefix_cache["gm1"] = "ISI_Market_Test/gmaps/gm1"
+        state = {"company_name": "ISI Market Test", "pipeline": "gmaps"}
+        with mock.patch.object(legacy_app, "_state_file",
+                               return_value=Path("/tmp/unused-state.json")), \
+             mock.patch.object(legacy_app, "_write_json"), \
+             mock.patch.object(legacy_app.asyncio, "create_task",
+                               side_effect=capture_task), \
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+            asyncio.run(legacy_app.write_upload_artifact("gm1", "state", state))
+
+        self.assertEqual(legacy_app._s3_run_prefix_cache["gm1"],
+                         "ISI_Market_Test/gmaps/gm1")
+        self.assertEqual(len(scheduled), 1)
+
     def test_cached_current_prefix_lists_once_without_suffix_scan(self):
         class FakeS3:
             def __init__(self):

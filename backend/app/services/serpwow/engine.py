@@ -795,7 +795,7 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
-        _s3_run_prefix_cache[upload_id] = key.rsplit("/", 1)[0]
+        _s3_run_prefix_cache.setdefault(upload_id, key.rsplit("/", 1)[0])
 
         async def _write_s3_background():
             max_retries = 5

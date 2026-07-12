@@ -169,6 +169,8 @@ async function completedGsearchLlm() {
       confidence_mode: "llm", is_batch: true, model: "gemini-test",
       websites_found: 4, websites_not_found: 0,
       outcome_breakdown: { found: 4, not_found: 0, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} },
+      available_files: ["found.csv", "report.json"],
       token_usage: { prompt_tokens: 100, completion_tokens: 20 },
       cost: { llm_usd: 0.01, serpwow_usd: 0.02, serpwow_searches: 4, total_usd: 0.03 },
     },
@@ -189,6 +191,11 @@ async function completedGsearchLlm() {
   assert(byClass(document.body, "data-table").length === 1, "CSV data table missing");
   assert(document.body.textContent.includes("line one\nline two"), "embedded CSV newline was not preserved");
   assert(document.body.textContent.includes("1 row"), "CSV row count changed");
+  const unavailableLog = byClass(root, "file-row").find((row) => row.textContent.includes("run.log"));
+  assert(unavailableLog?.children[1]?.children[0]?.disabled,
+    "absent SerpWow result file View must be disabled");
+  assert(unavailableLog?.children[1]?.children[1]?.getAttribute("href") == null,
+    "absent SerpWow result file Download must not have an href");
 }
 
 async function completedGmapsHeuristic() {
@@ -198,6 +205,9 @@ async function completedGmapsHeuristic() {
     processing_seconds_total: 6, processing_seconds_avg: 2,
     serpwow_summary: {
       confidence_mode: "heuristic", websites_found: 2, websites_not_found: 2,
+      outcome_breakdown: { found: 2, not_found: 1, errored: 1 },
+      error_breakdown: { by_source: { serpwow: 1 }, by_category: { upstream: 1 } },
+      available_files: [],
       cost: { serpwow_usd: 0.1, total_usd: 0.1 },
     },
   });
@@ -216,6 +226,7 @@ async function completedRelationship() {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
       total_rows_original: 5, websites_found: 3, websites_not_found: 1, blank_rows: 1,
       outcome_breakdown: { found: 3, not_found: 1, errored: 0 }, unique_pairs: 2,
+      available_files: ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"],
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
@@ -232,6 +243,8 @@ async function finalizingBatch() {
     pipeline: "gsearch", status: "completed", total_rows: 4, processed_rows: 4,
     serpwow_summary: {
       confidence_mode: "llm", is_batch: true, websites_found: 4, websites_not_found: 0,
+      outcome_breakdown: { found: 4, not_found: 0, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} }, available_files: [],
       cost: {},
     },
   };
@@ -257,6 +270,9 @@ async function completedWithErrorsBatchIsTerminal() {
     failed_rows: 1, gemini_batch: { status: "completed_with_errors" },
     serpwow_summary: {
       confidence_mode: "llm", is_batch: true, websites_found: 2, websites_not_found: 1,
+      outcome_breakdown: { found: 2, not_found: 0, errored: 1 },
+      error_breakdown: { by_source: { gemini: 1 }, by_category: { llm_error: 1 } },
+      available_files: ["found.csv", "notFound.csv", "report.json", "run.log"],
       cost: {},
     },
   });
@@ -270,8 +286,8 @@ async function legacyCompatibility() {
     success_rows: 5, failed_rows: 2, processing_seconds_total: 14, processing_seconds_avg: 2,
   });
   assertOutcomeFirst(root, "5 of 7");
-  assert(labelValue(root, "Not found") === "0", "legacy not-found fallback wrong");
-  assert(labelValue(root, "Errors") === "2", "legacy failed rows must map to errors");
+  assert(labelValue(root, "Not found") == null, "non-reporting pipeline invented Not found");
+  assert(labelValue(root, "Failed") === "2", "legacy failed rows must use Failed label");
   assert(byClass(root, "files-section").length === 1, "legacy terminal files missing");
 }
 

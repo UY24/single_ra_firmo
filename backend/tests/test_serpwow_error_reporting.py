@@ -11,6 +11,17 @@ def _row(company, status, outcome, website=None, src=None, cat=None):
 
 
 class TestErrorReporting(unittest.TestCase):
+    def test_nonrelationship_outcomes_reconcile_for_gsearch_and_gmaps(self):
+        for pipeline in ("gsearch", "gmaps"):
+            with self.subTest(pipeline=pipeline):
+                state = {"pipeline": pipeline, "upload_id": "u1", "rows": [
+                    _row("A", "completed", o.OUTCOME_FOUND, website="https://a.com"),
+                    _row("B", "completed", o.OUTCOME_NOT_FOUND),
+                    _row("C", "failed", o.OUTCOME_ERROR),
+                ]}
+                summary = rep.build_summary(state, rep.state_to_entity_results(state))
+                self.assertEqual(sum(summary["outcome_breakdown"].values()), len(state["rows"]))
+
     def test_breakdowns_in_summary(self):
         state = {"pipeline": "gsearch", "upload_id": "u1", "rows": [
             _row("A", "completed", o.OUTCOME_FOUND, website="https://a.com"),

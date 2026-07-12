@@ -2054,6 +2054,34 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     return {name: str(base / name) for name in names}
 
 
+def _reporting_result_names(pipeline: str) -> list[str]:
+    if pipeline not in REPORTING_PIPELINES:
+        return []
+    names = ["found.csv", "notFound.csv"]
+    if pipeline == PIPELINE_RELATIONSHIP:
+        names.append("skipped.csv")
+    return [*names, "report.json", "run.log"]
+
+
+async def _available_reporting_files(upload_id: str, pipeline: str) -> list[str]:
+    """Return reporting artifacts that exist locally or in configured S3 storage."""
+    expected = _reporting_result_names(pipeline)
+    if not expected:
+        return []
+    upload_dir = _find_upload_dir(upload_id)
+    available = [name for name in expected if (upload_dir / name).exists()]
+    if not os.getenv("S3_BUCKET"):
+        return available
+
+    missing = [name for name in expected if name not in available]
+    keys = await asyncio.gather(*(
+        asyncio.to_thread(_find_s3_upload_key_sync, upload_id, name)
+        for name in missing
+    ))
+    present_in_s3 = {name for name, key in zip(missing, keys) if key}
+    return [name for name in expected if name in available or name in present_in_s3]
+
+
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
@@ -2121,21 +2149,8 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             success_count = ob.get("found", summ["websites_found"])
             failed_count = ob.get("errored", 0)
             if state.get("relationship"):
-                # relationship state/outcome counters are PAIR-level, but the CSVs
-                # (found.csv/notFound.csv) and this Supabase row are ORIGINAL-ROW-
-                # level (fan-out) — override with the already-fanned equivalents
-                # instead of the pair-level outcome_breakdown above. success=found:
-                # summ["websites_found"] already counts fanned rows with a website
-                # (== outcome "found"). failed=errored: a genuine per-pair error
-                # (row["outcome"] == "error", a raised LLM/search exception) fanned
-                # to its original rows — NOT a not-confirmed relationship gate,
-                # which is a business not_found, not a failure.
-                success_count = summ["websites_found"]
-                failed_count = sum(
-                    len(r.get("source_row_indices") or [])
-                    for r in state.get("rows", [])
-                    if isinstance(r, dict) and r.get("outcome") == _outcomes.OUTCOME_ERROR
-                )
+                # Relationship canonical outcomes are already fanned to original
+                # searchable rows; only the original total needs an explicit field.
                 extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
@@ -2253,15 +2268,6 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                     found = ob.get("found")
                     not_found = ob.get("not_found")
                     errored = ob.get("errored")
-                    if isinstance(relationship_meta, dict):
-                        # relationship's outcome_breakdown is PAIR-level (see the
-                        # total_rows override above); the found/not_found headline
-                        # should match the CSVs the user downloads (ORIGINAL-ROW
-                        # level), so keep using websites_found/websites_not_found
-                        # for those two. errored stays pair-level — it's a
-                        # diagnostic count, not something fanned out to rows.
-                        found = gs["websites_found"]
-                        not_found = gs["websites_not_found"]
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
                         "search_label": "SerpWow searches",
@@ -2269,6 +2275,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
+                        "llm_cost_usd": gs["cost"]["llm_usd"],
+                        "serpwow_cost_usd": gs["cost"]["serpwow_usd"],
                         "found": found,
                         "not_found": not_found,
                         "errored": errored,
@@ -4396,9 +4404,14 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
+            available_files = await _available_reporting_files(
+                upload_id, str(summary.get("pipeline") or PIPELINE_FULL))
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],
+                "outcome_breakdown": gs["outcome_breakdown"],
+                "error_breakdown": gs["error_breakdown"],
+                "available_files": available_files,
                 "model": gs["model"],
                 "confidence_mode": gs["confidence_mode"],
                 "is_batch": gs["is_batch"],

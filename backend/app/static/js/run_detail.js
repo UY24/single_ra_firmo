@@ -145,18 +145,24 @@ function safeCount(value) {
   return Number.isFinite(number) && number >= 0 ? number : 0;
 }
 
-function outcomeSummary({ found, notFound, errors = 0, total, skipped = null }) {
+function outcomeSummary({
+  found,
+  notFound = null,
+  errors = 0,
+  total,
+  skipped = null,
+  failureLabel = "Errors",
+}) {
   const safeFound = safeCount(found);
-  const safeNotFound = safeCount(notFound);
+  const safeNotFound = notFound == null ? null : safeCount(notFound);
   const safeErrors = safeCount(errors);
   const safeTotal = safeCount(total);
   const safeSkipped = skipped == null ? null : safeCount(skipped);
   const hasDenominator = safeTotal > 0;
   const rate = hasDenominator ? Math.min(100, Math.round((safeFound / safeTotal) * 100)) : null;
-  const secondary = [
-    metricItem("Not found", fmtNum(safeNotFound), "muted"),
-    metricItem("Errors", fmtNum(safeErrors), safeErrors > 0 ? "danger" : "muted"),
-  ];
+  const secondary = [];
+  if (safeNotFound != null) secondary.push(metricItem("Not found", fmtNum(safeNotFound), "muted"));
+  secondary.push(metricItem(failureLabel, fmtNum(safeErrors), safeErrors > 0 ? "danger" : "muted"));
   if (safeSkipped != null) secondary.push(metricItem("Skipped", fmtNum(safeSkipped), "warning"));
   return el("section", { class: "outcome-summary", "aria-label": "Run outcome" },
     el("div", { class: "outcome-primary" },
@@ -457,17 +463,13 @@ function renderLegacyStatus(root, ref, s) {
   const isRel = s.pipeline === "relationship";
   // Relationship totals use original CSV rows; state.total_rows is deduplicated queue work.
   const total = isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows;
-  // Newer summaries may provide an exclusive three-way outcome. Current compatibility
-  // payloads omit it and report websites_not_found inclusive of failed rows.
-  const errors = safeCount(outcome ? (outcome.errored ?? s.failed_rows) : s.failed_rows);
-  const found = safeCount(g
-    ? (outcome?.found ?? g.websites_found)
-    : s.success_rows);
-  const notFound = g
-    ? (outcome
-        ? safeCount(outcome.not_found ?? Math.max(safeCount(g.websites_not_found) - errors, 0))
-        : Math.max(safeCount(g.websites_not_found) - errors, 0))
-    : 0;
+  // Canonical reporting outcomes are already exclusive and original-row-level.
+  // Older reporting payloads omit the block and expose inclusive not-found counts.
+  const errors = safeCount(outcome ? outcome.errored : s.failed_rows);
+  const found = safeCount(outcome ? outcome.found : (g ? g.websites_found : s.success_rows));
+  const notFound = outcome
+    ? safeCount(outcome.not_found)
+    : (g ? Math.max(safeCount(g.websites_not_found) - errors, 0) : null);
   const execution = [
     {
       label: "Total / Processed",
@@ -502,6 +504,7 @@ function renderLegacyStatus(root, ref, s) {
       errors,
       total,
       skipped: isRel ? g?.blank_rows ?? 0 : null,
+      failureLabel: g ? "Errors" : "Failed",
     }),
     executionStrip(execution),
   ];
@@ -561,7 +564,7 @@ function renderLegacyStatus(root, ref, s) {
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
     ];
-    parts.push(filesSection(resultFiles, resultUrl, undefined, extras));
+    parts.push(filesSection(resultFiles, resultUrl, g?.available_files, extras));
   }
   root.replaceChildren(el("div", { class: "run-detail space-y-4" }, ...parts));
 }

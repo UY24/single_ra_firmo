@@ -217,9 +217,7 @@ class TestRelationshipOriginalRowLevelCounts(unittest.TestCase):
     def test_notify_slack_terminal_uses_original_row_counts(self):
         # Task 9: relationship is a REPORTING_PIPELINES member, so the Slack ping
         # now carries the found/not_found/errored trio instead of success/failed.
-        # found/not_found still use ORIGINAL-ROW-level counts (websites_found/
-        # websites_not_found), matching the CSVs the user downloads; errored is
-        # pair-level (diagnostic only) off outcome_breakdown.
+        # The canonical outcome breakdown is ORIGINAL-ROW-level, matching the CSVs.
         state = _relationship_state_one_pair_two_sources()
         with patch("app.core.notify.notify_run_complete") as notify_complete:
             engine._notify_slack_terminal(state)

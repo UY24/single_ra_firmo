@@ -790,12 +790,14 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
     if use_s3:
         company_name = str(data.get("company_name") or "")
         pipeline = str(data.get("pipeline") or PIPELINE_FULL)
-        key = (
+        default_key = (
             _state_s3_key(upload_id, company_name, pipeline)
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
-        _s3_run_prefix_cache.setdefault(upload_id, key.rsplit("/", 1)[0])
+        default_prefix, suffix = default_key.rsplit("/", 1)
+        run_prefix = _s3_run_prefix_cache.setdefault(upload_id, default_prefix)
+        key = f"{run_prefix}/{suffix}"
 
         async def _write_s3_background():
             max_retries = 5
@@ -2054,7 +2056,8 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     if pipe == PIPELINE_RELATIONSHIP:
         names += ["skipped.csv"]
     if bucket:
-        prefix = _upload_s3_prefix(upload_id, company_name, pipe)
+        prefix = _s3_run_prefix_cache.get(upload_id) or _upload_s3_prefix(
+            upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
     base = _find_upload_dir(upload_id)
     return {name: str(base / name) for name in names}

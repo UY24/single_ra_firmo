@@ -1,6 +1,8 @@
 import asyncio
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from fastapi.testclient import TestClient
@@ -39,9 +41,18 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
 
     def _post(self, action, job_name, state):
         remote = "_gemini_batch_cancel_sync" if action == "cancel" else "_gemini_batch_delete_sync"
+
+        async def fake_tombstone(_upload_id, _state, deleted_job, deleted_at, *, top_level_deleted):
+            return {
+                "deleted_by_user_at": deleted_at,
+                "job_names": [deleted_job],
+                "top_level_deleted": top_level_deleted,
+            }
+
         with patch.object(engine, remote, return_value={"ok": True}), \
              patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
              patch.object(engine, "persist_upload_state", AsyncMock()) as persist, \
+             patch.object(engine, "_write_batch_deletion_tombstone", side_effect=fake_tombstone), \
              patch.object(engine, "_now_iso", return_value="now"):
             response = self.client.post(
                 f"/batch/jobs/{action}",
@@ -56,7 +67,8 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertTrue(response.json().get("local_state_updated"))
                 persisted = persist.await_args.args[1]
-                self.assertEqual(persisted["gemini_batch"]["status"], "cancel_requested")
+                aggregate_expected = "cancel_requested" if job_name == "jobs/top" else "running"
+                self.assertEqual(persisted["gemini_batch"]["status"], aggregate_expected)
                 chunk = persisted["gemini_batch"]["chunks"][0]
                 expected = "cancel_requested" if job_name == "jobs/chunk 0" else "running"
                 self.assertEqual(chunk["status"], expected)
@@ -67,28 +79,38 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
                 response, persist = self._post("delete", job_name, copy.deepcopy(batch_state()))
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertTrue(response.json().get("local_state_updated"))
-                batch = persist.await_args.args[1]["gemini_batch"]
-                self.assertEqual(batch["status"], "failed")
-                self.assertEqual(batch["completed_at"], "now")
-                self.assertEqual(batch["error"], "Remote batch deleted by user")
-                self.assertEqual(persist.await_args.args[1]["batch_deleted_by_user_at"], "now")
+                persisted = persist.await_args.args[1]
+                batch = persisted["gemini_batch"]
                 if job_name == "jobs/top":
+                    self.assertEqual(batch["status"], "failed")
+                    self.assertEqual(batch["completed_at"], "now")
+                    self.assertEqual(batch["error"], "Remote batch deleted by user")
+                    self.assertEqual(persisted["batch_deleted_by_user_at"], "now")
                     self.assertNotIn("job_name", batch)
                 else:
+                    self.assertEqual(batch["status"], "running")
+                    self.assertNotIn("batch_deleted_by_user_at", persisted)
                     chunk = batch["chunks"][0]
                     self.assertNotIn("job_name", chunk)
                     self.assertEqual(chunk["status"], "failed")
                     self.assertEqual(chunk["error"], "Remote batch deleted by user")
 
-    def test_mismatched_job_keeps_local_state_unchanged(self):
-        for action in ("cancel", "delete"):
-            with self.subTest(action=action):
-                state = copy.deepcopy(batch_state())
-                response, persist = self._post(action, "jobs/other", state)
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertIs(response.json().get("local_state_updated"), False)
-                persist.assert_not_awaited()
-                self.assertEqual(state, batch_state())
+    def test_mismatched_cancel_keeps_local_state_unchanged(self):
+        state = copy.deepcopy(batch_state())
+        response, persist = self._post("cancel", "jobs/other", state)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json().get("local_state_updated"), False)
+        persist.assert_not_awaited()
+        self.assertEqual(state, batch_state())
+
+    def test_delete_before_chunk_metadata_persists_still_records_tombstone(self):
+        state = copy.deepcopy(batch_state())
+        response, persist = self._post("delete", "jobs/new-chunk", state)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json().get("local_state_updated"))
+        persisted = persist.await_args.args[1]
+        self.assertIn("jobs/new-chunk", persisted["batch_deleted_job_names"])
+        self.assertEqual(persisted["gemini_batch"]["status"], "running")
 
     def test_missing_upload_retains_remote_only_behavior(self):
         with patch.object(engine, "_gemini_batch_cancel_sync", return_value={"ok": True}), \
@@ -118,6 +140,7 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
         with patch.object(engine, "rabbitmq_exchange", MagicMock()), \
              patch.object(engine, "get_upload_state", AsyncMock(return_value=state)), \
              patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "_clear_batch_deletion_tombstone", AsyncMock()), \
              patch.object(engine, "persist_upload_state", AsyncMock()) as persist, \
              patch.object(engine, "publish_job", AsyncMock()), \
              patch.object(engine, "_batch_postprocess_enabled_for", return_value=True):
@@ -128,6 +151,50 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
         self.assertNotIn("deleted_by_user_at", persisted["gemini_batch"])
         self.assertEqual(persisted["gemini_batch"]["status"], "waiting_for_rows")
 
+    def test_batch_jobs_list_correlates_reporting_pipeline_chunks(self):
+        summary = {
+            "upload_id": "gsearch-upload",
+            "pipeline": "gsearch",
+            "status": "completed",
+            "updated_at": "2026-07-12T00:00:00Z",
+            "gemini_batch": {
+                "status": "completed_with_errors",
+                "job_name": "jobs/top",
+                "chunks": [
+                    {"chunk_id": 0, "job_name": "jobs/chunk-0", "status": "running"},
+                    {"chunk_id": 1, "job_name": "jobs/chunk-1", "status": "cancel_requested"},
+                ],
+            },
+        }
+        list_summaries = AsyncMock(return_value=[summary])
+        with patch.object(engine, "list_upload_summaries", list_summaries), \
+             patch.dict("os.environ", {"ENABLE_REMOTE_GEMINI_BATCH_LIST": "false"}, clear=False):
+            response = self.client.get("/batch/jobs")
+        self.assertEqual(response.status_code, 200, response.text)
+        jobs = {job["job_name"]: job for job in response.json()["jobs"]}
+        self.assertEqual(set(jobs), {"jobs/top", "jobs/chunk-0", "jobs/chunk-1"})
+        self.assertEqual(jobs["jobs/top"]["batch_status"], "completed_with_errors")
+        self.assertEqual(jobs["jobs/chunk-0"]["upload_id"], "gsearch-upload")
+        self.assertEqual(jobs["jobs/chunk-0"].get("chunk_id"), 0)
+        self.assertEqual(jobs["jobs/chunk-0"]["batch_status"], "running")
+        self.assertEqual(jobs["jobs/chunk-1"]["upload_id"], "gsearch-upload")
+        self.assertEqual(jobs["jobs/chunk-1"].get("chunk_id"), 1)
+        self.assertEqual(jobs["jobs/chunk-1"]["batch_status"], "cancel_requested")
+        self.assertIsNone(list_summaries.await_args.kwargs["pipeline"])
+
+    def test_destructive_actions_invalidate_remote_job_cache(self):
+        for action in ("cancel", "delete"):
+            with self.subTest(action=action):
+                engine.gemini_batch_list_cache = [{"name": "jobs/stale"}]
+                engine.gemini_batch_list_cache_fetched_at = 123.0
+                engine.gemini_batch_list_error_cooldown_until = 456.0
+                response, _persist = self._post(
+                    action, "jobs/top", copy.deepcopy(batch_state()))
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(engine.gemini_batch_list_cache, [])
+                self.assertEqual(engine.gemini_batch_list_cache_fetched_at, 0.0)
+                self.assertEqual(engine.gemini_batch_list_error_cooldown_until, 0.0)
+
 
 class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
     async def _sync_with_real_persist(self, action):
@@ -136,7 +203,9 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
         finalize = AsyncMock()
         notify_terminal = Mock()
         run_batch = AsyncMock()
-        with patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
              patch.object(engine, "write_upload_artifact", write_artifact), \
              patch.object(engine, "update_summary_cache"), \
              patch.object(engine, "build_upload_output_payload", return_value={}), \
@@ -232,6 +301,7 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
             with patch.object(engine, "rabbitmq_exchange", MagicMock()), \
                  patch.object(engine, "get_upload_state", AsyncMock(return_value=state)), \
                  patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+                 patch.object(engine, "_clear_batch_deletion_tombstone", AsyncMock()), \
                  patch.object(engine, "persist_upload_state", persist), \
                  patch.object(engine, "publish_job", AsyncMock()), \
                  patch.object(engine, "_batch_postprocess_enabled_for", return_value=True):
@@ -245,6 +315,209 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
             if not old_task.done():
                 old_task.cancel()
                 await asyncio.gather(old_task, return_exceptions=True)
+
+    async def test_explicit_retry_waits_for_chunk_deleted_generation_to_exit(self):
+        state = batch_state()
+        state["rows"][0]["status"] = "failed"
+        state["batch_deleted_job_names"] = ["jobs/chunk 0"]
+        state["gemini_batch"]["deleted_jobs_by_user_at"] = "deleted-at"
+        old_driver_exited = asyncio.Event()
+
+        async def old_driver():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                old_driver_exited.set()
+
+        old_task = asyncio.create_task(old_driver())
+        await asyncio.sleep(0)
+        engine.gemini_batch_tasks["upload-1"] = old_task
+        try:
+            with patch.object(engine, "rabbitmq_exchange", MagicMock()), \
+                 patch.object(engine, "get_upload_state", AsyncMock(return_value=state)), \
+                 patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+                 patch.object(engine, "_clear_batch_deletion_tombstone", AsyncMock()), \
+                 patch.object(engine, "persist_upload_state", AsyncMock()), \
+                 patch.object(engine, "publish_job", AsyncMock()), \
+                 patch.object(engine, "_batch_postprocess_enabled_for", return_value=True):
+                await engine.retry_failed_rows("upload-1", limit=0)
+            self.assertTrue(old_driver_exited.is_set())
+            self.assertTrue(old_task.cancelled())
+        finally:
+            engine.gemini_batch_tasks.pop("upload-1", None)
+            if not old_task.done():
+                old_task.cancel()
+                await asyncio.gather(old_task, return_exceptions=True)
+
+    async def test_stale_worker_snapshot_cannot_erase_separate_delete_tombstone(self):
+        upload_id = "cross-process-upload"
+        live_state = batch_state()
+        live_state["upload_id"] = upload_id
+        stale_worker_snapshot = copy.deepcopy(live_state)
+        delayed_write_snapshot = copy.deepcopy(live_state)
+        run_batch = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": ""}, clear=False), \
+             patch.object(engine, "_batch_postprocess_enabled_for", return_value=True), \
+             patch.object(engine, "_notify_slack_terminal"), \
+             patch.object(engine, "_finalize_serpwow_outputs", AsyncMock()), \
+             patch.object(engine, "run_gemini_batch_for_upload", run_batch):
+            engine._write_json(
+                engine._upload_dir(upload_id) / "state.json", live_state)
+            updated = await engine._sync_batch_job_action_local_state(
+                upload_id, "jobs/top", "delete")
+            self.assertTrue(updated)
+
+            # Independent worker had already read before delete and now writes
+            # its stale completed snapshot after the API persisted deletion.
+            await engine.persist_upload_state(upload_id, stale_worker_snapshot)
+            await asyncio.sleep(0)
+            # Model a delayed state.json/S3 writer that had already passed its
+            # persist-time tombstone check before the delete committed.
+            engine._write_json(engine._state_file(upload_id), delayed_write_snapshot)
+            final_state = await engine.read_upload_artifact(upload_id, "state")
+
+        task = engine.gemini_batch_tasks.pop(upload_id, None)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(final_state["gemini_batch"]["status"], "failed")
+        self.assertTrue(final_state.get("batch_deleted_by_user_at"))
+        run_batch.assert_not_awaited()
+
+    async def test_s3_clear_marker_supersedes_another_instances_cached_tombstone(self):
+        upload_id = "cross-instance-retry"
+        state = batch_state()
+        state["upload_id"] = upload_id
+        remote_artifacts = {}
+
+        def capture_s3_write(key, payload):
+            remote_artifacts[key] = copy.deepcopy(payload)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": "bucket"}, clear=False), \
+             patch.object(engine, "_write_json_to_s3_sync", side_effect=capture_s3_write), \
+             patch.object(engine, "_read_json_from_s3_sync", side_effect=lambda key: copy.deepcopy(remote_artifacts[key])):
+            await engine._write_batch_deletion_tombstone(
+                upload_id, state, "jobs/chunk 0", "deleted-at",
+                top_level_deleted=False,
+            )
+            await engine._clear_batch_deletion_tombstone(upload_id, state)
+
+            # A second instance still has the pre-retry deletion cached.
+            engine._write_json(
+                engine._batch_deletion_tombstone_path(upload_id),
+                {
+                    "deleted_by_user_at": "deleted-at",
+                    "job_names": ["jobs/chunk 0"],
+                    "top_level_deleted": False,
+                },
+            )
+            resolved = await engine._read_batch_deletion_tombstone(upload_id, state)
+
+        self.assertTrue(resolved.get("cleared_at"))
+        self.assertFalse(resolved.get("deleted_by_user_at"))
+        stale_state = batch_state()
+        stale_state["gemini_batch"]["status"] = "running"
+        engine._apply_batch_deletion_tombstone(stale_state, resolved)
+        self.assertEqual(stale_state["gemini_batch"]["generation"], resolved["generation"])
+        self.assertEqual(stale_state["gemini_batch"]["status"], "waiting_for_rows")
+
+    async def test_old_process_generation_cannot_apply_results_after_retry(self):
+        upload_id = "cross-process-generation"
+        original = batch_state()
+        original["upload_id"] = upload_id
+        original["gemini_batch"]["status"] = "queued"
+        original["gemini_batch"]["generation"] = 0
+        persisted = {"state": original}
+
+        async def fake_persist(_upload_id, latest):
+            persisted["state"] = latest
+
+        async def finish_old_generation(*_args):
+            retried = copy.deepcopy(persisted["state"])
+            retried["gemini_batch"] = {
+                "status": "waiting_for_rows",
+                "generation": 1,
+                "job_name": None,
+                "error": None,
+            }
+            persisted["state"] = retried
+            return {
+                "chunk_id": 0,
+                "job_name": "jobs/old-generation",
+                "status": "succeeded",
+                "error": None,
+                "parsed_by_row": {1: {"official_website": "https://stale.example"}},
+                "usage": {},
+            }
+
+        with patch.object(
+            engine, "read_upload_artifact",
+            AsyncMock(side_effect=lambda _uid, _name: persisted["state"]),
+        ), patch.object(
+            engine, "persist_upload_state", side_effect=fake_persist,
+        ), patch.object(
+            engine, "_run_one_gemini_chunk", side_effect=finish_old_generation,
+        ):
+            await engine.run_gemini_batch_for_upload(upload_id)
+
+        self.assertEqual(persisted["state"]["gemini_batch"]["generation"], 1)
+        self.assertEqual(persisted["state"]["gemini_batch"]["status"], "waiting_for_rows")
+        self.assertEqual(
+            persisted["state"]["rows"][0]["result"]["official_website"],
+            "https://acme.example",
+        )
+
+    async def test_waiting_retry_generation_cannot_be_adopted_by_old_driver(self):
+        state = batch_state()
+        state["gemini_batch"] = {
+            "status": "waiting_for_rows",
+            "generation": 1,
+            "job_name": None,
+            "error": None,
+        }
+        persist = AsyncMock()
+        run_chunk = AsyncMock()
+
+        with patch.object(
+            engine, "read_upload_artifact", AsyncMock(return_value=state),
+        ), patch.object(
+            engine, "persist_upload_state", persist,
+        ), patch.object(
+            engine, "_run_one_gemini_chunk", run_chunk,
+        ):
+            await engine.run_gemini_batch_for_upload("upload /1")
+
+        persist.assert_not_awaited()
+        run_chunk.assert_not_awaited()
+        self.assertEqual(state["gemini_batch"]["status"], "waiting_for_rows")
+
+    async def test_maybe_start_preserves_retry_generation_when_queueing(self):
+        upload_id = "versioned-retry"
+        state = batch_state()
+        state["status"] = "completed"
+        state["gemini_batch"] = {
+            "status": "waiting_for_rows",
+            "generation": 2,
+            "job_name": None,
+            "error": None,
+        }
+        run_batch = AsyncMock()
+
+        with patch.object(engine, "persist_upload_state", AsyncMock()), \
+             patch.object(engine, "run_gemini_batch_for_upload", run_batch):
+            await engine.maybe_start_gemini_batch_for_upload(upload_id, state)
+            await asyncio.sleep(0)
+
+        task = engine.gemini_batch_tasks.pop(upload_id, None)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(state["gemini_batch"]["status"], "queued")
+        self.assertEqual(state["gemini_batch"]["generation"], 2)
+        run_batch.assert_awaited_once_with(upload_id)
 
 
 if __name__ == "__main__":

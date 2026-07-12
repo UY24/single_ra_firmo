@@ -332,6 +332,14 @@ def _batch_deleted_by_user(state: dict[str, Any]) -> bool:
     return bool(state.get("batch_deleted_by_user_at") or batch.get("deleted_by_user_at"))
 
 
+def _batch_generation(state: dict[str, Any]) -> int:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    try:
+        return max(0, int(batch.get("generation") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 
 
 
@@ -879,6 +887,10 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
                         if state_key:
                             _remember_s3_run_prefix(
                                 upload_id, state_key.rsplit("/", 1)[0])
+                if name == "state":
+                    tombstone = await _read_batch_deletion_tombstone(upload_id, data)
+                    if tombstone:
+                        _apply_batch_deletion_tombstone(data, tombstone)
                 return data
         except Exception:
             pass
@@ -892,6 +904,10 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
             raise FileNotFoundError(f"upload {upload_id!r} not found in S3")
         data = await asyncio.to_thread(_read_json_from_s3_sync, key)
         _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
+        if name == "state":
+            tombstone = await _read_batch_deletion_tombstone(upload_id, data)
+            if tombstone:
+                _apply_batch_deletion_tombstone(data, tombstone)
         # Cache it locally so subsequent reads are instant
         try:
             _write_json(local_path, data)
@@ -900,6 +916,196 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         return data
 
     raise FileNotFoundError(str(local_path))
+
+
+def _batch_deletion_tombstone_path(upload_id: str) -> Path:
+    return _find_upload_dir(upload_id) / ".batch_deleted_by_user.json"
+
+
+def _batch_deletion_tombstone_s3_key(upload_id: str, state: dict[str, Any]) -> str:
+    prefix = _resolved_upload_s3_prefix(
+        upload_id,
+        str(state.get("company_name") or ""),
+        str(state.get("pipeline") or PIPELINE_FULL),
+    )
+    return f"{prefix}/batch_deleted_by_user.json"
+
+
+async def _read_batch_deletion_tombstone(
+    upload_id: str,
+    state: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_data: Optional[dict[str, Any]] = None
+    if local_path.exists():
+        try:
+            data = json.loads(local_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and (
+                data.get("deleted_by_user_at") or data.get("cleared_at")
+            ):
+                local_data = data
+        except Exception:
+            pass
+    if not os.getenv("S3_BUCKET") or not isinstance(state, dict):
+        return local_data
+    key = _batch_deletion_tombstone_s3_key(upload_id, state)
+    try:
+        data = await asyncio.to_thread(_read_json_from_s3_sync, key)
+    except Exception:
+        return local_data
+    if not isinstance(data, dict) or not (
+        data.get("deleted_by_user_at") or data.get("cleared_at")
+    ):
+        return local_data
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(local_path, data)
+    except Exception:
+        pass
+    return data
+
+
+def _apply_batch_deletion_tombstone(
+    state: dict[str, Any],
+    tombstone: dict[str, Any],
+) -> None:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    state_generation = _batch_generation(state)
+    try:
+        artifact_generation = max(0, int(tombstone.get("generation") or 0))
+    except (TypeError, ValueError):
+        artifact_generation = 0
+    batch["generation"] = max(state_generation, artifact_generation)
+    state["gemini_batch"] = batch
+    if tombstone.get("cleared_at"):
+        if state_generation < artifact_generation:
+            batch = {
+                "status": "waiting_for_rows",
+                "generation": artifact_generation,
+                "queued_at": None,
+                "job_name": None,
+                "error": None,
+            }
+            state["gemini_batch"] = batch
+        state.pop("batch_deleted_by_user_at", None)
+        state.pop("batch_deleted_job_names", None)
+        batch.pop("deleted_by_user_at", None)
+        batch.pop("deleted_jobs_by_user_at", None)
+        return
+    deleted_at = str(tombstone.get("deleted_by_user_at") or "").strip()
+    if not deleted_at:
+        return
+    deleted_jobs = {
+        str(job_name).strip()
+        for job_name in (tombstone.get("job_names") or [])
+        if str(job_name).strip()
+    }
+    deletion_error = "Remote batch deleted by user"
+    top_level_deleted = bool(tombstone.get("top_level_deleted"))
+    if str(batch.get("job_name") or "").strip() in deleted_jobs:
+        batch.pop("job_name", None)
+    chunks = batch.get("chunks") if isinstance(batch.get("chunks"), list) else []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if str(chunk.get("job_name") or "").strip() not in deleted_jobs:
+            continue
+        chunk.pop("job_name", None)
+        chunk["status"] = "failed"
+        chunk["error"] = deletion_error
+    state["batch_deleted_job_names"] = sorted(deleted_jobs)
+    if top_level_deleted:
+        batch["status"] = "failed"
+        batch["completed_at"] = deleted_at
+        batch["deleted_by_user_at"] = deleted_at
+        batch["error"] = deletion_error
+        state["batch_deleted_by_user_at"] = deleted_at
+    else:
+        batch["status"] = _aggregate_batch_chunk_status(chunks)
+        batch["deleted_jobs_by_user_at"] = deleted_at
+        if batch["status"] in {"waiting_for_rows", "queued", "running", "cancel_requested"}:
+            batch.pop("completed_at", None)
+            batch["error"] = None
+    state["gemini_batch"] = batch
+
+
+def _aggregate_batch_chunk_status(chunks: list[Any]) -> str:
+    statuses = [
+        str(chunk.get("status") or "")
+        for chunk in chunks
+        if isinstance(chunk, dict)
+    ]
+    if not statuses or any(status in {
+        "waiting_for_rows", "queued", "running", "cancel_requested", "",
+    } for status in statuses):
+        return "running"
+    if all(status == "succeeded" for status in statuses):
+        return "succeeded"
+    if all(status in {"failed", "cancelled", "skipped"} for status in statuses):
+        return "failed"
+    return "completed_with_errors"
+
+
+async def _write_batch_deletion_tombstone(
+    upload_id: str,
+    state: dict[str, Any],
+    job_name: str,
+    deleted_at: str,
+    *,
+    top_level_deleted: bool,
+) -> dict[str, Any]:
+    existing = await _read_batch_deletion_tombstone(upload_id, state) or {}
+    if existing.get("cleared_at"):
+        existing = {}
+    job_names = {
+        str(value).strip()
+        for value in (existing.get("job_names") or [])
+        if str(value).strip()
+    }
+    job_names.add(job_name)
+    tombstone = {
+        "upload_id": upload_id,
+        "deleted_by_user_at": str(existing.get("deleted_by_user_at") or deleted_at),
+        "job_names": sorted(job_names),
+        "top_level_deleted": bool(existing.get("top_level_deleted")) or top_level_deleted,
+        "generation": max(
+            _batch_generation(state),
+            int(existing.get("generation") or 0),
+        ),
+    }
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(local_path, tombstone)
+    if os.getenv("S3_BUCKET"):
+        key = _batch_deletion_tombstone_s3_key(upload_id, state)
+        await asyncio.to_thread(_write_json_to_s3_sync, key, tombstone)
+    return tombstone
+
+
+async def _clear_batch_deletion_tombstone(
+    upload_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    existing = await _read_batch_deletion_tombstone(upload_id, state) or {}
+    try:
+        artifact_generation = max(0, int(existing.get("generation") or 0))
+    except (TypeError, ValueError):
+        artifact_generation = 0
+    clear_marker = {
+        "upload_id": upload_id,
+        "cleared_at": _now_iso(),
+        "deleted_by_user_at": None,
+        "job_names": [],
+        "top_level_deleted": False,
+        "generation": max(_batch_generation(state), artifact_generation) + 1,
+    }
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(local_path, clear_marker)
+    if os.getenv("S3_BUCKET"):
+        key = _batch_deletion_tombstone_s3_key(upload_id, state)
+        await asyncio.to_thread(_write_json_to_s3_sync, key, clear_marker)
+    return clear_marker
 
 
 def _write_text_to_s3_sync(key: str, text: str, content_type: str = "text/plain; charset=utf-8") -> None:
@@ -1314,12 +1520,15 @@ def _extract_upload_id_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[str
     if not display_name:
         return None
     marker = "single-ra-upload-"
-    if marker not in display_name:
-        return None
-    tail = display_name.split(marker, 1)[1]
-    # Expected: {upload_id}-{uuid}
-    candidate = tail.rsplit("-", 1)[0].strip()
-    return candidate or None
+    if marker in display_name:
+        tail = display_name.split(marker, 1)[1]
+        # Expected: {upload_id}-{uuid}
+        candidate = tail.rsplit("-", 1)[0].strip()
+        return candidate or None
+    chunk_match = re.match(r"^gsearch-(.+)-chunk\d+$", display_name)
+    if chunk_match:
+        return chunk_match.group(1).strip() or None
+    return None
 
 
 def _derive_ui_batch_status(
@@ -1348,6 +1557,7 @@ def _derive_ui_batch_status(
         "cancel_requested",
         "cancelled",
         "succeeded",
+        "completed_with_errors",
         "failed",
         "skipped",
     }:
@@ -1574,10 +1784,24 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     return "completed"
 
 
-async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
+async def _persist_chunk_meta(
+    upload_id: str,
+    chunk_id: int,
+    patch: dict[str, Any],
+    expected_generation: int,
+) -> None:
     async with get_upload_lock(upload_id):
         state = await read_upload_artifact(upload_id, "state")
         if _batch_deleted_by_user(state):
+            return
+        if _batch_generation(state) != expected_generation:
+            return
+        deleted_jobs = {
+            str(value).strip()
+            for value in (state.get("batch_deleted_job_names") or [])
+            if str(value).strip()
+        }
+        if str(patch.get("job_name") or "").strip() in deleted_jobs:
             return
         gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
         chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
@@ -1592,7 +1816,8 @@ async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, An
 
 async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
                                 items: list[tuple[str, dict[str, Any]]],
-                                existing_job_name: str, batch_model: str) -> dict[str, Any]:
+                                existing_job_name: str, batch_model: str,
+                                driver_generation: int = 0) -> dict[str, Any]:
     """Submit (or resume) one chunk's Gemini batch job, poll to terminal, and return
     {chunk_id, job_name, status, error, parsed_by_row, usage}. Never raises — a failed
     chunk returns status='failed' with its rows unmapped (-> not found)."""
@@ -1614,7 +1839,12 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
         _log_gemini_batch(upload_id, f"chunk={chunk_id} submitted job_name={job_name} rows={len(items)}")
         # Persist the job_name immediately so a restart can re-poll this chunk.
         try:
-            await _persist_chunk_meta(upload_id, chunk_id, {"job_name": job_name, "status": "running"})
+            await _persist_chunk_meta(
+                upload_id,
+                chunk_id,
+                {"job_name": job_name, "status": "running"},
+                driver_generation,
+            )
         except Exception as _pm_exc:
             _log_gemini_batch(upload_id, f"chunk={chunk_id} _persist_chunk_meta failed (non-fatal): {_pm_exc!r}")
         deadline = asyncio.get_event_loop().time() + poll_timeout
@@ -1657,25 +1887,31 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
 
 
 async def run_gemini_batch_for_upload(upload_id: str) -> None:
+    driver_generation = 0
     try:
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
             if _batch_deleted_by_user(state):
                 return
             gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-            if gb.get("status") == "succeeded":
+            entry_status = str(gb.get("status") or "")
+            legacy_waiting = entry_status == "waiting_for_rows" and _batch_generation(state) == 0
+            if entry_status not in {"queued", "running"} and not legacy_waiting:
                 return
+            driver_generation = _batch_generation(state)
             gb_started = gb.get("started_at") or _now_iso()
             existing_chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
             state["gemini_batch"] = {**gb, "status": "running", "started_at": gb_started,
-                                     "chunks": existing_chunks, "error": None}
+                                     "chunks": existing_chunks, "error": None,
+                                     "generation": driver_generation}
             await persist_upload_state(upload_id, state)
 
         items, row_index_by_key = _build_batch_items_for_state(state)
         if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
-                if _batch_deleted_by_user(state):
+                if (_batch_deleted_by_user(state)
+                        or _batch_generation(state) != driver_generation):
                     return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "skipped",
                                          "completed_at": _now_iso(),
@@ -1709,7 +1945,14 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 return {"chunk_id": cid, "job_name": done.get("job_name"), "status": "succeeded",
                         "error": None, "parsed_by_row": {}, "usage": {}}
             async with sem:
-                return await _run_one_gemini_chunk(upload_id, cid, chunk_items, prior.get(cid, ""), batch_model)
+                return await _run_one_gemini_chunk(
+                    upload_id,
+                    cid,
+                    chunk_items,
+                    prior.get(cid, ""),
+                    batch_model,
+                    driver_generation,
+                )
 
         results = await asyncio.gather(*[_guarded(i, c) for i, c in enumerate(chunks)])
 
@@ -1719,6 +1962,25 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             if _batch_deleted_by_user(state):
                 _log_gemini_batch(upload_id, "discarding completed chunk results after user deletion")
                 return
+            if _batch_generation(state) != driver_generation:
+                _log_gemini_batch(upload_id, "discarding completed chunk results from stale generation")
+                return
+            deleted_jobs = {
+                str(value).strip()
+                for value in (state.get("batch_deleted_job_names") or [])
+                if str(value).strip()
+            }
+            results = [
+                ({
+                    **result,
+                    "job_name": None,
+                    "status": "failed",
+                    "error": "Remote batch deleted by user",
+                    "parsed_by_row": {},
+                    "usage": {},
+                } if str(result.get("job_name") or "").strip() in deleted_jobs else result)
+                for result in results
+            ]
             parsed_all, usage_all = {}, {}
             for r in results:
                 parsed_all.update(r.get("parsed_by_row") or {})
@@ -1776,6 +2038,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             state["gemini_batch"] = {
                 "status": agg, "started_at": state.get("gemini_batch", {}).get("started_at"),
                 "completed_at": _now_iso(),
+                "generation": driver_generation,
                 "chunks": [{"chunk_id": r["chunk_id"], "job_name": r["job_name"],
                             "status": r["status"], "error": r["error"]} for r in results],
                 "usage": batch_usage, "batch_cost_usd": calculate_gemini_batch_cost_usd(batch_usage),
@@ -1788,7 +2051,8 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         async with get_upload_lock(upload_id):
             try:
                 state = await read_upload_artifact(upload_id, "state")
-                if _batch_deleted_by_user(state):
+                if (_batch_deleted_by_user(state)
+                        or _batch_generation(state) != driver_generation):
                     return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "failed",
                                          "completed_at": _now_iso(), "error": str(exc)}
@@ -1821,6 +2085,7 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
         return
     state["gemini_batch"] = {
         "status": "queued",
+        "generation": _batch_generation(state),
         "queued_at": _now_iso(),
         "job_name": None,
         "error": None,
@@ -2459,6 +2724,9 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
+    deletion_tombstone = await _read_batch_deletion_tombstone(upload_id, state)
+    if deletion_tombstone:
+        _apply_batch_deletion_tombstone(state, deletion_tombstone)
     state = summarize_upload_state(state)
     # gsearch batch mode: rows reach "completed" before the Gemini batch (the LLM
     # confidence step) runs. Defer the terminal side-effects (Supabase 'completed'
@@ -4010,7 +4278,9 @@ async def retry_failed_rows(
     # A user-deleted batch may still have a local driver unwinding. Explicit
     # retry is the only operation allowed to clear the tombstone, so wait for
     # that older generation to exit before opening a new one.
-    if _batch_deleted_by_user(current_state):
+    if _batch_deleted_by_user(current_state) or bool(
+        current_state.get("batch_deleted_job_names")
+    ):
         old_batch_task = gemini_batch_tasks.get(upload_id)
         if old_batch_task is not None and old_batch_task is not asyncio.current_task():
             if not old_batch_task.done():
@@ -4036,8 +4306,17 @@ async def retry_failed_rows(
         phase = str(state.get("phase") or "all")
         # Retrying a stopped upload re-opens it: clear the stop marker so the
         # batch post-process can run again once the retried rows finish.
+        retry_generation = _batch_generation(state)
+        if _batch_postprocess_enabled_for(pipeline):
+            clear_marker = await _clear_batch_deletion_tombstone(upload_id, state)
+            retry_generation = (
+                int(clear_marker.get("generation") or 0)
+                if isinstance(clear_marker, dict)
+                else retry_generation + 1
+            )
         state.pop("stopped_by_user_at", None)
         state.pop("batch_deleted_by_user_at", None)
+        state.pop("batch_deleted_job_names", None)
         failed_rows = [
             row for row in (state.get("rows") or [])
             if isinstance(row, dict) and row.get("status") in {"failed", "queued", "processing"}
@@ -4077,6 +4356,7 @@ async def retry_failed_rows(
         if _batch_postprocess_enabled_for(pipeline):
             state["gemini_batch"] = {
                 "status": "waiting_for_rows",
+                "generation": retry_generation,
                 "queued_at": None,
                 "job_name": None,
                 "error": None,
@@ -4228,13 +4508,34 @@ async def uploads_list(
 @app.get("/batch/jobs")
 async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
     global gemini_batch_list_cache, gemini_batch_list_cache_fetched_at, gemini_batch_list_error_cooldown_until
-    items = await list_upload_summaries(max(limit, 500), pipeline=PIPELINE_FULL)
+    items = await list_upload_summaries(max(limit, 500), pipeline=None)
     local_by_job: dict[str, dict[str, Any]] = {}
     for item in items:
+        if str(item.get("pipeline") or PIPELINE_FULL) not in {
+            PIPELINE_FULL, PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
+        }:
+            continue
         batch_meta = item.get("gemini_batch") if isinstance(item.get("gemini_batch"), dict) else {}
         job_name = str(batch_meta.get("job_name") or "").strip()
         if job_name:
-            local_by_job[job_name] = item
+            local_by_job[job_name] = {
+                "item": item,
+                "batch": batch_meta,
+                "local_status": batch_meta.get("status"),
+                "chunk": None,
+            }
+        chunks = batch_meta.get("chunks") if isinstance(batch_meta.get("chunks"), list) else []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_job_name = str(chunk.get("job_name") or "").strip()
+            if chunk_job_name:
+                local_by_job[chunk_job_name] = {
+                    "item": item,
+                    "batch": batch_meta,
+                    "local_status": chunk.get("status"),
+                    "chunk": chunk,
+                }
 
     remote_error: Optional[str] = None
     operations: list[dict[str, Any]] = []
@@ -4291,20 +4592,23 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         ):
             continue
 
-        local_item = local_by_job.get(job_name) or {}
+        local_ref = local_by_job.get(job_name) or {}
+        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
         inferred_upload_id = _extract_upload_id_from_batch_obj(op)
-        local_batch = local_item.get("gemini_batch") if isinstance(local_item.get("gemini_batch"), dict) else {}
+        local_batch = local_ref.get("batch") if isinstance(local_ref.get("batch"), dict) else {}
+        local_chunk = local_ref.get("chunk") if isinstance(local_ref.get("chunk"), dict) else {}
 
         batch_status = _derive_ui_batch_status(
             live_state=live_state,
             done_flag=done_flag,
             error_obj=error_obj,
-            local_status=local_batch.get("status"),
+            local_status=local_ref.get("local_status"),
         )
 
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": batch_status,
                 "job_name": job_name,
@@ -4315,9 +4619,9 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
                     or metadata.get("endTime")
                     or local_item.get("updated_at")
                 ),
-                "started_at": metadata.get("createTime") or local_batch.get("started_at"),
-                "completed_at": metadata.get("endTime") or local_batch.get("completed_at"),
-                "error": local_batch.get("error") or (json.dumps(error_obj, ensure_ascii=True) if error_obj else None),
+                "started_at": metadata.get("createTime") or local_chunk.get("started_at") or local_batch.get("started_at"),
+                "completed_at": metadata.get("endTime") or local_chunk.get("completed_at") or local_batch.get("completed_at"),
+                "error": local_chunk.get("error") or local_batch.get("error") or (json.dumps(error_obj, ensure_ascii=True) if error_obj else None),
             }
         )
         seen_job_names.add(job_name)
@@ -4326,27 +4630,30 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
 
     # Always merge in locally tracked jobs that may not appear in the
     # current remote page (or may be temporarily absent from remote listing).
-    for job_name, local_item in local_by_job.items():
+    for job_name, local_ref in local_by_job.items():
         if job_name in seen_job_names:
             continue
-        local_batch = local_item.get("gemini_batch") if isinstance(local_item.get("gemini_batch"), dict) else {}
+        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
+        local_batch = local_ref.get("batch") if isinstance(local_ref.get("batch"), dict) else {}
+        local_chunk = local_ref.get("chunk") if isinstance(local_ref.get("chunk"), dict) else {}
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": _derive_ui_batch_status(
                     live_state="",
                     done_flag=False,
                     error_obj=None,
-                    local_status=local_batch.get("status"),
+                    local_status=local_ref.get("local_status"),
                 ),
                 "job_name": job_name,
                 "live_state": None,
                 "done": None,
                 "updated_at": local_item.get("updated_at"),
-                "started_at": local_batch.get("started_at"),
-                "completed_at": local_batch.get("completed_at"),
-                "error": local_batch.get("error"),
+                "started_at": local_chunk.get("started_at") or local_batch.get("started_at"),
+                "completed_at": local_chunk.get("completed_at") or local_batch.get("completed_at"),
+                "error": local_chunk.get("error") or local_batch.get("error"),
             }
         )
 
@@ -4357,6 +4664,13 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         "source": "remote" if remote_error is None else "local_fallback",
         "remote_error": remote_error,
     }
+
+
+def _invalidate_gemini_batch_list_cache() -> None:
+    global gemini_batch_list_cache, gemini_batch_list_cache_fetched_at, gemini_batch_list_error_cooldown_until
+    gemini_batch_list_cache = []
+    gemini_batch_list_cache_fetched_at = 0.0
+    gemini_batch_list_error_cooldown_until = 0.0
 
 
 @app.post("/batch/jobs/{upload_id}/status")
@@ -4463,6 +4777,7 @@ async def batch_job_cancel(upload_id: str) -> dict[str, Any]:
         except Exception:
             pass
 
+    _invalidate_gemini_batch_list_cache()
     return {
         "upload_id": upload_id,
         "status": "cancel_requested",
@@ -4511,27 +4826,26 @@ async def _sync_batch_job_action_local_state(
                 if isinstance(chunk, dict)
                 and str(chunk.get("job_name") or "").strip() == job_name
             ]
-            if not top_matches and not matching_chunks:
-                return False
 
             if action == "cancel":
-                batch["status"] = "cancel_requested"
+                if not top_matches and not matching_chunks:
+                    return False
                 for chunk in matching_chunks:
                     chunk["status"] = "cancel_requested"
+                batch["status"] = (
+                    "cancel_requested" if top_matches
+                    else _aggregate_batch_chunk_status(chunks)
+                )
             elif action == "delete":
-                deletion_error = "Remote batch deleted by user"
                 deleted_at = _now_iso()
-                batch["status"] = "failed"
-                batch["completed_at"] = deleted_at
-                batch["deleted_by_user_at"] = deleted_at
-                batch["error"] = deletion_error
-                state["batch_deleted_by_user_at"] = deleted_at
-                if top_matches:
-                    batch.pop("job_name", None)
-                for chunk in matching_chunks:
-                    chunk.pop("job_name", None)
-                    chunk["status"] = "failed"
-                    chunk["error"] = deletion_error
+                tombstone = await _write_batch_deletion_tombstone(
+                    upload_id,
+                    state,
+                    job_name,
+                    deleted_at,
+                    top_level_deleted=top_matches,
+                )
+                _apply_batch_deletion_tombstone(state, tombstone)
             else:
                 return False
 
@@ -4556,6 +4870,7 @@ async def batch_job_cancel_by_name(
         raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
     local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
         str(upload_id), job_name, "cancel")
+    _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,
         "status": "cancel_requested",
@@ -4575,6 +4890,7 @@ async def batch_job_delete_by_name(
         raise HTTPException(status_code=502, detail=f"Gemini batch delete failed: {str(exc)}") from exc
     local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
         str(upload_id), job_name, "delete")
+    _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,
         "status": "deleted",

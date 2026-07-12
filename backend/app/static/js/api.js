@@ -28,17 +28,31 @@ export const defaultTerminal = (status) =>
 
 export function pollStatus(path, onUpdate, intervalMs = 2000, isTerminal = defaultTerminal) {
   let stopped = false;
+  let timerId = null;
   async function tick() {
     if (stopped) return;
     try {
       const status = await api(path);
+      if (stopped) return;
       onUpdate(status);
-      if (isTerminal(status)) return;
-    } catch (e) { console.error(e); }
-    setTimeout(tick, intervalMs);
+      if (stopped || isTerminal(status)) return;
+    } catch (e) {
+      if (!stopped) console.error(e);
+    }
+    if (stopped) return;
+    timerId = setTimeout(() => {
+      timerId = null;
+      tick();
+    }, intervalMs);
   }
   tick();
-  return () => { stopped = true; };
+  return () => {
+    stopped = true;
+    if (timerId != null) {
+      clearTimeout(timerId);
+      timerId = null;
+    }
+  };
 }
 
 export function el(tag, attrs = {}, ...children) {

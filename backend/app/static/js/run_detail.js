@@ -19,14 +19,38 @@ import {
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
+const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship"]);
 const BATCH_TERMINAL_STATUSES = new Set([
   "succeeded", "completed_with_errors", "failed", "skipped", "not_started",
 ]);
+const STOPPABLE_BATCH_STATUSES = new Set(["waiting_for_rows", "queued", "running"]);
 
-function legacyStatusTerminal(status) {
-  const rowsTerminal = ROW_TERMINAL_STATUSES.has(String(status?.status ?? ""));
-  const batchStatus = status?.gemini_batch?.status ?? null;
-  return rowsTerminal && (batchStatus == null || BATCH_TERMINAL_STATUSES.has(String(batchStatus)));
+function deriveLegacyRunState(s) {
+  const status = String(s?.status ?? "");
+  const pipeline = String(s?.pipeline ?? "");
+  const reporting = REPORTING_PIPELINES.has(pipeline);
+  const rowTerminal = ROW_TERMINAL_STATUSES.has(status);
+  const batchStatus = s?.gemini_batch?.status == null
+    ? null
+    : String(s.gemini_batch.status);
+  const batchTerminal = !reporting || batchStatus == null
+    || BATCH_TERMINAL_STATUSES.has(batchStatus);
+  const finalizing = reporting && rowTerminal && !batchTerminal;
+  const pollTerminal = rowTerminal && !finalizing;
+  const filesReady = pollTerminal;
+  const cancellationRequested = status === "cancel_requested" || batchStatus === "cancel_requested";
+  const canStop = !cancellationRequested
+    && (!rowTerminal || (finalizing && STOPPABLE_BATCH_STATUSES.has(batchStatus)));
+  return {
+    reporting,
+    rowTerminal,
+    batchStatus,
+    batchTerminal,
+    finalizing,
+    pollTerminal,
+    filesReady,
+    canStop,
+  };
 }
 
 // ── inline file viewer modal ──────────────────────────────────────────────────
@@ -435,16 +459,7 @@ function renderAiStatus(root, ref, s) {
 }
 
 function renderLegacyStatus(root, ref, s) {
-  const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
-  // gsearch/gmaps batch mode: rows finish before the Gemini batch. Treat the run as
-  // "done" only once the batch is terminal so the UI doesn't claim completion early.
-  const batchStatus = s.gemini_batch?.status ?? null;
-  const batchTerminal = batchStatus == null
-    || BATCH_TERMINAL_STATUSES.has(String(batchStatus));
-  const isSerp = ["gsearch", "gmaps", "relationship"].includes(s.pipeline);
-  const finalizing = isSerp && rowsDone && !batchTerminal;
-  const active = !["completed", "completed_with_errors", "failed"].includes(String(s.status ?? ""))
-    || finalizing;
+  const runState = deriveLegacyRunState(s);
   const g = s.serpwow_summary;
   const outcome = g?.outcome_breakdown ?? null;
 
@@ -491,13 +506,14 @@ function renderLegacyStatus(root, ref, s) {
         ? fmtNum(g.token_usage.completion_tokens) : null,
       tone: "muted",
     },
-    { label: "Batch job", value: s.gemini_batch?.status ?? null, tone: finalizing ? "warning" : "default" },
+    { label: "Batch job", value: runState.batchStatus, tone: runState.finalizing ? "warning" : "default" },
     { label: "Unique pairs", value: isRel && g?.unique_pairs != null ? fmtNum(g.unique_pairs) : null },
   ];
 
   const parts = [
     headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (SerpWow pipeline)`,
-      finalizing ? "running" : s.status, finalizing ? "finalizing" : null, chips),
+      runState.finalizing ? "running" : s.status,
+      runState.finalizing ? "finalizing" : null, chips),
     outcomeSummary({
       found,
       notFound,
@@ -519,7 +535,7 @@ function renderLegacyStatus(root, ref, s) {
   // Stop button while the run is still doing work (rows in flight, or the
   // Gemini batch still running). Remaining rows are marked failed; retryable
   // later via "Retry failed rows".
-  if (active) {
+  if (runState.canStop) {
     const stopMsg = el("div", { class: "mt-3" });
     const stopBtn = el("button", {
       class: "btn-secondary min-h-0 px-3 py-1.5 text-xs text-red-600 disabled:opacity-50",
@@ -553,9 +569,9 @@ function renderLegacyStatus(root, ref, s) {
   // Single file surface: result files (gsearch/gmaps) + output.json/xlsx (all pipelines),
   // shown once the run is terminal (and, for batch runs, once the batch is terminal too —
   // result files aren't written until then, so View/Download would 404).
-  if (rowsDone && !finalizing) {
+  if (runState.filesReady) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-    const resultFiles = (isSerp && batchTerminal)
+    const resultFiles = (runState.reporting && runState.batchTerminal)
       ? (s.pipeline === "relationship"
           ? ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
@@ -592,7 +608,12 @@ export async function render(root, params) {
     const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
     try {
       await api(legacyPath); // 404 here too → unknown run
-      stop = pollStatus(legacyPath, (s) => renderLegacyStatus(root, ref, s), 2000, legacyStatusTerminal);
+      stop = pollStatus(
+        legacyPath,
+        (s) => renderLegacyStatus(root, ref, s),
+        2000,
+        (s) => deriveLegacyRunState(s).pollTerminal,
+      );
     } catch (e) {
       root.replaceChildren(errorCard(
         /not found/i.test(e.message) ? `Run "${ref}" was not found.` : e.message));

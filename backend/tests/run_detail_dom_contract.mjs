@@ -280,6 +280,54 @@ async function completedWithErrorsBatchIsTerminal() {
     "completed_with_errors batch must be terminal and expose files");
 }
 
+async function fullPipelineIgnoresBatchState() {
+  const { root } = await renderStatus("full-batch", {
+    pipeline: "full", status: "completed", total_rows: 2, processed_rows: 2,
+    success_rows: 2, failed_rows: 0, gemini_batch: { status: "running" },
+  });
+  assert(timers.length === 0, "full pipeline silently kept polling irrelevant batch state");
+  assert(!root.textContent.includes("finalizing"), "full pipeline showed reporting finalizing state");
+  assert(byClass(root, "files-section").length === 1, "terminal full pipeline files missing");
+}
+
+async function failedReportingRunShowsFiles() {
+  const { root } = await renderStatus("failed-report", {
+    pipeline: "gsearch", status: "failed", total_rows: 3, processed_rows: 3,
+    success_rows: 1, failed_rows: 2,
+    serpwow_summary: {
+      confidence_mode: "llm", is_batch: false,
+      outcome_breakdown: { found: 1, not_found: 0, errored: 2 },
+      error_breakdown: { by_source: { serpwow: 2 }, by_category: { upstream: 2 } },
+      websites_found: 1, websites_not_found: 2, available_files: ["run.log"], cost: {},
+    },
+  });
+  assert(timers.length === 0, "failed reporting run did not terminate polling");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "failed reporting run hid Files surface");
+  const log = byClass(files, "file-row").find((row) => row.textContent.includes("run.log"));
+  assert(!log?.children[1]?.children[0]?.disabled, "available failed-run log was disabled");
+  const found = byClass(files, "file-row").find((row) => row.textContent.includes("found.csv"));
+  assert(found?.children[1]?.children[0]?.disabled, "absent failed-run result was enabled");
+  assert(files.textContent.includes("output.json") && files.textContent.includes("output.xlsx"),
+    "failed run lost output endpoint fallbacks");
+}
+
+async function cancelRequestedContinuesWithoutStop() {
+  const { root } = await renderStatus("cancel", {
+    pipeline: "gsearch", status: "cancel_requested", total_rows: 3, processed_rows: 1,
+    success_rows: 1, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "llm", is_batch: true,
+      outcome_breakdown: { found: 1, not_found: 0, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} },
+      websites_found: 1, websites_not_found: 0, available_files: [], cost: {},
+    },
+  });
+  assert(timers.length === 1, "cancel_requested stopped polling before terminal state");
+  assert(!byText(root, "button", "Stop run"), "cancel_requested exposed duplicate Stop action");
+  assert(!byClass(root, "files-section").length, "cancel_requested exposed terminal files");
+}
+
 async function legacyCompatibility() {
   const { root } = await renderStatus("legacy", {
     pipeline: "full", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
@@ -390,6 +438,9 @@ await completedGmapsHeuristic();
 await completedRelationship();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
+await fullPipelineIgnoresBatchState();
+await failedReportingRunShowsFiles();
+await cancelRequestedContinuesWithoutStop();
 await legacyCompatibility();
 await completedAiMode();
 await erroredAiMode();

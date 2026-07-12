@@ -18,6 +18,40 @@ class TestUiShell(unittest.TestCase):
         self.assertIn("text/html", res.headers["content-type"])
         self.assertIn("Forage Console", res.text)
 
+    def test_app_shell_has_accessible_mobile_navigation(self):
+        res = self.client.get("/app")
+        self.assertEqual(res.status_code, 200)
+        for marker in (
+            'id="sidebar-toggle"',
+            'aria-controls="app-sidebar"',
+            'id="sidebar-backdrop"',
+            'id="app-sidebar"',
+        ):
+            self.assertIn(marker, res.text)
+
+    def test_midnight_ledger_theme_contract_is_served(self):
+        res = self.client.get("/static/css/app.css")
+        self.assertEqual(res.status_code, 200)
+        for token in (
+            "--bg: #080d16",
+            "--sidebar: #0b111c",
+            "--accent: #65d6ad",
+            ".outcome-summary",
+            ".metric-strip",
+            ".mobile-nav-toggle",
+            "prefers-reduced-motion",
+        ):
+            self.assertIn(token, res.text)
+
+    def test_all_console_views_are_static_assets(self):
+        for path in (
+            "/static/js/tools.js",
+            "/static/js/operations.js",
+            "/static/js/run_detail.js",
+        ):
+            res = self.client.get(path)
+            self.assertEqual(res.status_code, 200, path)
+
     def test_static_assets_served(self):
         for path in ("/static/js/api.js", "/static/js/main.js",
                      "/static/js/ui.js",

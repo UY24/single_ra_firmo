@@ -33,6 +33,54 @@ def _chunked_running_state(age_seconds: int = 300) -> dict:
 
 
 class TestChunkedStatusReconcileGuard(unittest.IsolatedAsyncioTestCase):
+    def test_remote_cancelled_states_are_terminal(self):
+        for live_state in ("JOB_STATE_CANCELLED", "BATCH_STATE_CANCELLED"):
+            with self.subTest(live_state=live_state):
+                self.assertEqual(app._derive_ui_batch_status(
+                    live_state=live_state,
+                    done_flag=True,
+                    error_obj=None,
+                    local_status="cancel_requested",
+                ), "cancelled")
+
+    async def test_cancel_requested_reconciles_once_to_cancelled(self):
+        state = {
+            "upload_id": "u-cancelled",
+            "pipeline": "gsearch",
+            "status": "completed",
+            "gemini_batch": {"status": "cancel_requested", "job_name": "batches/cancelled"},
+        }
+        persisted = []
+
+        async def fake_persist(_uid, latest):
+            persisted.append(latest)
+
+        get_batch = mock.Mock(return_value={
+            "done": True,
+            "state": {"name": "JOB_STATE_CANCELLED"},
+        })
+        with mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}, clear=False), \
+             mock.patch.object(app, "_gemini_batch_get_sync", get_batch), \
+             mock.patch.object(app, "read_upload_artifact",
+                               new=mock.AsyncMock(return_value=state)), \
+             mock.patch.object(app, "persist_upload_state", new=fake_persist):
+            result = await app.maybe_reconcile_gemini_batch_status("u-cancelled", state)
+            self.assertEqual(result["gemini_batch"]["status"], "cancelled")
+            self.assertTrue(result["gemini_batch"].get("completed_at"))
+            self.assertIsNone(result["gemini_batch"].get("error"))
+            self.assertFalse(app._batch_postprocess_pending(result))
+            get_batch.reset_mock()
+            again = await app.maybe_reconcile_gemini_batch_status("u-cancelled", result)
+
+            restart_persist = mock.AsyncMock()
+            with mock.patch.object(app, "persist_upload_state", new=restart_persist):
+                await app.maybe_start_gemini_batch_for_upload("u-cancelled", result)
+
+        self.assertEqual(again["gemini_batch"]["status"], "cancelled")
+        get_batch.assert_not_called()
+        self.assertEqual(len(persisted), 1)
+        restart_persist.assert_not_called()
+
     async def test_chunked_running_not_force_failed_after_startup_timeout(self):
         """C1 regression: a chunked run older than GEMINI_BATCH_STARTUP_TIMEOUT_SEC
         must NOT be force-failed by maybe_reconcile_gemini_batch_status."""

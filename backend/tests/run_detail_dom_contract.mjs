@@ -222,6 +222,8 @@ async function completedGsearchLlm() {
     "absent SerpWow result file View must be disabled");
   assert(unavailableLog?.children[1]?.children[1]?.getAttribute("href") == null,
     "absent SerpWow result file Download must not have an href");
+  assert(unavailableLog?.children[1]?.children[1]?.getAttribute("aria-disabled") === "true",
+    "absent SerpWow Download must expose aria-disabled");
   await byText(document.body, "button", "Close").click();
 }
 
@@ -339,20 +341,33 @@ async function failedReportingRunShowsFiles() {
     "failed run lost output endpoint fallbacks");
 }
 
-async function cancelRequestedContinuesWithoutStop() {
-  const { root } = await renderStatus("cancel", {
-    pipeline: "gsearch", status: "cancel_requested", total_rows: 3, processed_rows: 1,
+async function cancelledBatchTerminalizes() {
+  const base = {
+    pipeline: "gsearch", status: "completed", total_rows: 3, processed_rows: 3,
     success_rows: 1, failed_rows: 0,
     serpwow_summary: {
       confidence_mode: "llm", is_batch: true,
-      outcome_breakdown: { found: 1, not_found: 0, errored: 0 },
+      outcome_breakdown: { found: 1, not_found: 2, errored: 0 },
       error_breakdown: { by_source: {}, by_category: {} },
-      websites_found: 1, websites_not_found: 0, available_files: [], cost: {},
+      websites_found: 1, websites_not_found: 2, available_files: ["run.log"], cost: {},
     },
-  });
+  };
+  const { root } = await renderLegacySequence("cancel", [
+    { ...base, gemini_batch: { status: "cancel_requested" } },
+    { ...base, gemini_batch: { status: "cancelled" } },
+  ]);
   assert(timers.length === 1, "cancel_requested stopped polling before terminal state");
   assert(!byText(root, "button", "Stop run"), "cancel_requested exposed duplicate Stop action");
   assert(!byClass(root, "files-section").length, "cancel_requested exposed terminal files");
+  await timers.shift()();
+  await settle();
+  assert(timers.length === 0, "cancelled batch did not terminalize polling");
+  assert(!root.textContent.includes("finalizing"), "cancelled batch remained finalizing");
+  assert(!byText(root, "button", "Stop run"), "cancelled batch exposed Stop action");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "cancelled batch did not reveal Files surface");
+  const log = byClass(files, "file-row").find((row) => row.textContent.includes("run.log"));
+  assert(!log?.children[1]?.children[0]?.disabled, "cancelled batch disabled available run.log");
 }
 
 async function legacyCompatibility() {
@@ -367,21 +382,36 @@ async function legacyCompatibility() {
 }
 
 function aiPayload(status, errors = 0) {
+  const notFound = Math.max(0, 2 - errors);
   return {
     company_name: "AI Co", mode_label: "AI Mode", status, phase: "cleanup",
-    total_rows: 6, entities_processed: 6, websites_found: 3, websites_not_found: 2,
+    total_rows: 6, entities_processed: 6, websites_found: 4, websites_not_found: 2,
     llm_errors: errors,
-    outcome_breakdown: { found: 4, not_found: 1, errored: errors },
+    outcome_breakdown: { found: 4, not_found: notFound, errored: errors },
     batches_done: 2, batches_total: 2, batch_duration_seconds: 18,
     token_usage: { prompt_tokens: 120, completion_tokens: 30 }, model: "gemini-ai", is_batch: true,
     scrapedo_request_count: 5, failed_request_count: 0,
-    cost: { scrapedo_searches: 5, llm_usd: 0.2, total_usd: 0.4 },
+    cost: { scrapedo_searches: 5, llm_usd: 0.4, total_usd: 0.4 },
     available_files: ["found.csv", "run.log"],
   };
 }
 
+function assertProductionTerminalAiShape(payload) {
+  const outcome = payload.outcome_breakdown;
+  assert(outcome.found + outcome.not_found + outcome.errored === payload.total_rows,
+    "terminal AI fixture outcome does not reconcile to total");
+  assert(payload.websites_found === outcome.found,
+    "terminal AI fixture websites_found differs from canonical found");
+  assert(payload.websites_not_found === outcome.not_found + outcome.errored,
+    "terminal AI fixture websites_not_found is not inclusive of errors");
+  assert(payload.cost.llm_usd === payload.cost.total_usd,
+    "terminal AI fixture does not match production LLM cost shape");
+}
+
 async function completedAiMode() {
-  const { root } = await renderStatus("ai", aiPayload("completed"), { ai: true });
+  const payload = aiPayload("completed");
+  assertProductionTerminalAiShape(payload);
+  const { root } = await renderStatus("ai", payload, { ai: true });
   assertOutcomeFirst(root, "4 of 6");
   for (const text of ["18s", "120", "30", "gemini-ai", "Yes", "Batches", "found.csv"]) {
     assert(root.textContent.includes(text), `AI Mode detail missing ${text}`);
@@ -391,17 +421,21 @@ async function completedAiMode() {
     && progress.getAttribute("aria-label") === "Batch progress",
   "batch progress semantics missing");
   const llmCost = byClass(root, "cost-item").find((item) => item.children[0]?.textContent === "LLM");
-  assert(llmCost?.children[1]?.textContent === "$0.2000", "AI cost did not prefer explicit llm_usd");
+  assert(llmCost?.children[1]?.textContent === "$0.4000", "AI cost did not prefer explicit llm_usd");
   const unavailable = byClass(root, "file-row").find((row) => row.textContent.includes("final_report.json"));
   assert(unavailable?.children[1]?.children[0]?.disabled, "unavailable AI file View must be disabled");
   assert(unavailable?.children[1]?.children[1]?.getAttribute("href") == null,
     "unavailable AI file Download must not have an href");
+  assert(unavailable?.children[1]?.children[1]?.getAttribute("aria-disabled") === "true",
+    "unavailable AI file Download must expose aria-disabled");
   assert(!byText(root, "button", "Rerun failed"), "successful AI Mode run exposed rerun");
 }
 
 async function erroredAiMode() {
   const ref = "ai errors";
-  const { root } = await renderStatus(ref, aiPayload("completed_with_errors", 1), { ai: true });
+  const payload = aiPayload("completed_with_errors", 1);
+  assertProductionTerminalAiShape(payload);
+  const { root } = await renderStatus(ref, payload, { ai: true });
   assertOutcomeFirst(root, "4 of 6");
   assert(labelValue(root, "Not found") === "1", "AI inclusive not-found double counted errors");
   assert(labelValue(root, "Errors") === "1", "AI Mode outcome errors wrong");
@@ -413,20 +447,31 @@ async function erroredAiMode() {
   "AI Mode rerun endpoint changed");
 }
 
-async function queuedAiFilesAndLegacyOutcome() {
-  const payload = aiPayload("queued", 1);
-  delete payload.outcome_breakdown;
-  payload.available_files = [];
+async function queuedAiFiles() {
+  const payload = aiPayload("queued", 0);
+  payload.entities_processed = 1;
+  payload.websites_found = 1;
+  payload.websites_not_found = 0;
+  payload.outcome_breakdown = { found: 1, not_found: 0, errored: 0 };
+  payload.available_files = ["input.csv"];
   const { root } = await renderStatus("queued-ai", payload, { ai: true });
-  assert(labelValue(root, "Not found") === "1", "AI legacy inclusive not-found double counted errors");
-  assert(labelValue(root, "Errors") === "1", "AI legacy llm_errors fallback missing");
+  assert(labelValue(root, "Not found") === "0", "queued AI not-found count is not production-real");
+  assert(labelValue(root, "Errors") === "0", "queued AI error count is not production-real");
   const files = byClass(root, "files-section")[0];
   assert(files, "queued AI run must retain file availability surface");
   assert(byClass(files, "file-row").length === 5, "queued AI file rows missing");
-  assert(byClass(files, "file-row").every((row) =>
-    row.children[1]?.children[0]?.disabled
-      && row.children[1]?.children[1]?.getAttribute("href") == null),
-  "empty available_files must disable every queued AI file action");
+  const input = byClass(files, "file-row").find((row) => row.textContent.includes("input.csv"));
+  assert(!input?.children[1]?.children[0]?.disabled, "always-present queued input.csv was disabled");
+  assert(byClass(files, "file-row").filter((row) => !row.textContent.includes("input.csv")).every((row) =>
+    row.children[1]?.children[0]?.disabled), "queued AI enabled a result that is not available");
+}
+
+async function malformedLegacyAiInclusiveOutcome() {
+  const payload = aiPayload("completed_with_errors", 1);
+  delete payload.outcome_breakdown;
+  const { root } = await renderStatus("malformed-legacy-ai", payload, { ai: true });
+  assert(labelValue(root, "Not found") === "1", "legacy inclusive not-found fallback regressed");
+  assert(labelValue(root, "Errors") === "1", "legacy llm_errors fallback regressed");
 }
 
 async function unknownTotalAndLongModel() {
@@ -560,10 +605,11 @@ await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
 await fullPipelineIgnoresBatchState();
 await failedReportingRunShowsFiles();
-await cancelRequestedContinuesWithoutStop();
+await cancelledBatchTerminalizes();
 await legacyCompatibility();
 await completedAiMode();
 await erroredAiMode();
-await queuedAiFilesAndLegacyOutcome();
+await queuedAiFiles();
+await malformedLegacyAiInclusiveOutcome();
 await unknownTotalAndLongModel();
 await accessibleModalLifecycleAndRace();

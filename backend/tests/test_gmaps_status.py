@@ -44,6 +44,18 @@ class TestGmapsStatusBlock(unittest.TestCase):
                          ["found.csv", "report.json"])
 
     def test_status_checks_s3_for_missing_reporting_files(self):
+        class FakeS3:
+            def __init__(self):
+                self.calls = []
+
+            def list_objects_v2(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"Contents": [
+                    {"Key": "acme/gmaps/gm1/run.log"},
+                    {"Key": "acme/gmaps/gm1/unrelated.txt"},
+                ]}
+
+        s3 = FakeS3()
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(legacy_app, "get_upload_state",
                                new=mock.AsyncMock(return_value=_state())), \
@@ -52,9 +64,30 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "maybe_fail_stale_processing_rows",
                                new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
-             mock.patch.object(legacy_app, "_find_s3_upload_key_sync",
-                               side_effect=lambda _uid, name: f"runs/gm1/{name}" if name == "run.log" else None) as find_key, \
+             mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
              mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
             resp = asyncio.run(legacy_app.upload_status("gm1"))
         self.assertEqual(resp["serpwow_summary"]["available_files"], ["run.log"])
-        self.assertEqual(find_key.call_count, 4)
+        self.assertEqual(len(s3.calls), 1)
+        self.assertEqual(s3.calls[0]["Bucket"], "bucket")
+        self.assertEqual(s3.calls[0]["Prefix"], "acme/gmaps/gm1/")
+
+    def test_status_skips_s3_when_all_reporting_files_are_local(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            for name in ("found.csv", "notFound.csv", "report.json", "run.log"):
+                (run_dir / name).write_text("")
+            s3 = mock.Mock()
+            with mock.patch.object(legacy_app, "get_upload_state",
+                                   new=mock.AsyncMock(return_value=_state())), \
+                 mock.patch.object(legacy_app, "maybe_reconcile_gemini_batch_status",
+                                   new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+                 mock.patch.object(legacy_app, "maybe_fail_stale_processing_rows",
+                                   new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
+                 mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
+                 mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                resp = asyncio.run(legacy_app.upload_status("gm1"))
+        self.assertEqual(resp["serpwow_summary"]["available_files"],
+                         ["found.csv", "notFound.csv", "report.json", "run.log"])
+        s3.list_objects_v2.assert_not_called()

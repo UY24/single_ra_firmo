@@ -21,7 +21,7 @@ const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log
 const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
 const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship"]);
 const BATCH_TERMINAL_STATUSES = new Set([
-  "succeeded", "completed_with_errors", "failed", "skipped", "not_started",
+  "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
 ]);
 const STOPPABLE_BATCH_STATUSES = new Set(["waiting_for_rows", "queued", "running"]);
 
@@ -439,7 +439,9 @@ function filesSection(allFiles, baseUrl, available, extras) {
         }, "View"),
         el("a", {
           class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
-          ...(isAvailable ? { href: `${baseUrl(name)}&download=true`, download: name } : {}),
+          ...(isAvailable
+            ? { href: `${baseUrl(name)}&download=true`, download: name }
+            : { "aria-disabled": "true" }),
         }, "Download"),
       ),
     );

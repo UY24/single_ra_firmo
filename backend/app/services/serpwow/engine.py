@@ -1275,7 +1275,7 @@ def _derive_ui_batch_status(
     if state.endswith("FAILED") or state.endswith("EXPIRED"):
         return "failed"
     if state.endswith("CANCELLED"):
-        return "cancel_requested"
+        return "cancelled"
     if done_flag:
         return "failed" if error_obj else "succeeded"
 
@@ -1284,6 +1284,7 @@ def _derive_ui_batch_status(
         "queued",
         "running",
         "cancel_requested",
+        "cancelled",
         "succeeded",
         "failed",
         "skipped",
@@ -1735,7 +1736,9 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
     if state.get("status") not in {"completed", "completed_with_errors"}:
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-    if gemini_batch_meta.get("status") in {"queued", "running", "succeeded"}:
+    if gemini_batch_meta.get("status") in {
+        "queued", "running", "cancel_requested", "cancelled", "succeeded",
+    }:
         return
     if upload_id in gemini_batch_tasks:
         return
@@ -1842,7 +1845,7 @@ async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, A
                 latest_batch["completed_at"] = _now_iso()
             if error_obj:
                 latest_batch["error"] = json.dumps(error_obj, ensure_ascii=True)
-            elif resolved_status in {"succeeded", "running"}:
+            elif resolved_status in {"succeeded", "running", "cancelled"}:
                 latest_batch["error"] = None
             latest["gemini_batch"] = latest_batch
             await persist_upload_state(upload_id, latest)
@@ -2063,7 +2066,37 @@ def _reporting_result_names(pipeline: str) -> list[str]:
     return [*names, "report.json", "run.log"]
 
 
-async def _available_reporting_files(upload_id: str, pipeline: str) -> list[str]:
+def _list_available_reporting_files_s3_sync(
+    upload_id: str,
+    company_name: str,
+    pipeline: str,
+    expected: list[str],
+) -> set[str]:
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket or not expected:
+        return set()
+    prefix = f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/"
+    try:
+        response = get_s3_client().list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix,
+            MaxKeys=1000,
+        )
+    except Exception:
+        return set()
+    expected_keys = {f"{prefix}{name}": name for name in expected}
+    return {
+        expected_keys[key]
+        for obj in response.get("Contents", [])
+        if (key := str(obj.get("Key") or "")) in expected_keys
+    }
+
+
+async def _available_reporting_files(
+    upload_id: str,
+    company_name: str,
+    pipeline: str,
+) -> list[str]:
     """Return reporting artifacts that exist locally or in configured S3 storage."""
     expected = _reporting_result_names(pipeline)
     if not expected:
@@ -2074,11 +2107,13 @@ async def _available_reporting_files(upload_id: str, pipeline: str) -> list[str]
         return available
 
     missing = [name for name in expected if name not in available]
-    keys = await asyncio.gather(*(
-        asyncio.to_thread(_find_s3_upload_key_sync, upload_id, name)
-        for name in missing
-    ))
-    present_in_s3 = {name for name, key in zip(missing, keys) if key}
+    present_in_s3 = await asyncio.to_thread(
+        _list_available_reporting_files_s3_sync,
+        upload_id,
+        company_name,
+        pipeline,
+        missing,
+    )
     return [name for name in expected if name in available or name in present_in_s3]
 
 
@@ -4257,7 +4292,7 @@ async def batch_job_get_status(upload_id: str) -> dict[str, Any]:
                     latest_batch["completed_at"] = _now_iso()
                 if error_obj:
                     latest_batch["error"] = json.dumps(error_obj, ensure_ascii=True)
-                elif batch_status in {"succeeded", "running"}:
+                elif batch_status in {"succeeded", "running", "cancelled"}:
                     latest_batch["error"] = None
                 latest["gemini_batch"] = latest_batch
                 await persist_upload_state(upload_id, latest)
@@ -4405,7 +4440,10 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
             available_files = await _available_reporting_files(
-                upload_id, str(summary.get("pipeline") or PIPELINE_FULL))
+                upload_id,
+                str(summary.get("company_name") or ""),
+                str(summary.get("pipeline") or PIPELINE_FULL),
+            )
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],

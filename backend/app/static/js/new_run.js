@@ -67,7 +67,7 @@ const buttonCls = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
 const secondaryButtonCls = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
 
 function redCallout(text) {
-  return el("div", { class: "callout callout-red" },
+  return el("div", { class: "callout callout-red", role: "alert" },
     el("p", { class: "text-sm whitespace-pre-wrap" }, text));
 }
 
@@ -77,8 +77,8 @@ function amberCallout(lines) {
 }
 
 function stepCard(n, title, body) {
-  const card = el("div", { class: "panel step-card" },
-    el("div", { class: "mb-4 flex items-center gap-3" },
+  const card = el("div", { class: "panel workflow-step" },
+    el("div", { class: "step-rail mb-4 flex items-center gap-3" },
       el("span", { class: "step-number" }, String(n)),
       el("h2", { class: "section-title" }, title),
     ),
@@ -86,6 +86,10 @@ function stepCard(n, title, body) {
   );
   card.setEnabled = (enabled) => {
     card.setAttribute("aria-disabled", String(!enabled));
+  };
+  card.setCurrent = (current) => {
+    if (current) card.setAttribute("aria-current", "step");
+    else card.removeAttribute("aria-current");
   };
   return card;
 }
@@ -107,7 +111,7 @@ function csvSchemaPanel(pipeline) {
       ? el("span", { class: "ml-0.5 text-amber-400 font-bold leading-none" }, "*")
       : el("span", { class: "ml-0.5 text-slate-500 text-[10px] leading-none" }, "opt"),
   );
-  return el("div", { class: "mb-4 rounded-lg border border-slate-700/50 bg-slate-800/40 p-3" },
+  return el("div", { class: "schema-panel mb-4" },
     el("p", { class: "mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500" },
       `Expected CSV columns — ${pipeline.label}`),
     el("div", { class: "flex flex-col gap-2" },
@@ -155,12 +159,13 @@ function previewTables(preview) {
   const mapping = preview.columns_detected ?? {};
   if (Object.keys(mapping).length) {
     parts.push(tableShell(
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table preview-table" },
         el("thead", {},
           el("tr", {}, head("Field"), head("CSV header"))),
-        el("tbody", { class: "divide-y divide-gray-100" },
+        el("tbody", {},
           ...Object.entries(mapping).map(([field, header]) =>
-            el("tr", {}, cell(field, "font-semibold text-slate-50"), cell(header ?? "-"))),
+            el("tr", { class: "data-row" },
+              cell(field, "font-semibold text-slate-50"), cell(header ?? "-"))),
         ),
       ),
     ));
@@ -170,12 +175,12 @@ function previewTables(preview) {
   if (sample.length) {
     const sampleCols = preview.sample_columns ?? SAMPLE_COLS;
     parts.push(tableShell(
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table preview-table" },
         el("thead", {},
           el("tr", {}, ...sampleCols.map((c) => head(c)))),
-        el("tbody", { class: "divide-y divide-gray-100" },
+        el("tbody", {},
           ...sample.map((row) =>
-            el("tr", {}, ...sampleCols.map((c) =>
+            el("tr", { class: "data-row" }, ...sampleCols.map((c) =>
               cell(row[c] == null || row[c] === "" ? "-" : String(row[c]))))),
         ),
       ),
@@ -185,7 +190,7 @@ function previewTables(preview) {
 }
 
 function summaryItem(label, valueNode) {
-  return el("div", { class: "panel-muted p-3" },
+  return el("div", { class: "launch-row" },
     el("dt", { class: "view-kicker" }, label),
     valueNode,
   );
@@ -221,7 +226,7 @@ export async function render(root) {
   }
   companySelect.addEventListener("change", onCompanyChange);
 
-  const newCompanyMsg = el("p", { class: "mt-2 hidden text-sm" });
+  const newCompanyMsg = el("p", { class: "mt-2 hidden text-sm", "aria-live": "polite" });
   const newCompanyInput = el("input", {
     type: "text", placeholder: "New company name", class: `${inputCls} w-full`,
   });
@@ -270,7 +275,7 @@ export async function render(root) {
       type: "radio", name: "pipeline", value: p.key, class: "mt-1 accent-amber-500",
       onchange: () => { state.pipeline = p; refresh(); },
     });
-    return el("label", { class: "pipeline-card flex items-start gap-3" },
+    return el("label", { class: "pipeline-option flex items-start gap-3" },
       radio,
       el("span", {},
         el("span", { class: "block text-sm font-semibold text-slate-50" }, p.label),
@@ -286,7 +291,7 @@ export async function render(root) {
     refresh();
   });
 
-  const phaseRow = el("div", { class: "hidden mt-4 border-t border-gray-100 pt-4" },
+  const phaseRow = el("div", { class: "phase-field divider-top hidden mt-4 pt-4" },
     el("label", { class: "mb-1.5 block view-kicker" }, "Search phase"),
     phaseSelect,
     el("p", { class: "mt-2 text-xs text-slate-400" },
@@ -300,10 +305,10 @@ export async function render(root) {
     ));
 
   const schemaArea = el("div");
-  const previewArea = el("div", { class: "mt-4" });
+  const previewArea = el("div", { class: "mt-4", "aria-live": "polite" });
   const fileInput = el("input", {
-    type: "file", accept: ".csv",
-    class: "block w-full text-sm text-slate-300",
+    id: "new-run-csv", type: "file", accept: ".csv",
+    class: "file-input block w-full text-sm text-slate-300",
     onchange: async () => {
       state.file = fileInput.files[0] ?? null;
       state.preview = null;
@@ -327,10 +332,16 @@ export async function render(root) {
       refresh();
     },
   });
-  const step3 = stepCard(3, "File and preview", el("div", {}, schemaArea, fileInput, previewArea));
+  const step3 = stepCard(3, "File and preview", el("div", {}, schemaArea,
+    el("div", { class: "file-field" },
+      el("label", { class: "file-field-label", for: "new-run-csv" }, "CSV input"),
+      fileInput,
+    ),
+    previewArea,
+  ));
 
   const summary = el("p", { class: "section-copy" }, "-");
-  const startMsg = el("div", { class: "mt-3 hidden" });
+  const startMsg = el("div", { class: "mt-3 hidden", "aria-live": "polite" });
   const startBtn = el("button", { class: buttonCls, disabled: "" }, "Start run");
   startBtn.addEventListener("click", async () => {
     if (!state.companyId || !state.pipeline || !state.file || !state.preview) return;
@@ -367,10 +378,10 @@ export async function render(root) {
   const summaryRows = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
   const readiness = el("p", { class: "mt-4 text-sm text-slate-400" },
     "Complete the workflow to enable launch.");
-  const summaryPanel = el("aside", { class: "summary-panel panel" },
+  const summaryPanel = el("aside", { class: "launch-summary panel" },
     el("p", { class: "view-kicker" }, "Run setup"),
     el("h2", { class: "mt-1 text-base font-semibold text-slate-50" }, "Launch summary"),
-    el("dl", { class: "mt-4 grid grid-cols-1 gap-3" },
+    el("dl", { class: "launch-list mt-4" },
       summaryItem("Company", summaryCompany),
       summaryItem("Pipeline", summaryPipeline),
       summaryItem("Phase", summaryPhase),
@@ -393,6 +404,14 @@ export async function render(root) {
     step2.setEnabled(hasCompany);
     step3.setEnabled(hasCompany && hasPipeline);
     step4.setEnabled(hasCompany && hasPipeline && hasPreview);
+    const currentStep = !hasCompany
+      ? step1
+      : !hasPipeline
+        ? step2
+        : !hasPreview
+          ? step3
+          : step4;
+    [step1, step2, step3, step4].forEach((step) => step.setCurrent(step === currentStep));
     startBtn.disabled = !(hasCompany && hasPipeline && hasPreview);
     phaseRow.classList.toggle("hidden", state.pipeline?.key !== "gsearch");
     schemaArea.replaceChildren(csvSchemaPanel(state.pipeline));

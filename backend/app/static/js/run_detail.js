@@ -18,6 +18,16 @@ import {
 } from "./ui.js";
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
+const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
+const BATCH_TERMINAL_STATUSES = new Set([
+  "succeeded", "completed_with_errors", "failed", "skipped", "not_started",
+]);
+
+function legacyStatusTerminal(status) {
+  const rowsTerminal = ROW_TERMINAL_STATUSES.has(String(status?.status ?? ""));
+  const batchStatus = status?.gemini_batch?.status ?? null;
+  return rowsTerminal && (batchStatus == null || BATCH_TERMINAL_STATUSES.has(String(batchStatus)));
+}
 
 // ── inline file viewer modal ──────────────────────────────────────────────────
 let _modal = null;
@@ -141,9 +151,8 @@ function outcomeSummary({ found, notFound, errors = 0, total, skipped = null }) 
   const safeErrors = safeCount(errors);
   const safeTotal = safeCount(total);
   const safeSkipped = skipped == null ? null : safeCount(skipped);
-  const rate = safeTotal > 0
-    ? Math.min(100, Math.round((safeFound / safeTotal) * 100))
-    : 0;
+  const hasDenominator = safeTotal > 0;
+  const rate = hasDenominator ? Math.min(100, Math.round((safeFound / safeTotal) * 100)) : null;
   const secondary = [
     metricItem("Not found", fmtNum(safeNotFound), "muted"),
     metricItem("Errors", fmtNum(safeErrors), safeErrors > 0 ? "danger" : "muted"),
@@ -153,8 +162,10 @@ function outcomeSummary({ found, notFound, errors = 0, total, skipped = null }) 
     el("div", { class: "outcome-primary" },
       el("p", { class: "outcome-label" }, "Websites found"),
       el("div", { class: "outcome-result" },
-        el("span", { class: "outcome-value" }, `${fmtNum(safeFound)} of ${fmtNum(safeTotal)}`),
-        el("span", { class: "outcome-rate" }, `${fmtNum(rate)}%`),
+        el("span", { class: "outcome-value" }, hasDenominator
+          ? `${fmtNum(safeFound)} of ${fmtNum(safeTotal)}`
+          : fmtNum(safeFound)),
+        ...(hasDenominator ? [el("span", { class: "outcome-rate" }, `${fmtNum(rate)}%`)] : []),
       ),
     ),
     el("dl", { class: "outcome-secondary" }, ...secondary),
@@ -173,9 +184,10 @@ function executionStrip(items) {
 // Small metadata pill (e.g. "Confidence LLM"). `tone` picks a semantic color
 // (good/info/warn/danger/muted) from the shared .pill classes in app.css.
 function chip(label, value, tone = "muted") {
+  const text = String(value);
   return el("span", { class: `pill pill--${tone}` },
     el("span", { class: "pill-label" }, label),
-    el("span", {}, String(value)),
+    el("span", { class: "pill-value", title: text }, text),
   );
 }
 
@@ -272,7 +284,7 @@ function progressSection(done, total, running) {
 // files served by a different endpoint (e.g. the full output.json/xlsx). Used by
 // both AI Mode and the SerpWow gsearch/gmaps detail view.
 function filesSection(allFiles, baseUrl, available, extras) {
-  const files = available?.length ? available : allFiles;
+  const files = Array.isArray(available) ? available : allFiles;
   const rows = allFiles.map((name) => {
     const isAvailable = files.includes(name);
     return el("div", { class: "file-row" },
@@ -352,7 +364,20 @@ function warningsNote(warnings) {
 function renderAiStatus(root, ref, s) {
   const running = ["queued", "running"].includes(s.status);
   const outcome = s.outcome_breakdown ?? {};
+  const hasOutcome = s.outcome_breakdown != null;
   const total = s.total_rows ?? s.entities_processed;
+  // Newer AI payloads report an exclusive three-way outcome. Older payloads expose
+  // websites_not_found inclusive of LLM errors, so subtract the error fallback once.
+  const errors = safeCount(hasOutcome ? outcome.errored : s.llm_errors);
+  const found = safeCount(hasOutcome ? outcome.found : s.websites_found);
+  const notFound = hasOutcome
+    ? safeCount(outcome.not_found)
+    : Math.max(safeCount(s.websites_not_found) - errors, 0);
+  const chips = [];
+  if (s.model) chips.push(chip("Model", s.model, "muted"));
+  if (s.is_batch != null) {
+    chips.push(chip("Batch mode", s.is_batch ? "On" : "Off", s.is_batch ? "good" : "muted"));
+  }
   const execution = [
     {
       label: "Total / Processed",
@@ -362,7 +387,6 @@ function renderAiStatus(root, ref, s) {
     { label: "Duration", value: s.batch_duration_seconds == null ? null : fmtDuration(s.batch_duration_seconds) },
     { label: "Input tokens", value: s.token_usage?.prompt_tokens == null ? null : fmtNum(s.token_usage.prompt_tokens), tone: "muted" },
     { label: "Output tokens", value: s.token_usage?.completion_tokens == null ? null : fmtNum(s.token_usage.completion_tokens), tone: "muted" },
-    { label: "Model", value: s.model ?? null, tone: "info" },
     { label: "Batch mode", value: s.is_batch == null ? null : s.is_batch ? "Yes" : "No" },
     {
       label: "Scrape.do requests",
@@ -373,11 +397,11 @@ function renderAiStatus(root, ref, s) {
 
   const parts = [
     headerCard(s.company_name || "—",
-      `${s.mode_label ?? s.mode ?? "—"} · run ${ref}`, s.status, s.phase),
+      `${s.mode_label ?? s.mode ?? "—"} · run ${ref}`, s.status, s.phase, chips),
     outcomeSummary({
-      found: s.websites_found,
-      notFound: s.websites_not_found,
-      errors: outcome.errored ?? s.llm_errors,
+      found,
+      notFound,
+      errors,
       total,
     }),
     executionStrip(execution),
@@ -397,9 +421,8 @@ function renderAiStatus(root, ref, s) {
       totalCostKey: null,
     }));
   }
-  if (["completed", "completed_with_errors", "failed"].includes(s.status)) {
-    parts.push(downloadsSection(ref, s.available_files));
-  }
+  // Keep the availability surface visible throughout a run; unavailable files are disabled.
+  parts.push(downloadsSection(ref, s.available_files));
   if (["failed", "completed_with_errors"].includes(s.status)) parts.push(rerunFailedSection(ref));
 
   root.replaceChildren(el("div", { class: "run-detail space-y-4" }, ...parts));
@@ -411,13 +434,13 @@ function renderLegacyStatus(root, ref, s) {
   // "done" only once the batch is terminal so the UI doesn't claim completion early.
   const batchStatus = s.gemini_batch?.status ?? null;
   const batchTerminal = batchStatus == null
-    || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
+    || BATCH_TERMINAL_STATUSES.has(String(batchStatus));
   const isSerp = ["gsearch", "gmaps", "relationship"].includes(s.pipeline);
   const finalizing = isSerp && rowsDone && !batchTerminal;
   const active = !["completed", "completed_with_errors", "failed"].includes(String(s.status ?? ""))
     || finalizing;
   const g = s.serpwow_summary;
-  const outcome = g?.outcome_breakdown ?? {};
+  const outcome = g?.outcome_breakdown ?? null;
 
   // Header chips: confidence mode always (gsearch/gmaps); batch + model only when LLM
   // (batch is meaningless in heuristic mode). Non-serpwow pipelines get no chips.
@@ -434,9 +457,17 @@ function renderLegacyStatus(root, ref, s) {
   const isRel = s.pipeline === "relationship";
   // Relationship totals use original CSV rows; state.total_rows is deduplicated queue work.
   const total = isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows;
-  const found = g?.websites_found ?? s.success_rows;
-  const notFound = g?.websites_not_found ?? 0;
-  const errors = outcome.errored ?? (g ? 0 : s.failed_rows);
+  // Newer summaries may provide an exclusive three-way outcome. Current compatibility
+  // payloads omit it and report websites_not_found inclusive of failed rows.
+  const errors = safeCount(outcome ? (outcome.errored ?? s.failed_rows) : s.failed_rows);
+  const found = safeCount(g
+    ? (outcome?.found ?? g.websites_found)
+    : s.success_rows);
+  const notFound = g
+    ? (outcome
+        ? safeCount(outcome.not_found ?? Math.max(safeCount(g.websites_not_found) - errors, 0))
+        : Math.max(safeCount(g.websites_not_found) - errors, 0))
+    : 0;
   const execution = [
     {
       label: "Total / Processed",
@@ -558,7 +589,7 @@ export async function render(root, params) {
     const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
     try {
       await api(legacyPath); // 404 here too → unknown run
-      stop = pollStatus(legacyPath, (s) => renderLegacyStatus(root, ref, s));
+      stop = pollStatus(legacyPath, (s) => renderLegacyStatus(root, ref, s), 2000, legacyStatusTerminal);
     } catch (e) {
       root.replaceChildren(errorCard(
         /not found/i.test(e.message) ? `Run "${ref}" was not found.` : e.message));

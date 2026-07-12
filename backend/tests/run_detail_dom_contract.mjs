@@ -51,9 +51,16 @@ globalThis.window = {
   confirm: () => true,
   location: { reload() {} },
 };
-globalThis.setTimeout = () => 1;
+let timers = [];
+globalThis.setTimeout = (callback) => {
+  timers.push(callback);
+  return timers.length;
+};
 
-const { render } = await import("../app/static/js/run_detail.js");
+const [{ render }, { pollStatus }] = await Promise.all([
+  import("../app/static/js/run_detail.js"),
+  import("../app/static/js/api.js"),
+]);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -88,6 +95,7 @@ async function settle() {
 
 async function renderStatus(ref, status, { ai = false } = {}) {
   requests = [];
+  timers = [];
   const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
   const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
   let aiCalls = 0;
@@ -108,6 +116,29 @@ async function renderStatus(ref, status, { ai = false } = {}) {
     if (String(path).endsWith("/resume") || String(path).endsWith("/stop")) {
       return response({ stopped_rows: 1, batch_cancelled: false });
     }
+    throw new Error(`Unexpected fetch: ${path}`);
+  };
+  const root = new Element("main");
+  const cleanup = await render(root, { runRef: ref });
+  await settle();
+  return { root, cleanup };
+}
+
+async function renderLegacySequence(ref, statuses) {
+  requests = [];
+  timers = [];
+  const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
+  const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
+  let legacyCalls = 0;
+  globalThis.fetch = async (path, options = {}) => {
+    requests.push({ path, options });
+    if (path === aiPath) return response({ detail: "Not Found" }, 404);
+    if (path === legacyPath) {
+      legacyCalls += 1;
+      const index = legacyCalls === 1 ? 0 : Math.min(legacyCalls - 2, statuses.length - 1);
+      return response(statuses[index]);
+    }
+    if (String(path).endsWith("/stop")) return response({ stopped_rows: 1, batch_cancelled: false });
     throw new Error(`Unexpected fetch: ${path}`);
   };
   const root = new Element("main");
@@ -137,7 +168,7 @@ async function completedGsearchLlm() {
     serpwow_summary: {
       confidence_mode: "llm", is_batch: true, model: "gemini-test",
       websites_found: 4, websites_not_found: 0,
-      outcome_breakdown: { errored: 0 },
+      outcome_breakdown: { found: 4, not_found: 0, errored: 0 },
       token_usage: { prompt_tokens: 100, completion_tokens: 20 },
       cost: { llm_usd: 0.01, serpwow_usd: 0.02, serpwow_searches: 4, total_usd: 0.03 },
     },
@@ -162,14 +193,17 @@ async function completedGsearchLlm() {
 
 async function completedGmapsHeuristic() {
   const { root } = await renderStatus("gmaps", {
-    pipeline: "gmaps", status: "completed", total_rows: 3, processed_rows: 3,
+    pipeline: "gmaps", status: "completed_with_errors", total_rows: 4, processed_rows: 4,
+    failed_rows: 1,
     processing_seconds_total: 6, processing_seconds_avg: 2,
     serpwow_summary: {
-      confidence_mode: "heuristic", websites_found: 2, websites_not_found: 1,
-      outcome_breakdown: { errored: 0 }, cost: { serpwow_usd: 0.1, total_usd: 0.1 },
+      confidence_mode: "heuristic", websites_found: 2, websites_not_found: 2,
+      cost: { serpwow_usd: 0.1, total_usd: 0.1 },
     },
   });
-  assertOutcomeFirst(root, "2 of 3");
+  assertOutcomeFirst(root, "2 of 4");
+  assert(labelValue(root, "Not found") === "1", "SerpWow inclusive not-found double counted errors");
+  assert(labelValue(root, "Errors") === "1", "SerpWow failed rows did not map to errors");
   assert(root.textContent.includes("Heuristic"), "heuristic metadata missing");
   assert(!root.textContent.includes("Input tokens"), "heuristic run exposed token metrics");
 }
@@ -181,7 +215,7 @@ async function completedRelationship() {
     serpwow_summary: {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
       total_rows_original: 5, websites_found: 3, websites_not_found: 1, blank_rows: 1,
-      outcome_breakdown: { errored: 0 }, unique_pairs: 2,
+      outcome_breakdown: { found: 3, not_found: 1, errored: 0 }, unique_pairs: 2,
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
@@ -194,22 +228,40 @@ async function completedRelationship() {
 }
 
 async function finalizingBatch() {
-  const { root } = await renderStatus("final", {
+  const base = {
     pipeline: "gsearch", status: "completed", total_rows: 4, processed_rows: 4,
-    gemini_batch: { status: "running" },
     serpwow_summary: {
       confidence_mode: "llm", is_batch: true, websites_found: 4, websites_not_found: 0,
-      outcome_breakdown: { errored: 0 }, cost: {},
+      cost: {},
     },
-  });
+  };
+  const { root } = await renderLegacySequence("final", [
+    { ...base, gemini_batch: { status: "running" } },
+    { ...base, gemini_batch: { status: "succeeded" } },
+  ]);
   assertOutcomeFirst(root, "4 of 4");
   assert(root.textContent.includes("running") && root.textContent.includes("finalizing"), "finalizing status missing");
   assert(!byClass(root, "files-section").length, "finalizing run exposed files early");
   const stop = byText(root, "button", "Stop run");
   assert(stop?.listeners.click, "finalizing run lost Stop action");
-  await stop.click();
-  assert(requests.some(({ path, options }) =>
-    path === "/uploads/final/stop" && options.method === "POST"), "Stop endpoint changed");
+  assert(timers.length === 1, "completed rows with running batch stopped polling");
+  await timers.shift()();
+  await settle();
+  assert(byClass(root, "files-section").length === 1, "terminal batch poll did not reveal files");
+  assert(!root.textContent.includes("finalizing"), "terminal batch remained finalizing");
+}
+
+async function completedWithErrorsBatchIsTerminal() {
+  const { root } = await renderStatus("batch-errors", {
+    pipeline: "gsearch", status: "completed_with_errors", total_rows: 3, processed_rows: 3,
+    failed_rows: 1, gemini_batch: { status: "completed_with_errors" },
+    serpwow_summary: {
+      confidence_mode: "llm", is_batch: true, websites_found: 2, websites_not_found: 1,
+      cost: {},
+    },
+  });
+  assert(byClass(root, "files-section").length === 1,
+    "completed_with_errors batch must be terminal and expose files");
 }
 
 async function legacyCompatibility() {
@@ -226,8 +278,9 @@ async function legacyCompatibility() {
 function aiPayload(status, errors = 0) {
   return {
     company_name: "AI Co", mode_label: "AI Mode", status, phase: "cleanup",
-    total_rows: 6, entities_processed: 6, websites_found: 4, websites_not_found: 1,
-    llm_errors: errors, outcome_breakdown: errors ? { errored: errors } : undefined,
+    total_rows: 6, entities_processed: 6, websites_found: 3, websites_not_found: 2,
+    llm_errors: errors,
+    outcome_breakdown: { found: 4, not_found: 1, errored: errors },
     batches_done: 2, batches_total: 2, batch_duration_seconds: 18,
     token_usage: { prompt_tokens: 120, completion_tokens: 30 }, model: "gemini-ai", is_batch: true,
     scrapedo_request_count: 5, failed_request_count: 0,
@@ -252,6 +305,7 @@ async function erroredAiMode() {
   const ref = "ai errors";
   const { root } = await renderStatus(ref, aiPayload("completed_with_errors", 1), { ai: true });
   assertOutcomeFirst(root, "4 of 6");
+  assert(labelValue(root, "Not found") === "1", "AI inclusive not-found double counted errors");
   assert(labelValue(root, "Errors") === "1", "AI Mode outcome errors wrong");
   const rerun = byText(root, "button", "Rerun failed");
   assert(rerun?.listeners.click, "AI Mode rerun action missing");
@@ -261,10 +315,67 @@ async function erroredAiMode() {
   "AI Mode rerun endpoint changed");
 }
 
+async function queuedAiFilesAndLegacyOutcome() {
+  const payload = aiPayload("queued", 1);
+  delete payload.outcome_breakdown;
+  payload.available_files = [];
+  const { root } = await renderStatus("queued-ai", payload, { ai: true });
+  assert(labelValue(root, "Not found") === "1", "AI legacy inclusive not-found double counted errors");
+  assert(labelValue(root, "Errors") === "1", "AI legacy llm_errors fallback missing");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "queued AI run must retain file availability surface");
+  assert(byClass(files, "file-row").length === 5, "queued AI file rows missing");
+  assert(byClass(files, "file-row").every((row) =>
+    row.children[1]?.children[0]?.disabled
+      && row.children[1]?.children[1]?.getAttribute("href") == null),
+  "empty available_files must disable every queued AI file action");
+}
+
+async function unknownTotalAndLongModel() {
+  const longModel = "gemini-2.5-pro-preview-with-an-extremely-long-model-identifier";
+  const payload = aiPayload("completed");
+  payload.total_rows = null;
+  payload.entities_processed = null;
+  payload.model = longModel;
+  const { root } = await renderStatus("unknown-total", payload, { ai: true });
+  const primary = byClass(root, "outcome-primary")[0];
+  assert(byClass(primary, "outcome-value")[0]?.textContent === "4", "unknown total must retain found value");
+  assert(!primary.textContent.includes("of 0") && !primary.textContent.includes("%"),
+    "unknown total must omit denominator and percentage");
+  const modelPill = byClass(root, "pill").find((pill) => pill.children[0]?.textContent === "Model");
+  const value = modelPill?.children[1];
+  assert(value?.classList.contains("pill-value"), "model pill value class missing");
+  assert(value?.getAttribute("title") === longModel, "model pill must expose full value as title");
+  assert(byClass(root, "pill").some((pill) => pill.children[0]?.textContent === "Batch mode"),
+    "AI Batch mode header chip missing");
+  assert(!root.textContent.includes("Total / Processed"), "unknown total execution metric should be omitted");
+}
+
+async function customPollTerminalPredicate() {
+  timers = [];
+  const updates = [];
+  const statuses = [
+    { status: "completed", batch: "running" },
+    { status: "completed", batch: "succeeded" },
+  ];
+  globalThis.fetch = async () => response(statuses.shift());
+  pollStatus("/predicate", (status) => updates.push(status), 1,
+    (status) => status.batch === "succeeded");
+  await settle();
+  assert(updates.length === 1 && timers.length === 1, "custom terminal predicate did not continue polling");
+  await timers.shift()();
+  await settle();
+  assert(updates.length === 2 && timers.length === 0, "custom terminal predicate did not stop polling");
+}
+
+await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
 await completedRelationship();
 await finalizingBatch();
+await completedWithErrorsBatchIsTerminal();
 await legacyCompatibility();
 await completedAiMode();
 await erroredAiMode();
+await queuedAiFilesAndLegacyOutcome();
+await unknownTotalAndLongModel();

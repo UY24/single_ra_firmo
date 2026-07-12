@@ -23,14 +23,17 @@ export async function api(path, opts = {}) {
   }
 }
 
-export function pollStatus(path, onUpdate, intervalMs = 2000) {
+export const defaultTerminal = (status) =>
+  ["completed", "completed_with_errors", "failed"].includes(status?.status);
+
+export function pollStatus(path, onUpdate, intervalMs = 2000, isTerminal = defaultTerminal) {
   let stopped = false;
   async function tick() {
     if (stopped) return;
     try {
       const status = await api(path);
       onUpdate(status);
-      if (["completed", "completed_with_errors", "failed"].includes(status.status)) return;
+      if (isTerminal(status)) return;
     } catch (e) { console.error(e); }
     setTimeout(tick, intervalMs);
   }

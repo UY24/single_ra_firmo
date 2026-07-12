@@ -70,6 +70,7 @@ class TestUiShell(unittest.TestCase):
             ".file-actions",
             ".modal-surface",
             ".code-block",
+            ".pill-value",
             ".empty-state",
             "font-variant-numeric: tabular-nums",
             "grid-template-columns: repeat(4, minmax(0, 1fr))",
@@ -169,6 +170,15 @@ class TestUiShell(unittest.TestCase):
             "Errors",
         ):
             self.assertIn(marker, res.text)
+
+        api = self.client.get("/static/js/api.js")
+        self.assertEqual(api.status_code, 200)
+        for marker in ("defaultTerminal", "isTerminal"):
+            self.assertIn(marker, api.text)
+
+        css = self.client.get("/static/css/app.css")
+        self.assertEqual(css.status_code, 200)
+        self.assertIn("@media (max-width: 768px)", css.text)
 
     def test_shell_script_has_accessible_drawer_state(self):
         res = self.client.get("/static/js/main.js")

@@ -53,7 +53,13 @@ class TestGmapsStatusBlock(unittest.TestCase):
                 return {"Contents": [
                     {"Key": "acme/gmaps/gm1/run.log"},
                     {"Key": "acme/gmaps/gm1/unrelated.txt"},
-                ]}
+                ],
+                    "CommonPrefixes": [
+                        {"Prefix": "acme/gmaps/gm1/errors/"},
+                        {"Prefix": "acme/gmaps/gm1/serpwow_response/"},
+                    ],
+                    "IsTruncated": True,
+                }
 
         s3 = FakeS3()
         with tempfile.TemporaryDirectory() as td, \
@@ -71,6 +77,7 @@ class TestGmapsStatusBlock(unittest.TestCase):
         self.assertEqual(len(s3.calls), 1)
         self.assertEqual(s3.calls[0]["Bucket"], "bucket")
         self.assertEqual(s3.calls[0]["Prefix"], "acme/gmaps/gm1/")
+        self.assertEqual(s3.calls[0]["Delimiter"], "/")
 
     def test_status_skips_s3_when_all_reporting_files_are_local(self):
         with tempfile.TemporaryDirectory() as td:

@@ -2080,6 +2080,7 @@ def _list_available_reporting_files_s3_sync(
         response = get_s3_client().list_objects_v2(
             Bucket=bucket,
             Prefix=prefix,
+            Delimiter="/",
             MaxKeys=1000,
         )
     except Exception:

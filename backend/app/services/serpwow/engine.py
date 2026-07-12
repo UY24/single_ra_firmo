@@ -2079,6 +2079,7 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
         return
     if gemini_batch_meta.get("status") in {
         "queued", "running", "cancel_requested", "cancelled", "succeeded",
+        "completed_with_errors", "failed", "skipped",
     }:
         return
     if upload_id in gemini_batch_tasks:

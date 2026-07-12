@@ -240,6 +240,64 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("upload /1", engine.gemini_batch_tasks)
         run_batch.assert_not_awaited()
 
+    async def test_delete_chunk_with_terminal_sibling_does_not_relaunch_batch(self):
+        upload_id = "terminal-sibling-upload"
+        state = batch_state()
+        state["upload_id"] = upload_id
+        state["gemini_batch"]["chunks"][1]["status"] = "succeeded"
+        run_batch = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": ""}, clear=False), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "write_upload_artifact", AsyncMock()), \
+             patch.object(engine, "update_summary_cache"), \
+             patch.object(engine, "build_upload_output_payload", return_value={}), \
+             patch.object(engine, "_batch_postprocess_enabled_for", return_value=True), \
+             patch.object(engine, "_finalize_serpwow_outputs", AsyncMock()), \
+             patch.object(engine, "_notify_slack_terminal"), \
+             patch.object(engine, "run_gemini_batch_for_upload", run_batch):
+            updated = await engine._sync_batch_job_action_local_state(
+                upload_id, "jobs/chunk 0", "delete")
+            await asyncio.sleep(0)
+
+        task = engine.gemini_batch_tasks.pop(upload_id, None)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(updated)
+        self.assertEqual(state["gemini_batch"]["status"], "completed_with_errors")
+        run_batch.assert_not_awaited()
+
+    async def test_delete_chunk_when_all_chunks_fail_does_not_relaunch_batch(self):
+        upload_id = "all-terminal-failure-upload"
+        state = batch_state()
+        state["upload_id"] = upload_id
+        state["gemini_batch"]["chunks"][1]["status"] = "failed"
+        run_batch = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": ""}, clear=False), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "write_upload_artifact", AsyncMock()), \
+             patch.object(engine, "update_summary_cache"), \
+             patch.object(engine, "build_upload_output_payload", return_value={}), \
+             patch.object(engine, "_batch_postprocess_enabled_for", return_value=True), \
+             patch.object(engine, "_finalize_serpwow_outputs", AsyncMock()), \
+             patch.object(engine, "_notify_slack_terminal"), \
+             patch.object(engine, "run_gemini_batch_for_upload", run_batch):
+            updated = await engine._sync_batch_job_action_local_state(
+                upload_id, "jobs/chunk 0", "delete")
+            await asyncio.sleep(0)
+
+        task = engine.gemini_batch_tasks.pop(upload_id, None)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(updated)
+        self.assertEqual(state["gemini_batch"]["status"], "failed")
+        run_batch.assert_not_awaited()
+
     async def test_inflight_driver_does_not_overwrite_delete_marker(self):
         state = batch_state()
         state["gemini_batch"]["status"] = "queued"

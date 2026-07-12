@@ -185,6 +185,49 @@ textarea:focus-visible {
   padding: 1rem;
 }
 
+.page-intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-intro > :first-child,
+.section-heading > :first-child {
+  min-width: 0;
+}
+
+.page-heading {
+  margin-top: 0.35rem;
+  color: var(--text);
+  font-size: clamp(1.5rem, 2vw, 1.75rem);
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.page-copy {
+  max-width: 48rem;
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-heading .section-copy {
+  margin-top: 0.3rem;
+}
+
 .outcome-summary {
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
@@ -193,24 +236,32 @@ textarea:focus-visible {
   padding: 1rem;
 }
 
+.metric-group,
 .metric-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 0.5rem;
-  background: var(--border);
+  margin: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
-.metric-strip > * {
-  background: var(--panel);
+.metric-item {
+  min-width: 0;
   padding: 1rem;
+}
+
+.metric-group > .metric-item + .metric-item,
+.metric-strip > .metric-item + .metric-item {
+  border-left: 1px solid var(--border);
 }
 
 .metric-label {
   color: var(--subtle);
   font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.35;
+  text-transform: uppercase;
 }
 
 .metric-value {
@@ -218,6 +269,39 @@ textarea:focus-visible {
   color: var(--text);
   font-size: 1.25rem;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+}
+
+.metric-item--default .metric-value {
+  color: var(--text);
+}
+
+.metric-item--good .metric-value {
+  color: var(--accent);
+}
+
+.metric-item--muted .metric-value {
+  color: var(--muted);
+}
+
+.metric-item--warning .metric-value {
+  color: var(--amber);
+}
+
+.metric-item--danger .metric-value {
+  color: var(--red);
+}
+
+.metric-item--info .metric-value {
+  color: var(--blue);
+}
+
+.metric-detail {
+  margin-top: 0.35rem;
+  color: var(--subtle);
+  font-size: 0.75rem;
+  line-height: 1.45;
 }
 
 .section-title {
@@ -229,6 +313,25 @@ textarea:focus-visible {
 .section-copy {
   color: var(--muted);
   font-size: 0.875rem;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2rem 1rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  text-align: center;
+}
+
+.empty-state .section-copy {
+  max-width: 36rem;
+  margin-top: 0.35rem;
+}
+
+.empty-state > :nth-child(n + 3) {
+  margin-top: 1rem;
 }
 
 .control,
@@ -796,6 +899,32 @@ tbody tr:hover {
     max-width: none;
   }
 
+  .page-intro,
+  .section-heading {
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .metric-group,
+  .metric-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .metric-group > .metric-item,
+  .metric-strip > .metric-item {
+    border-left: 0;
+  }
+
+  .metric-group > .metric-item:nth-child(even),
+  .metric-strip > .metric-item:nth-child(even) {
+    border-left: 1px solid var(--border);
+  }
+
+  .metric-group > .metric-item:nth-child(n + 3),
+  .metric-strip > .metric-item:nth-child(n + 3) {
+    border-top: 1px solid var(--border);
+  }
+
   .panel,
   .callout {
     padding: 1rem;
@@ -806,6 +935,31 @@ tbody tr:hover {
   .btn-ghost,
   .btn-danger {
     width: 100%;
+  }
+}
+
+@media (max-width: 479px) {
+  .metric-group,
+  .metric-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-group > .metric-item:nth-child(even),
+  .metric-strip > .metric-item:nth-child(even) {
+    border-left: 0;
+  }
+
+  .metric-group > .metric-item:nth-child(n + 2),
+  .metric-strip > .metric-item:nth-child(n + 2) {
+    border-top: 1px solid var(--border);
+  }
+
+  .metric-item {
+    padding: 0.875rem 0;
+  }
+
+  .empty-state {
+    padding: 1.5rem 0;
   }
 }
 

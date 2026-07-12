@@ -43,6 +43,20 @@ class TestUiShell(unittest.TestCase):
             "--red: #f07b84",
             ".outcome-summary",
             ".metric-strip",
+            ".page-intro",
+            ".page-heading",
+            ".page-copy",
+            ".section-heading",
+            ".metric-group",
+            ".metric-item--default",
+            ".metric-item--good",
+            ".metric-item--muted",
+            ".metric-item--warning",
+            ".metric-item--danger",
+            ".metric-item--info",
+            ".metric-detail",
+            ".empty-state",
+            "font-variant-numeric: tabular-nums",
             ".mobile-nav-toggle",
             ".sidebar-backdrop.hidden",
             "outline: 2px solid var(--accent)",
@@ -51,6 +65,11 @@ class TestUiShell(unittest.TestCase):
             "prefers-reduced-motion",
         ):
             self.assertIn(token, res.text)
+
+        ui = self.client.get("/static/js/ui.js")
+        self.assertEqual(ui.status_code, 200)
+        for helper in ("pageIntro", "sectionHeading", "metricItem", "emptyState"):
+            self.assertIn(f"function {helper}", ui.text)
 
     def test_shell_script_has_accessible_drawer_state(self):
         res = self.client.get("/static/js/main.js")

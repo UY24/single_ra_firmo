@@ -91,6 +91,18 @@ class TestUiShell(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_core_views_use_midnight_ledger_hierarchy(self):
+        markers = {
+            "/static/js/dashboard.js": ("pageIntro", "company-summary", "Recent runs"),
+            "/static/js/companies.js": ("pageIntro", "Create company", "companiesTable"),
+            "/static/js/runs.js": ("pageIntro", "Clear", "filter-toolbar"),
+        }
+        for path, expected in markers.items():
+            res = self.client.get(path)
+            self.assertEqual(res.status_code, 200, path)
+            for marker in expected:
+                self.assertIn(marker, res.text, f"{marker!r} missing from {path}")
+
     def test_shell_script_has_accessible_drawer_state(self):
         res = self.client.get("/static/js/main.js")
         self.assertEqual(res.status_code, 200)

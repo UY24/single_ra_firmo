@@ -492,6 +492,183 @@ tbody tr:hover {
   background: var(--panel-soft) !important;
 }
 
+.data-table {
+  width: 100%;
+  min-width: 42rem;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.875rem;
+}
+
+.data-table thead th {
+  border-bottom: 1px solid var(--border);
+}
+
+.data-row > td {
+  border-top: 1px solid var(--border);
+}
+
+.data-table tbody .data-row:first-child > td {
+  border-top: 0;
+}
+
+.data-row {
+  transition: background-color 180ms ease;
+}
+
+.data-row:hover {
+  background: var(--panel-soft);
+}
+
+/* Core console views */
+.core-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.core-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.company-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.company-summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+
+.company-summary:hover,
+.company-summary:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--panel-strong);
+}
+
+.company-name {
+  overflow: hidden;
+  padding: 1.1rem 1.1rem 0;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.company-outcome {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.5rem 1.1rem 1rem;
+}
+
+.company-outcome-value {
+  color: var(--accent);
+  font-size: 1.35rem;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+
+.company-outcome-rate {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.company-metrics {
+  width: 100%;
+  margin-top: auto;
+  border-bottom: 0;
+}
+
+.company-metrics .metric-item {
+  padding: 0.8rem 1.1rem;
+}
+
+.company-metrics .metric-value {
+  font-size: 1rem;
+}
+
+.create-company {
+  padding: 1rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-soft);
+}
+
+.create-company form {
+  margin-top: 0.75rem;
+}
+
+.create-company-fields {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) auto;
+  gap: 0.45rem 0.75rem;
+  align-items: end;
+  max-width: 42rem;
+}
+
+.create-company-fields .filter-label {
+  grid-column: 1 / -1;
+}
+
+.form-message {
+  margin-top: 0.65rem;
+  font-size: 0.875rem;
+}
+
+.company-directory {
+  min-width: 0;
+}
+
+.filter-toolbar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(10rem, 1fr)) auto;
+  gap: 0.75rem;
+  align-items: end;
+  padding: 1rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-soft);
+}
+
+.filter-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.filter-label {
+  color: var(--subtle);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.filter-field select {
+  width: 100%;
+}
+
+.filter-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .divide-gray-100 > :not([hidden]) ~ :not([hidden]),
 .divide-gray-200 > :not([hidden]) ~ :not([hidden]) {
   border-color: var(--border) !important;
@@ -824,6 +1001,18 @@ tbody tr:hover {
   .metric-strip > .metric-item:nth-child(n + 3) {
     border-top: 1px solid var(--border);
   }
+
+  .company-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .filter-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .filter-actions {
+    align-self: end;
+  }
 }
 
 @media (max-width: 767px) {
@@ -940,6 +1129,10 @@ tbody tr:hover {
     gap: 1rem;
   }
 
+  .core-view {
+    gap: 1.25rem;
+  }
+
   .panel,
   .callout {
     padding: 1rem;
@@ -950,6 +1143,15 @@ tbody tr:hover {
   .btn-ghost,
   .btn-danger {
     width: 100%;
+  }
+
+  .filter-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .filter-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -976,6 +1178,24 @@ tbody tr:hover {
 
   .empty-state {
     padding: 1.5rem 0;
+  }
+
+  .company-outcome {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .company-metrics .metric-item {
+    padding-inline: 1.1rem;
+  }
+
+  .create-company-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .create-company-fields .filter-label {
+    grid-column: auto;
   }
 }
 

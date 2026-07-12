@@ -7,7 +7,7 @@
 //   GET /gsearch/discover?company_name=...&country=...&phase=...&...
 //     → {company_name, country, phase, queries_run, candidates, results, processing_seconds}
 import { api, el } from "./api.js";
-import { errorCard } from "./ui.js";
+import { errorCard, pageIntro, sectionHeading } from "./ui.js";
 
 const inputCls = "control w-full px-3 py-2 text-sm";
 const btnPrimary = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
@@ -25,9 +25,10 @@ const PHASES = [
 ];
 
 function labeled(labelText, input, optional = false) {
-  const div = el("div", { class: "flex flex-col gap-1" });
+  const div = el("div", { class: "control-field" });
   div.appendChild(el("label", {
-    class: "view-kicker",
+    class: "filter-label",
+    for: input.getAttribute("id"),
   }, labelText + (optional ? " (optional)" : " *")));
   div.appendChild(input);
   return div;
@@ -35,10 +36,9 @@ function labeled(labelText, input, optional = false) {
 
 function rawJsonToggle(data) {
   const pre = el("pre", {
-    class: "overflow-auto rounded-lg bg-slate-950 p-4 text-xs text-indigo-300 " +
-           "whitespace-pre-wrap break-all max-h-80",
+    class: "code-block tool-code",
   }, JSON.stringify(data, null, 2));
-  const wrap = el("div", { class: "hidden mt-2" });
+  const wrap = el("div", { class: "raw-json hidden" });
   wrap.appendChild(pre);
   const btn = el("button", { class: btnSecondary + " mt-3 min-h-0 py-1 px-2.5 text-xs" },
     "Show raw JSON");
@@ -46,17 +46,16 @@ function rawJsonToggle(data) {
     const nowHidden = wrap.classList.toggle("hidden");
     btn.textContent = nowHidden ? "Show raw JSON" : "Hide raw JSON";
   });
-  const wrapper = el("div", {});
+  const wrapper = el("div", { class: "raw-json-toggle" });
   wrapper.appendChild(btn);
   wrapper.appendChild(wrap);
   return wrapper;
 }
 
 function sectionCard(title, subtitle, body) {
-  const card = el("div", { class: "panel" });
-  card.appendChild(el("h2", { class: "section-title" }, title));
-  card.appendChild(el("p", { class: "mt-1 section-copy" }, subtitle));
-  card.appendChild(body);
+  const card = el("section", { class: "detail-section tool-section" });
+  card.appendChild(sectionHeading(title, subtitle));
+  card.appendChild(el("div", { class: "detail-section-body" }, body));
   return card;
 }
 
@@ -65,72 +64,74 @@ function sectionCard(title, subtitle, body) {
 function gmapsDiscoverSearchCard() {
   const queryIn = el("input", {
     class: inputCls, type: "text",
+    id: "gmaps-query",
     placeholder: "e.g. Acme Engineering Banani Dhaka",
   });
   const countryIn = el("input", {
     class: inputCls, type: "text",
+    id: "gmaps-country",
     placeholder: "e.g. Bangladesh or bd",
   });
   const discoverBtn = el("button", { class: btnSecondary }, "Discover Places");
   const searchBtn = el("button", { class: btnPrimary }, "Full Search");
-  const metaEl = el("p", { class: "mt-2 text-sm text-gray-400" });
-  const resultsEl = el("div", { class: "mt-4" });
+  const metaEl = el("p", { class: "message message--muted", "aria-live": "polite" });
+  const resultsEl = el("div", { class: "tool-results" });
 
-  function setMeta(msg, tone = "text-gray-400") {
+  function setMeta(msg, tone = "muted") {
     metaEl.textContent = msg;
-    metaEl.className = `mt-2 text-sm ${tone}`;
+    metaEl.className = `message message--${tone}`;
   }
 
   async function run(action) {
     const q = queryIn.value.trim();
-    if (!q) { setMeta("Search query is required.", "text-red-600"); return; }
+    if (!q) { setMeta("Search query is required.", "danger"); return; }
     const params = new URLSearchParams({ q });
     const country = countryIn.value.trim();
     if (country) params.set("country", country);
     discoverBtn.disabled = searchBtn.disabled = true;
-    setMeta("Running…", "text-indigo-500");
+    setMeta("Running…", "info");
     resultsEl.replaceChildren();
     try {
       const data = await api(`/gmaps/${action}?${params}`);
-      setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "text-gray-500");
-      const out = el("div", { class: "space-y-3" });
+      setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "muted");
+      const out = el("div", { class: "result-stack" });
       if (action === "discover") {
         const cids = data.cids ?? [];
-        const header = el("p", { class: "text-sm font-medium text-gray-700" },
+        const header = el("p", { class: "data-value" },
           `Found ${cids.length} CID${cids.length !== 1 ? "s" : ""}` +
           ` for "${data.query}"${data.gl ? ` (gl=${data.gl})` : ""}`);
         out.appendChild(header);
         if (cids.length > 0) {
-          const list = el("ul", { class: "mt-2 space-y-1 font-mono text-xs text-gray-600" });
-          cids.forEach((c) => list.appendChild(el("li", { class: "break-all" }, c)));
+          const list = el("ul", { class: "data-list" });
+          cids.forEach((c) => list.appendChild(el("li", { class: "data-list-row data-value font-mono" }, c)));
           out.appendChild(list);
         } else {
-          out.appendChild(el("p", { class: "text-sm text-gray-400" }, "No CIDs discovered."));
+          out.appendChild(el("p", { class: "section-copy" }, "No CIDs discovered."));
         }
       } else {
         const website = data.official_website;
-        const websiteEl = el("p", { class: "text-sm font-medium text-gray-700" });
+        const websiteEl = el("p", { class: "data-value" });
         websiteEl.appendChild(document.createTextNode("Website: "));
         if (website) {
           const a = el("a", {
             href: website, target: "_blank",
-            class: "text-indigo-600 hover:underline break-all",
+            class: "semantic-link break-all",
           }, website);
           websiteEl.appendChild(a);
         } else {
-          websiteEl.appendChild(el("span", { class: "text-gray-400" }, "none found"));
+          websiteEl.appendChild(el("span", { class: "section-copy" }, "none found"));
         }
         out.appendChild(websiteEl);
         const raw = data.raw_response ?? data;
         const places = (raw.results ?? []).slice(0, 6);
         if (places.length > 0) {
-          const listHeader = el("p", { class: "text-xs text-gray-400" },
+          const listHeader = el("p", { class: "data-label" },
             `Top ${places.length} place(s):`);
           out.appendChild(listHeader);
-          const list = el("ul", { class: "mt-1 space-y-1 text-xs text-gray-600" });
+          const list = el("ul", { class: "data-list" });
           places.forEach((p) => {
             const site = p.website ?? p.official_website ?? "";
-            list.appendChild(el("li", { class: "break-all" },
+            list.appendChild(el("li", { class: "data-list-row data-value break-all" },
               `${p.name ?? "—"}${site ? " — " + site : ""}${p.address ? " — " + p.address : ""}`));
           });
           out.appendChild(list);
@@ -139,7 +140,7 @@ function gmapsDiscoverSearchCard() {
       out.appendChild(rawJsonToggle(data));
       resultsEl.appendChild(out);
     } catch (e) {
-      setMeta("", "text-gray-400");
+      setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
       discoverBtn.disabled = searchBtn.disabled = false;
@@ -149,12 +150,12 @@ function gmapsDiscoverSearchCard() {
   discoverBtn.addEventListener("click", () => run("discover"));
   searchBtn.addEventListener("click", () => run("search"));
 
-  const body = el("div", {});
-  const grid = el("div", { class: "mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2" });
+  const body = el("div", { class: "tool-form" });
+  const grid = el("div", { class: "control-grid" });
   grid.appendChild(labeled("Search Query", queryIn));
   grid.appendChild(labeled("Country Hint", countryIn, true));
   body.appendChild(grid);
-  const btns = el("div", { class: "mt-4 flex gap-3" });
+  const btns = el("div", { class: "action-group tool-actions" });
   btns.appendChild(discoverBtn);
   btns.appendChild(searchBtn);
   body.appendChild(btns);
@@ -171,26 +172,27 @@ function gmapsDiscoverSearchCard() {
 function gmapsDetailsCard() {
   const cidIn = el("input", {
     class: inputCls, type: "text",
+    id: "gmaps-cid",
     placeholder: "e.g. 0x3755c7a0f75e10d3:0x4d59a7213b28b7e2",
   });
   const fetchBtn = el("button", { class: btnGreen }, "Fetch Place Details");
-  const metaEl = el("p", { class: "mt-2 text-sm text-gray-400" });
-  const resultsEl = el("div", { class: "mt-4" });
+  const metaEl = el("p", { class: "message message--muted", "aria-live": "polite" });
+  const resultsEl = el("div", { class: "tool-results" });
 
-  function setMeta(msg, tone = "text-gray-400") {
+  function setMeta(msg, tone = "muted") {
     metaEl.textContent = msg;
-    metaEl.className = `mt-2 text-sm ${tone}`;
+    metaEl.className = `message message--${tone}`;
   }
 
   fetchBtn.addEventListener("click", async () => {
     const cid = cidIn.value.trim();
-    if (!cid) { setMeta("CID is required.", "text-red-600"); return; }
+    if (!cid) { setMeta("CID is required.", "danger"); return; }
     fetchBtn.disabled = true;
-    setMeta("Fetching…", "text-indigo-500");
+    setMeta("Fetching…", "info");
     resultsEl.replaceChildren();
     try {
       const data = await api(`/gmaps/details?cid=${encodeURIComponent(cid)}`);
-      setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "text-gray-500");
+      setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "muted");
       const FIELD_LABELS = [
         ["name", "Name"], ["website", "Website"], ["phone", "Phone"],
         ["address", "Address"], ["category", "Category"], ["type", "Type"],
@@ -200,45 +202,43 @@ function gmapsDetailsCard() {
         .map(([key, label]) => [label, data[key]])
         .filter(([, v]) => v != null && v !== "");
       if (rows.length > 0) {
-        const table = el("div", {
-          class: "rounded-lg border border-gray-200 divide-y divide-gray-100",
-        });
+        const table = el("div", { class: "data-list" });
         rows.forEach(([label, value]) => {
-          const row = el("div", { class: "flex gap-3 px-4 py-2.5 text-sm" });
+          const row = el("div", { class: "data-list-row" });
           row.appendChild(el("span", {
-            class: "w-24 shrink-0 text-xs font-medium uppercase tracking-wide text-gray-400",
+            class: "data-label",
           }, label));
           if (label === "Website" && value) {
             row.appendChild(el("a", {
               href: value, target: "_blank",
-              class: "text-indigo-600 hover:underline break-all",
+              class: "semantic-link break-all",
             }, String(value)));
           } else {
-            row.appendChild(el("span", { class: "break-all text-gray-700" }, String(value)));
+            row.appendChild(el("span", { class: "data-value break-all" }, String(value)));
           }
           table.appendChild(row);
         });
-        const rawWrap = el("div", { class: "px-4 py-2.5" });
+        const rawWrap = el("div", { class: "data-list-row" });
         rawWrap.appendChild(rawJsonToggle(data));
         table.appendChild(rawWrap);
         resultsEl.appendChild(table);
       } else {
-        resultsEl.appendChild(el("p", { class: "text-sm text-gray-400" }, "No details returned."));
+        resultsEl.appendChild(el("p", { class: "section-copy" }, "No details returned."));
         resultsEl.appendChild(rawJsonToggle(data));
       }
     } catch (e) {
-      setMeta("", "text-gray-400");
+      setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
       fetchBtn.disabled = false;
     }
   });
 
-  const body = el("div", {});
-  const fieldWrap = el("div", { class: "mt-4 max-w-lg" });
+  const body = el("div", { class: "tool-form" });
+  const fieldWrap = el("div", { class: "control-stack" });
   fieldWrap.appendChild(labeled("Place CID (data_cid)", cidIn));
   body.appendChild(fieldWrap);
-  const btnWrap = el("div", { class: "mt-4" });
+  const btnWrap = el("div", { class: "action-group tool-actions" });
   btnWrap.appendChild(fetchBtn);
   body.appendChild(btnWrap);
   body.appendChild(metaEl);
@@ -255,38 +255,39 @@ function gmapsDetailsCard() {
 
 function gsearchCard() {
   const companyIn = el("input", {
-    class: inputCls, type: "text", placeholder: "e.g. Acme Engineering",
+    class: inputCls, type: "text", id: "gsearch-company", placeholder: "e.g. Acme Engineering",
   });
   const countryIn = el("input", {
-    class: inputCls, type: "text", placeholder: "e.g. Bangladesh or bd",
+    class: inputCls, type: "text", id: "gsearch-country", placeholder: "e.g. Bangladesh or bd",
   });
   const cityIn = el("input", {
-    class: inputCls, type: "text", placeholder: "e.g. Dhaka",
+    class: inputCls, type: "text", id: "gsearch-city", placeholder: "e.g. Dhaka",
   });
   const industryIn = el("input", {
-    class: inputCls, type: "text", placeholder: "e.g. Engineering",
+    class: inputCls, type: "text", id: "gsearch-industry", placeholder: "e.g. Engineering",
   });
   const addressIn = el("input", {
     class: inputCls, type: "text",
+    id: "gsearch-address",
     placeholder: "e.g. Plot-12, Road-5, Block-B, Banani",
   });
-  const phaseSelect = el("select", { class: inputCls });
+  const phaseSelect = el("select", { class: inputCls, id: "gsearch-phase" });
   PHASES.forEach((p) => phaseSelect.appendChild(el("option", { value: p.value }, p.label)));
 
   const execBtn = el("button", { class: btnPrimary }, "Execute Search");
-  const metaEl = el("p", { class: "mt-2 text-sm text-gray-400" });
-  const resultsEl = el("div", { class: "mt-4" });
+  const metaEl = el("p", { class: "message message--muted", "aria-live": "polite" });
+  const resultsEl = el("div", { class: "tool-results" });
 
-  function setMeta(msg, tone = "text-gray-400") {
+  function setMeta(msg, tone = "muted") {
     metaEl.textContent = msg;
-    metaEl.className = `mt-2 text-sm ${tone}`;
+    metaEl.className = `message message--${tone}`;
   }
 
   execBtn.addEventListener("click", async () => {
     const company = companyIn.value.trim();
     const country = countryIn.value.trim();
     if (!company || !country) {
-      setMeta("Company Name and Country are required.", "text-red-600");
+      setMeta("Company Name and Country are required.", "danger");
       return;
     }
     const params = new URLSearchParams({ company_name: company, country });
@@ -299,73 +300,68 @@ function gsearchCard() {
     params.set("phase", phaseSelect.value);
 
     execBtn.disabled = true;
-    setMeta("Running…", "text-indigo-500");
+    setMeta("Running…", "info");
     resultsEl.replaceChildren();
     try {
       const data = await api(`/gsearch/discover?${params}`);
       const qCount = data.queries_run ?? 0;
       setMeta(
         `Ran ${qCount} quer${qCount === 1 ? "y" : "ies"} in ${data.processing_seconds ?? "?"}s`,
-        "text-gray-500",
+        "muted",
       );
 
       const candidates = data.candidates ?? [];
       const queryResults = data.results ?? [];
-      const out = el("div", { class: "space-y-4" });
+      const out = el("div", { class: "result-stack" });
 
       // Candidates
-      const candCard = el("div", { class: "rounded-lg border border-gray-200 p-4" });
+      const candCard = el("div", { class: "result-group" });
       candCard.appendChild(el("p", {
-        class: "text-xs font-medium uppercase tracking-wide text-gray-400",
+        class: "data-label",
       }, `URL Candidates (${candidates.length})`));
       if (candidates.length > 0) {
-        const chips = el("div", { class: "mt-2 flex flex-wrap gap-2" });
+        const chips = el("div", { class: "result-links" });
         candidates.forEach((c) => {
           const href = c.startsWith("http") ? c : `https://${c}`;
           chips.appendChild(el("a", {
             href, target: "_blank",
-            class: "inline-block rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 " +
-                   "text-xs text-indigo-700 hover:bg-indigo-100",
+            class: "pill pill--info semantic-link",
           }, c));
         });
         candCard.appendChild(chips);
       } else {
-        candCard.appendChild(el("p", { class: "mt-1 text-sm text-gray-400" }, "No candidates found."));
+        candCard.appendChild(el("p", { class: "section-copy" }, "No candidates found."));
       }
       out.appendChild(candCard);
 
       // Query log
       if (queryResults.length > 0) {
-        const logCard = el("div", { class: "rounded-lg border border-gray-200 p-4" });
+        const logCard = el("div", { class: "result-group" });
         logCard.appendChild(el("p", {
-          class: "text-xs font-medium uppercase tracking-wide text-gray-400",
+          class: "data-label",
         }, `Search Execution Log (${queryResults.length})`));
-        const log = el("div", { class: "mt-2 space-y-2" });
+        const log = el("div", { class: "data-list result-log" });
         queryResults.forEach((r) => {
           const isOk = Boolean(r.success);
           const row = el("div", {
-            class: `rounded-lg border p-3 text-xs ${isOk
-              ? "border-emerald-200 bg-emerald-50"
-              : "border-gray-200 bg-gray-50"}`,
+            class: `data-list-row result-row ${isOk ? "result-row--good" : "result-row--muted"}`,
           });
-          const rowHead = el("div", { class: "flex items-center justify-between gap-2" });
+          const rowHead = el("div", { class: "result-row-heading" });
           rowHead.appendChild(el("span", {
-            class: `rounded-full px-2 py-0.5 font-mono font-medium ${isOk
-              ? "bg-emerald-100 text-emerald-800"
-              : "bg-gray-200 text-gray-600"}`,
+            class: `pill ${isOk ? "pill--good" : "pill--muted"}`,
           }, r.phase ?? "—"));
           if (r.search_url) {
             const link = el("a", {
               href: r.search_url, target: "_blank",
-              class: "text-gray-400 hover:text-indigo-600",
+              class: "semantic-link",
               title: "Open search URL",
             }, "↗");
             rowHead.appendChild(link);
           }
           row.appendChild(rowHead);
-          row.appendChild(el("p", { class: "mt-1.5 break-all text-gray-700" }, r.query ?? ""));
+          row.appendChild(el("p", { class: "data-value break-all" }, r.query ?? ""));
           if (r.error) {
-            row.appendChild(el("p", { class: "mt-1 text-red-600" }, r.error));
+            row.appendChild(el("p", { class: "message message--danger" }, r.error));
           }
           log.appendChild(row);
         });
@@ -375,27 +371,27 @@ function gsearchCard() {
 
       resultsEl.appendChild(out);
     } catch (e) {
-      setMeta("", "text-gray-400");
+      setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
       execBtn.disabled = false;
     }
   });
 
-  const body = el("div", {});
-  const grid = el("div", { class: "mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2" });
+  const body = el("div", { class: "tool-form" });
+  const grid = el("div", { class: "control-grid" });
   grid.appendChild(labeled("Company Name", companyIn));
   grid.appendChild(labeled("Country", countryIn));
   grid.appendChild(labeled("City / State", cityIn, true));
   grid.appendChild(labeled("Industry", industryIn, true));
   body.appendChild(grid);
-  const addressRow = el("div", { class: "mt-4" });
+  const addressRow = el("div", { class: "control-stack" });
   addressRow.appendChild(labeled("Full Address", addressIn, true));
   body.appendChild(addressRow);
-  const phaseRow = el("div", { class: "mt-4" });
+  const phaseRow = el("div", { class: "control-stack" });
   phaseRow.appendChild(labeled("Search Phase", phaseSelect));
   body.appendChild(phaseRow);
-  const btnWrap = el("div", { class: "mt-5" });
+  const btnWrap = el("div", { class: "action-group tool-actions" });
   btnWrap.appendChild(execBtn);
   body.appendChild(btnWrap);
   body.appendChild(metaEl);
@@ -411,29 +407,33 @@ function gsearchCard() {
 // ── view ─────────────────────────────────────────────────────────────────────
 
 export async function render(root) {
-  const page = el("div", { class: "max-w-3xl space-y-8" });
+  const page = el("div", { class: "tools-view" });
+
+  page.appendChild(pageIntro(
+    "Tools",
+    "Interactive discovery workbench",
+    "Run immediate Google Maps and Google Search lookups without creating a tracked batch run.",
+  ));
 
   // GMaps heading
-  const gmapsHead = el("div", {});
-  gmapsHead.appendChild(el("h2", { class: "text-base font-semibold text-gray-900" },
-    "Google Maps"));
-  gmapsHead.appendChild(el("p", { class: "mt-1 text-sm text-gray-500" },
-    "Interactive place lookup — results are immediate, not tracked batch runs."));
-  const gmapsCards = el("div", { class: "mt-4 space-y-6" });
+  const gmapsHead = el("section", { class: "tool-category" });
+  gmapsHead.appendChild(sectionHeading(
+    "Google Maps",
+    "Interactive place lookup — results are immediate, not tracked batch runs.",
+  ));
+  const gmapsCards = el("div", { class: "tool-section-list" });
   gmapsCards.appendChild(gmapsDiscoverSearchCard());
   gmapsCards.appendChild(gmapsDetailsCard());
   gmapsHead.appendChild(gmapsCards);
   page.appendChild(gmapsHead);
 
-  page.appendChild(el("hr", { class: "border-gray-200" }));
-
   // GSearch heading
-  const gsHead = el("div", {});
-  gsHead.appendChild(el("h2", { class: "text-base font-semibold text-gray-900" },
-    "Google Search"));
-  gsHead.appendChild(el("p", { class: "mt-1 text-sm text-gray-500" },
-    "Interactive single-entity search — not a tracked batch run."));
-  const gsCards = el("div", { class: "mt-4" });
+  const gsHead = el("section", { class: "tool-category" });
+  gsHead.appendChild(sectionHeading(
+    "Google Search",
+    "Interactive single-entity search — not a tracked batch run.",
+  ));
+  const gsCards = el("div", { class: "tool-section-list" });
   gsCards.appendChild(gsearchCard());
   gsHead.appendChild(gsCards);
   page.appendChild(gsHead);

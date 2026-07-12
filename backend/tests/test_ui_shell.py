@@ -145,6 +145,16 @@ class TestUiShell(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_operations_and_tools_dom_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["node", "tests/operations_tools_dom_contract.mjs"],
+            cwd=backend_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_core_views_use_midnight_ledger_hierarchy(self):
         markers = {
             "/static/js/dashboard.js": ("pageIntro", "company-summary", "Recent runs"),
@@ -156,6 +166,13 @@ class TestUiShell(unittest.TestCase):
             self.assertEqual(res.status_code, 200, path)
             for marker in expected:
                 self.assertIn(marker, res.text, f"{marker!r} missing from {path}")
+
+    def test_operations_and_tools_use_dark_semantic_classes(self):
+        for path in ("/static/js/operations.js", "/static/js/tools.js"):
+            res = self.client.get(path)
+            self.assertEqual(res.status_code, 200, path)
+            for light_class in ("hover:bg-gray-50", "text-gray-700", "border-gray-200"):
+                self.assertNotIn(light_class, res.text, f"{light_class!r} remains in {path}")
 
     def test_new_run_uses_step_and_selection_contract(self):
         res = self.client.get("/static/js/new_run.js")

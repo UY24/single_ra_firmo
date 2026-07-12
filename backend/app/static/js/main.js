@@ -62,11 +62,12 @@ function mountNavIcons() {
   });
 }
 
-function setDrawerOpen(open) {
+function setDrawerOpen(open, { returnFocus = true } = {}) {
   const sidebar = document.getElementById("app-sidebar");
   const toggle = document.getElementById("sidebar-toggle");
   const backdrop = document.getElementById("sidebar-backdrop");
-  if (!sidebar || !toggle || !backdrop) return;
+  const main = document.querySelector("main");
+  if (!sidebar || !toggle || !backdrop || !main) return;
 
   const wasOpen = sidebar.classList.contains("is-open");
   sidebar.classList.toggle("is-open", open);
@@ -74,8 +75,17 @@ function setDrawerOpen(open) {
   toggle.setAttribute("aria-expanded", String(open));
   toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
   document.body.classList.toggle("nav-open", open);
+  main.toggleAttribute("inert", open);
 
-  if (wasOpen && !open) toggle.focus({ preventScroll: true });
+  if (open) {
+    main.setAttribute("aria-hidden", "true");
+    const firstNavLink = sidebar.querySelector(".nav-link");
+    if (firstNavLink) firstNavLink.focus({ preventScroll: true });
+  } else {
+    main.removeAttribute("aria-hidden");
+  }
+
+  if (wasOpen && !open && returnFocus) toggle.focus({ preventScroll: true });
 }
 
 function bindShellInteractions() {
@@ -96,6 +106,11 @@ function bindShellInteractions() {
     if (event.key === "Escape" && toggle.getAttribute("aria-expanded") === "true") {
       setDrawerOpen(false);
     }
+  });
+
+  const desktopMedia = window.matchMedia("(min-width: 768px)");
+  desktopMedia.addEventListener("change", (event) => {
+    if (event.matches) setDrawerOpen(false, { returnFocus: false });
   });
 }
 
@@ -135,7 +150,10 @@ function route() {
     s.classList.toggle("hidden", s.dataset.view !== view);
   });
   document.querySelectorAll("#sidebar-nav .nav-link").forEach((a) => {
-    a.classList.toggle("active", a.dataset.nav === view);
+    const isActive = a.dataset.nav === view;
+    a.classList.toggle("active", isActive);
+    if (isActive) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
   });
   const title = document.getElementById("view-title");
   if (title) title.textContent = TITLES[view] ?? view;

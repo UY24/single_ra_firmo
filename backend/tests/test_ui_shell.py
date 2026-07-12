@@ -36,12 +36,35 @@ class TestUiShell(unittest.TestCase):
             "--bg: #080d16",
             "--sidebar: #0b111c",
             "--accent: #65d6ad",
+            "--blue: #72a7ff",
+            "--blue-strong: #4d8df4",
+            "--cyan: #65d6ad",
+            "--amber: #f2b95f",
+            "--red: #f07b84",
             ".outcome-summary",
             ".metric-strip",
             ".mobile-nav-toggle",
+            ".sidebar-backdrop.hidden",
+            "outline: 2px solid var(--accent)",
+            "color: var(--subtle) !important",
+            "color-mix(in srgb, var(--accent)",
             "prefers-reduced-motion",
         ):
             self.assertIn(token, res.text)
+
+    def test_shell_script_has_accessible_drawer_state(self):
+        res = self.client.get("/static/js/main.js")
+        self.assertEqual(res.status_code, 200)
+        for marker in (
+            'main.toggleAttribute("inert", open)',
+            'main.setAttribute("aria-hidden", "true")',
+            'main.removeAttribute("aria-hidden")',
+            'firstNavLink.focus({ preventScroll: true })',
+            'a.setAttribute("aria-current", "page")',
+            'a.removeAttribute("aria-current")',
+            'matchMedia("(min-width: 768px)")',
+        ):
+            self.assertIn(marker, res.text)
 
     def test_all_console_views_are_static_assets(self):
         for path in (

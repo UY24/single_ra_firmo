@@ -239,7 +239,7 @@ textarea:focus-visible {
 .metric-group,
 .metric-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 0;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -250,9 +250,19 @@ textarea:focus-visible {
   padding: 1rem;
 }
 
-.metric-group > .metric-item + .metric-item,
-.metric-strip > .metric-item + .metric-item {
+.metric-group > .metric-item,
+.metric-strip > .metric-item {
   border-left: 1px solid var(--border);
+}
+
+.metric-group > .metric-item:nth-child(4n + 1),
+.metric-strip > .metric-item:nth-child(4n + 1) {
+  border-left: 0;
+}
+
+.metric-group > .metric-item:nth-child(n + 5),
+.metric-strip > .metric-item:nth-child(n + 5) {
+  border-top: 1px solid var(--border);
 }
 
 .metric-label {
@@ -789,6 +799,31 @@ tbody tr:hover {
   .summary-panel {
     position: static;
   }
+
+  .metric-group,
+  .metric-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .metric-group > .metric-item,
+  .metric-strip > .metric-item {
+    border-top: 0;
+  }
+
+  .metric-group > .metric-item:nth-child(odd),
+  .metric-strip > .metric-item:nth-child(odd) {
+    border-left: 0;
+  }
+
+  .metric-group > .metric-item:nth-child(even),
+  .metric-strip > .metric-item:nth-child(even) {
+    border-left: 1px solid var(--border);
+  }
+
+  .metric-group > .metric-item:nth-child(n + 3),
+  .metric-strip > .metric-item:nth-child(n + 3) {
+    border-top: 1px solid var(--border);
+  }
 }
 
 @media (max-width: 767px) {
@@ -905,26 +940,6 @@ tbody tr:hover {
     gap: 1rem;
   }
 
-  .metric-group,
-  .metric-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .metric-group > .metric-item,
-  .metric-strip > .metric-item {
-    border-left: 0;
-  }
-
-  .metric-group > .metric-item:nth-child(even),
-  .metric-strip > .metric-item:nth-child(even) {
-    border-left: 1px solid var(--border);
-  }
-
-  .metric-group > .metric-item:nth-child(n + 3),
-  .metric-strip > .metric-item:nth-child(n + 3) {
-    border-top: 1px solid var(--border);
-  }
-
   .panel,
   .callout {
     padding: 1rem;
@@ -938,15 +953,16 @@ tbody tr:hover {
   }
 }
 
-@media (max-width: 479px) {
+@media (max-width: 640px) {
   .metric-group,
   .metric-strip {
     grid-template-columns: 1fr;
   }
 
-  .metric-group > .metric-item:nth-child(even),
-  .metric-strip > .metric-item:nth-child(even) {
+  .metric-group > .metric-item,
+  .metric-strip > .metric-item {
     border-left: 0;
+    border-top: 0;
   }
 
   .metric-group > .metric-item:nth-child(n + 2),

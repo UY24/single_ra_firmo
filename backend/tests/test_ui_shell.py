@@ -1,5 +1,7 @@
 # backend/tests/test_ui_shell.py
 """Task 18: /app shell + /static mounting (offline; no Supabase needed)."""
+from pathlib import Path
+import subprocess
 import unittest
 
 from fastapi.testclient import TestClient
@@ -57,6 +59,14 @@ class TestUiShell(unittest.TestCase):
             ".metric-detail",
             ".empty-state",
             "font-variant-numeric: tabular-nums",
+            "grid-template-columns: repeat(4, minmax(0, 1fr))",
+            ".metric-group > .metric-item:nth-child(4n + 1)",
+            ".metric-strip > .metric-item:nth-child(n + 5)",
+            "@media (max-width: 1024px)",
+            ".metric-group > .metric-item:nth-child(odd)",
+            ".metric-strip > .metric-item:nth-child(n + 3)",
+            "@media (max-width: 640px)",
+            ".metric-strip > .metric-item:nth-child(n + 2)",
             ".mobile-nav-toggle",
             ".sidebar-backdrop.hidden",
             "outline: 2px solid var(--accent)",
@@ -70,6 +80,16 @@ class TestUiShell(unittest.TestCase):
         self.assertEqual(ui.status_code, 200)
         for helper in ("pageIntro", "sectionHeading", "metricItem", "emptyState"):
             self.assertIn(f"function {helper}", ui.text)
+
+    def test_ui_helpers_dom_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["node", "tests/ui_dom_contract.mjs"],
+            cwd=backend_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_shell_script_has_accessible_drawer_state(self):
         res = self.client.get("/static/js/main.js")

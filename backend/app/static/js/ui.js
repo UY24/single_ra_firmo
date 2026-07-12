@@ -51,10 +51,12 @@ export function sectionHeading(title, copy, action) {
 }
 
 export function metricItem(label, value, tone = "default", detail = "") {
-  return el("div", { class: `metric-item metric-item--${tone}` },
+  const allowedTones = new Set(["default", "good", "muted", "warning", "danger", "info"]);
+  const safeTone = allowedTones.has(tone) ? tone : "default";
+  return el("div", { class: `metric-item metric-item--${safeTone}` },
     el("dt", { class: "metric-label" }, label),
     el("dd", { class: "metric-value" }, value),
-    ...(detail ? [el("p", { class: "metric-detail" }, detail)] : []),
+    ...(detail ? [el("dd", { class: "metric-detail" }, detail)] : []),
   );
 }
 

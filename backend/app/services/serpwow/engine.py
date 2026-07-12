@@ -795,6 +795,7 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
+        _s3_run_prefix_cache[upload_id] = key.rsplit("/", 1)[0]
 
         async def _write_s3_background():
             max_retries = 5
@@ -2108,6 +2109,8 @@ async def _available_reporting_files(
         return available
 
     missing = [name for name in expected if name not in available]
+    if not missing:
+        return available
     cached_prefix = _s3_run_prefix_cache.get(upload_id)
     normalized_prefix = _upload_s3_prefix(upload_id, company_name, pipeline)
     run_prefix = cached_prefix or normalized_prefix

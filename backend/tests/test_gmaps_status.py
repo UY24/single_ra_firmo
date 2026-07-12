@@ -88,6 +88,7 @@ class TestGmapsStatusBlock(unittest.TestCase):
             for name in ("found.csv", "notFound.csv", "report.json", "run.log"):
                 (run_dir / name).write_text("")
             s3 = mock.Mock()
+            resolve = mock.Mock()
             with mock.patch.object(legacy_app, "get_upload_state",
                                    new=mock.AsyncMock(return_value=_state())), \
                  mock.patch.object(legacy_app, "maybe_reconcile_gemini_batch_status",
@@ -96,11 +97,59 @@ class TestGmapsStatusBlock(unittest.TestCase):
                                    new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
                  mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
                  mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
+                 mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
                  mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
                 resp = asyncio.run(legacy_app.upload_status("gm1"))
         self.assertEqual(resp["serpwow_summary"]["available_files"],
                          ["found.csv", "notFound.csv", "report.json", "run.log"])
         s3.list_objects_v2.assert_not_called()
+        resolve.assert_not_called()
+
+    def test_normal_s3_write_seeds_exact_run_prefix_before_background_write(self):
+        scheduled = []
+
+        def capture_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return mock.Mock()
+
+        state = {"company_name": "Acme Inc", "pipeline": "gmaps"}
+        with mock.patch.object(legacy_app, "_state_file",
+                               return_value=Path("/tmp/unused-state.json")), \
+             mock.patch.object(legacy_app, "_write_json"), \
+             mock.patch.object(legacy_app.asyncio, "create_task",
+                               side_effect=capture_task), \
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+            asyncio.run(legacy_app.write_upload_artifact("up-1", "state", state))
+
+        self.assertEqual(legacy_app._s3_run_prefix_cache.get("up-1"),
+                         "acme-inc/gmaps/up-1")
+        self.assertEqual(len(scheduled), 1)
+
+    def test_cached_current_prefix_lists_once_without_suffix_scan(self):
+        class FakeS3:
+            def __init__(self):
+                self.calls = []
+
+            def list_objects_v2(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"Contents": [{"Key": "acme/gmaps/gm1/run.log"}]}
+
+        s3 = FakeS3()
+        resolve = mock.Mock()
+        legacy_app._s3_run_prefix_cache["gm1"] = "acme/gmaps/gm1"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
+             mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
+             mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+            available = asyncio.run(legacy_app._available_reporting_files(
+                "gm1", "Acme", "gmaps"))
+
+        self.assertEqual(available, ["run.log"])
+        self.assertEqual(len(s3.calls), 1)
+        self.assertEqual(s3.calls[0]["Prefix"], "acme/gmaps/gm1/")
+        resolve.assert_not_called()
 
     def test_reading_legacy_s3_state_caches_actual_run_prefix(self):
         legacy_key = "ISI_Market_Test/gmaps/gm1/state.json"

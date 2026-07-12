@@ -13,6 +13,29 @@ const inputCls = "control w-full px-3 py-2 text-sm";
 const btnPrimary = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
 const btnSecondary = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
 const btnGreen = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
+let rawJsonId = 0;
+
+const isAbortError = (error) => error?.name === "AbortError";
+
+function createLifecycle() {
+  let mounted = true;
+  const controllers = new Set();
+  return {
+    isMounted: () => mounted,
+    request: (path, opts = {}) => {
+      const controller = new AbortController();
+      controllers.add(controller);
+      return api(path, { ...opts, signal: controller.signal })
+        .finally(() => controllers.delete(controller));
+    },
+    cleanup: () => {
+      if (!mounted) return;
+      mounted = false;
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+    },
+  };
+}
 
 const PHASES = [
   { value: "all",      label: "All Phases Combined" },
@@ -35,16 +58,22 @@ function labeled(labelText, input, optional = false) {
 }
 
 function rawJsonToggle(data) {
+  const contentId = `tool-raw-json-${++rawJsonId}`;
   const pre = el("pre", {
     class: "code-block tool-code",
   }, JSON.stringify(data, null, 2));
-  const wrap = el("div", { class: "raw-json hidden" });
+  const wrap = el("div", { class: "raw-json hidden", id: contentId });
   wrap.appendChild(pre);
-  const btn = el("button", { class: btnSecondary + " mt-3 min-h-0 py-1 px-2.5 text-xs" },
+  const btn = el("button", {
+    class: btnSecondary + " mt-3 min-h-0 py-1 px-2.5 text-xs",
+    "aria-controls": contentId,
+    "aria-expanded": "false",
+  },
     "Show raw JSON");
   btn.addEventListener("click", () => {
     const nowHidden = wrap.classList.toggle("hidden");
     btn.textContent = nowHidden ? "Show raw JSON" : "Hide raw JSON";
+    btn.setAttribute("aria-expanded", String(!nowHidden));
   });
   const wrapper = el("div", { class: "raw-json-toggle" });
   wrapper.appendChild(btn);
@@ -61,7 +90,8 @@ function sectionCard(title, subtitle, body) {
 
 // ── Google Maps ──────────────────────────────────────────────────────────────
 
-function gmapsDiscoverSearchCard() {
+function gmapsDiscoverSearchCard(lifecycle) {
+  const { isMounted, request } = lifecycle;
   const queryIn = el("input", {
     class: inputCls, type: "text",
     id: "gmaps-query",
@@ -92,7 +122,8 @@ function gmapsDiscoverSearchCard() {
     setMeta("Running…", "info");
     resultsEl.replaceChildren();
     try {
-      const data = await api(`/gmaps/${action}?${params}`);
+      const data = await request(`/gmaps/${action}?${params}`);
+      if (!isMounted()) return;
       setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "muted");
       const out = el("div", { class: "result-stack" });
       if (action === "discover") {
@@ -140,10 +171,11 @@ function gmapsDiscoverSearchCard() {
       out.appendChild(rawJsonToggle(data));
       resultsEl.appendChild(out);
     } catch (e) {
+      if (!isMounted() || isAbortError(e)) return;
       setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
-      discoverBtn.disabled = searchBtn.disabled = false;
+      if (isMounted()) discoverBtn.disabled = searchBtn.disabled = false;
     }
   }
 
@@ -169,7 +201,8 @@ function gmapsDiscoverSearchCard() {
   );
 }
 
-function gmapsDetailsCard() {
+function gmapsDetailsCard(lifecycle) {
+  const { isMounted, request } = lifecycle;
   const cidIn = el("input", {
     class: inputCls, type: "text",
     id: "gmaps-cid",
@@ -191,7 +224,8 @@ function gmapsDetailsCard() {
     setMeta("Fetching…", "info");
     resultsEl.replaceChildren();
     try {
-      const data = await api(`/gmaps/details?cid=${encodeURIComponent(cid)}`);
+      const data = await request(`/gmaps/details?cid=${encodeURIComponent(cid)}`);
+      if (!isMounted()) return;
       setMeta(`Done in ${data.processing_seconds ?? "?"}s`, "muted");
       const FIELD_LABELS = [
         ["name", "Name"], ["website", "Website"], ["phone", "Phone"],
@@ -227,10 +261,11 @@ function gmapsDetailsCard() {
         resultsEl.appendChild(rawJsonToggle(data));
       }
     } catch (e) {
+      if (!isMounted() || isAbortError(e)) return;
       setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
-      fetchBtn.disabled = false;
+      if (isMounted()) fetchBtn.disabled = false;
     }
   });
 
@@ -253,7 +288,8 @@ function gmapsDetailsCard() {
 
 // ── Google Search ────────────────────────────────────────────────────────────
 
-function gsearchCard() {
+function gsearchCard(lifecycle) {
+  const { isMounted, request } = lifecycle;
   const companyIn = el("input", {
     class: inputCls, type: "text", id: "gsearch-company", placeholder: "e.g. Acme Engineering",
   });
@@ -303,7 +339,8 @@ function gsearchCard() {
     setMeta("Running…", "info");
     resultsEl.replaceChildren();
     try {
-      const data = await api(`/gsearch/discover?${params}`);
+      const data = await request(`/gsearch/discover?${params}`);
+      if (!isMounted()) return;
       const qCount = data.queries_run ?? 0;
       setMeta(
         `Ran ${qCount} quer${qCount === 1 ? "y" : "ies"} in ${data.processing_seconds ?? "?"}s`,
@@ -355,6 +392,7 @@ function gsearchCard() {
               href: r.search_url, target: "_blank",
               class: "semantic-link",
               title: "Open search URL",
+              "aria-label": `Open search query for ${r.phase ?? "unknown phase"}`,
             }, "↗");
             rowHead.appendChild(link);
           }
@@ -371,10 +409,11 @@ function gsearchCard() {
 
       resultsEl.appendChild(out);
     } catch (e) {
+      if (!isMounted() || isAbortError(e)) return;
       setMeta("", "muted");
       resultsEl.appendChild(errorCard(e.message));
     } finally {
-      execBtn.disabled = false;
+      if (isMounted()) execBtn.disabled = false;
     }
   });
 
@@ -406,7 +445,8 @@ function gsearchCard() {
 
 // ── view ─────────────────────────────────────────────────────────────────────
 
-export async function render(root) {
+export function render(root) {
+  const lifecycle = createLifecycle();
   const page = el("div", { class: "tools-view" });
 
   page.appendChild(pageIntro(
@@ -422,8 +462,8 @@ export async function render(root) {
     "Interactive place lookup — results are immediate, not tracked batch runs.",
   ));
   const gmapsCards = el("div", { class: "tool-section-list" });
-  gmapsCards.appendChild(gmapsDiscoverSearchCard());
-  gmapsCards.appendChild(gmapsDetailsCard());
+  gmapsCards.appendChild(gmapsDiscoverSearchCard(lifecycle));
+  gmapsCards.appendChild(gmapsDetailsCard(lifecycle));
   gmapsHead.appendChild(gmapsCards);
   page.appendChild(gmapsHead);
 
@@ -434,9 +474,10 @@ export async function render(root) {
     "Interactive single-entity search — not a tracked batch run.",
   ));
   const gsCards = el("div", { class: "tool-section-list" });
-  gsCards.appendChild(gsearchCard());
+  gsCards.appendChild(gsearchCard(lifecycle));
   gsHead.appendChild(gsCards);
   page.appendChild(gsHead);
 
   root.replaceChildren(page);
+  return lifecycle.cleanup;
 }

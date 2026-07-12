@@ -20,6 +20,42 @@ import {
 } from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
+const ROW_TERMINAL = new Set(["completed", "completed_with_errors", "failed"]);
+const BATCH_TERMINAL = new Set([
+  "not_started", "succeeded", "completed_with_errors", "failed", "skipped", "cancelled",
+]);
+
+const uploadIsTerminal = (status) => ROW_TERMINAL.has(String(status?.status ?? ""))
+  && BATCH_TERMINAL.has(String(status?.gemini_batch?.status ?? "not_started"));
+
+const isAbortError = (error) => error?.name === "AbortError";
+
+function createLifecycle() {
+  let mounted = true;
+  const controllers = new Set();
+  const cleanups = [];
+
+  const startRequest = (path, opts = {}) => {
+    const controller = new AbortController();
+    controllers.add(controller);
+    const promise = api(path, { ...opts, signal: controller.signal })
+      .finally(() => controllers.delete(controller));
+    return { controller, promise };
+  };
+
+  return {
+    isMounted: () => mounted,
+    registerCleanup: (fn) => cleanups.push(fn),
+    startRequest,
+    cleanup: () => {
+      if (!mounted) return;
+      mounted = false;
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+      cleanups.forEach((fn) => fn());
+    },
+  };
+}
 
 // ---- pills (legacy statusClass/batchClass → shared .pill tones) ------------
 const PILL_CLS = {
@@ -61,6 +97,7 @@ function batchLabel(status) {
     cancel_requested: "Cancel Requested",
     cancelled: "Batch Cancelled",
     succeeded: "Batch Done",
+    completed_with_errors: "Batch Completed With Errors",
     failed: "Batch Failed",
     skipped: "Batch Skipped",
     not_started: "Batch N/A",
@@ -71,6 +108,7 @@ function batchLabel(status) {
 function batchClass(status) {
   const key = String(status ?? "");
   if (key === "succeeded") return "done";
+  if (key === "completed_with_errors") return "warn";
   if (key === "cancelled") return "";
   if (key === "cancel_requested") return "warn";
   if (key === "failed" || key === "skipped") return "error";
@@ -115,7 +153,11 @@ function downloadButton(uploadId, label, format) {
   }, label);
 }
 
-function uploadHistoryCard(registerCleanup) {
+function uploadHistoryCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
+  let controller = null;
+  let generation = 0;
+  let timer = null;
   const tbody = el("tbody", {});
   const empty = el("p", { class: "empty-state hidden" },
     "No SerpWow uploads found.");
@@ -127,11 +169,8 @@ function uploadHistoryCard(registerCleanup) {
     empty.classList.toggle("hidden", items.length > 0);
     tbody.replaceChildren(...items.map((item) => {
       const uploadId = String(item.upload_id ?? "");
-      const rowsDone = ["completed", "completed_with_errors"].includes(String(item.status ?? ""));
-      const batch = item.gemini_batch?.status ?? "not_started";
-      const batchTerminal = ["not_started", "succeeded", "failed", "skipped", "cancelled"].includes(String(batch));
-      const ready = ["full", "gsearch", "relationship"].includes(item.pipeline)
-        ? rowsDone && batchTerminal : rowsDone;
+      const ready = ROW_TERMINAL.has(String(item.status ?? ""))
+        && BATCH_TERMINAL.has(String(item.gemini_batch?.status ?? "not_started"));
       return el("tr", {
         class: "data-row",
       },
@@ -158,15 +197,31 @@ function uploadHistoryCard(registerCleanup) {
   }
 
   async function refresh() {
+    const currentGeneration = ++generation;
+    controller?.abort();
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    const request = startRequest("/uploads?limit=200");
+    controller = request.controller;
     try {
-      const data = await api("/uploads?limit=200");
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== generation) return;
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.uploads) ? data.uploads : []);
       note.textContent = "Showing all SerpWow uploads. Select a row to open its run detail.";
     } catch (e) {
+      if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
       errorArea.replaceChildren(errorCard(e.message));
+    } finally {
+      if (isMounted() && currentGeneration === generation) {
+        controller = null;
+        timer = setTimeout(() => {
+          timer = null;
+          refresh();
+        }, REFRESH_MS);
+      }
     }
   }
 
@@ -204,13 +259,24 @@ function uploadHistoryCard(registerCleanup) {
     ),
   );
 
-  const timer = setInterval(refresh, REFRESH_MS);
-  registerCleanup(() => clearInterval(timer));
+  registerCleanup(() => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+  });
   return { card, refresh };
 }
 
 // ---- Batch Manager ----------------------------------------------------------
-function batchManagerCard() {
+function batchManagerCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
+  let controller = null;
+  let generation = 0;
+  let timer = null;
+  const busyJobs = new Set();
+  let buttonsByJob = new Map();
   const note = el("p", { class: "message message--muted", "aria-live": "polite" },
     "Use actions to fetch live status or cancel a Gemini batch job.");
   const tbody = el("tbody", {});
@@ -223,14 +289,25 @@ function batchManagerCard() {
     note.className = isError ? "message message--danger" : "message message--muted";
   };
 
-  async function handleAction(action, jobName, btn) {
+  const setJobBusy = (jobName, busy) => {
+    if (busy) busyJobs.add(jobName);
+    else busyJobs.delete(jobName);
+    for (const button of buttonsByJob.get(jobName) ?? []) button.disabled = busy;
+  };
+
+  async function handleAction(action, uploadId, jobName) {
+    if (busyJobs.has(jobName) || !isMounted()) return;
     if (action === "cancel" && !confirm(`Cancel Gemini batch ${jobName}?`)) return;
     if (action === "delete" && !confirm(`Delete Gemini batch ${jobName}? This cannot be undone.`)) return;
 
-    btn.disabled = true;
+    setJobBusy(jobName, true);
     try {
-      const data = await api(`/batch/jobs/${action}?job_name=${encodeURIComponent(jobName)}`,
-        { method: "POST" });
+      let path = `/batch/jobs/${action}?job_name=${encodeURIComponent(jobName)}`;
+      if ((action === "cancel" || action === "delete") && uploadId) {
+        path += `&upload_id=${encodeURIComponent(uploadId)}`;
+      }
+      const data = await startRequest(path, { method: "POST" }).promise;
+      if (!isMounted()) return;
       if (action === "status") {
         setNote(`Live batch status for ${jobName}: ${data.live_state ?? "-"} (done=${Boolean(data.done)})`);
       } else if (action === "delete") {
@@ -239,49 +316,77 @@ function batchManagerCard() {
         setNote(`Cancel requested for ${jobName}.`);
       }
     } catch (e) {
+      if (!isMounted() || isAbortError(e)) return;
       setNote(`Action failed (${action}) for ${jobName}: ${e.message}`, true);
     } finally {
-      btn.disabled = false;
-      await refresh();
+      if (isMounted()) {
+        setJobBusy(jobName, false);
+        await refresh();
+      }
     }
   }
 
-  const actionBtn = (label, action, jobName, extra = "") => {
+  const actionBtn = (label, action, uploadId, jobName, extra = "") => {
     const btn = el("button", { class: `${actionBtnCls} ${extra}`, type: "button" }, label);
-    btn.addEventListener("click", () => handleAction(action, jobName, btn));
+    btn.disabled = busyJobs.has(jobName);
+    if (!buttonsByJob.has(jobName)) buttonsByJob.set(jobName, new Set());
+    buttonsByJob.get(jobName).add(btn);
+    btn.addEventListener("click", () => handleAction(action, uploadId, jobName));
     return btn;
   };
 
   function renderRows(items) {
+    buttonsByJob = new Map();
     empty.classList.toggle("hidden", items.length > 0);
     tbody.replaceChildren(...items.map((item) => {
       const uploadId = String(item.upload_id ?? "");
       const jobName = String(item.job_name ?? "");
       return el("tr", { class: "data-row" },
-        cell(el("span", { class: "font-mono text-xs", title: uploadId }, uploadId ? shortId(uploadId) : "-")),
+        cell(uploadId ? el("a", {
+          class: "table-link font-mono text-xs",
+          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          title: uploadId,
+          "aria-label": `Open run ${uploadId}`,
+        }, shortId(uploadId)) : "-"),
         cell(pill(statusLabel(item.upload_status), statusClass(item.upload_status))),
         cell(pill(batchLabel(item.batch_status), batchClass(item.batch_status))),
         cell(pill(String(item.live_state ?? "-") || "-", batchClass(item.live_state))),
         cell(el("span", { class: "font-mono text-xs", title: jobName }, jobName || "-")),
         cell(shortDate(item.updated_at), "whitespace-nowrap text-slate-400"),
         cell(el("div", { class: "action-group operations-actions" },
-          actionBtn("Get Status", "status", jobName),
-          actionBtn("Cancel", "cancel", jobName, "btn-warning"),
-          actionBtn("Delete", "delete", jobName, "btn-danger"),
+          actionBtn("Get Status", "status", uploadId, jobName),
+          actionBtn("Cancel", "cancel", uploadId, jobName, "btn-warning"),
+          actionBtn("Delete", "delete", uploadId, jobName, "btn-danger"),
         )),
       );
     }));
   }
 
   async function refresh() {
+    const currentGeneration = ++generation;
+    controller?.abort();
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    const request = startRequest("/batch/jobs?limit=300");
+    controller = request.controller;
     try {
-      const data = await api("/batch/jobs?limit=300");
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== generation) return;
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.jobs) ? data.jobs : []);
     } catch (e) {
+      if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
       errorArea.replaceChildren(errorCard(e.message));
+    } finally {
+      if (isMounted() && currentGeneration === generation) {
+        controller = null;
+        timer = setTimeout(() => {
+          timer = null;
+          refresh();
+        }, REFRESH_MS);
+      }
     }
   }
 
@@ -312,11 +417,21 @@ function batchManagerCard() {
     ),
   );
 
+  registerCleanup(() => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    buttonsByJob.clear();
+    busyJobs.clear();
+  });
   return { card, refresh };
 }
 
 // ---- Retry Operations ---------------------------------------------------------
-function retryCard(registerCleanup) {
+function retryCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
   const meta = el("p", { class: "message message--muted", "aria-live": "polite" },
     "Ready to trigger manual retry.");
   const setMeta = (msg, tone = "muted") => {
@@ -331,7 +446,15 @@ function retryCard(registerCleanup) {
   });
 
   let stopPoll = null;
-  registerCleanup(() => { if (stopPoll) stopPoll(); });
+  let postController = null;
+  let postGeneration = 0;
+  registerCleanup(() => {
+    postGeneration += 1;
+    postController?.abort();
+    postController = null;
+    if (stopPoll) stopPoll();
+    stopPoll = null;
+  });
 
   const btn = el("button", { class: "btn-primary disabled:opacity-50" }, "Retry Failed Rows");
 
@@ -341,25 +464,35 @@ function retryCard(registerCleanup) {
       setMeta("Error: Upload ID is required.", "danger");
       return;
     }
+    if (stopPoll) stopPoll();
+    stopPoll = null;
+    const currentGeneration = ++postGeneration;
     btn.disabled = true;
     setMeta(`Triggering retry for ${uid}…`, "info");
     try {
-      const data = await api(`/uploads/${encodeURIComponent(uid)}/retry-failed-rows`, { method: "POST" });
+      const request = startRequest(`/uploads/${encodeURIComponent(uid)}/retry-failed-rows`, { method: "POST" });
+      postController = request.controller;
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== postGeneration) return;
       setMeta(`Success! Enqueued ${data.enqueued_rows ?? 0} failed rows for processing.`, "good");
       // Legacy polled /uploads/{id}/status after the retry; keep that, shown inline.
-      if (stopPoll) stopPoll();
       stopPoll = pollStatus(`/uploads/${encodeURIComponent(uid)}/status`, (status) => {
+        if (!isMounted() || currentGeneration !== postGeneration) return;
         const batch = status.gemini_batch?.status ?? "not_started";
         setMeta(
           `Upload ${uid} — status: ${status.status ?? "-"} | rows: ${status.processed_rows ?? 0}/${status.total_rows ?? 0}` +
           ` (ok ${status.success_rows ?? 0}, failed ${status.failed_rows ?? 0}) | batch: ${batch}`,
           "muted",
         );
-      });
+      }, 2000, uploadIsTerminal);
     } catch (e) {
+      if (!isMounted() || currentGeneration !== postGeneration || isAbortError(e)) return;
       setMeta(`Failed: ${e.message}`, "danger");
     } finally {
-      btn.disabled = false;
+      if (isMounted() && currentGeneration === postGeneration) {
+        postController = null;
+        btn.disabled = false;
+      }
     }
   });
 
@@ -378,12 +511,10 @@ function retryCard(registerCleanup) {
 }
 
 // ---- view ---------------------------------------------------------------------
-export async function render(root) {
-  const cleanups = [];
-  const registerCleanup = (fn) => cleanups.push(fn);
-
-  const history = uploadHistoryCard(registerCleanup);
-  const batch = batchManagerCard();
+export function render(root) {
+  const lifecycle = createLifecycle();
+  const history = uploadHistoryCard(lifecycle);
+  const batch = batchManagerCard(lifecycle);
   root.replaceChildren(
     el("div", { class: "operations-view" },
       pageIntro(
@@ -393,14 +524,12 @@ export async function render(root) {
       ),
       history.card,
       batch.card,
-      retryCard(registerCleanup),
+      retryCard(lifecycle),
     ),
   );
 
-  await history.refresh();
-  await batch.refresh();
-  const timer = setInterval(batch.refresh, REFRESH_MS);
-  registerCleanup(() => clearInterval(timer));
+  history.refresh();
+  batch.refresh();
 
-  return () => cleanups.forEach((fn) => fn());
+  return lifecycle.cleanup;
 }

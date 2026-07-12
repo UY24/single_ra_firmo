@@ -322,7 +322,14 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     if not _batch_postprocess_enabled_for(pipe):
         return False
     gb = state.get("gemini_batch")
-    return isinstance(gb, dict) and gb.get("status") in {"waiting_for_rows", "queued", "running"}
+    return isinstance(gb, dict) and gb.get("status") in {
+        "waiting_for_rows", "queued", "running", "cancel_requested",
+    }
+
+
+def _batch_deleted_by_user(state: dict[str, Any]) -> bool:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    return bool(state.get("batch_deleted_by_user_at") or batch.get("deleted_by_user_at"))
 
 
 
@@ -1570,6 +1577,8 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
 async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
     async with get_upload_lock(upload_id):
         state = await read_upload_artifact(upload_id, "state")
+        if _batch_deleted_by_user(state):
+            return
         gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
         chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
         found = next((c for c in chunks if isinstance(c, dict) and c.get("chunk_id") == chunk_id), None)
@@ -1651,6 +1660,8 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
     try:
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
+            if _batch_deleted_by_user(state):
+                return
             gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
             if gb.get("status") == "succeeded":
                 return
@@ -1664,6 +1675,8 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
+                if _batch_deleted_by_user(state):
+                    return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "skipped",
                                          "completed_at": _now_iso(),
                                          "error": "No rows available for Gemini batch processing."}
@@ -1703,6 +1716,9 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         # Apply all parsed results, set chunk + aggregate status, persist once -> gated finalize.
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
+            if _batch_deleted_by_user(state):
+                _log_gemini_batch(upload_id, "discarding completed chunk results after user deletion")
+                return
             parsed_all, usage_all = {}, {}
             for r in results:
                 parsed_all.update(r.get("parsed_by_row") or {})
@@ -1772,6 +1788,8 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         async with get_upload_lock(upload_id):
             try:
                 state = await read_upload_artifact(upload_id, "state")
+                if _batch_deleted_by_user(state):
+                    return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "failed",
                                          "completed_at": _now_iso(), "error": str(exc)}
                 await persist_upload_state(upload_id, state)
@@ -1791,6 +1809,10 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
     if state.get("status") not in {"completed", "completed_with_errors"}:
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    if _batch_deleted_by_user(state):
+        # A destructive Batch Manager action is durable. Explicit failed-row
+        # retry replaces this metadata block and intentionally re-enables batch.
+        return
     if gemini_batch_meta.get("status") in {
         "queued", "running", "cancel_requested", "cancelled", "succeeded",
     }:
@@ -3981,9 +4003,21 @@ async def retry_failed_rows(
         raise HTTPException(status_code=503, detail=detail)
 
     try:
-        await get_upload_state(upload_id)
+        current_state = await get_upload_state(upload_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Upload ID not found") from exc
+
+    # A user-deleted batch may still have a local driver unwinding. Explicit
+    # retry is the only operation allowed to clear the tombstone, so wait for
+    # that older generation to exit before opening a new one.
+    if _batch_deleted_by_user(current_state):
+        old_batch_task = gemini_batch_tasks.get(upload_id)
+        if old_batch_task is not None and old_batch_task is not asyncio.current_task():
+            if not old_batch_task.done():
+                old_batch_task.cancel()
+            await asyncio.gather(old_batch_task, return_exceptions=True)
+            if gemini_batch_tasks.get(upload_id) is old_batch_task:
+                gemini_batch_tasks.pop(upload_id, None)
 
     jobs_to_retry: list[dict[str, Any]] = []
     retried_row_indexes: list[int] = []
@@ -4003,6 +4037,7 @@ async def retry_failed_rows(
         # Retrying a stopped upload re-opens it: clear the stop marker so the
         # batch post-process can run again once the retried rows finish.
         state.pop("stopped_by_user_at", None)
+        state.pop("batch_deleted_by_user_at", None)
         failed_rows = [
             row for row in (state.get("rows") or [])
             if isinstance(row, dict) and row.get("status") in {"failed", "queued", "processing"}
@@ -4485,9 +4520,12 @@ async def _sync_batch_job_action_local_state(
                     chunk["status"] = "cancel_requested"
             elif action == "delete":
                 deletion_error = "Remote batch deleted by user"
+                deleted_at = _now_iso()
                 batch["status"] = "failed"
-                batch["completed_at"] = _now_iso()
+                batch["completed_at"] = deleted_at
+                batch["deleted_by_user_at"] = deleted_at
                 batch["error"] = deletion_error
+                state["batch_deleted_by_user_at"] = deleted_at
                 if top_matches:
                     batch.pop("job_name", None)
                 for chunk in matching_chunks:

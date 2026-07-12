@@ -431,20 +431,29 @@ def _upload_s3_prefix(upload_id: str, company_name: str = "", pipeline: str = ""
     return upload_id
 
 
+def _resolved_upload_s3_prefix(
+    upload_id: str,
+    company_name: str = "",
+    pipeline: str = "",
+) -> str:
+    return _s3_run_prefix_cache.get(upload_id) or _upload_s3_prefix(
+        upload_id, company_name, pipeline)
+
+
 def _state_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/state.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/state.json"
 
 
 def _output_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/output.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/output.json"
 
 
 def _batch_input_jsonl_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_input.jsonl"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_input.jsonl"
 
 
 def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_output.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_output.json"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -889,7 +898,9 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pip
     # uses the ROW company so each response is identifiable. Per-row raw responses
     # live under a serpwow_response/ subfolder, apart from the run aggregates.
     safe_name = _safe_name(row_company_name or upload_company_name)
-    key = f"{_upload_s3_prefix(upload_id, upload_company_name, pipeline)}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
+    prefix = _resolved_upload_s3_prefix(
+        upload_id, upload_company_name, pipeline)
+    key = f"{prefix}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -2056,8 +2067,7 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     if pipe == PIPELINE_RELATIONSHIP:
         names += ["skipped.csv"]
     if bucket:
-        prefix = _s3_run_prefix_cache.get(upload_id) or _upload_s3_prefix(
-            upload_id, company_name, pipe)
+        prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
     base = _find_upload_dir(upload_id)
     return {name: str(base / name) for name in names}
@@ -2116,7 +2126,7 @@ async def _available_reporting_files(
         return available
     cached_prefix = _s3_run_prefix_cache.get(upload_id)
     normalized_prefix = _upload_s3_prefix(upload_id, company_name, pipeline)
-    run_prefix = cached_prefix or normalized_prefix
+    run_prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipeline)
     present_in_s3 = await asyncio.to_thread(
         _list_available_reporting_files_s3_sync,
         run_prefix,
@@ -2373,7 +2383,8 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
         return
     from app.core import s3 as core_s3
     pipeline = str(state.get("pipeline") or PIPELINE_GSEARCH)
-    prefix = _upload_s3_prefix(upload_id, str(state.get("company_name") or ""), pipeline)
+    prefix = _resolved_upload_s3_prefix(
+        upload_id, str(state.get("company_name") or ""), pipeline)
     for name, path in paths.items():
         try:
             await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")

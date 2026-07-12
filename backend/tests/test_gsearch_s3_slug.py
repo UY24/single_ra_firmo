@@ -168,6 +168,9 @@ class TestSerpwowKeyLayout(unittest.TestCase):
     """_upload_serpwow_json_sync: per-row raw JSON lands under serpwow_response/
     with a 6-digit index + the ROW company name, inside the UPLOAD company folder."""
 
+    def tearDown(self):
+        app._s3_run_prefix_cache.clear()
+
     def test_key_uses_subfolder_rowname_and_6digit_index(self):
         captured = {}
 
@@ -186,6 +189,29 @@ class TestSerpwowKeyLayout(unittest.TestCase):
         self.assertEqual(
             key,
             "isi-market-test/gsearch/uid123/serpwow_response/000001_A_M_Corporation_serpwow.json",
+        )
+        self.assertEqual(captured["Key"], key)
+
+    def test_key_uses_resolved_legacy_run_prefix(self):
+        captured = {}
+
+        class _FakeS3:
+            def put_object(self, **kw):
+                captured.update(kw)
+
+        app._s3_run_prefix_cache["uid123"] = "ISI_Market_Test/gsearch/uid123"
+        with mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}, clear=False), \
+             mock.patch.object(app, "get_s3_client", return_value=_FakeS3()):
+            key = app._upload_serpwow_json_sync(
+                "uid123", 1, '{"x": 1}', "gsearch",
+                upload_company_name="ISI Market Test",
+                row_company_name="A M Corporation",
+            )
+
+        self.assertEqual(
+            key,
+            "ISI_Market_Test/gsearch/uid123/serpwow_response/"
+            "000001_A_M_Corporation_serpwow.json",
         )
         self.assertEqual(captured["Key"], key)
 

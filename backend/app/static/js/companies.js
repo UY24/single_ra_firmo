@@ -64,11 +64,11 @@ function createForm(onCreated) {
 
 function companiesTable(companies) {
   const rows = companies.map((c) =>
-    el("tr", {
-      class: "data-row cursor-pointer",
-      onclick: () => { window.location.hash = `#/runs?company_id=${encodeURIComponent(c.id)}`; },
-    },
-      cell(c.name ?? "-", "font-semibold text-slate-50"),
+    el("tr", { class: "data-row" },
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs?company_id=${encodeURIComponent(c.id)}`,
+      }, c.name ?? "-"), "font-semibold text-slate-50"),
       cell(fmtNum(c.runs), "text-right"),
       cell(`${fmtNum(c.websites_found)} / ${fmtNum(c.websites_not_found)}`, "text-right"),
       cell(fmtUsd(c.total_cost_usd), "text-right"),

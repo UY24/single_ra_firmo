@@ -91,6 +91,16 @@ class TestUiShell(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_core_views_dom_contract(self):
+        backend_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["node", "tests/core_views_dom_contract.mjs"],
+            cwd=backend_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
     def test_core_views_use_midnight_ledger_hierarchy(self):
         markers = {
             "/static/js/dashboard.js": ("pageIntro", "company-summary", "Recent runs"),

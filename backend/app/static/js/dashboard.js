@@ -32,19 +32,18 @@ function companyCard(c) {
     ? `${((found / totalOutcomes) * 100).toFixed(1)}%`
     : "—";
 
-  return el("button", {
-    type: "button",
+  return el("a", {
     class: "company-summary",
-    onclick: () => { window.location.hash = `#/runs?company_id=${encodeURIComponent(c.id)}`; },
+    href: `#/runs?company_id=${encodeURIComponent(c.id)}`,
   },
     el("span", { class: "company-name" }, c.name ?? "—"),
     el("span", { class: "company-outcome" },
-      el("span", { class: "company-outcome-value" }, `${fmtNum(c.websites_found)} found`),
+      el("span", { class: "company-outcome-value" }, `${fmtNum(found)} found`),
       el("span", { class: "company-outcome-rate" }, `${foundRate} of resolved rows`),
     ),
     el("dl", { class: "metric-group company-metrics" },
       metricItem("Runs", fmtNum(c.runs)),
-      metricItem("Not found", fmtNum(c.websites_not_found), "muted"),
+      metricItem("Not found", fmtNum(notFound), "muted"),
       metricItem("Scrape.do searches", fmtNum(c.total_searches), "info"),
       metricItem("Total rows", fmtNum(c.total_rows)),
       metricItem("Input tokens", fmtNum(c.total_input_tokens), "muted"),
@@ -55,20 +54,22 @@ function companyCard(c) {
 }
 
 function recentRunsTable(runs, companiesById) {
-  const rows = runs.map((r) =>
-    el("tr", {
-      class: "data-row cursor-pointer",
-      onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(r.run_ref)}`; },
-    },
-      cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
+  const rows = runs.map((r) => {
+    const companyName = companiesById.get(r.company_id)?.name ?? "-";
+    return el("tr", { class: "data-row" },
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
+      }, companyName), "font-semibold text-slate-50"),
       cell(r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
       cell(fmtNum(r.websites_found), "text-right"),
       cell(fmtUsd(runCost(r)), "text-right"),
       cell(shortDate(r.created_at), "text-slate-400"),
-    ),
-  );
+    );
+  });
 
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll max-h-96 overflow-y-auto" },

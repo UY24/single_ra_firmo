@@ -86,21 +86,23 @@ function filterBar(companies, query) {
 }
 
 function runsTable(runs, companiesById) {
-  const rows = runs.map((r) =>
-    el("tr", {
-      class: "data-row cursor-pointer",
-      onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(r.run_ref)}`; },
-    },
+  const rows = runs.map((r) => {
+    const companyName = companiesById.get(r.company_id)?.name ?? "-";
+    return el("tr", { class: "data-row" },
       cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
-      cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
+      }, companyName), "font-semibold text-slate-50"),
       cell(PIPELINE_LABELS[r.pipeline] ?? r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
       cell(fmtNum(r.websites_found ?? r.success_count), "text-right"),
       cell(fmtUsd(runCost(r)), "text-right"),
       cell(fmtDuration(r.duration_seconds), "text-right"),
-    ),
-  );
+    );
+  });
 
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll" },

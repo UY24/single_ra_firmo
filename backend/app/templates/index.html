@@ -9,11 +9,26 @@
 </head>
 <body class="h-full bg-slate-950 text-slate-100 antialiased">
   <div class="app-shell flex h-screen overflow-hidden">
+    <button
+      id="sidebar-toggle"
+      class="mobile-nav-toggle"
+      type="button"
+      aria-label="Open navigation"
+      aria-controls="app-sidebar"
+      aria-expanded="false"
+    >
+      <span class="mobile-nav-toggle-lines" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
+    </button>
+    <div id="sidebar-backdrop" class="sidebar-backdrop hidden" aria-hidden="true"></div>
 
     <!-- Sidebar -->
-    <aside class="app-sidebar flex w-60 shrink-0 flex-col text-slate-300">
+    <aside id="app-sidebar" class="app-sidebar flex w-60 shrink-0 flex-col text-slate-300">
       <div class="flex items-center gap-3 px-5 py-5 border-b border-slate-800">
-        <span class="brand-mark">FC</span>
+        <span class="brand-mark">F</span>
         <span>
           <span class="block text-sm font-semibold tracking-wide text-white">Forage Console</span>
           <span class="view-kicker">Website discovery</span>

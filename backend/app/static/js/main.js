@@ -27,6 +27,78 @@ const VIEWS = {
   tools: renderTools,
 };
 
+const NAV_ICON_PATHS = {
+  dashboard: ["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h6v6h-6z"],
+  companies: ["M4 20V8l8-4v16", "M12 10h8v10", "M8 9v1", "M8 13v1", "M8 17v1", "M16 13v1", "M16 17v1"],
+  "new-run": ["M12 3a9 9 0 1 0 9 9", "M12 7v10", "M7 12h10"],
+  runs: ["M4 12a8 8 0 1 0 2.34-5.66L4 8", "M4 4v4h4", "M12 8v5l3 2"],
+  operations: ["M4 6h10", "M18 6h2", "M4 12h2", "M10 12h10", "M4 18h7", "M15 18h5", "M14 4v4", "M6 10v4", "M11 16v4"],
+  tools: ["M14.7 6.3a4 4 0 0 0-5-5L12 4 9 7 6.3 4.3a4 4 0 0 0 5 5L19 17a1.4 1.4 0 0 1-2 2l-7.7-7.7"],
+};
+
+function mountNavIcons() {
+  const namespace = "http://www.w3.org/2000/svg";
+  document.querySelectorAll("#sidebar-nav .nav-link[data-nav]").forEach((link) => {
+    if (link.querySelector(".nav-icon")) return;
+    const paths = NAV_ICON_PATHS[link.dataset.nav];
+    if (!paths) return;
+
+    const icon = document.createElementNS(namespace, "svg");
+    icon.setAttribute("class", "nav-icon");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "1.75");
+    icon.setAttribute("stroke-linecap", "round");
+    icon.setAttribute("stroke-linejoin", "round");
+
+    paths.forEach((pathData) => {
+      const path = document.createElementNS(namespace, "path");
+      path.setAttribute("d", pathData);
+      icon.append(path);
+    });
+    link.prepend(icon);
+  });
+}
+
+function setDrawerOpen(open) {
+  const sidebar = document.getElementById("app-sidebar");
+  const toggle = document.getElementById("sidebar-toggle");
+  const backdrop = document.getElementById("sidebar-backdrop");
+  if (!sidebar || !toggle || !backdrop) return;
+
+  const wasOpen = sidebar.classList.contains("is-open");
+  sidebar.classList.toggle("is-open", open);
+  backdrop.classList.toggle("hidden", !open);
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+  document.body.classList.toggle("nav-open", open);
+
+  if (wasOpen && !open) toggle.focus({ preventScroll: true });
+}
+
+function bindShellInteractions() {
+  const toggle = document.getElementById("sidebar-toggle");
+  const backdrop = document.getElementById("sidebar-backdrop");
+  const sidebarNav = document.getElementById("sidebar-nav");
+  if (!toggle || !backdrop || !sidebarNav) return;
+
+  mountNavIcons();
+  toggle.addEventListener("click", () => {
+    setDrawerOpen(toggle.getAttribute("aria-expanded") !== "true");
+  });
+  backdrop.addEventListener("click", () => setDrawerOpen(false));
+  sidebarNav.addEventListener("click", (event) => {
+    if (event.target.closest(".nav-link")) setDrawerOpen(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && toggle.getAttribute("aria-expanded") === "true") {
+      setDrawerOpen(false);
+    }
+  });
+}
+
 function parseHash() {
   const hash = window.location.hash.replace(/^#\/?/, ""); // e.g. "runs?company_id=x" | "runs/abc"
   const [path, queryString] = hash.split("?");
@@ -78,4 +150,7 @@ function route() {
 }
 
 window.addEventListener("hashchange", route);
-window.addEventListener("DOMContentLoaded", route);
+window.addEventListener("DOMContentLoaded", () => {
+  bindShellInteractions();
+  route();
+});

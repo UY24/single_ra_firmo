@@ -39,7 +39,7 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(engine.app)
 
-    def _post(self, action, job_name, state):
+    def _post(self, action, job_name, state, expected_generation=None):
         remote = "_gemini_batch_cancel_sync" if action == "cancel" else "_gemini_batch_delete_sync"
 
         async def fake_tombstone(_upload_id, _state, deleted_job, deleted_at, *, top_level_deleted):
@@ -54,10 +54,10 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
              patch.object(engine, "persist_upload_state", AsyncMock()) as persist, \
              patch.object(engine, "_write_batch_deletion_tombstone", side_effect=fake_tombstone), \
              patch.object(engine, "_now_iso", return_value="now"):
-            response = self.client.post(
-                f"/batch/jobs/{action}",
-                params={"job_name": job_name, "upload_id": "upload /1"},
-            )
+            params = {"job_name": job_name, "upload_id": "upload /1"}
+            if expected_generation is not None:
+                params["expected_generation"] = expected_generation
+            response = self.client.post(f"/batch/jobs/{action}", params=params)
         return response, persist
 
     def test_cancel_matching_top_and_chunk_updates_local_state(self):
@@ -105,7 +105,8 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
 
     def test_delete_before_chunk_metadata_persists_still_records_tombstone(self):
         state = copy.deepcopy(batch_state())
-        response, persist = self._post("delete", "jobs/new-chunk", state)
+        response, persist = self._post(
+            "delete", "jobs/new-chunk", state, expected_generation=0)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json().get("local_state_updated"))
         persisted = persist.await_args.args[1]
@@ -204,6 +205,139 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["jobs"][0]["upload_id"], upload_id)
+
+    def test_batch_jobs_list_carries_generation_for_pre_persist_remote_job(self):
+        upload_id = "team-alpha-run-123"
+        summary = {
+            "upload_id": upload_id,
+            "pipeline": "gsearch",
+            "status": "completed",
+            "gemini_batch": {
+                "status": "waiting_for_rows",
+                "generation": 2,
+            },
+        }
+        operation = {
+            "name": "operations/batch-new",
+            "metadata": {
+                "state": "BATCH_STATE_RUNNING",
+                "displayName": "gsearch-team-alpha-run-123-gen2-chunk0",
+            },
+        }
+        engine.gemini_batch_list_cache = []
+        engine.gemini_batch_list_cache_fetched_at = 0.0
+        engine.gemini_batch_list_error_cooldown_until = 0.0
+        with patch.object(
+            engine, "list_upload_summaries", AsyncMock(return_value=[summary])
+        ), patch.object(
+            engine, "_gemini_batch_list_sync", return_value={"operations": [operation]}
+        ), patch.dict(
+            "os.environ", {"ENABLE_REMOTE_GEMINI_BATCH_LIST": "true"}, clear=False
+        ):
+            response = self.client.get("/batch/jobs")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["jobs"][0]["upload_id"], upload_id)
+        self.assertEqual(response.json()["jobs"][0]["batch_generation"], 2)
+
+    def test_batch_jobs_keeps_stale_remote_operation_generation_after_retry(self):
+        upload_id = "team-alpha-run-123"
+        summary = {
+            "upload_id": upload_id,
+            "pipeline": "gsearch",
+            "status": "completed",
+            "gemini_batch": {
+                "status": "waiting_for_rows",
+                "generation": 2,
+            },
+        }
+        stale_operation = {
+            "name": "operations/batch-old",
+            "metadata": {
+                "state": "BATCH_STATE_RUNNING",
+                "displayName": "gsearch-team-alpha-run-123-gen1-chunk0",
+            },
+        }
+        engine.gemini_batch_list_cache = []
+        engine.gemini_batch_list_cache_fetched_at = 0.0
+        engine.gemini_batch_list_error_cooldown_until = 0.0
+        with patch.object(
+            engine, "list_upload_summaries", AsyncMock(return_value=[summary])
+        ), patch.object(
+            engine,
+            "_gemini_batch_list_sync",
+            return_value={"operations": [stale_operation]},
+        ), patch.dict(
+            "os.environ", {"ENABLE_REMOTE_GEMINI_BATCH_LIST": "true"}, clear=False
+        ):
+            response = self.client.get("/batch/jobs")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["jobs"][0]["upload_id"], upload_id)
+        self.assertEqual(response.json()["jobs"][0]["batch_generation"], 1)
+
+    def test_stale_delete_generation_does_not_contaminate_retry_state(self):
+        state = batch_state()
+        state["gemini_batch"] = {
+            "status": "waiting_for_rows",
+            "generation": 2,
+            "job_name": None,
+            "error": None,
+        }
+        with patch.object(engine, "_gemini_batch_delete_sync", return_value={"ok": True}), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "_write_batch_deletion_tombstone", AsyncMock()) as tombstone, \
+             patch.object(engine, "persist_upload_state", AsyncMock()) as persist:
+            response = self.client.post(
+                "/batch/jobs/delete",
+                params={
+                    "job_name": "jobs/generation-1",
+                    "upload_id": "upload /1",
+                    "expected_generation": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json()["local_state_updated"], False)
+        self.assertEqual(state["gemini_batch"]["status"], "waiting_for_rows")
+        self.assertEqual(state["gemini_batch"]["generation"], 2)
+        tombstone.assert_not_awaited()
+        persist.assert_not_awaited()
+
+    def test_same_generation_pre_persist_delete_still_records_tombstone(self):
+        state = batch_state()
+        state["gemini_batch"] = {
+            "status": "waiting_for_rows",
+            "generation": 2,
+            "job_name": None,
+            "error": None,
+        }
+
+        async def fake_tombstone(*_args, **_kwargs):
+            return {
+                "deleted_by_user_at": "now",
+                "job_names": ["jobs/generation-2"],
+                "top_level_deleted": False,
+                "generation": 2,
+            }
+
+        with patch.object(engine, "_gemini_batch_delete_sync", return_value={"ok": True}), \
+             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
+             patch.object(engine, "_write_batch_deletion_tombstone", side_effect=fake_tombstone), \
+             patch.object(engine, "persist_upload_state", AsyncMock()) as persist:
+            response = self.client.post(
+                "/batch/jobs/delete",
+                params={
+                    "job_name": "jobs/generation-2",
+                    "upload_id": "upload /1",
+                    "expected_generation": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(response.json()["local_state_updated"], True)
+        self.assertIn("jobs/generation-2", state["batch_deleted_job_names"])
+        persist.assert_awaited_once()
 
     def test_destructive_actions_invalidate_remote_job_cache(self):
         for action in ("cancel", "delete"):

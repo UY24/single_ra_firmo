@@ -295,7 +295,7 @@ function batchManagerCard(lifecycle) {
     for (const button of buttonsByJob.get(jobName) ?? []) button.disabled = busy;
   };
 
-  async function handleAction(action, uploadId, jobName) {
+  async function handleAction(action, uploadId, jobName, batchGeneration) {
     if (busyJobs.has(jobName) || !isMounted()) return;
     if (action === "cancel" && !confirm(`Cancel Gemini batch ${jobName}?`)) return;
     if (action === "delete" && !confirm(`Delete Gemini batch ${jobName}? This cannot be undone.`)) return;
@@ -305,6 +305,9 @@ function batchManagerCard(lifecycle) {
       let path = `/batch/jobs/${action}?job_name=${encodeURIComponent(jobName)}`;
       if ((action === "cancel" || action === "delete") && uploadId) {
         path += `&upload_id=${encodeURIComponent(uploadId)}`;
+        if (Number.isInteger(batchGeneration) && batchGeneration >= 0) {
+          path += `&expected_generation=${batchGeneration}`;
+        }
       }
       const data = await startRequest(path, { method: "POST" }).promise;
       if (!isMounted()) return;
@@ -326,12 +329,14 @@ function batchManagerCard(lifecycle) {
     }
   }
 
-  const actionBtn = (label, action, uploadId, jobName, extra = "") => {
+  const actionBtn = (label, action, uploadId, jobName, batchGeneration, extra = "") => {
     const btn = el("button", { class: `${actionBtnCls} ${extra}`, type: "button" }, label);
     btn.disabled = busyJobs.has(jobName);
     if (!buttonsByJob.has(jobName)) buttonsByJob.set(jobName, new Set());
     buttonsByJob.get(jobName).add(btn);
-    btn.addEventListener("click", () => handleAction(action, uploadId, jobName));
+    btn.addEventListener("click", () => handleAction(
+      action, uploadId, jobName, batchGeneration,
+    ));
     return btn;
   };
 
@@ -341,6 +346,9 @@ function batchManagerCard(lifecycle) {
     tbody.replaceChildren(...items.map((item) => {
       const uploadId = String(item.upload_id ?? "");
       const jobName = String(item.job_name ?? "");
+      const batchGeneration = item.batch_generation == null
+        ? null
+        : Number(item.batch_generation);
       return el("tr", { class: "data-row" },
         cell(uploadId ? el("a", {
           class: "table-link font-mono text-xs",
@@ -354,9 +362,9 @@ function batchManagerCard(lifecycle) {
         cell(el("span", { class: "font-mono text-xs", title: jobName }, jobName || "-")),
         cell(shortDate(item.updated_at), "whitespace-nowrap text-slate-400"),
         cell(el("div", { class: "action-group operations-actions" },
-          actionBtn("Get Status", "status", uploadId, jobName),
-          actionBtn("Cancel", "cancel", uploadId, jobName, "btn-warning"),
-          actionBtn("Delete", "delete", uploadId, jobName, "btn-danger"),
+          actionBtn("Get Status", "status", uploadId, jobName, batchGeneration),
+          actionBtn("Cancel", "cancel", uploadId, jobName, batchGeneration, "btn-warning"),
+          actionBtn("Delete", "delete", uploadId, jobName, batchGeneration, "btn-danger"),
         )),
       );
     }));

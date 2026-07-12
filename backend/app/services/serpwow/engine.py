@@ -1559,10 +1559,25 @@ def _extract_upload_id_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[str
         )
         if match:
             return match.group("upload_id").strip() or None
-    chunk_match = re.match(r"^gsearch-(.+)-chunk\d+$", display_name)
+    versioned_chunk_match = re.fullmatch(
+        r"gsearch-(.+)-gen\d+-chunk\d+", display_name)
+    if versioned_chunk_match:
+        return versioned_chunk_match.group(1).strip() or None
+    chunk_match = re.fullmatch(r"gsearch-(.+)-chunk\d+", display_name)
     if chunk_match:
         return chunk_match.group(1).strip() or None
     return None
+
+
+def _extract_generation_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[int]:
+    if not isinstance(batch_obj, dict):
+        return None
+    metadata = batch_obj.get("metadata") if isinstance(batch_obj.get("metadata"), dict) else {}
+    display_name = str(
+        metadata.get("displayName") or metadata.get("display_name") or ""
+    ).strip()
+    match = re.fullmatch(r"gsearch-.+-gen(\d+)-chunk\d+", display_name)
+    return int(match.group(1)) if match else None
 
 
 def _derive_ui_batch_status(
@@ -1865,7 +1880,13 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
         create_obj: dict[str, Any] = {}
         if not job_name:
             create_obj = await asyncio.to_thread(
-                lambda: gb.create_batch(batch_model, items, display_name=f"gsearch-{upload_id}-chunk{chunk_id}"))
+                lambda: gb.create_batch(
+                    batch_model,
+                    items,
+                    display_name=(
+                        f"gsearch-{upload_id}-gen{driver_generation}-chunk{chunk_id}"
+                    ),
+                ))
             job_name = gb.batch_name_from_create(create_obj)
             if not job_name:
                 raise RuntimeError(f"no job name from create: {create_obj}")
@@ -4545,12 +4566,16 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
     global gemini_batch_list_cache, gemini_batch_list_cache_fetched_at, gemini_batch_list_error_cooldown_until
     items = await list_upload_summaries(max(limit, 500), pipeline=None)
     local_by_job: dict[str, dict[str, Any]] = {}
+    local_by_upload: dict[str, dict[str, Any]] = {}
     for item in items:
         if str(item.get("pipeline") or PIPELINE_FULL) not in {
             PIPELINE_FULL, PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
         }:
             continue
         batch_meta = item.get("gemini_batch") if isinstance(item.get("gemini_batch"), dict) else {}
+        upload_id = str(item.get("upload_id") or "").strip()
+        if upload_id:
+            local_by_upload[upload_id] = {"item": item, "batch": batch_meta}
         job_name = str(batch_meta.get("job_name") or "").strip()
         if job_name:
             local_by_job[job_name] = {
@@ -4628,8 +4653,12 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
             continue
 
         local_ref = local_by_job.get(job_name) or {}
-        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
+        operation_matches_local_job = bool(local_ref)
         inferred_upload_id = _extract_upload_id_from_batch_obj(op)
+        operation_generation = _extract_generation_from_batch_obj(op)
+        if not local_ref and inferred_upload_id:
+            local_ref = local_by_upload.get(inferred_upload_id) or {}
+        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
         local_batch = local_ref.get("batch") if isinstance(local_ref.get("batch"), dict) else {}
         local_chunk = local_ref.get("chunk") if isinstance(local_ref.get("chunk"), dict) else {}
 
@@ -4643,6 +4672,11 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "batch_generation": (
+                    _batch_generation({"gemini_batch": local_batch})
+                    if operation_matches_local_job and local_batch
+                    else operation_generation
+                ),
                 "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": batch_status,
@@ -4674,6 +4708,10 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "batch_generation": (
+                    _batch_generation({"gemini_batch": local_batch})
+                    if local_batch else None
+                ),
                 "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": _derive_ui_batch_status(
@@ -4848,12 +4886,19 @@ async def _sync_batch_job_action_local_state(
     upload_id: str,
     job_name: str,
     action: str,
+    expected_generation: Optional[int] = None,
 ) -> bool:
     """Best-effort reconciliation after a destructive by-name remote action."""
     async with get_upload_lock(upload_id):
         try:
             state = await read_upload_artifact(upload_id, "state")
             batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+            current_generation = _batch_generation(state)
+            if (
+                expected_generation is not None
+                and expected_generation != current_generation
+            ):
+                return False
             chunks = batch.get("chunks") if isinstance(batch.get("chunks"), list) else []
             top_matches = str(batch.get("job_name") or "").strip() == job_name
             matching_chunks = [
@@ -4872,6 +4917,15 @@ async def _sync_batch_job_action_local_state(
                     else _aggregate_batch_chunk_status(chunks)
                 )
             elif action == "delete":
+                # An unmatched operation can be a just-created chunk whose
+                # metadata has not persisted yet. Require the generation from
+                # the listing so an old operation cannot mark a newer retry.
+                if (
+                    not top_matches
+                    and not matching_chunks
+                    and expected_generation is None
+                ):
+                    return False
                 deleted_at = _now_iso()
                 tombstone = await _write_batch_deletion_tombstone(
                     upload_id,
@@ -4898,13 +4952,14 @@ async def _sync_batch_job_action_local_state(
 async def batch_job_cancel_by_name(
     job_name: str = Query(..., min_length=1),
     upload_id: Optional[str] = Query(None),
+    expected_generation: Optional[int] = Query(None, ge=0),
 ) -> dict[str, Any]:
     try:
         cancel_resp = await asyncio.to_thread(_gemini_batch_cancel_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
     local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
-        str(upload_id), job_name, "cancel")
+        str(upload_id), job_name, "cancel", expected_generation)
     _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,
@@ -4918,13 +4973,14 @@ async def batch_job_cancel_by_name(
 async def batch_job_delete_by_name(
     job_name: str = Query(..., min_length=1),
     upload_id: Optional[str] = Query(None),
+    expected_generation: Optional[int] = Query(None, ge=0),
 ) -> dict[str, Any]:
     try:
         delete_resp = await asyncio.to_thread(_gemini_batch_delete_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch delete failed: {str(exc)}") from exc
     local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
-        str(upload_id), job_name, "delete")
+        str(upload_id), job_name, "delete", expected_generation)
     _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,

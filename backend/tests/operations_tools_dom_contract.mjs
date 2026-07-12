@@ -149,7 +149,7 @@ async function terminalAndActionContract() {
   ] });
   const managedJob = {
     upload_id: "up id/1?", upload_status: "completed", batch_status: "cancelled",
-    live_state: "cancelled", job_name: "jobs/one & two",
+    live_state: "cancelled", job_name: "jobs/one & two", batch_generation: 7,
   };
   const partialJob = {
     upload_id: "partial", upload_status: "completed_with_errors",
@@ -157,8 +157,8 @@ async function terminalAndActionContract() {
     job_name: "jobs/partial",
   };
   queue("/batch/jobs?limit=300", { jobs: [managedJob, partialJob] }, { jobs: [managedJob] }, emptyJobs);
-  const cancelPath = "/batch/jobs/cancel?job_name=jobs%2Fone%20%26%20two&upload_id=up%20id%2F1%3F";
-  const deletePath = "/batch/jobs/delete?job_name=jobs%2Fone%20%26%20two&upload_id=up%20id%2F1%3F";
+  const cancelPath = "/batch/jobs/cancel?job_name=jobs%2Fone%20%26%20two&upload_id=up%20id%2F1%3F&expected_generation=7";
+  const deletePath = "/batch/jobs/delete?job_name=jobs%2Fone%20%26%20two&upload_id=up%20id%2F1%3F&expected_generation=7";
   const cancelPending = deferred();
   queue(cancelPath, cancelPending);
   queue(deletePath, {});

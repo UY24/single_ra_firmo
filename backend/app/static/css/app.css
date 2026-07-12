@@ -16,12 +16,12 @@
   --accent: #65d6ad;
   --accent-strong: #4cc697;
   --accent-soft: #10251f;
-  --blue: #60a5fa;
-  --blue-strong: #3b82f6;
-  --cyan: #67e8f9;
-  --amber: #fbbf24;
+  --blue: #72a7ff;
+  --blue-strong: #4d8df4;
+  --cyan: #65d6ad;
+  --amber: #f2b95f;
   --green: var(--accent);
-  --red: #fb7185;
+  --red: #f07b84;
   --shadow: 0 16px 40px rgba(0, 0, 0, 0.3);
   --ring: 0 0 0 3px rgba(101, 214, 173, 0.25);
 }
@@ -371,16 +371,16 @@ td {
 }
 
 tbody tr {
-  border-color: #1e293b;
+  border-color: var(--border);
 }
 
 tbody tr:hover {
-  background: rgba(37, 99, 235, 0.1) !important;
+  background: var(--panel-soft) !important;
 }
 
 .divide-gray-100 > :not([hidden]) ~ :not([hidden]),
 .divide-gray-200 > :not([hidden]) ~ :not([hidden]) {
-  border-color: #1e293b !important;
+  border-color: var(--border) !important;
 }
 
 /* Tailwind compatibility color corrections */

@@ -931,6 +931,27 @@ def _batch_deletion_tombstone_s3_key(upload_id: str, state: dict[str, Any]) -> s
     return f"{prefix}/batch_deleted_by_user.json"
 
 
+def _batch_deletion_tombstone_version(marker: dict[str, Any]) -> tuple[int, float, str, int]:
+    """Return a sortable version for reconciling local and shared markers."""
+    try:
+        generation = max(0, int(marker.get("generation") or 0))
+    except (TypeError, ValueError):
+        generation = 0
+    event_at = str(
+        marker.get("cleared_at") or marker.get("deleted_by_user_at") or ""
+    ).strip()
+    parsed_at = _parse_iso_datetime(event_at)
+    if parsed_at is not None:
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        timestamp = parsed_at.timestamp()
+    else:
+        timestamp = 0.0
+    # A clear marker wins an exact tie so a retry cannot be reverted by a
+    # duplicate deletion marker written for the same generation and instant.
+    return generation, timestamp, event_at, int(bool(marker.get("cleared_at")))
+
+
 async def _read_batch_deletion_tombstone(
     upload_id: str,
     state: Optional[dict[str, Any]] = None,
@@ -957,12 +978,16 @@ async def _read_batch_deletion_tombstone(
         data.get("deleted_by_user_at") or data.get("cleared_at")
     ):
         return local_data
+    selected = max(
+        (marker for marker in (local_data, data) if isinstance(marker, dict)),
+        key=_batch_deletion_tombstone_version,
+    )
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_json(local_path, data)
+        _write_json(local_path, selected)
     except Exception:
         pass
-    return data
+    return selected
 
 
 def _apply_batch_deletion_tombstone(
@@ -975,6 +1000,8 @@ def _apply_batch_deletion_tombstone(
         artifact_generation = max(0, int(tombstone.get("generation") or 0))
     except (TypeError, ValueError):
         artifact_generation = 0
+    if artifact_generation < state_generation:
+        return
     batch["generation"] = max(state_generation, artifact_generation)
     state["gemini_batch"] = batch
     if tombstone.get("cleared_at"):
@@ -1520,11 +1547,18 @@ def _extract_upload_id_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[str
     if not display_name:
         return None
     marker = "single-ra-upload-"
-    if marker in display_name:
-        tail = display_name.split(marker, 1)[1]
-        # Expected: {upload_id}-{uuid}
-        candidate = tail.rsplit("-", 1)[0].strip()
-        return candidate or None
+    if display_name.startswith(marker):
+        tail = display_name[len(marker):]
+        # The generated suffix is a canonical UUID. Match the complete suffix
+        # so every hyphen belonging to the upload ID remains intact.
+        match = re.fullmatch(
+            r"(?P<upload_id>.+)-[0-9a-f]{8}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group("upload_id").strip() or None
     chunk_match = re.match(r"^gsearch-(.+)-chunk\d+$", display_name)
     if chunk_match:
         return chunk_match.group(1).strip() or None

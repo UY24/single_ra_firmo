@@ -182,6 +182,29 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
         self.assertEqual(jobs["jobs/chunk-1"]["batch_status"], "cancel_requested")
         self.assertIsNone(list_summaries.await_args.kwargs["pipeline"])
 
+    def test_batch_jobs_list_correlates_remote_only_hyphenated_upload_id(self):
+        upload_id = "team-alpha-run-123"
+        operation = {
+            "name": "operations/batch-remote",
+            "metadata": {
+                "state": "BATCH_STATE_RUNNING",
+                "displayName": (
+                    "single-ra-upload-team-alpha-run-123-"
+                    "123e4567-e89b-12d3-a456-426614174000"
+                ),
+            },
+        }
+        engine.gemini_batch_list_cache = []
+        engine.gemini_batch_list_cache_fetched_at = 0.0
+        engine.gemini_batch_list_error_cooldown_until = 0.0
+        with patch.object(engine, "list_upload_summaries", AsyncMock(return_value=[])), \
+             patch.object(engine, "_gemini_batch_list_sync", return_value={"operations": [operation]}), \
+             patch.dict("os.environ", {"ENABLE_REMOTE_GEMINI_BATCH_LIST": "true"}, clear=False):
+            response = self.client.get("/batch/jobs")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["jobs"][0]["upload_id"], upload_id)
+
     def test_destructive_actions_invalidate_remote_job_cache(self):
         for action in ("cancel", "delete"):
             with self.subTest(action=action):
@@ -482,6 +505,84 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
         engine._apply_batch_deletion_tombstone(stale_state, resolved)
         self.assertEqual(stale_state["gemini_batch"]["generation"], resolved["generation"])
         self.assertEqual(stale_state["gemini_batch"]["status"], "waiting_for_rows")
+
+    async def test_newer_local_retry_marker_beats_stale_s3_deletion(self):
+        upload_id = "newer-local-retry"
+        state = batch_state()
+        state["upload_id"] = upload_id
+        state["gemini_batch"]["generation"] = 2
+        local_marker = {
+            "upload_id": upload_id,
+            "cleared_at": "2026-07-12T12:00:00+00:00",
+            "generation": 2,
+        }
+        stale_remote_marker = {
+            "upload_id": upload_id,
+            "deleted_by_user_at": "2026-07-12T12:01:00+00:00",
+            "job_names": ["jobs/top"],
+            "top_level_deleted": True,
+            "generation": 1,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": "bucket"}, clear=False), \
+             patch.object(engine, "_read_json_from_s3_sync", return_value=stale_remote_marker):
+            marker_path = engine._batch_deletion_tombstone_path(upload_id)
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            engine._write_json(marker_path, local_marker)
+            resolved = await engine._read_batch_deletion_tombstone(upload_id, state)
+
+        self.assertEqual(resolved, local_marker)
+
+    def test_generation_one_deletion_cannot_override_generation_two_retry(self):
+        state = batch_state()
+        state["gemini_batch"] = {
+            "status": "waiting_for_rows",
+            "generation": 2,
+            "job_name": None,
+            "error": None,
+        }
+        tombstone = {
+            "deleted_by_user_at": "2026-07-12T12:01:00+00:00",
+            "job_names": ["jobs/top"],
+            "top_level_deleted": True,
+            "generation": 1,
+        }
+
+        engine._apply_batch_deletion_tombstone(state, tombstone)
+
+        self.assertEqual(state["gemini_batch"]["status"], "waiting_for_rows")
+        self.assertEqual(state["gemini_batch"]["generation"], 2)
+        self.assertNotIn("batch_deleted_by_user_at", state)
+
+    async def test_same_generation_newer_local_marker_beats_older_s3_marker(self):
+        upload_id = "same-generation-recency"
+        state = batch_state()
+        state["upload_id"] = upload_id
+        local_marker = {
+            "upload_id": upload_id,
+            "deleted_by_user_at": "2026-07-12T12:02:00+00:00",
+            "job_names": ["jobs/top"],
+            "top_level_deleted": True,
+            "generation": 3,
+        }
+        older_remote_marker = {
+            "upload_id": upload_id,
+            "cleared_at": "2026-07-12T12:01:00+00:00",
+            "generation": 3,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(engine, "UPLOAD_BASE_DIR", Path(tmp)), \
+             patch.dict("os.environ", {"S3_BUCKET": "bucket"}, clear=False), \
+             patch.object(engine, "_read_json_from_s3_sync", return_value=older_remote_marker):
+            marker_path = engine._batch_deletion_tombstone_path(upload_id)
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            engine._write_json(marker_path, local_marker)
+            resolved = await engine._read_batch_deletion_tombstone(upload_id, state)
+
+        self.assertEqual(resolved, local_marker)
 
     async def test_old_process_generation_cannot_apply_results_after_retry(self):
         upload_id = "cross-process-generation"

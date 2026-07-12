@@ -1055,16 +1055,8 @@ tbody tr:hover {
   max-width: 100%;
 }
 
-.file-input::file-selector-button {
-  margin-right: 0.75rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.4rem;
-  background: var(--panel-strong);
-  color: var(--text);
-  padding: 0.45rem 0.7rem;
-  font: inherit;
-  font-weight: 700;
-  cursor: pointer;
+.new-company-message {
+  min-height: 1.25rem;
 }
 
 .launch-summary {

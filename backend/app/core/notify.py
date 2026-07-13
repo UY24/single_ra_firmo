@@ -65,6 +65,12 @@ def _fmt_tokens(n: int | None) -> str | None:
     return str(n)
 
 
+def _fmt_usd(value: int | float) -> str:
+    if value != 0 and abs(value) < 0.01:
+        return f"${value:,.6f}".rstrip("0").rstrip(".")
+    return f"${value:,.2f}"
+
+
 def _field(label: str, value: str) -> dict:
     """One cell in the two-column Block Kit field grid."""
     return {"type": "mrkdwn", "text": f"*{label}*\n{value}"}
@@ -123,6 +129,7 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
                         search_label: str = "Searches",
                         tokens: int | None = None, input_tokens: int | None = None,
                         output_tokens: int | None = None, cost_usd: float | None = None,
+                        llm_cost_usd: float | None = None, serpwow_cost_usd: float | None = None,
                         duration_seconds: float | None = None,
                         llm_errors: int | None = None) -> bool:
     """Notify that a run reached a terminal completed / completed_with_errors state.
@@ -151,16 +158,26 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         fields.append(_field("🎯 Outcome", f"*{success or 0:,}* succeeded\n*{failed or 0:,}* failed"))
     if isinstance(total_rows, int):
         fields.append(_field("📋 Rows", f"{total_rows:,}"))
+    # SerpWow cell: searches THEN cost in one field when a SerpWow cost is given;
+    # otherwise the bare search count (e.g. AI Mode's scrape.do flat-fee searches).
     if isinstance(searches, int):
-        fields.append(_field(f"🔎 {search_label}", f"{searches:,}"))
+        if isinstance(serpwow_cost_usd, (int, float)):
+            fields.append(_field(f"🔎 {search_label}",
+                                 f"{searches:,} searches · {_fmt_usd(serpwow_cost_usd)}"))
+        else:
+            fields.append(_field(f"🔎 {search_label}", f"{searches:,}"))
     if isinstance(tokens, int):
         val = f"{tokens:,}"
         tin, tout = _fmt_tokens(input_tokens), _fmt_tokens(output_tokens)
         if tin and tout:
             val += f"\n{tin} input / {tout} output"
         fields.append(_field("🪙 Tokens", val))
-    if isinstance(cost_usd, (int, float)) and cost_usd > 0:
-        fields.append(_field("💰 Cost", f"${cost_usd:,.2f}"))
+    # Cost cell: when the LLM/SerpWow split is provided, show LLM + Total (SerpWow
+    # is already in the 🔎 cell above); otherwise a single total.
+    if isinstance(llm_cost_usd, (int, float)) and isinstance(cost_usd, (int, float)):
+        fields.append(_field("💰 Cost", f"LLM {_fmt_usd(llm_cost_usd)}\nTotal {_fmt_usd(cost_usd)}"))
+    elif isinstance(cost_usd, (int, float)) and cost_usd > 0:
+        fields.append(_field("💰 Cost", _fmt_usd(cost_usd)))
     dur = _fmt_dur(duration_seconds)
     if dur:
         fields.append(_field("⏱️ Duration", dur))

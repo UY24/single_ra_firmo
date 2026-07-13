@@ -1,6 +1,46 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-10 (NEW `errorTaxonomy` branch — `found`/`not_found`/`error` row outcome taxonomy with error source+category, NOT yet merged; see top section). Read this first if you're picking up this repo.
+Last updated: 2026-07-13 (`uiuximp` — Midnight Ledger UI/UX redesign complete, batch-operation lifecycle hardened, Slack split-cost precision fixed; see top section). Read this first if you're picking up this repo.
+
+---
+
+## ⭐ 2026-07-13 — Midnight Ledger UI/UX + Slack cost precision (branch `uiuximp`)
+
+**Status: COMPLETE and reviewed.** The website UI has been fully redesigned in the approved **“A · Midnight Ledger”** direction: an elegant, lower-density dark interface with clearer hierarchy, fewer boxed metrics, outcome-first run details, responsive navigation, accessible controls, and consistent shared primitives. The final branch review found no remaining Critical/Important issues. Fresh suite: **487/487 passing** with the mandatory command `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`; notification-focused suite: **28/28**. At handoff time the working tree is clean on `uiuximp`, with local commits still to push to `origin/uiuximp`.
+
+### UI/UX redesign
+
+- **Global shell/theme:** Midnight navy surfaces, warm off-white text, teal/cyan primary accent, amber warnings, red errors, restrained borders/shadows, consistent typography/spacing, visible `:focus-visible` treatment, and reusable button/card/table/status/empty-state primitives. Desktop sidebar becomes an accessible mobile drawer with toggle, backdrop, Escape close, and focus restoration.
+- **Whole-site migration:** Dashboard, Companies, New Run, Runs, Run Detail, Operations, and Tools now share one visual language. Stale light-theme utility classes and emoji-as-interface-icon patterns were removed. Tables scroll within their containers instead of widening the page.
+- **Run Detail (priority area):** Outcome comes before telemetry. Reporting pipelines show Websites found / Not found / Errored; generic legacy pipelines correctly show Succeeded / Failed. Technical metrics (time, average/row, tokens, cost, batch status) are secondary rather than a wall of equal boxes. Headers use human-readable pipeline names, run ID, and available created/updated timestamp. Files use one accessible View/Download surface with a keyboard-safe modal, focus trap, Escape/backdrop close, abort/race cleanup, and mobile-contained actions.
+- **Responsive verification:** A reproducible headless-Chrome matrix covered **8 views × 4 widths = 32 checks** at 375, 768, 1024, and 1440 px: Dashboard, Companies, New Run, Runs, AI detail, SerpWow detail, Operations, and Tools. Result: zero page-overflow/focus failures; internal table scrolling, outcome-before-telemetry, distinct status colors, controls, and mobile drawer interactions all passed.
+- **Accessibility fixes:** Operations storage-copy controls are native keyboard-operable buttons with accessible labels; modal actions are exempt from the mobile full-width button rule; polling/request cleanup prevents old views from updating detached DOM; New Run preview/modal state is inert and race-safe.
+
+### Operations and batch lifecycle hardening
+
+The redesigned Operations view exposed destructive by-name batch actions, so local state reconciliation was hardened rather than leaving UI actions remote-only:
+
+- `/batch/jobs` correlates top-level and chunk jobs across `full`, `gsearch`, `gmaps`, and `relationship`; Operations sends `upload_id` plus an optional expected generation.
+- Cancel/delete updates local state, invalidates the remote-list cache, preserves sibling chunk state, and rejects stale Operations actions after an explicit retry.
+- Deletion uses durable local/S3 tombstones plus batch generations so a stale worker snapshot cannot resurrect deleted jobs or overwrite a newer retry generation. Explicit retry clears the correct generation safely.
+- `cancel_requested` remains nonterminal for reporting/finalization. Available reporting-file scans are gated to terminal, batch-settled status instead of adding S3 latency to every two-second active-run poll.
+
+### Slack split-cost precision
+
+SerpWow terminal notifications now receive separate LLM and SerpWow costs in addition to total cost. The SerpWow search field shows search count plus provider cost; the Cost field shows LLM and Total. `app.core.notify._fmt_usd` prevents genuine sub-cent values from collapsing to `$0.00`:
+
+- normal amounts: `$1.23`;
+- sub-cent values: up to six decimals with trailing zeros removed (`$0.00105`, `$0.0002`);
+- signed zero: `$0.00`;
+- nonzero values below one micro-dollar: explicit thresholds (`<$0.000001` / `>-$0.000001`).
+
+Key commits at the tip: `e8ba02a` (adaptive precision), `504cd07` (signed zero), `7a96b35` (sub-micro thresholds). Design/plan: `docs/superpowers/specs/2026-07-13-adaptive-slack-cost-precision-design.md` and `docs/superpowers/plans/2026-07-13-adaptive-slack-cost-precision.md`.
+
+### Pickup / deployment notes
+
+- Restart both API server and worker before live verification; several changes are in `services/serpwow/engine.py`, not static UI only.
+- Recommended live smoke: one reporting run through row processing → batch finalization → files available, one cancel/delete from Operations, one explicit retry, and one Slack completion message confirming the split costs.
+- Do not re-open the UI redesign unless a new product request appears. The next source-control decision is whether to push the remaining local tip and open/refresh the PR, or merge `uiuximp` into the chosen base branch.
 
 ---
 

@@ -54,9 +54,9 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
         self.assertEqual(ctx["relationship"]["verified_pair"], "eastlinkcap ↔ Modal")
         self.assertFalse(ctx["skip_llm"])
-        # 4 phases fired (X + input_url present)
-        self.assertEqual(search.await_count, 4)
-        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 4)
+        # 3 phases fired (X + input_url present); phase3 was removed.
+        self.assertEqual(search.await_count, 3)
+        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 3)
 
     def test_not_confirmed_gates_url_to_none(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "No relation."))
@@ -111,8 +111,9 @@ class TestRelationshipExecutor(unittest.TestCase):
         llm.assert_not_called()
         self.assertTrue(resp.context["skip_llm"])
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_X)
-        # only phase3 fired (no X, no input_url)
-        self.assertEqual(search.await_count, 1)
+        # no phases fire: phase1/phase2 need X, phase4 needs a domain, and phase3 is
+        # gone. The row short-circuits anyway, so no SerpWow search is wasted.
+        self.assertEqual(search.await_count, 0)
 
     def test_batch_mode_defers_llm_but_gathers_evidence(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "evidence"))
@@ -131,7 +132,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         ok = _serp(["https://modal.com/"], "text")
 
         async def flaky(query, country=None, client=None):
-            if "official website" in query and "financial" not in query:
+            # Fail only the phase2 investment-evidence query; phase1 still succeeds.
+            if "investment OR portfolio" in query:
                 raise RuntimeError("boom")
             return ok
 

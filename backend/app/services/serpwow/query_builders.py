@@ -565,29 +565,33 @@ def build_relationship_phase_queries(
     """Parallel phase queries for the relationship pipeline (spec §3).
 
     Y is used VERBATIM (noisy OCR included) — Google tolerates the noise and
-    algorithmic cleanup risks destroying signal. Phases 1/2 need X; phase 4
-    needs X's domain (from Input_URL); phase 3 always fires.
+    algorithmic cleanup risks destroying signal. EVERY phase anchors to Company X
+    (name and/or domain) so a query can never surface an unrelated company that
+    merely shares Y's name (e.g. example.com vs the X-related example.org). Phases
+    1/2 need X's name; phase 4 needs X's domain (from Input_URL). When X's domain is
+    present it is added to phases 1/2 as context — NOT a site: restriction, so
+    external evidence still surfaces — while phase 4 uses it as a site: anchor.
+    (There is no phase 3: the old Y-only "official website" search had no tie to X
+    and could return a same-named but unrelated company, so it was removed.)
     """
     x = str(x_name or "").strip()
     y = str(y_name or "").strip()
-    location = " ".join(part for part in (str(city or "").strip(),
-                                          str(country or "").strip()) if part)
+    xd = str(x_domain or "").strip()
     queries: list[tuple[str, str]] = []
     if x:
+        x_ident = f'"{x}" (website: {xd})' if xd else f'"{x}"'
         queries.append((
             "phase1_relationship",
-            f'What is the financial relationship between "{x}" and "{y}"? '
+            f'What is the financial relationship between {x_ident} and "{y}"? '
             f'What is the official website of "{y}"? give actual url',
         ))
+        x_terms = f'"{x}" "{xd}"' if xd else f'"{x}"'
         queries.append((
             "phase2_investment_evidence",
-            f'"{x}" "{y}" investment OR portfolio OR funding OR acquisition',
+            f'{x_terms} "{y}" investment OR portfolio OR funding OR acquisition',
         ))
-    queries.append((
-        "phase3_official_site",
-        f'"{y}" official website {location}'.strip(),
-    ))
-    if x_domain:
-        queries.append(("phase4_portfolio_anchor", f'"{y}" site:{x_domain}'))
+    if xd:
+        anchor = f'"{x}" "{y}" site:{xd}' if x else f'"{y}" site:{xd}'
+        queries.append(("phase4_portfolio_anchor", anchor))
     cap = max(1, int(max_phases))
     return queries[:cap]

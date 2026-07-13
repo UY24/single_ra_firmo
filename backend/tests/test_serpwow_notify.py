@@ -163,6 +163,14 @@ class NotifyRenderTests(unittest.TestCase):
 
         self.assertEqual(notify._fmt_usd(-0.0), "$0.00")
 
+    def test_sub_micro_costs_use_explicit_thresholds(self):
+        from app.core import notify
+
+        self.assertEqual(notify._fmt_usd(0.000001), "$0.000001")
+        self.assertEqual(notify._fmt_usd(-0.000001), "$-0.000001")
+        self.assertEqual(notify._fmt_usd(0.0000001), "<$0.000001")
+        self.assertEqual(notify._fmt_usd(-0.0000001), ">-$0.000001")
+
     def _fields(self, **kw):
         from app.core import notify
         captured = {}

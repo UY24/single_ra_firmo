@@ -68,6 +68,10 @@ def _fmt_tokens(n: int | None) -> str | None:
 def _fmt_usd(value: int | float) -> str:
     if value == 0:
         return "$0.00"
+    if 0 < value < 0.000001:
+        return "<$0.000001"
+    if -0.000001 < value < 0:
+        return ">-$0.000001"
     if abs(value) < 0.01:
         return f"${value:,.6f}".rstrip("0").rstrip(".")
     return f"${value:,.2f}"

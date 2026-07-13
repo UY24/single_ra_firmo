@@ -74,7 +74,8 @@ class TestChooseRelationshipAndWebsite(unittest.TestCase):
             parsed, error, model, out_usage = choose_relationship_and_website(
                 "eastlinkcap", "Modal", "", "",
                 CANDS, ["Eastlink Capital is an investor in Modal Labs."],
-                [{"attempt": "phase1_relationship", "query": "q"}], True)
+                [{"attempt": "phase1_relationship", "query": "q"}], True,
+                "eastlinkcap.com")
         self.assertIsNone(error)
         self.assertEqual(parsed["relationship_status"], "confirmed")
         self.assertEqual(out_usage, usage)
@@ -82,6 +83,8 @@ class TestChooseRelationshipAndWebsite(unittest.TestCase):
         self.assertIn("eastlinkcap", prompt_sent)
         self.assertIn("Modal", prompt_sent)
         self.assertIn("modal.com", prompt_sent)
+        self.assertIn("eastlinkcap.com", prompt_sent)
+        self.assertIn("company_x_domain", prompt_sent)
 
     def test_http_error_surfaces(self):
         with patch("app.services.serpwow.gemini_llm._gemini_generate_content_json",
@@ -96,11 +99,23 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
     def test_prompt_contains_contract_and_evidence(self):
         prompt = build_relationship_prompt(
             "m25vc", "Sanzo", "NYC", "US", CANDS,
-            ["overview text A"], [{"attempt": "phase1_relationship", "query": "q1"}], True)
+            ["overview text A"], [{"attempt": "phase1_relationship", "query": "q1"}], True,
+            "eastlinkcap.com")
         for needle in ("relationship_status", "confirmed", "not_confirmed", "unclear",
                        "official_website", "confidence_score", "extra_flags",
-                       "overview text A", "m25vc", "Sanzo", "financial"):
+                       "overview text A", "m25vc", "Sanzo", "financial",
+                       "company_x_domain", "eastlinkcap.com"):
             self.assertIn(needle, prompt)
+
+    def test_prompt_falls_back_to_name_when_no_domain(self):
+        # No domain: company_x_domain serializes to null but the X name is still present.
+        prompt = build_relationship_prompt(
+            "m25vc", "Sanzo", "NYC", "US", CANDS,
+            ["overview text A"], [{"attempt": "phase1_relationship", "query": "q1"}], True,
+            "")
+        self.assertIn("company_x_domain", prompt)
+        self.assertIn('"company_x_domain": null', prompt)
+        self.assertIn("m25vc", prompt)
 
 
 if __name__ == "__main__":

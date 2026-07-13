@@ -177,7 +177,7 @@ async def execute_relationship_lookup_for_worker(
         parsed, error, model, usage = await asyncio.to_thread(
             choose_relationship_and_website,
             x_name, y_name, city, country,
-            deduped, ai_overview_texts, search_attempts, phase4_hit)
+            deduped, ai_overview_texts, search_attempts, phase4_hit, x_domain)
         if parsed is None:
             # LLM failure: the gate cannot be guessed — fail the row (retryable).
             # Tag the source so the worker's classify_exception attributes it to

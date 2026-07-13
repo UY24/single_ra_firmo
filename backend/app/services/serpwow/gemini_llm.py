@@ -723,12 +723,14 @@ def build_relationship_prompt(
     ai_overview_texts: list[str],
     search_attempts: list[dict[str, Any]],
     phase4_hit: bool,
+    x_domain: str = "",
 ) -> str:
     """Prompt for the relationship pipeline (spec §4). Shared by the per-row
     call (choose_relationship_and_website) and the Gemini-batch item builder so
     both modes judge with identical instructions."""
     input_obj = {
-        "company_x": x_name, "company_y_ocr": y_name,
+        "company_x": x_name, "company_x_domain": x_domain or None,
+        "company_y_ocr": y_name,
         "city": city or None, "country": country or None,
         "company_y_appears_on_company_x_site": bool(phase4_hit),
     }
@@ -753,6 +755,7 @@ def build_relationship_prompt(
         "- 'confirmed' requires explicit supporting evidence in the provided material.\n"
         "- official_website must be company_y's site, chosen from Candidate URLs ONLY.\n"
         "  Never invent a URL. Never return company_x's own website.\n"
+        "- company_x_domain (when present) is company_x's own website domain — never return it as official_website.\n"
         "- Set official_website to null unless relationship_status is 'confirmed'.\n"
         "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
         "- confidence_score is 0-100 for the overall answer (relationship + URL).\n"
@@ -775,6 +778,7 @@ def choose_relationship_and_website(
     ai_overview_texts: list[str],
     search_attempts: list[dict[str, Any]],
     phase4_hit: bool,
+    x_domain: str = "",
 ) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
     """Per-pair relationship verdict + URL pick. Returns (parsed, error, model, usage)
     following choose_final_website_with_gemini's convention. Validation of the parsed
@@ -787,7 +791,7 @@ def choose_relationship_and_website(
             ordered_models.append(model_name)
     prompt = build_relationship_prompt(
         x_name, y_name, city, country, candidates,
-        ai_overview_texts, search_attempts, phase4_hit)
+        ai_overview_texts, search_attempts, phase4_hit, x_domain)
     last_error: Optional[str] = None
     for model in ordered_models:
         text, usage, error = _gemini_generate_content_json(model, prompt)

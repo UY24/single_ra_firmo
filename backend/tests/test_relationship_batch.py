@@ -36,6 +36,9 @@ class TestRelationshipBatchPrompt(unittest.TestCase):
         self.assertIn("eastlinkcap", prompt)
         self.assertIn("Modal", prompt)
         self.assertIn("modal.com", prompt)
+        # Batch parity: the x_domain from context is threaded into the prompt too.
+        self.assertIn("eastlinkcap.com", prompt)
+        self.assertIn("company_x_domain", prompt)
 
     def test_gsearch_prompt_unchanged(self):
         row = {"row_index": 1, "company_name": "Acme", "country": "US",

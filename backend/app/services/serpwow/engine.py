@@ -1264,6 +1264,7 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
             ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
             search_attempts=list(_ctx_probe.get("search_attempts") or []),
             phase4_hit=bool(_ctx_probe.get("phase4_hit")),
+            x_domain=str(_ctx_probe.get("x_domain") or ""),
         )
     input_obj = {
         "company_name": row.get("company_name"),

@@ -158,6 +158,11 @@ class NotifyRenderTests(unittest.TestCase):
     """notify_run_complete renders the SerpWow searches·cost cell and the split
     LLM/Total cost cell; AI-Mode-shaped calls (no split) render as before."""
 
+    def test_signed_zero_cost_uses_standard_zero_format(self):
+        from app.core import notify
+
+        self.assertEqual(notify._fmt_usd(-0.0), "$0.00")
+
     def _fields(self, **kw):
         from app.core import notify
         captured = {}

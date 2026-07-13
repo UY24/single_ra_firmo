@@ -117,6 +117,31 @@ class TestRelationshipReporting(unittest.TestCase):
         self.assertEqual(summary["confidence_mode"], "llm")
         self.assertEqual(summary["cost"]["serpwow_searches"], 8)
 
+    def test_outcomes_fan_out_to_searchable_original_rows(self):
+        state = _state()
+        state["relationship"]["original_rows"].extend([{}, {}])
+        state["relationship"]["row_count_original"] = 6
+        found, not_found = state["rows"]
+        found["source_row_indices"] = [1, 2]
+        found["outcome"] = "found"
+        not_found["source_row_indices"] = [3]
+        not_found["status"] = "completed"
+        not_found["outcome"] = "not_found"
+        errored = _pair_row(3, "Broken", "x", [4, 5], None, "unclear", error="boom")
+        errored.update({"outcome": "error", "error_source": "gemini", "error_category": "llm_error"})
+        orphan = _pair_row(4, "Orphan", "x", [], None, "unclear", error="orphan")
+        orphan["outcome"] = "error"
+        state["rows"].extend([errored, orphan])
+
+        results = serpwow_reporting.state_to_entity_results(state)
+        summary = serpwow_reporting.build_summary(state, results)
+
+        self.assertEqual(summary["outcome_breakdown"],
+                         {"found": 2, "not_found": 1, "errored": 2})
+        self.assertEqual(summary["error_breakdown"]["by_source"], {"gemini": 2})
+        self.assertEqual(summary["searchable_rows"], 5)
+        self.assertEqual(sum(summary["outcome_breakdown"].values()), summary["searchable_rows"])
+
     def test_report_json_rows_include_relationship(self):
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), _state())

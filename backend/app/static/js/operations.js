@@ -8,21 +8,67 @@
 //   Retry:          POST /uploads/{id}/retry-failed-rows
 //                   GET  /uploads/{id}/status   (poll after a retry)
 import { api, el, pollStatus } from "./api.js";
-import { errorCard, head, cell, shortDate, fmtDuration, copyCell } from "./ui.js";
+import {
+  errorCard,
+  head,
+  cell,
+  shortDate,
+  fmtDuration,
+  copyCell,
+  pageIntro,
+  sectionHeading,
+} from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
+const ROW_TERMINAL = new Set(["completed", "completed_with_errors", "failed"]);
+const BATCH_TERMINAL = new Set([
+  "not_started", "succeeded", "completed_with_errors", "failed", "skipped", "cancelled",
+]);
 
-// ---- pills (legacy statusClass/batchClass → tailwind tones) ----------------
+const uploadIsTerminal = (status) => ROW_TERMINAL.has(String(status?.status ?? ""))
+  && BATCH_TERMINAL.has(String(status?.gemini_batch?.status ?? "not_started"));
+
+const isAbortError = (error) => error?.name === "AbortError";
+
+function createLifecycle() {
+  let mounted = true;
+  const controllers = new Set();
+  const cleanups = [];
+
+  const startRequest = (path, opts = {}) => {
+    const controller = new AbortController();
+    controllers.add(controller);
+    const promise = api(path, { ...opts, signal: controller.signal })
+      .finally(() => controllers.delete(controller));
+    return { controller, promise };
+  };
+
+  return {
+    isMounted: () => mounted,
+    registerCleanup: (fn) => cleanups.push(fn),
+    startRequest,
+    cleanup: () => {
+      if (!mounted) return;
+      mounted = false;
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+      cleanups.forEach((fn) => fn());
+    },
+  };
+}
+
+// ---- pills (legacy statusClass/batchClass → shared .pill tones) ------------
 const PILL_CLS = {
-  done: "bg-emerald-100 text-emerald-800",
-  error: "bg-red-100 text-red-800",
-  running: "bg-indigo-100 text-indigo-800",
-  "": "bg-gray-100 text-gray-600",
+  done: "pill--good",
+  error: "pill--danger",
+  running: "pill--info",
+  warn: "pill--warn",
+  "": "pill--muted",
 };
 
 const pill = (label, kind) =>
   el("span", {
-    class: `inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${PILL_CLS[kind] ?? PILL_CLS[""]}`,
+    class: `pill ${PILL_CLS[kind] ?? PILL_CLS[""]}`,
   }, label);
 
 function statusLabel(status) {
@@ -49,7 +95,9 @@ function batchLabel(status) {
     queued: "Batch Queued",
     running: "Batch Running",
     cancel_requested: "Cancel Requested",
+    cancelled: "Batch Cancelled",
     succeeded: "Batch Done",
+    completed_with_errors: "Batch Completed With Errors",
     failed: "Batch Failed",
     skipped: "Batch Skipped",
     not_started: "Batch N/A",
@@ -60,7 +108,10 @@ function batchLabel(status) {
 function batchClass(status) {
   const key = String(status ?? "");
   if (key === "succeeded") return "done";
-  if (key === "failed" || key === "skipped" || key === "cancel_requested") return "error";
+  if (key === "completed_with_errors") return "warn";
+  if (key === "cancelled") return "";
+  if (key === "cancel_requested") return "warn";
+  if (key === "failed" || key === "skipped") return "error";
   if (key === "waiting_for_rows" || key === "queued" || key === "running") return "running";
   return "";
 }
@@ -102,28 +153,33 @@ function downloadButton(uploadId, label, format) {
   }, label);
 }
 
-function uploadHistoryCard(registerCleanup) {
-  const tbody = el("tbody", { class: "divide-y divide-gray-100" });
-  const empty = el("p", { class: "hidden p-6 text-center text-sm text-gray-400" },
+function uploadHistoryCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
+  let controller = null;
+  let generation = 0;
+  let timer = null;
+  const tbody = el("tbody", {});
+  const empty = el("p", { class: "empty-state hidden" },
     "No SerpWow uploads found.");
-  const note = el("p", { class: "mt-3 text-xs text-gray-400" },
+  const note = el("p", { class: "message message--muted", "aria-live": "polite" },
     "Showing all SerpWow uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
-  const errorArea = el("div", { class: "mt-3 hidden" });
+  const errorArea = el("div", { class: "operations-feedback hidden" });
 
   function renderRows(items) {
     empty.classList.toggle("hidden", items.length > 0);
     tbody.replaceChildren(...items.map((item) => {
       const uploadId = String(item.upload_id ?? "");
-      const rowsDone = ["completed", "completed_with_errors"].includes(String(item.status ?? ""));
-      const batch = item.gemini_batch?.status ?? "not_started";
-      const batchTerminal = ["not_started", "succeeded", "failed", "skipped"].includes(String(batch));
-      const ready = ["full", "gsearch", "relationship"].includes(item.pipeline)
-        ? rowsDone && batchTerminal : rowsDone;
+      const ready = ROW_TERMINAL.has(String(item.status ?? ""))
+        && BATCH_TERMINAL.has(String(item.gemini_batch?.status ?? "not_started"));
       return el("tr", {
-        class: "cursor-pointer hover:bg-gray-50/50",
-        onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(uploadId)}`; },
+        class: "data-row",
       },
-        cell(el("span", { class: "font-mono text-xs", title: uploadId }, uploadId ? shortId(uploadId) : "-")),
+        cell(uploadId ? el("a", {
+          class: "table-link font-mono text-xs",
+          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          title: uploadId,
+          "aria-label": `Open run ${uploadId}`,
+        }, shortId(uploadId)) : "-"),
         cell(pill(pipelineLabel(item.pipeline), "")),
         cell(pill(statusLabel(item.status), statusClass(item.status))),
         cell(Number(item.total_rows ?? 0).toLocaleString(), "text-right"),
@@ -141,15 +197,31 @@ function uploadHistoryCard(registerCleanup) {
   }
 
   async function refresh() {
+    const currentGeneration = ++generation;
+    controller?.abort();
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    const request = startRequest("/uploads?limit=200");
+    controller = request.controller;
     try {
-      const data = await api("/uploads?limit=200");
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== generation) return;
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.uploads) ? data.uploads : []);
       note.textContent = "Showing all SerpWow uploads. Select a row to open its run detail.";
     } catch (e) {
+      if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
       errorArea.replaceChildren(errorCard(e.message));
+    } finally {
+      if (isMounted() && currentGeneration === generation) {
+        controller = null;
+        timer = setTimeout(() => {
+          timer = null;
+          refresh();
+        }, REFRESH_MS);
+      }
     }
   }
 
@@ -158,19 +230,17 @@ function uploadHistoryCard(registerCleanup) {
     onclick: refresh,
   }, "Refresh");
 
-  const card = el("div", { class: "panel" },
-    el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
-      el("div", {},
-        el("h2", { class: "section-title" }, "SerpWow Uploads History"),
-        el("p", { class: "mt-1 section-copy" },
-          "All modes in one table: progress, timing, downloads, and artifact storage paths."),
-      ),
+  const card = el("section", { class: "detail-section operations-section" },
+    sectionHeading(
+      "SerpWow Uploads History",
+      "All modes in one table: progress, timing, downloads, and artifact storage paths.",
       refreshBtn,
     ),
-    errorArea,
-    el("div", { class: "table-shell mt-4" },
+    el("div", { class: "detail-section-body" },
+      errorArea,
+      el("div", { class: "table-shell" },
       el("div", { class: "table-scroll" },
-        el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+        el("table", { class: "data-table operations-table" },
           el("thead", {},
             el("tr", {},
               head("Upload ID"), head("Mode"), head("Status"),
@@ -185,36 +255,62 @@ function uploadHistoryCard(registerCleanup) {
       ),
       empty,
     ),
-    note,
+      note,
+    ),
   );
 
-  const timer = setInterval(refresh, REFRESH_MS);
-  registerCleanup(() => clearInterval(timer));
+  registerCleanup(() => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+  });
   return { card, refresh };
 }
 
 // ---- Batch Manager ----------------------------------------------------------
-function batchManagerCard() {
-  const note = el("p", { class: "mt-3 text-xs text-gray-400" },
+function batchManagerCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
+  let controller = null;
+  let generation = 0;
+  let timer = null;
+  const busyJobs = new Set();
+  let buttonsByJob = new Map();
+  const note = el("p", { class: "message message--muted", "aria-live": "polite" },
     "Use actions to fetch live status or cancel a Gemini batch job.");
-  const tbody = el("tbody", { class: "divide-y divide-gray-100" });
-  const empty = el("p", { class: "hidden p-6 text-center text-sm text-gray-400" },
+  const tbody = el("tbody", {});
+  const empty = el("p", { class: "empty-state hidden" },
     "No Gemini batch jobs found.");
-  const errorArea = el("div", { class: "mt-3 hidden" });
+  const errorArea = el("div", { class: "operations-feedback hidden" });
 
   const setNote = (msg, isError = false) => {
     note.textContent = msg;
-    note.className = isError ? "mt-3 text-xs text-red-600" : "mt-3 text-xs text-gray-400";
+    note.className = isError ? "message message--danger" : "message message--muted";
   };
 
-  async function handleAction(action, jobName, btn) {
+  const setJobBusy = (jobName, busy) => {
+    if (busy) busyJobs.add(jobName);
+    else busyJobs.delete(jobName);
+    for (const button of buttonsByJob.get(jobName) ?? []) button.disabled = busy;
+  };
+
+  async function handleAction(action, uploadId, jobName, batchGeneration) {
+    if (busyJobs.has(jobName) || !isMounted()) return;
     if (action === "cancel" && !confirm(`Cancel Gemini batch ${jobName}?`)) return;
     if (action === "delete" && !confirm(`Delete Gemini batch ${jobName}? This cannot be undone.`)) return;
 
-    btn.disabled = true;
+    setJobBusy(jobName, true);
     try {
-      const data = await api(`/batch/jobs/${action}?job_name=${encodeURIComponent(jobName)}`,
-        { method: "POST" });
+      let path = `/batch/jobs/${action}?job_name=${encodeURIComponent(jobName)}`;
+      if ((action === "cancel" || action === "delete") && uploadId) {
+        path += `&upload_id=${encodeURIComponent(uploadId)}`;
+        if (Number.isInteger(batchGeneration) && batchGeneration >= 0) {
+          path += `&expected_generation=${batchGeneration}`;
+        }
+      }
+      const data = await startRequest(path, { method: "POST" }).promise;
+      if (!isMounted()) return;
       if (action === "status") {
         setNote(`Live batch status for ${jobName}: ${data.live_state ?? "-"} (done=${Boolean(data.done)})`);
       } else if (action === "delete") {
@@ -223,49 +319,82 @@ function batchManagerCard() {
         setNote(`Cancel requested for ${jobName}.`);
       }
     } catch (e) {
+      if (!isMounted() || isAbortError(e)) return;
       setNote(`Action failed (${action}) for ${jobName}: ${e.message}`, true);
     } finally {
-      btn.disabled = false;
-      await refresh();
+      if (isMounted()) {
+        setJobBusy(jobName, false);
+        await refresh();
+      }
     }
   }
 
-  const actionBtn = (label, action, jobName, extra = "") => {
+  const actionBtn = (label, action, uploadId, jobName, batchGeneration, extra = "") => {
     const btn = el("button", { class: `${actionBtnCls} ${extra}`, type: "button" }, label);
-    btn.addEventListener("click", () => handleAction(action, jobName, btn));
+    btn.disabled = busyJobs.has(jobName);
+    if (!buttonsByJob.has(jobName)) buttonsByJob.set(jobName, new Set());
+    buttonsByJob.get(jobName).add(btn);
+    btn.addEventListener("click", () => handleAction(
+      action, uploadId, jobName, batchGeneration,
+    ));
     return btn;
   };
 
   function renderRows(items) {
+    buttonsByJob = new Map();
     empty.classList.toggle("hidden", items.length > 0);
     tbody.replaceChildren(...items.map((item) => {
       const uploadId = String(item.upload_id ?? "");
       const jobName = String(item.job_name ?? "");
-      return el("tr", { class: "hover:bg-gray-50/50" },
-        cell(el("span", { class: "font-mono text-xs", title: uploadId }, uploadId ? shortId(uploadId) : "-")),
+      const batchGeneration = item.batch_generation == null
+        ? null
+        : Number(item.batch_generation);
+      return el("tr", { class: "data-row" },
+        cell(uploadId ? el("a", {
+          class: "table-link font-mono text-xs",
+          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          title: uploadId,
+          "aria-label": `Open run ${uploadId}`,
+        }, shortId(uploadId)) : "-"),
         cell(pill(statusLabel(item.upload_status), statusClass(item.upload_status))),
         cell(pill(batchLabel(item.batch_status), batchClass(item.batch_status))),
         cell(pill(String(item.live_state ?? "-") || "-", batchClass(item.live_state))),
         cell(el("span", { class: "font-mono text-xs", title: jobName }, jobName || "-")),
-        cell(shortDate(item.updated_at), "whitespace-nowrap text-gray-400"),
-        cell(el("div", { class: "flex gap-1.5" },
-          actionBtn("Get Status", "status", jobName),
-          actionBtn("Cancel", "cancel", jobName, "text-amber-700 border-amber-300 hover:bg-amber-50"),
-          actionBtn("Delete", "delete", jobName, "text-red-700 border-red-300 hover:bg-red-50"),
+        cell(shortDate(item.updated_at), "whitespace-nowrap text-slate-400"),
+        cell(el("div", { class: "action-group operations-actions" },
+          actionBtn("Get Status", "status", uploadId, jobName, batchGeneration),
+          actionBtn("Cancel", "cancel", uploadId, jobName, batchGeneration, "btn-warning"),
+          actionBtn("Delete", "delete", uploadId, jobName, batchGeneration, "btn-danger"),
         )),
       );
     }));
   }
 
   async function refresh() {
+    const currentGeneration = ++generation;
+    controller?.abort();
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    const request = startRequest("/batch/jobs?limit=300");
+    controller = request.controller;
     try {
-      const data = await api("/batch/jobs?limit=300");
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== generation) return;
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.jobs) ? data.jobs : []);
     } catch (e) {
+      if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
       errorArea.replaceChildren(errorCard(e.message));
+    } finally {
+      if (isMounted() && currentGeneration === generation) {
+        controller = null;
+        timer = setTimeout(() => {
+          timer = null;
+          refresh();
+        }, REFRESH_MS);
+      }
     }
   }
 
@@ -274,18 +403,13 @@ function batchManagerCard() {
     onclick: refresh,
   }, "Refresh");
 
-  const card = el("div", { class: "panel" },
-    el("div", { class: "flex items-center justify-between" },
-      el("div", {},
-        el("h2", { class: "section-title" }, "Batch Manager"),
-        el("p", { class: "mt-1 section-copy" }, "Gemini batch jobs for full-pipeline uploads."),
-      ),
-      refreshBtn,
-    ),
-    errorArea,
-    el("div", { class: "table-shell mt-4" },
+  const card = el("section", { class: "detail-section operations-section" },
+    sectionHeading("Batch Manager", "Gemini batch jobs for full-pipeline uploads.", refreshBtn),
+    el("div", { class: "detail-section-body" },
+      errorArea,
+      el("div", { class: "table-shell" },
       el("div", { class: "table-scroll" },
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table operations-table" },
         el("thead", {},
           el("tr", {},
             head("Upload ID"), head("Upload Status"), head("Batch Status"),
@@ -297,86 +421,123 @@ function batchManagerCard() {
       ),
       empty,
     ),
-    note,
+      note,
+    ),
   );
 
+  registerCleanup(() => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+    buttonsByJob.clear();
+    busyJobs.clear();
+  });
   return { card, refresh };
 }
 
 // ---- Retry Operations ---------------------------------------------------------
-function retryCard(registerCleanup) {
-  const meta = el("p", { class: "mt-4 text-sm text-gray-500" }, "Ready to trigger manual retry.");
-  const setMeta = (msg, tone = "text-gray-500") => {
+function retryCard(lifecycle) {
+  const { isMounted, registerCleanup, startRequest } = lifecycle;
+  const meta = el("p", { class: "message message--muted", "aria-live": "polite" },
+    "Ready to trigger manual retry.");
+  const setMeta = (msg, tone = "muted") => {
     meta.textContent = msg;
-    meta.className = `mt-4 text-sm ${tone}`;
+    meta.className = `message message--${tone}`;
   };
 
   const input = el("input", {
     class: inputCls, type: "text",
+    id: "retry-upload-id",
     placeholder: "e.g. fb2884b0-f38c-4776-bf7f-582028f59522",
   });
 
   let stopPoll = null;
-  registerCleanup(() => { if (stopPoll) stopPoll(); });
+  let postController = null;
+  let postGeneration = 0;
+  registerCleanup(() => {
+    postGeneration += 1;
+    postController?.abort();
+    postController = null;
+    if (stopPoll) stopPoll();
+    stopPoll = null;
+  });
 
   const btn = el("button", { class: "btn-primary disabled:opacity-50" }, "Retry Failed Rows");
 
   btn.addEventListener("click", async () => {
     const uid = input.value.trim();
     if (!uid) {
-      setMeta("Error: Upload ID is required.", "text-red-600");
+      setMeta("Error: Upload ID is required.", "danger");
       return;
     }
+    if (stopPoll) stopPoll();
+    stopPoll = null;
+    const currentGeneration = ++postGeneration;
     btn.disabled = true;
-    setMeta(`Triggering retry for ${uid}…`, "text-indigo-600");
+    setMeta(`Triggering retry for ${uid}…`, "info");
     try {
-      const data = await api(`/uploads/${encodeURIComponent(uid)}/retry-failed-rows`, { method: "POST" });
-      setMeta(`Success! Enqueued ${data.enqueued_rows ?? 0} failed rows for processing.`, "text-emerald-600");
+      const request = startRequest(`/uploads/${encodeURIComponent(uid)}/retry-failed-rows`, { method: "POST" });
+      postController = request.controller;
+      const data = await request.promise;
+      if (!isMounted() || currentGeneration !== postGeneration) return;
+      setMeta(`Success! Enqueued ${data.enqueued_rows ?? 0} failed rows for processing.`, "good");
       // Legacy polled /uploads/{id}/status after the retry; keep that, shown inline.
-      if (stopPoll) stopPoll();
       stopPoll = pollStatus(`/uploads/${encodeURIComponent(uid)}/status`, (status) => {
+        if (!isMounted() || currentGeneration !== postGeneration) return;
         const batch = status.gemini_batch?.status ?? "not_started";
         setMeta(
           `Upload ${uid} — status: ${status.status ?? "-"} | rows: ${status.processed_rows ?? 0}/${status.total_rows ?? 0}` +
           ` (ok ${status.success_rows ?? 0}, failed ${status.failed_rows ?? 0}) | batch: ${batch}`,
-          "text-gray-600",
+          "muted",
         );
-      });
+      }, 2000, uploadIsTerminal);
     } catch (e) {
-      setMeta(`Failed: ${e.message}`, "text-red-600");
+      if (!isMounted() || currentGeneration !== postGeneration || isAbortError(e)) return;
+      setMeta(`Failed: ${e.message}`, "danger");
     } finally {
-      btn.disabled = false;
+      if (isMounted() && currentGeneration === postGeneration) {
+        postController = null;
+        btn.disabled = false;
+      }
     }
   });
 
-  return el("div", { class: "panel" },
-    el("h2", { class: "section-title" }, "Retry Operations"),
-    el("p", { class: "mt-1 section-copy" },
-      "Manually retry all failed, queued, or stuck processing rows for a specific upload ID instantly."),
-    el("div", { class: "mt-4 flex max-w-xl flex-col gap-3" },
-      el("label", { class: "view-kicker" }, "Upload ID *"),
+  return el("section", { class: "detail-section operations-section" },
+    sectionHeading(
+      "Retry Operations",
+      "Manually retry all failed, queued, or stuck processing rows for a specific upload ID instantly.",
+    ),
+    el("div", { class: "detail-section-body retry-control-group" },
+      el("label", { class: "filter-label", for: "retry-upload-id" }, "Upload ID *"),
       input,
       btn,
+      meta,
     ),
-    meta,
   );
 }
 
 // ---- view ---------------------------------------------------------------------
-export async function render(root) {
-  const cleanups = [];
-  const registerCleanup = (fn) => cleanups.push(fn);
-
-  const history = uploadHistoryCard(registerCleanup);
-  const batch = batchManagerCard();
+export function render(root) {
+  const lifecycle = createLifecycle();
+  const history = uploadHistoryCard(lifecycle);
+  const batch = batchManagerCard(lifecycle);
   root.replaceChildren(
-    el("div", { class: "space-y-6" }, history.card, batch.card, retryCard(registerCleanup)),
+    el("div", { class: "operations-view" },
+      pageIntro(
+        "Operations",
+        "Run and batch ledger",
+        "Monitor upload history, manage Gemini batch jobs, and retry failed rows without leaving the console.",
+      ),
+      history.card,
+      batch.card,
+      retryCard(lifecycle),
+    ),
   );
 
-  await history.refresh();
-  await batch.refresh();
-  const timer = setInterval(batch.refresh, REFRESH_MS);
-  registerCleanup(() => clearInterval(timer));
+  history.refresh();
+  batch.refresh();
 
-  return () => cleanups.forEach((fn) => fn());
+  return lifecycle.cleanup;
 }

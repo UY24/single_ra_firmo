@@ -67,7 +67,7 @@ const buttonCls = "btn-primary disabled:opacity-50 disabled:cursor-not-allowed";
 const secondaryButtonCls = "btn-secondary disabled:opacity-50 disabled:cursor-not-allowed";
 
 function redCallout(text) {
-  return el("div", { class: "callout callout-red" },
+  return el("div", { class: "callout callout-red", role: "alert" },
     el("p", { class: "text-sm whitespace-pre-wrap" }, text));
 }
 
@@ -77,8 +77,8 @@ function amberCallout(lines) {
 }
 
 function stepCard(n, title, body) {
-  const card = el("div", { class: "panel step-card" },
-    el("div", { class: "mb-4 flex items-center gap-3" },
+  const card = el("div", { class: "panel workflow-step" },
+    el("div", { class: "step-rail mb-4 flex items-center gap-3" },
       el("span", { class: "step-number" }, String(n)),
       el("h2", { class: "section-title" }, title),
     ),
@@ -86,6 +86,11 @@ function stepCard(n, title, body) {
   );
   card.setEnabled = (enabled) => {
     card.setAttribute("aria-disabled", String(!enabled));
+    card.inert = !enabled;
+  };
+  card.setCurrent = (current) => {
+    if (current) card.setAttribute("aria-current", "step");
+    else card.removeAttribute("aria-current");
   };
   return card;
 }
@@ -105,22 +110,22 @@ function csvSchemaPanel(pipeline) {
     col.name,
     col.req
       ? el("span", { class: "ml-0.5 text-amber-400 font-bold leading-none" }, "*")
-      : el("span", { class: "ml-0.5 text-slate-500 text-[10px] leading-none" }, "opt"),
+      : el("span", { class: "ml-0.5 text-slate-400 text-[10px] leading-none" }, "opt"),
   );
-  return el("div", { class: "mb-4 rounded-lg border border-slate-700/50 bg-slate-800/40 p-3" },
-    el("p", { class: "mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500" },
+  return el("div", { class: "schema-panel mb-4" },
+    el("p", { class: "mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400" },
       `Expected CSV columns — ${pipeline.label}`),
     el("div", { class: "flex flex-col gap-2" },
       el("div", { class: "flex flex-wrap items-center gap-2" },
-        el("span", { class: "w-16 shrink-0 text-xs text-slate-500" }, "Required"),
+        el("span", { class: "w-16 shrink-0 text-xs text-slate-400" }, "Required"),
         ...req.map(chip),
       ),
       opt.length ? el("div", { class: "flex flex-wrap items-center gap-2" },
-        el("span", { class: "w-16 shrink-0 text-xs text-slate-500" }, "Optional"),
+        el("span", { class: "w-16 shrink-0 text-xs text-slate-400" }, "Optional"),
         ...opt.map(chip),
       ) : el("span"),
     ),
-    el("p", { class: "mt-2 text-xs text-slate-600" },
+    el("p", { class: "mt-2 text-xs text-slate-400" },
       "* required · hover any column to see accepted header aliases"),
   );
 }
@@ -155,12 +160,13 @@ function previewTables(preview) {
   const mapping = preview.columns_detected ?? {};
   if (Object.keys(mapping).length) {
     parts.push(tableShell(
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table preview-table" },
         el("thead", {},
           el("tr", {}, head("Field"), head("CSV header"))),
-        el("tbody", { class: "divide-y divide-gray-100" },
+        el("tbody", {},
           ...Object.entries(mapping).map(([field, header]) =>
-            el("tr", {}, cell(field, "font-semibold text-slate-50"), cell(header ?? "-"))),
+            el("tr", { class: "data-row" },
+              cell(field, "font-semibold text-slate-50"), cell(header ?? "-"))),
         ),
       ),
     ));
@@ -170,12 +176,12 @@ function previewTables(preview) {
   if (sample.length) {
     const sampleCols = preview.sample_columns ?? SAMPLE_COLS;
     parts.push(tableShell(
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table preview-table" },
         el("thead", {},
           el("tr", {}, ...sampleCols.map((c) => head(c)))),
-        el("tbody", { class: "divide-y divide-gray-100" },
+        el("tbody", {},
           ...sample.map((row) =>
-            el("tr", {}, ...sampleCols.map((c) =>
+            el("tr", { class: "data-row" }, ...sampleCols.map((c) =>
               cell(row[c] == null || row[c] === "" ? "-" : String(row[c]))))),
         ),
       ),
@@ -185,16 +191,24 @@ function previewTables(preview) {
 }
 
 function summaryItem(label, valueNode) {
-  return el("div", { class: "panel-muted p-3" },
+  return el("div", { class: "launch-row" },
     el("dt", { class: "view-kicker" }, label),
     valueNode,
   );
 }
 
+export function previewCanLaunch(preview, pipeline) {
+  if (!preview || !pipeline) return false;
+  return pipeline.key === "relationship"
+    ? Number(preview.unique_pairs ?? 0) > 0
+    : Number(preview.total_rows ?? 0) > 0;
+}
+
 export async function render(root) {
   const state = { companyId: "", companyName: "", pipeline: null, phase: "all", file: null, preview: null };
+  let previewGeneration = 0;
 
-  const companySelect = el("select", { class: `${inputCls} w-full` });
+  const companySelect = el("select", { id: "new-run-company", class: `${inputCls} w-full` });
   const companyArea = el("div", {}, el("p", { class: "section-copy" }, "Loading companies..."));
 
   async function loadCompanies(selectId) {
@@ -216,14 +230,18 @@ export async function render(root) {
 
   function onCompanyChange() {
     state.companyId = companySelect.value;
-    state.companyName = companySelect.selectedOptions[0]?.textContent ?? "";
+    state.companyName = state.companyId
+      ? companySelect.selectedOptions[0]?.textContent ?? ""
+      : "";
     refresh();
   }
   companySelect.addEventListener("change", onCompanyChange);
 
-  const newCompanyMsg = el("p", { class: "mt-2 hidden text-sm" });
+  const newCompanyMsg = el("p", {
+    class: "new-company-message mt-2 text-sm", "aria-live": "polite",
+  });
   const newCompanyInput = el("input", {
-    type: "text", placeholder: "New company name", class: `${inputCls} w-full`,
+    id: "new-company-name", type: "text", placeholder: "New company name", class: `${inputCls} w-full`,
   });
   const newCompanyBtn = el("button", { type: "submit", class: buttonCls }, "Create");
   const newCompanyForm = el("form", {
@@ -241,16 +259,17 @@ export async function render(root) {
         });
         newCompanyInput.value = "";
         newCompanyMsg.textContent = `Created "${company.name ?? name}".`;
-        newCompanyMsg.className = "mt-2 text-sm text-emerald-600";
+        newCompanyMsg.className = "new-company-message mt-2 text-sm text-emerald-600";
         await loadCompanies(company.id);
       } catch (e) {
         newCompanyMsg.textContent = e.message;
-        newCompanyMsg.className = "mt-2 text-sm text-red-600";
+        newCompanyMsg.className = "new-company-message mt-2 text-sm text-red-600";
       } finally {
         newCompanyBtn.disabled = false;
       }
     },
   },
+    el("label", { class: "filter-label mb-1.5 block", for: "new-company-name" }, "Company name"),
     el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_auto]" },
       newCompanyInput, newCompanyBtn),
     newCompanyMsg,
@@ -258,8 +277,9 @@ export async function render(root) {
 
   const step1 = stepCard(1, "Company",
     el("div", {},
+      el("label", { class: "filter-label mb-1.5 block", for: "new-run-company" }, "Company"),
       companyArea,
-      el("p", { class: "mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500" },
+      el("p", { class: "mt-4 text-xs font-semibold uppercase tracking-wide text-slate-400" },
         "Or create a new one"),
       newCompanyForm,
     ),
@@ -268,9 +288,15 @@ export async function render(root) {
   const pipelineCards = PIPELINES.map((p) => {
     const radio = el("input", {
       type: "radio", name: "pipeline", value: p.key, class: "mt-1 accent-amber-500",
-      onchange: () => { state.pipeline = p; refresh(); },
+      onchange: async () => {
+        if (!state.companyId) return;
+        state.pipeline = p;
+        invalidatePreview();
+        refresh();
+        if (state.file) await previewFile();
+      },
     });
-    return el("label", { class: "pipeline-card flex items-start gap-3" },
+    return el("label", { class: "pipeline-option flex items-start gap-3" },
       radio,
       el("span", {},
         el("span", { class: "block text-sm font-semibold text-slate-50" }, p.label),
@@ -279,15 +305,15 @@ export async function render(root) {
     );
   });
 
-  const phaseSelect = el("select", { class: `${inputCls} w-full` },
+  const phaseSelect = el("select", { id: "new-run-phase", class: `${inputCls} w-full` },
     ...PHASES.map((p) => el("option", { value: p.value }, p.label)));
   phaseSelect.addEventListener("change", () => {
     state.phase = phaseSelect.value;
     refresh();
   });
 
-  const phaseRow = el("div", { class: "hidden mt-4 border-t border-gray-100 pt-4" },
-    el("label", { class: "mb-1.5 block view-kicker" }, "Search phase"),
+  const phaseRow = el("div", { class: "phase-field divider-top hidden mt-4 pt-4" },
+    el("label", { class: "mb-1.5 block view-kicker", for: "new-run-phase" }, "Search phase"),
     phaseSelect,
     el("p", { class: "mt-2 text-xs text-slate-400" },
       "Only applies to Google Search uploads."),
@@ -300,40 +326,70 @@ export async function render(root) {
     ));
 
   const schemaArea = el("div");
-  const previewArea = el("div", { class: "mt-4" });
+  const previewArea = el("div", { class: "mt-4", "aria-live": "polite" });
+
+  function invalidatePreview() {
+    previewGeneration += 1;
+    state.preview = null;
+    previewArea.replaceChildren();
+  }
+
+  async function previewFile() {
+    const generation = previewGeneration;
+    const file = state.file;
+    const pipeline = state.pipeline;
+    if (!state.companyId || !file || !pipeline) return;
+
+    const pipelineKey = pipeline.key;
+    previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
+    // Relationship CSVs have their own header shape (Company_Name_Y /
+    // Company_Name_X / Input_URL), so they get their own dry-run preview
+    // endpoint; everything else uses the shared /uploads/preview.
+    const previewEndpoint = (!pipeline.ai && pipelineKey === "relationship")
+      ? "/uploads/relationship/preview" : "/uploads/preview";
+    const requestIsCurrent = () => generation === previewGeneration
+      && state.file === file
+      && state.pipeline?.key === pipelineKey;
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const preview = await api(previewEndpoint, { method: "POST", body: fd });
+      if (!requestIsCurrent()) return;
+      state.preview = preview;
+      previewArea.replaceChildren(previewTables(preview));
+    } catch (e) {
+      if (!requestIsCurrent()) return;
+      previewArea.replaceChildren(redCallout(e.message));
+    }
+    if (requestIsCurrent()) refresh();
+  }
+
   const fileInput = el("input", {
-    type: "file", accept: ".csv",
-    class: "block w-full text-sm text-slate-300",
+    id: "new-run-csv", type: "file", accept: ".csv",
+    class: "file-input block w-full text-sm text-slate-300",
     onchange: async () => {
+      if (!state.companyId || !state.pipeline) return;
       state.file = fileInput.files[0] ?? null;
-      state.preview = null;
+      invalidatePreview();
       refresh();
-      if (!state.file) { previewArea.replaceChildren(); return; }
-      previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
-      const p = state.pipeline;
-      // relationship CSVs have their own header shape (Company_Name_Y /
-      // Company_Name_X / Input_URL), so they get their own dry-run preview
-      // endpoint; everything else uses the shared /uploads/preview.
-      const previewEndpoint = (p && !p.ai && p.key === "relationship")
-        ? "/uploads/relationship/preview" : "/uploads/preview";
-      try {
-        const fd = new FormData();
-        fd.append("file", state.file);
-        state.preview = await api(previewEndpoint, { method: "POST", body: fd });
-        previewArea.replaceChildren(previewTables(state.preview));
-      } catch (e) {
-        previewArea.replaceChildren(redCallout(e.message));
-      }
-      refresh();
+      if (state.file) await previewFile();
     },
   });
-  const step3 = stepCard(3, "File and preview", el("div", {}, schemaArea, fileInput, previewArea));
+  const step3 = stepCard(3, "File and preview", el("div", {}, schemaArea,
+    el("div", { class: "file-field" },
+      el("label", { class: "file-field-label", for: "new-run-csv" }, "CSV input"),
+      fileInput,
+    ),
+    previewArea,
+  ));
 
   const summary = el("p", { class: "section-copy" }, "-");
-  const startMsg = el("div", { class: "mt-3 hidden" });
+  const startMsg = el("div", { class: "mt-3 hidden", "aria-live": "polite" });
   const startBtn = el("button", { class: buttonCls, disabled: "" }, "Start run");
   startBtn.addEventListener("click", async () => {
-    if (!state.companyId || !state.pipeline || !state.file || !state.preview) return;
+    if (!state.companyId || !state.pipeline || !state.file
+        || !previewCanLaunch(state.preview, state.pipeline)) return;
     startBtn.disabled = true;
     startMsg.className = "mt-3";
     startMsg.replaceChildren(el("p", { class: "section-copy" }, "Starting..."));
@@ -367,10 +423,10 @@ export async function render(root) {
   const summaryRows = el("dd", { class: "mt-1 text-sm font-semibold text-slate-50" }, "-");
   const readiness = el("p", { class: "mt-4 text-sm text-slate-400" },
     "Complete the workflow to enable launch.");
-  const summaryPanel = el("aside", { class: "summary-panel panel" },
+  const summaryPanel = el("aside", { class: "launch-summary panel" },
     el("p", { class: "view-kicker" }, "Run setup"),
     el("h2", { class: "mt-1 text-base font-semibold text-slate-50" }, "Launch summary"),
-    el("dl", { class: "mt-4 grid grid-cols-1 gap-3" },
+    el("dl", { class: "launch-list mt-4" },
       summaryItem("Company", summaryCompany),
       summaryItem("Pipeline", summaryPipeline),
       summaryItem("Phase", summaryPhase),
@@ -389,16 +445,26 @@ export async function render(root) {
   function refresh() {
     const hasCompany = Boolean(state.companyId);
     const hasPipeline = Boolean(state.pipeline);
-    const hasPreview = Boolean(state.preview);
+    const canLaunch = hasCompany && hasPipeline && Boolean(state.file)
+      && previewCanLaunch(state.preview, state.pipeline);
+    step1.setEnabled(true);
     step2.setEnabled(hasCompany);
     step3.setEnabled(hasCompany && hasPipeline);
-    step4.setEnabled(hasCompany && hasPipeline && hasPreview);
-    startBtn.disabled = !(hasCompany && hasPipeline && hasPreview);
+    step4.setEnabled(canLaunch);
+    const currentStep = !hasCompany
+      ? step1
+      : !hasPipeline
+        ? step2
+        : !canLaunch
+          ? step3
+          : step4;
+    [step1, step2, step3, step4].forEach((step) => step.setCurrent(step === currentStep));
+    startBtn.disabled = !canLaunch;
     phaseRow.classList.toggle("hidden", state.pipeline?.key !== "gsearch");
     schemaArea.replaceChildren(csvSchemaPanel(state.pipeline));
     const phaseInfo = state.pipeline?.key === "gsearch" && state.phase && state.phase !== "all"
       ? ` - ${PHASES.find((p) => p.value === state.phase)?.label ?? state.phase}` : "";
-    summary.textContent = hasCompany && hasPipeline && hasPreview
+    summary.textContent = canLaunch
       ? `${state.companyName} / ${state.pipeline.label}${phaseInfo} / ${fmtNum(state.preview.total_rows)} rows`
       : "Complete the steps above to start.";
     summaryCompany.textContent = state.companyName || "-";
@@ -408,10 +474,10 @@ export async function render(root) {
       : "Default";
     summaryFile.textContent = state.file?.name || "-";
     summaryRows.textContent = state.preview ? fmtNum(state.preview.total_rows) : "-";
-    readiness.textContent = hasCompany && hasPipeline && hasPreview
+    readiness.textContent = canLaunch
       ? "Ready to launch. Review the preview before starting."
       : "Complete the workflow to enable launch.";
-    readiness.className = hasCompany && hasPipeline && hasPreview
+    readiness.className = canLaunch
       ? "mt-4 text-sm font-semibold text-amber-700"
       : "mt-4 text-sm text-slate-400";
   }

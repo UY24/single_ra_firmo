@@ -1,12 +1,17 @@
 // backend/app/static/js/companies.js — create company + companies table with stats.
 import { api, el, fmtUsd, fmtNum } from "./api.js";
-import { errorCard, loadingCard, head, cell, shortDate } from "./ui.js";
+import { cell, emptyState, errorCard, head, loadingCard, pageIntro, shortDate } from "./ui.js";
 
 function createForm(onCreated) {
-  const message = el("p", { class: "mt-2 hidden text-sm" });
+  const message = el("p", {
+    class: "form-message hidden",
+    "aria-live": "polite",
+  });
   const input = el("input", {
+    id: "company-name",
     type: "text",
-    placeholder: "Company name",
+    placeholder: "e.g. Acme Industries",
+    autocomplete: "organization",
     class: "control w-full px-3 py-2 text-sm",
   });
   const button = el("button", {
@@ -16,7 +21,9 @@ function createForm(onCreated) {
 
   function setMessage(text, ok) {
     message.textContent = text;
-    message.className = `mt-2 text-sm ${ok ? "text-green-700" : "text-red-600"}`;
+    message.className = `form-message ${ok ? "text-green-700" : "text-red-600"}`;
+    if (ok) message.removeAttribute("role");
+    else message.setAttribute("role", "alert");
   }
 
   const form = el("form", {
@@ -41,23 +48,27 @@ function createForm(onCreated) {
       }
     },
   },
-    el("div", { class: "grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_auto]" }, input, button),
+    el("div", { class: "create-company-fields" },
+      el("label", { for: "company-name", class: "filter-label" }, "Company name"),
+      input,
+      button,
+    ),
     message,
   );
 
-  return el("div", { class: "panel" },
-    el("h2", { class: "mb-3 section-title" }, "Create company"),
+  return el("section", { class: "create-company" },
+    el("h2", { class: "section-title" }, "Create company"),
     form,
   );
 }
 
 function companiesTable(companies) {
   const rows = companies.map((c) =>
-    el("tr", {
-      class: "cursor-pointer hover:bg-indigo-50/40",
-      onclick: () => { window.location.hash = `#/runs?company_id=${encodeURIComponent(c.id)}`; },
-    },
-      cell(c.name ?? "-", "font-semibold text-slate-50"),
+    el("tr", { class: "data-row" },
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs?company_id=${encodeURIComponent(c.id)}`,
+      }, c.name ?? "-"), "font-semibold text-slate-50"),
       cell(fmtNum(c.runs), "text-right"),
       cell(`${fmtNum(c.websites_found)} / ${fmtNum(c.websites_not_found)}`, "text-right"),
       cell(fmtUsd(c.total_cost_usd), "text-right"),
@@ -67,7 +78,7 @@ function companiesTable(companies) {
 
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll" },
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table" },
         el("thead", {},
           el("tr", {},
             head("Name"), head("Runs", "text-right"),
@@ -75,15 +86,24 @@ function companiesTable(companies) {
             head("Cost", "text-right"), head("Created"),
           ),
         ),
-        el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
+        el("tbody", {}, ...rows),
       ),
     ),
   );
 }
 
 export async function render(root) {
-  const listArea = el("div", { class: "mt-6" }, loadingCard());
-  root.replaceChildren(createForm(() => refresh()), listArea);
+  const listArea = el("div", { class: "company-directory" }, loadingCard());
+  const view = el("div", { class: "core-view" },
+    pageIntro(
+      "Directory",
+      "Companies",
+      "Create and review the company workspaces used to organize pipeline runs.",
+    ),
+    createForm(() => refresh()),
+    listArea,
+  );
+  root.replaceChildren(view);
 
   async function refresh() {
     listArea.replaceChildren(loadingCard());
@@ -97,10 +117,7 @@ export async function render(root) {
     const companies = stats.companies ?? [];
     if (companies.length === 0) {
       listArea.replaceChildren(
-        el("div", { class: "panel p-10 text-center" },
-          el("p", { class: "section-title" }, "No companies yet"),
-          el("p", { class: "mt-1 section-copy" }, "Add one above to get started."),
-        ),
+        emptyState("No companies yet", "Add a company above to get started."),
       );
       return;
     }

@@ -10,37 +10,74 @@ export function copyCell(text) {
   if (!text || text === "-" || text === "—") {
     return el("span", { class: "font-mono text-xs text-slate-500" }, "—");
   }
-  const span = el("span", {
-    class: "block max-w-[22rem] truncate font-mono text-xs text-slate-400 cursor-pointer hover:text-slate-200 transition-colors",
+  const button = el("button", {
+    type: "button",
+    class: "copy-control",
+    "aria-label": `Copy storage path: ${text}`,
     title: `${text}\n(click to copy)`,
   }, text);
-  span.addEventListener("click", (ev) => {
+  button.addEventListener("click", (ev) => {
     ev.stopPropagation();
     copyText(text);
-    span.classList.add("text-emerald-400");
-    span.classList.remove("text-slate-400", "text-slate-200");
+    button.classList.add("is-copied");
     setTimeout(() => {
-      span.classList.remove("text-emerald-400");
-      span.classList.add("text-slate-400");
+      button.classList.remove("is-copied");
     }, 1000);
   });
-  return span;
+  return button;
 }
 
 export function statusBadge(status) {
   return el("span", { class: "status-badge", "data-status": status ?? "" }, status ?? "—");
 }
 
+export function pageIntro(kicker, title, copy, action) {
+  const text = el("div", {},
+    el("p", { class: "view-kicker" }, kicker),
+    el("h2", { class: "page-heading" }, title),
+    ...(copy ? [el("p", { class: "page-copy" }, copy)] : []),
+  );
+  return el("div", { class: "page-intro" }, text, ...(action ? [action] : []));
+}
+
+export function sectionHeading(title, copy, action) {
+  return el("div", { class: "section-heading" },
+    el("div", {},
+      el("h2", { class: "section-title" }, title),
+      ...(copy ? [el("p", { class: "section-copy" }, copy)] : []),
+    ),
+    ...(action ? [action] : []),
+  );
+}
+
+export function metricItem(label, value, tone = "default", detail = "") {
+  const allowedTones = new Set(["default", "good", "muted", "warning", "danger", "info"]);
+  const safeTone = allowedTones.has(tone) ? tone : "default";
+  return el("div", { class: `metric-item metric-item--${safeTone}` },
+    el("dt", { class: "metric-label" }, label),
+    el("dd", { class: "metric-value" }, value),
+    ...(detail ? [el("dd", { class: "metric-detail" }, detail)] : []),
+  );
+}
+
+export function emptyState(title, copy, action) {
+  return el("div", { class: "empty-state" },
+    el("h2", { class: "section-title" }, title),
+    el("p", { class: "section-copy" }, copy),
+    ...(action ? [action] : []),
+  );
+}
+
 export function errorCard(message) {
   if (/supabase/i.test(message)) {
-    return el("div", { class: "callout callout-amber" },
+    return el("div", { class: "callout callout-amber", role: "alert" },
       el("p", { class: "text-sm font-semibold" }, "Supabase not configured / unreachable"),
       el("p", { class: "mt-1 text-sm" }, message),
       el("p", { class: "mt-3 text-xs opacity-80" },
         "In .env, SUPABASE_URL must be the bare REST URL (https://<project-ref>.supabase.co), not the :5432/postgres connection string. Then restart the server."),
     );
   }
-  return el("div", { class: "callout callout-red" },
+  return el("div", { class: "callout callout-red", role: "alert" },
     el("p", { class: "text-sm font-semibold" }, "Something went wrong"),
     el("p", { class: "mt-1 text-sm" }, message),
   );

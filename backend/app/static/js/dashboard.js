@@ -1,55 +1,79 @@
-// backend/app/static/js/dashboard.js — company cards + recent runs feed.
+// backend/app/static/js/dashboard.js — company summaries + recent runs ledger.
 import { api, el, fmtUsd, fmtNum } from "./api.js";
-import { errorCard, loadingCard, statusBadge, head, cell, shortDate } from "./ui.js";
+import {
+  cell,
+  emptyState,
+  errorCard,
+  head,
+  loadingCard,
+  metricItem,
+  pageIntro,
+  sectionHeading,
+  shortDate,
+  statusBadge,
+} from "./ui.js";
 
 const runCost = (r) => (r.cost && typeof r.cost === "object") ? r.cost.total_usd : r.cost;
 
-function statPair(label, value) {
-  return el("div", {},
-    el("dt", { class: "metric-label" }, label),
-    el("dd", { class: "mt-0.5 text-sm font-semibold text-slate-50" }, value),
-  );
+function numericOutcome(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function newRunAction() {
+  return el("a", { href: "#/new-run", class: "btn-primary" }, "New run");
 }
 
 function companyCard(c) {
-  return el("button", {
-    class: "panel text-left transition hover:border-cyan-400/60",
-    onclick: () => { window.location.hash = `#/runs?company_id=${encodeURIComponent(c.id)}`; },
+  const found = numericOutcome(c.websites_found);
+  const notFound = numericOutcome(c.websites_not_found);
+  const totalOutcomes = found + notFound;
+  const foundRate = totalOutcomes > 0
+    ? `${((found / totalOutcomes) * 100).toFixed(1)}%`
+    : "—";
+
+  return el("a", {
+    class: "company-summary",
+    href: `#/runs?company_id=${encodeURIComponent(c.id)}`,
   },
-    el("p", { class: "truncate text-sm font-semibold text-slate-50" }, c.name ?? "-"),
-    el("dl", { class: "mt-4 grid grid-cols-3 gap-x-4 gap-y-3" },
-      statPair("Runs", fmtNum(c.runs)),
-      statPair("Found", fmtNum(c.websites_found)),
-      statPair("Not found", fmtNum(c.websites_not_found)),
-      statPair("Success / failed", `${fmtNum(c.success_count)} / ${fmtNum(c.failed_count)}`),
-      statPair("Scrape.do searches", fmtNum(c.total_searches)),
-      statPair("Total rows", fmtNum(c.total_rows)),
-      statPair("Input tokens", fmtNum(c.total_input_tokens)),
-      statPair("Output tokens", fmtNum(c.total_output_tokens)),
-      statPair("LLM cost", fmtUsd(c.total_cost_usd)),
+    el("span", { class: "company-name" }, c.name ?? "—"),
+    el("span", { class: "company-outcome" },
+      el("span", { class: "company-outcome-value" }, `${fmtNum(found)} found`),
+      el("span", { class: "company-outcome-rate" }, `${foundRate} of resolved rows`),
+    ),
+    el("dl", { class: "metric-group company-metrics" },
+      metricItem("Runs", fmtNum(c.runs)),
+      metricItem("Not found", fmtNum(notFound), "muted"),
+      metricItem("Scrape.do searches", fmtNum(c.total_searches), "info"),
+      metricItem("Total rows", fmtNum(c.total_rows)),
+      metricItem("Input tokens", fmtNum(c.total_input_tokens), "muted"),
+      metricItem("Output tokens", fmtNum(c.total_output_tokens), "muted"),
+      metricItem("LLM cost", fmtUsd(c.total_cost_usd), "warning"),
     ),
   );
 }
 
 function recentRunsTable(runs, companiesById) {
-  const rows = runs.map((r) =>
-    el("tr", {
-      class: "cursor-pointer hover:bg-indigo-50/40",
-      onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(r.run_ref)}`; },
-    },
-      cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
+  const rows = runs.map((r) => {
+    const companyName = companiesById.get(r.company_id)?.name ?? "-";
+    return el("tr", { class: "data-row" },
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
+      }, companyName), "font-semibold text-slate-50"),
       cell(r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
       cell(fmtNum(r.websites_found), "text-right"),
       cell(fmtUsd(runCost(r)), "text-right"),
       cell(shortDate(r.created_at), "text-slate-400"),
-    ),
-  );
+    );
+  });
 
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll max-h-96 overflow-y-auto" },
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table" },
         el("thead", { class: "sticky-head" },
           el("tr", {},
             head("Company"), head("Pipeline"), head("Status"),
@@ -57,7 +81,7 @@ function recentRunsTable(runs, companiesById) {
             head("Cost", "text-right"), head("Created"),
           ),
         ),
-        el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
+        el("tbody", {}, ...rows),
       ),
     ),
   );
@@ -77,28 +101,41 @@ export async function render(root) {
   const companies = stats.companies ?? [];
   const runs = (runsResp.runs ?? []).slice(0, 20);
   const companiesById = new Map(companies.map((c) => [c.id, c]));
+  const intro = pageIntro(
+    "Overview",
+    "Company outcomes",
+    "Track discovery coverage, operating volume, and recent pipeline activity.",
+    newRunAction(),
+  );
 
   if (companies.length === 0) {
     root.replaceChildren(
-      el("div", { class: "panel p-10 text-center" },
-        el("p", { class: "section-title" }, "No companies yet"),
-        el("p", { class: "mt-1 section-copy" }, "Create your first company to start running pipelines."),
-        el("a", {
-          href: "#/companies",
-          class: "btn-primary mt-4",
-        }, "Go to Companies"),
+      el("div", { class: "core-view" },
+        intro,
+        emptyState(
+          "No companies yet",
+          "Create your first company before starting a pipeline run.",
+          el("a", { href: "#/companies", class: "btn-primary" }, "Go to Companies"),
+        ),
       ),
     );
     return;
   }
 
   root.replaceChildren(
-    el("div", { class: "grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3" },
-      ...companies.map(companyCard)),
-    el("h2", { class: "mt-8 mb-3 section-title" }, "Recent runs"),
-    runs.length === 0
-      ? el("div", { class: "panel panel-tight" },
-          el("p", { class: "section-copy" }, "No runs yet."))
-      : recentRunsTable(runs, companiesById),
+    el("div", { class: "core-view" },
+      intro,
+      el("div", { class: "company-summary-grid" }, ...companies.map(companyCard)),
+      el("section", { class: "core-section" },
+        sectionHeading("Recent runs", "The latest pipeline executions across every company."),
+        runs.length === 0
+          ? emptyState(
+              "No runs yet",
+              "Start a run to populate the execution ledger.",
+              newRunAction(),
+            )
+          : recentRunsTable(runs, companiesById),
+      ),
+    ),
   );
 }

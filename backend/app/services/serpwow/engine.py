@@ -210,6 +210,7 @@ gemini_batch_reconciler_stop: Optional[asyncio.Event] = None
 upload_active_rows: dict[str, set[int]] = {}
 upload_active_rows_lock = asyncio.Lock()
 upload_summaries_cache: dict[str, dict[str, Any]] = {}
+_s3_run_prefix_cache: dict[str, str] = {}
 gemini_batch_list_cache: list[dict[str, Any]] = []
 gemini_batch_list_cache_fetched_at: float = 0.0
 gemini_batch_list_error_cooldown_until: float = 0.0
@@ -321,7 +322,22 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     if not _batch_postprocess_enabled_for(pipe):
         return False
     gb = state.get("gemini_batch")
-    return isinstance(gb, dict) and gb.get("status") in {"waiting_for_rows", "queued", "running"}
+    return isinstance(gb, dict) and gb.get("status") in {
+        "waiting_for_rows", "queued", "running", "cancel_requested",
+    }
+
+
+def _batch_deleted_by_user(state: dict[str, Any]) -> bool:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    return bool(state.get("batch_deleted_by_user_at") or batch.get("deleted_by_user_at"))
+
+
+def _batch_generation(state: dict[str, Any]) -> int:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    try:
+        return max(0, int(batch.get("generation") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 
@@ -430,20 +446,56 @@ def _upload_s3_prefix(upload_id: str, company_name: str = "", pipeline: str = ""
     return upload_id
 
 
+def _remember_s3_run_prefix(upload_id: str, prefix: str) -> None:
+    value = str(prefix or "").strip()
+    if not value or "\n" in value or "\r" in value:
+        return
+    _s3_run_prefix_cache[upload_id] = value
+    try:
+        (_find_upload_dir(upload_id) / ".s3_prefix").write_text(
+            value, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _restore_s3_run_prefix(upload_id: str) -> Optional[str]:
+    cached = str(_s3_run_prefix_cache.get(upload_id) or "").strip()
+    if cached and "\n" not in cached and "\r" not in cached:
+        return cached
+    try:
+        restored = (_find_upload_dir(upload_id) / ".s3_prefix").read_text(
+            encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not restored or "\n" in restored or "\r" in restored:
+        return None
+    _s3_run_prefix_cache[upload_id] = restored
+    return restored
+
+
+def _resolved_upload_s3_prefix(
+    upload_id: str,
+    company_name: str = "",
+    pipeline: str = "",
+) -> str:
+    return _restore_s3_run_prefix(upload_id) or _upload_s3_prefix(
+        upload_id, company_name, pipeline)
+
+
 def _state_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/state.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/state.json"
 
 
 def _output_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/output.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/output.json"
 
 
 def _batch_input_jsonl_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_input.jsonl"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_input.jsonl"
 
 
 def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: str = "") -> str:
-    return f"{_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_output.json"
+    return f"{_resolved_upload_s3_prefix(upload_id, company_name, pipeline)}/gemini_batch_output.json"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
@@ -794,6 +846,7 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
+        _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
 
         async def _write_s3_background():
             max_retries = 5
@@ -820,6 +873,24 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         try:
             data = json.loads(local_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                if name == "state" and os.getenv("S3_BUCKET"):
+                    run_prefix = _restore_s3_run_prefix(upload_id)
+                    if run_prefix is None:
+                        try:
+                            state_key = await asyncio.to_thread(
+                                _find_s3_upload_key_sync,
+                                upload_id,
+                                "state.json",
+                            )
+                        except Exception:
+                            state_key = None
+                        if state_key:
+                            _remember_s3_run_prefix(
+                                upload_id, state_key.rsplit("/", 1)[0])
+                if name == "state":
+                    tombstone = await _read_batch_deletion_tombstone(upload_id, data)
+                    if tombstone:
+                        _apply_batch_deletion_tombstone(data, tombstone)
                 return data
         except Exception:
             pass
@@ -832,6 +903,11 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         if key is None:
             raise FileNotFoundError(f"upload {upload_id!r} not found in S3")
         data = await asyncio.to_thread(_read_json_from_s3_sync, key)
+        _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
+        if name == "state":
+            tombstone = await _read_batch_deletion_tombstone(upload_id, data)
+            if tombstone:
+                _apply_batch_deletion_tombstone(data, tombstone)
         # Cache it locally so subsequent reads are instant
         try:
             _write_json(local_path, data)
@@ -840,6 +916,223 @@ async def read_upload_artifact(upload_id: str, name: str) -> dict[str, Any]:
         return data
 
     raise FileNotFoundError(str(local_path))
+
+
+def _batch_deletion_tombstone_path(upload_id: str) -> Path:
+    return _find_upload_dir(upload_id) / ".batch_deleted_by_user.json"
+
+
+def _batch_deletion_tombstone_s3_key(upload_id: str, state: dict[str, Any]) -> str:
+    prefix = _resolved_upload_s3_prefix(
+        upload_id,
+        str(state.get("company_name") or ""),
+        str(state.get("pipeline") or PIPELINE_FULL),
+    )
+    return f"{prefix}/batch_deleted_by_user.json"
+
+
+def _batch_deletion_tombstone_version(marker: dict[str, Any]) -> tuple[int, float, str, int]:
+    """Return a sortable version for reconciling local and shared markers."""
+    try:
+        generation = max(0, int(marker.get("generation") or 0))
+    except (TypeError, ValueError):
+        generation = 0
+    event_at = str(
+        marker.get("cleared_at") or marker.get("deleted_by_user_at") or ""
+    ).strip()
+    parsed_at = _parse_iso_datetime(event_at)
+    if parsed_at is not None:
+        if parsed_at.tzinfo is None:
+            parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+        timestamp = parsed_at.timestamp()
+    else:
+        timestamp = 0.0
+    # A clear marker wins an exact tie so a retry cannot be reverted by a
+    # duplicate deletion marker written for the same generation and instant.
+    return generation, timestamp, event_at, int(bool(marker.get("cleared_at")))
+
+
+async def _read_batch_deletion_tombstone(
+    upload_id: str,
+    state: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_data: Optional[dict[str, Any]] = None
+    if local_path.exists():
+        try:
+            data = json.loads(local_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and (
+                data.get("deleted_by_user_at") or data.get("cleared_at")
+            ):
+                local_data = data
+        except Exception:
+            pass
+    if not os.getenv("S3_BUCKET") or not isinstance(state, dict):
+        return local_data
+    key = _batch_deletion_tombstone_s3_key(upload_id, state)
+    try:
+        data = await asyncio.to_thread(_read_json_from_s3_sync, key)
+    except Exception:
+        return local_data
+    if not isinstance(data, dict) or not (
+        data.get("deleted_by_user_at") or data.get("cleared_at")
+    ):
+        return local_data
+    selected = max(
+        (marker for marker in (local_data, data) if isinstance(marker, dict)),
+        key=_batch_deletion_tombstone_version,
+    )
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(local_path, selected)
+    except Exception:
+        pass
+    return selected
+
+
+def _apply_batch_deletion_tombstone(
+    state: dict[str, Any],
+    tombstone: dict[str, Any],
+) -> None:
+    batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    state_generation = _batch_generation(state)
+    try:
+        artifact_generation = max(0, int(tombstone.get("generation") or 0))
+    except (TypeError, ValueError):
+        artifact_generation = 0
+    if artifact_generation < state_generation:
+        return
+    batch["generation"] = max(state_generation, artifact_generation)
+    state["gemini_batch"] = batch
+    if tombstone.get("cleared_at"):
+        if state_generation < artifact_generation:
+            batch = {
+                "status": "waiting_for_rows",
+                "generation": artifact_generation,
+                "queued_at": None,
+                "job_name": None,
+                "error": None,
+            }
+            state["gemini_batch"] = batch
+        state.pop("batch_deleted_by_user_at", None)
+        state.pop("batch_deleted_job_names", None)
+        batch.pop("deleted_by_user_at", None)
+        batch.pop("deleted_jobs_by_user_at", None)
+        return
+    deleted_at = str(tombstone.get("deleted_by_user_at") or "").strip()
+    if not deleted_at:
+        return
+    deleted_jobs = {
+        str(job_name).strip()
+        for job_name in (tombstone.get("job_names") or [])
+        if str(job_name).strip()
+    }
+    deletion_error = "Remote batch deleted by user"
+    top_level_deleted = bool(tombstone.get("top_level_deleted"))
+    if str(batch.get("job_name") or "").strip() in deleted_jobs:
+        batch.pop("job_name", None)
+    chunks = batch.get("chunks") if isinstance(batch.get("chunks"), list) else []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if str(chunk.get("job_name") or "").strip() not in deleted_jobs:
+            continue
+        chunk.pop("job_name", None)
+        chunk["status"] = "failed"
+        chunk["error"] = deletion_error
+    state["batch_deleted_job_names"] = sorted(deleted_jobs)
+    if top_level_deleted:
+        batch["status"] = "failed"
+        batch["completed_at"] = deleted_at
+        batch["deleted_by_user_at"] = deleted_at
+        batch["error"] = deletion_error
+        state["batch_deleted_by_user_at"] = deleted_at
+    else:
+        batch["status"] = _aggregate_batch_chunk_status(chunks)
+        batch["deleted_jobs_by_user_at"] = deleted_at
+        if batch["status"] in {"waiting_for_rows", "queued", "running", "cancel_requested"}:
+            batch.pop("completed_at", None)
+            batch["error"] = None
+    state["gemini_batch"] = batch
+
+
+def _aggregate_batch_chunk_status(chunks: list[Any]) -> str:
+    statuses = [
+        str(chunk.get("status") or "")
+        for chunk in chunks
+        if isinstance(chunk, dict)
+    ]
+    if not statuses or any(status in {
+        "waiting_for_rows", "queued", "running", "cancel_requested", "",
+    } for status in statuses):
+        return "running"
+    if all(status == "succeeded" for status in statuses):
+        return "succeeded"
+    if all(status in {"failed", "cancelled", "skipped"} for status in statuses):
+        return "failed"
+    return "completed_with_errors"
+
+
+async def _write_batch_deletion_tombstone(
+    upload_id: str,
+    state: dict[str, Any],
+    job_name: str,
+    deleted_at: str,
+    *,
+    top_level_deleted: bool,
+) -> dict[str, Any]:
+    existing = await _read_batch_deletion_tombstone(upload_id, state) or {}
+    if existing.get("cleared_at"):
+        existing = {}
+    job_names = {
+        str(value).strip()
+        for value in (existing.get("job_names") or [])
+        if str(value).strip()
+    }
+    job_names.add(job_name)
+    tombstone = {
+        "upload_id": upload_id,
+        "deleted_by_user_at": str(existing.get("deleted_by_user_at") or deleted_at),
+        "job_names": sorted(job_names),
+        "top_level_deleted": bool(existing.get("top_level_deleted")) or top_level_deleted,
+        "generation": max(
+            _batch_generation(state),
+            int(existing.get("generation") or 0),
+        ),
+    }
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(local_path, tombstone)
+    if os.getenv("S3_BUCKET"):
+        key = _batch_deletion_tombstone_s3_key(upload_id, state)
+        await asyncio.to_thread(_write_json_to_s3_sync, key, tombstone)
+    return tombstone
+
+
+async def _clear_batch_deletion_tombstone(
+    upload_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    existing = await _read_batch_deletion_tombstone(upload_id, state) or {}
+    try:
+        artifact_generation = max(0, int(existing.get("generation") or 0))
+    except (TypeError, ValueError):
+        artifact_generation = 0
+    clear_marker = {
+        "upload_id": upload_id,
+        "cleared_at": _now_iso(),
+        "deleted_by_user_at": None,
+        "job_names": [],
+        "top_level_deleted": False,
+        "generation": max(_batch_generation(state), artifact_generation) + 1,
+    }
+    local_path = _batch_deletion_tombstone_path(upload_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(local_path, clear_marker)
+    if os.getenv("S3_BUCKET"):
+        key = _batch_deletion_tombstone_s3_key(upload_id, state)
+        await asyncio.to_thread(_write_json_to_s3_sync, key, clear_marker)
+    return clear_marker
 
 
 def _write_text_to_s3_sync(key: str, text: str, content_type: str = "text/plain; charset=utf-8") -> None:
@@ -884,7 +1177,9 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pip
     # uses the ROW company so each response is identifiable. Per-row raw responses
     # live under a serpwow_response/ subfolder, apart from the run aggregates.
     safe_name = _safe_name(row_company_name or upload_company_name)
-    key = f"{_upload_s3_prefix(upload_id, upload_company_name, pipeline)}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
+    prefix = _resolved_upload_s3_prefix(
+        upload_id, upload_company_name, pipeline)
+    key = f"{prefix}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -1252,12 +1547,37 @@ def _extract_upload_id_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[str
     if not display_name:
         return None
     marker = "single-ra-upload-"
-    if marker not in display_name:
+    if display_name.startswith(marker):
+        tail = display_name[len(marker):]
+        # The generated suffix is a canonical UUID. Match the complete suffix
+        # so every hyphen belonging to the upload ID remains intact.
+        match = re.fullmatch(
+            r"(?P<upload_id>.+)-[0-9a-f]{8}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group("upload_id").strip() or None
+    versioned_chunk_match = re.fullmatch(
+        r"gsearch-(.+)-gen\d+-chunk\d+", display_name)
+    if versioned_chunk_match:
+        return versioned_chunk_match.group(1).strip() or None
+    chunk_match = re.fullmatch(r"gsearch-(.+)-chunk\d+", display_name)
+    if chunk_match:
+        return chunk_match.group(1).strip() or None
+    return None
+
+
+def _extract_generation_from_batch_obj(batch_obj: dict[str, Any]) -> Optional[int]:
+    if not isinstance(batch_obj, dict):
         return None
-    tail = display_name.split(marker, 1)[1]
-    # Expected: {upload_id}-{uuid}
-    candidate = tail.rsplit("-", 1)[0].strip()
-    return candidate or None
+    metadata = batch_obj.get("metadata") if isinstance(batch_obj.get("metadata"), dict) else {}
+    display_name = str(
+        metadata.get("displayName") or metadata.get("display_name") or ""
+    ).strip()
+    match = re.fullmatch(r"gsearch-.+-gen(\d+)-chunk\d+", display_name)
+    return int(match.group(1)) if match else None
 
 
 def _derive_ui_batch_status(
@@ -1275,7 +1595,7 @@ def _derive_ui_batch_status(
     if state.endswith("FAILED") or state.endswith("EXPIRED"):
         return "failed"
     if state.endswith("CANCELLED"):
-        return "cancel_requested"
+        return "cancelled"
     if done_flag:
         return "failed" if error_obj else "succeeded"
 
@@ -1284,7 +1604,9 @@ def _derive_ui_batch_status(
         "queued",
         "running",
         "cancel_requested",
+        "cancelled",
         "succeeded",
+        "completed_with_errors",
         "failed",
         "skipped",
     }:
@@ -1511,9 +1833,25 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     return "completed"
 
 
-async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, Any]) -> None:
+async def _persist_chunk_meta(
+    upload_id: str,
+    chunk_id: int,
+    patch: dict[str, Any],
+    expected_generation: int,
+) -> None:
     async with get_upload_lock(upload_id):
         state = await read_upload_artifact(upload_id, "state")
+        if _batch_deleted_by_user(state):
+            return
+        if _batch_generation(state) != expected_generation:
+            return
+        deleted_jobs = {
+            str(value).strip()
+            for value in (state.get("batch_deleted_job_names") or [])
+            if str(value).strip()
+        }
+        if str(patch.get("job_name") or "").strip() in deleted_jobs:
+            return
         gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
         chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
         found = next((c for c in chunks if isinstance(c, dict) and c.get("chunk_id") == chunk_id), None)
@@ -1527,7 +1865,8 @@ async def _persist_chunk_meta(upload_id: str, chunk_id: int, patch: dict[str, An
 
 async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
                                 items: list[tuple[str, dict[str, Any]]],
-                                existing_job_name: str, batch_model: str) -> dict[str, Any]:
+                                existing_job_name: str, batch_model: str,
+                                driver_generation: int = 0) -> dict[str, Any]:
     """Submit (or resume) one chunk's Gemini batch job, poll to terminal, and return
     {chunk_id, job_name, status, error, parsed_by_row, usage}. Never raises — a failed
     chunk returns status='failed' with its rows unmapped (-> not found)."""
@@ -1541,7 +1880,13 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
         create_obj: dict[str, Any] = {}
         if not job_name:
             create_obj = await asyncio.to_thread(
-                lambda: gb.create_batch(batch_model, items, display_name=f"gsearch-{upload_id}-chunk{chunk_id}"))
+                lambda: gb.create_batch(
+                    batch_model,
+                    items,
+                    display_name=(
+                        f"gsearch-{upload_id}-gen{driver_generation}-chunk{chunk_id}"
+                    ),
+                ))
             job_name = gb.batch_name_from_create(create_obj)
             if not job_name:
                 raise RuntimeError(f"no job name from create: {create_obj}")
@@ -1549,7 +1894,12 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
         _log_gemini_batch(upload_id, f"chunk={chunk_id} submitted job_name={job_name} rows={len(items)}")
         # Persist the job_name immediately so a restart can re-poll this chunk.
         try:
-            await _persist_chunk_meta(upload_id, chunk_id, {"job_name": job_name, "status": "running"})
+            await _persist_chunk_meta(
+                upload_id,
+                chunk_id,
+                {"job_name": job_name, "status": "running"},
+                driver_generation,
+            )
         except Exception as _pm_exc:
             _log_gemini_batch(upload_id, f"chunk={chunk_id} _persist_chunk_meta failed (non-fatal): {_pm_exc!r}")
         deadline = asyncio.get_event_loop().time() + poll_timeout
@@ -1592,22 +1942,32 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
 
 
 async def run_gemini_batch_for_upload(upload_id: str) -> None:
+    driver_generation = 0
     try:
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
-            gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-            if gb.get("status") == "succeeded":
+            if _batch_deleted_by_user(state):
                 return
+            gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+            entry_status = str(gb.get("status") or "")
+            legacy_waiting = entry_status == "waiting_for_rows" and _batch_generation(state) == 0
+            if entry_status not in {"queued", "running"} and not legacy_waiting:
+                return
+            driver_generation = _batch_generation(state)
             gb_started = gb.get("started_at") or _now_iso()
             existing_chunks = gb.get("chunks") if isinstance(gb.get("chunks"), list) else []
             state["gemini_batch"] = {**gb, "status": "running", "started_at": gb_started,
-                                     "chunks": existing_chunks, "error": None}
+                                     "chunks": existing_chunks, "error": None,
+                                     "generation": driver_generation}
             await persist_upload_state(upload_id, state)
 
         items, row_index_by_key = _build_batch_items_for_state(state)
         if not items:
             async with get_upload_lock(upload_id):
                 state = await read_upload_artifact(upload_id, "state")
+                if (_batch_deleted_by_user(state)
+                        or _batch_generation(state) != driver_generation):
+                    return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "skipped",
                                          "completed_at": _now_iso(),
                                          "error": "No rows available for Gemini batch processing."}
@@ -1640,13 +2000,42 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 return {"chunk_id": cid, "job_name": done.get("job_name"), "status": "succeeded",
                         "error": None, "parsed_by_row": {}, "usage": {}}
             async with sem:
-                return await _run_one_gemini_chunk(upload_id, cid, chunk_items, prior.get(cid, ""), batch_model)
+                return await _run_one_gemini_chunk(
+                    upload_id,
+                    cid,
+                    chunk_items,
+                    prior.get(cid, ""),
+                    batch_model,
+                    driver_generation,
+                )
 
         results = await asyncio.gather(*[_guarded(i, c) for i, c in enumerate(chunks)])
 
         # Apply all parsed results, set chunk + aggregate status, persist once -> gated finalize.
         async with get_upload_lock(upload_id):
             state = await read_upload_artifact(upload_id, "state")
+            if _batch_deleted_by_user(state):
+                _log_gemini_batch(upload_id, "discarding completed chunk results after user deletion")
+                return
+            if _batch_generation(state) != driver_generation:
+                _log_gemini_batch(upload_id, "discarding completed chunk results from stale generation")
+                return
+            deleted_jobs = {
+                str(value).strip()
+                for value in (state.get("batch_deleted_job_names") or [])
+                if str(value).strip()
+            }
+            results = [
+                ({
+                    **result,
+                    "job_name": None,
+                    "status": "failed",
+                    "error": "Remote batch deleted by user",
+                    "parsed_by_row": {},
+                    "usage": {},
+                } if str(result.get("job_name") or "").strip() in deleted_jobs else result)
+                for result in results
+            ]
             parsed_all, usage_all = {}, {}
             for r in results:
                 parsed_all.update(r.get("parsed_by_row") or {})
@@ -1704,6 +2093,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             state["gemini_batch"] = {
                 "status": agg, "started_at": state.get("gemini_batch", {}).get("started_at"),
                 "completed_at": _now_iso(),
+                "generation": driver_generation,
                 "chunks": [{"chunk_id": r["chunk_id"], "job_name": r["job_name"],
                             "status": r["status"], "error": r["error"]} for r in results],
                 "usage": batch_usage, "batch_cost_usd": calculate_gemini_batch_cost_usd(batch_usage),
@@ -1716,6 +2106,9 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
         async with get_upload_lock(upload_id):
             try:
                 state = await read_upload_artifact(upload_id, "state")
+                if (_batch_deleted_by_user(state)
+                        or _batch_generation(state) != driver_generation):
+                    return
                 state["gemini_batch"] = {**state.get("gemini_batch", {}), "status": "failed",
                                          "completed_at": _now_iso(), "error": str(exc)}
                 await persist_upload_state(upload_id, state)
@@ -1735,12 +2128,20 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
     if state.get("status") not in {"completed", "completed_with_errors"}:
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
-    if gemini_batch_meta.get("status") in {"queued", "running", "succeeded"}:
+    if _batch_deleted_by_user(state):
+        # A destructive Batch Manager action is durable. Explicit failed-row
+        # retry replaces this metadata block and intentionally re-enables batch.
+        return
+    if gemini_batch_meta.get("status") in {
+        "queued", "running", "cancel_requested", "cancelled", "succeeded",
+        "completed_with_errors", "failed", "skipped",
+    }:
         return
     if upload_id in gemini_batch_tasks:
         return
     state["gemini_batch"] = {
         "status": "queued",
+        "generation": _batch_generation(state),
         "queued_at": _now_iso(),
         "job_name": None,
         "error": None,
@@ -1842,7 +2243,7 @@ async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, A
                 latest_batch["completed_at"] = _now_iso()
             if error_obj:
                 latest_batch["error"] = json.dumps(error_obj, ensure_ascii=True)
-            elif resolved_status in {"succeeded", "running"}:
+            elif resolved_status in {"succeeded", "running", "cancelled"}:
                 latest_batch["error"] = None
             latest["gemini_batch"] = latest_batch
             await persist_upload_state(upload_id, latest)
@@ -2048,10 +2449,84 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     if pipe == PIPELINE_RELATIONSHIP:
         names += ["skipped.csv"]
     if bucket:
-        prefix = _upload_s3_prefix(upload_id, company_name, pipe)
+        prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
     base = _find_upload_dir(upload_id)
     return {name: str(base / name) for name in names}
+
+
+def _reporting_result_names(pipeline: str) -> list[str]:
+    if pipeline not in REPORTING_PIPELINES:
+        return []
+    names = ["found.csv", "notFound.csv"]
+    if pipeline == PIPELINE_RELATIONSHIP:
+        names.append("skipped.csv")
+    return [*names, "report.json", "run.log"]
+
+
+def _list_available_reporting_files_s3_sync(
+    run_prefix: str,
+    expected: list[str],
+) -> set[str]:
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket or not expected:
+        return set()
+    prefix = f"{run_prefix.rstrip('/')}/"
+    try:
+        response = get_s3_client().list_objects_v2(
+            Bucket=bucket,
+            Prefix=prefix,
+            Delimiter="/",
+            MaxKeys=1000,
+        )
+    except Exception:
+        return set()
+    expected_keys = {f"{prefix}{name}": name for name in expected}
+    return {
+        expected_keys[key]
+        for obj in response.get("Contents", [])
+        if (key := str(obj.get("Key") or "")) in expected_keys
+    }
+
+
+async def _available_reporting_files(
+    upload_id: str,
+    company_name: str,
+    pipeline: str,
+) -> list[str]:
+    """Return reporting artifacts that exist locally or in configured S3 storage."""
+    expected = _reporting_result_names(pipeline)
+    if not expected:
+        return []
+    upload_dir = _find_upload_dir(upload_id)
+    available = [name for name in expected if (upload_dir / name).exists()]
+    if not os.getenv("S3_BUCKET"):
+        return available
+
+    missing = [name for name in expected if name not in available]
+    if not missing:
+        return available
+    cached_prefix = _restore_s3_run_prefix(upload_id)
+    normalized_prefix = _upload_s3_prefix(upload_id, company_name, pipeline)
+    run_prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipeline)
+    present_in_s3 = await asyncio.to_thread(
+        _list_available_reporting_files_s3_sync,
+        run_prefix,
+        missing,
+    )
+    if not present_in_s3 and cached_prefix is None:
+        legacy_state_key = await asyncio.to_thread(
+            _find_s3_upload_key_sync, upload_id, "state.json")
+        if legacy_state_key:
+            actual_prefix = legacy_state_key.rsplit("/", 1)[0]
+            _remember_s3_run_prefix(upload_id, actual_prefix)
+            if actual_prefix != normalized_prefix:
+                present_in_s3 = await asyncio.to_thread(
+                    _list_available_reporting_files_s3_sync,
+                    actual_prefix,
+                    missing,
+                )
+    return [name for name in expected if name in available or name in present_in_s3]
 
 
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
@@ -2121,21 +2596,8 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             success_count = ob.get("found", summ["websites_found"])
             failed_count = ob.get("errored", 0)
             if state.get("relationship"):
-                # relationship state/outcome counters are PAIR-level, but the CSVs
-                # (found.csv/notFound.csv) and this Supabase row are ORIGINAL-ROW-
-                # level (fan-out) — override with the already-fanned equivalents
-                # instead of the pair-level outcome_breakdown above. success=found:
-                # summ["websites_found"] already counts fanned rows with a website
-                # (== outcome "found"). failed=errored: a genuine per-pair error
-                # (row["outcome"] == "error", a raised LLM/search exception) fanned
-                # to its original rows — NOT a not-confirmed relationship gate,
-                # which is a business not_found, not a failure.
-                success_count = summ["websites_found"]
-                failed_count = sum(
-                    len(r.get("source_row_indices") or [])
-                    for r in state.get("rows", [])
-                    if isinstance(r, dict) and r.get("outcome") == _outcomes.OUTCOME_ERROR
-                )
+                # Relationship canonical outcomes are already fanned to original
+                # searchable rows; only the original total needs an explicit field.
                 extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
@@ -2253,15 +2715,6 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                     found = ob.get("found")
                     not_found = ob.get("not_found")
                     errored = ob.get("errored")
-                    if isinstance(relationship_meta, dict):
-                        # relationship's outcome_breakdown is PAIR-level (see the
-                        # total_rows override above); the found/not_found headline
-                        # should match the CSVs the user downloads (ORIGINAL-ROW
-                        # level), so keep using websites_found/websites_not_found
-                        # for those two. errored stays pair-level — it's a
-                        # diagnostic count, not something fanned out to rows.
-                        found = gs["websites_found"]
-                        not_found = gs["websites_not_found"]
                     extra = {
                         "searches": gs["cost"]["serpwow_searches"],
                         "search_label": "SerpWow searches",
@@ -2269,6 +2722,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
+                        "llm_cost_usd": gs["cost"]["llm_usd"],
+                        "serpwow_cost_usd": gs["cost"]["serpwow_usd"],
                         "found": found,
                         "not_found": not_found,
                         "errored": errored,
@@ -2310,7 +2765,8 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
         return
     from app.core import s3 as core_s3
     pipeline = str(state.get("pipeline") or PIPELINE_GSEARCH)
-    prefix = _upload_s3_prefix(upload_id, str(state.get("company_name") or ""), pipeline)
+    prefix = _resolved_upload_s3_prefix(
+        upload_id, str(state.get("company_name") or ""), pipeline)
     for name, path in paths.items():
         try:
             await asyncio.to_thread(core_s3.upload_file, path, f"{prefix}/{name}")
@@ -2324,6 +2780,9 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
 
 
 async def persist_upload_state(upload_id: str, state: dict[str, Any]) -> None:
+    deletion_tombstone = await _read_batch_deletion_tombstone(upload_id, state)
+    if deletion_tombstone:
+        _apply_batch_deletion_tombstone(state, deletion_tombstone)
     state = summarize_upload_state(state)
     # gsearch batch mode: rows reach "completed" before the Gemini batch (the LLM
     # confidence step) runs. Defer the terminal side-effects (Supabase 'completed'
@@ -3868,9 +4327,23 @@ async def retry_failed_rows(
         raise HTTPException(status_code=503, detail=detail)
 
     try:
-        await get_upload_state(upload_id)
+        current_state = await get_upload_state(upload_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Upload ID not found") from exc
+
+    # A user-deleted batch may still have a local driver unwinding. Explicit
+    # retry is the only operation allowed to clear the tombstone, so wait for
+    # that older generation to exit before opening a new one.
+    if _batch_deleted_by_user(current_state) or bool(
+        current_state.get("batch_deleted_job_names")
+    ):
+        old_batch_task = gemini_batch_tasks.get(upload_id)
+        if old_batch_task is not None and old_batch_task is not asyncio.current_task():
+            if not old_batch_task.done():
+                old_batch_task.cancel()
+            await asyncio.gather(old_batch_task, return_exceptions=True)
+            if gemini_batch_tasks.get(upload_id) is old_batch_task:
+                gemini_batch_tasks.pop(upload_id, None)
 
     jobs_to_retry: list[dict[str, Any]] = []
     retried_row_indexes: list[int] = []
@@ -3889,7 +4362,17 @@ async def retry_failed_rows(
         phase = str(state.get("phase") or "all")
         # Retrying a stopped upload re-opens it: clear the stop marker so the
         # batch post-process can run again once the retried rows finish.
+        retry_generation = _batch_generation(state)
+        if _batch_postprocess_enabled_for(pipeline):
+            clear_marker = await _clear_batch_deletion_tombstone(upload_id, state)
+            retry_generation = (
+                int(clear_marker.get("generation") or 0)
+                if isinstance(clear_marker, dict)
+                else retry_generation + 1
+            )
         state.pop("stopped_by_user_at", None)
+        state.pop("batch_deleted_by_user_at", None)
+        state.pop("batch_deleted_job_names", None)
         failed_rows = [
             row for row in (state.get("rows") or [])
             if isinstance(row, dict) and row.get("status") in {"failed", "queued", "processing"}
@@ -3929,6 +4412,7 @@ async def retry_failed_rows(
         if _batch_postprocess_enabled_for(pipeline):
             state["gemini_batch"] = {
                 "status": "waiting_for_rows",
+                "generation": retry_generation,
                 "queued_at": None,
                 "job_name": None,
                 "error": None,
@@ -4080,13 +4564,38 @@ async def uploads_list(
 @app.get("/batch/jobs")
 async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
     global gemini_batch_list_cache, gemini_batch_list_cache_fetched_at, gemini_batch_list_error_cooldown_until
-    items = await list_upload_summaries(max(limit, 500), pipeline=PIPELINE_FULL)
+    items = await list_upload_summaries(max(limit, 500), pipeline=None)
     local_by_job: dict[str, dict[str, Any]] = {}
+    local_by_upload: dict[str, dict[str, Any]] = {}
     for item in items:
+        if str(item.get("pipeline") or PIPELINE_FULL) not in {
+            PIPELINE_FULL, PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
+        }:
+            continue
         batch_meta = item.get("gemini_batch") if isinstance(item.get("gemini_batch"), dict) else {}
+        upload_id = str(item.get("upload_id") or "").strip()
+        if upload_id:
+            local_by_upload[upload_id] = {"item": item, "batch": batch_meta}
         job_name = str(batch_meta.get("job_name") or "").strip()
         if job_name:
-            local_by_job[job_name] = item
+            local_by_job[job_name] = {
+                "item": item,
+                "batch": batch_meta,
+                "local_status": batch_meta.get("status"),
+                "chunk": None,
+            }
+        chunks = batch_meta.get("chunks") if isinstance(batch_meta.get("chunks"), list) else []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_job_name = str(chunk.get("job_name") or "").strip()
+            if chunk_job_name:
+                local_by_job[chunk_job_name] = {
+                    "item": item,
+                    "batch": batch_meta,
+                    "local_status": chunk.get("status"),
+                    "chunk": chunk,
+                }
 
     remote_error: Optional[str] = None
     operations: list[dict[str, Any]] = []
@@ -4143,20 +4652,32 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         ):
             continue
 
-        local_item = local_by_job.get(job_name) or {}
+        local_ref = local_by_job.get(job_name) or {}
+        operation_matches_local_job = bool(local_ref)
         inferred_upload_id = _extract_upload_id_from_batch_obj(op)
-        local_batch = local_item.get("gemini_batch") if isinstance(local_item.get("gemini_batch"), dict) else {}
+        operation_generation = _extract_generation_from_batch_obj(op)
+        if not local_ref and inferred_upload_id:
+            local_ref = local_by_upload.get(inferred_upload_id) or {}
+        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
+        local_batch = local_ref.get("batch") if isinstance(local_ref.get("batch"), dict) else {}
+        local_chunk = local_ref.get("chunk") if isinstance(local_ref.get("chunk"), dict) else {}
 
         batch_status = _derive_ui_batch_status(
             live_state=live_state,
             done_flag=done_flag,
             error_obj=error_obj,
-            local_status=local_batch.get("status"),
+            local_status=local_ref.get("local_status"),
         )
 
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "batch_generation": (
+                    _batch_generation({"gemini_batch": local_batch})
+                    if operation_matches_local_job and local_batch
+                    else operation_generation
+                ),
+                "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": batch_status,
                 "job_name": job_name,
@@ -4167,9 +4688,9 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
                     or metadata.get("endTime")
                     or local_item.get("updated_at")
                 ),
-                "started_at": metadata.get("createTime") or local_batch.get("started_at"),
-                "completed_at": metadata.get("endTime") or local_batch.get("completed_at"),
-                "error": local_batch.get("error") or (json.dumps(error_obj, ensure_ascii=True) if error_obj else None),
+                "started_at": metadata.get("createTime") or local_chunk.get("started_at") or local_batch.get("started_at"),
+                "completed_at": metadata.get("endTime") or local_chunk.get("completed_at") or local_batch.get("completed_at"),
+                "error": local_chunk.get("error") or local_batch.get("error") or (json.dumps(error_obj, ensure_ascii=True) if error_obj else None),
             }
         )
         seen_job_names.add(job_name)
@@ -4178,27 +4699,34 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
 
     # Always merge in locally tracked jobs that may not appear in the
     # current remote page (or may be temporarily absent from remote listing).
-    for job_name, local_item in local_by_job.items():
+    for job_name, local_ref in local_by_job.items():
         if job_name in seen_job_names:
             continue
-        local_batch = local_item.get("gemini_batch") if isinstance(local_item.get("gemini_batch"), dict) else {}
+        local_item = local_ref.get("item") if isinstance(local_ref.get("item"), dict) else {}
+        local_batch = local_ref.get("batch") if isinstance(local_ref.get("batch"), dict) else {}
+        local_chunk = local_ref.get("chunk") if isinstance(local_ref.get("chunk"), dict) else {}
         jobs.append(
             {
                 "upload_id": local_item.get("upload_id"),
+                "batch_generation": (
+                    _batch_generation({"gemini_batch": local_batch})
+                    if local_batch else None
+                ),
+                "chunk_id": local_chunk.get("chunk_id"),
                 "upload_status": local_item.get("status"),
                 "batch_status": _derive_ui_batch_status(
                     live_state="",
                     done_flag=False,
                     error_obj=None,
-                    local_status=local_batch.get("status"),
+                    local_status=local_ref.get("local_status"),
                 ),
                 "job_name": job_name,
                 "live_state": None,
                 "done": None,
                 "updated_at": local_item.get("updated_at"),
-                "started_at": local_batch.get("started_at"),
-                "completed_at": local_batch.get("completed_at"),
-                "error": local_batch.get("error"),
+                "started_at": local_chunk.get("started_at") or local_batch.get("started_at"),
+                "completed_at": local_chunk.get("completed_at") or local_batch.get("completed_at"),
+                "error": local_chunk.get("error") or local_batch.get("error"),
             }
         )
 
@@ -4209,6 +4737,13 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
         "source": "remote" if remote_error is None else "local_fallback",
         "remote_error": remote_error,
     }
+
+
+def _invalidate_gemini_batch_list_cache() -> None:
+    global gemini_batch_list_cache, gemini_batch_list_cache_fetched_at, gemini_batch_list_error_cooldown_until
+    gemini_batch_list_cache = []
+    gemini_batch_list_cache_fetched_at = 0.0
+    gemini_batch_list_error_cooldown_until = 0.0
 
 
 @app.post("/batch/jobs/{upload_id}/status")
@@ -4249,7 +4784,7 @@ async def batch_job_get_status(upload_id: str) -> dict[str, Any]:
                     latest_batch["completed_at"] = _now_iso()
                 if error_obj:
                     latest_batch["error"] = json.dumps(error_obj, ensure_ascii=True)
-                elif batch_status in {"succeeded", "running"}:
+                elif batch_status in {"succeeded", "running", "cancelled"}:
                     latest_batch["error"] = None
                 latest["gemini_batch"] = latest_batch
                 await persist_upload_state(upload_id, latest)
@@ -4315,6 +4850,7 @@ async def batch_job_cancel(upload_id: str) -> dict[str, Any]:
         except Exception:
             pass
 
+    _invalidate_gemini_batch_list_cache()
     return {
         "upload_id": upload_id,
         "status": "cancel_requested",
@@ -4346,29 +4882,111 @@ async def batch_job_get_status_by_name(job_name: str = Query(..., min_length=1))
     }
 
 
+async def _sync_batch_job_action_local_state(
+    upload_id: str,
+    job_name: str,
+    action: str,
+    expected_generation: Optional[int] = None,
+) -> bool:
+    """Best-effort reconciliation after a destructive by-name remote action."""
+    async with get_upload_lock(upload_id):
+        try:
+            state = await read_upload_artifact(upload_id, "state")
+            batch = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+            current_generation = _batch_generation(state)
+            if (
+                expected_generation is not None
+                and expected_generation != current_generation
+            ):
+                return False
+            chunks = batch.get("chunks") if isinstance(batch.get("chunks"), list) else []
+            top_matches = str(batch.get("job_name") or "").strip() == job_name
+            matching_chunks = [
+                chunk for chunk in chunks
+                if isinstance(chunk, dict)
+                and str(chunk.get("job_name") or "").strip() == job_name
+            ]
+
+            if action == "cancel":
+                if not top_matches and not matching_chunks:
+                    return False
+                for chunk in matching_chunks:
+                    chunk["status"] = "cancel_requested"
+                batch["status"] = (
+                    "cancel_requested" if top_matches
+                    else _aggregate_batch_chunk_status(chunks)
+                )
+            elif action == "delete":
+                # An unmatched operation can be a just-created chunk whose
+                # metadata has not persisted yet. Require the generation from
+                # the listing so an old operation cannot mark a newer retry.
+                if (
+                    not top_matches
+                    and not matching_chunks
+                    and expected_generation is None
+                ):
+                    return False
+                deleted_at = _now_iso()
+                tombstone = await _write_batch_deletion_tombstone(
+                    upload_id,
+                    state,
+                    job_name,
+                    deleted_at,
+                    top_level_deleted=top_matches,
+                )
+                _apply_batch_deletion_tombstone(state, tombstone)
+            else:
+                return False
+
+            state["gemini_batch"] = batch
+            await persist_upload_state(upload_id, state)
+            return True
+        except (FileNotFoundError, KeyError):
+            return False
+        except Exception as exc:
+            print(f"[batch-manager] local {action} sync failed for {upload_id}: {exc!r}")
+            return False
+
+
 @app.post("/batch/jobs/cancel")
-async def batch_job_cancel_by_name(job_name: str = Query(..., min_length=1)) -> dict[str, Any]:
+async def batch_job_cancel_by_name(
+    job_name: str = Query(..., min_length=1),
+    upload_id: Optional[str] = Query(None),
+    expected_generation: Optional[int] = Query(None, ge=0),
+) -> dict[str, Any]:
     try:
         cancel_resp = await asyncio.to_thread(_gemini_batch_cancel_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch cancel failed: {str(exc)}") from exc
+    local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
+        str(upload_id), job_name, "cancel", expected_generation)
+    _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,
         "status": "cancel_requested",
         "response": cancel_resp,
+        "local_state_updated": local_state_updated,
     }
 
 
 @app.post("/batch/jobs/delete")
-async def batch_job_delete_by_name(job_name: str = Query(..., min_length=1)) -> dict[str, Any]:
+async def batch_job_delete_by_name(
+    job_name: str = Query(..., min_length=1),
+    upload_id: Optional[str] = Query(None),
+    expected_generation: Optional[int] = Query(None, ge=0),
+) -> dict[str, Any]:
     try:
         delete_resp = await asyncio.to_thread(_gemini_batch_delete_sync, job_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Gemini batch delete failed: {str(exc)}") from exc
+    local_state_updated = bool(upload_id) and await _sync_batch_job_action_local_state(
+        str(upload_id), job_name, "delete", expected_generation)
+    _invalidate_gemini_batch_list_cache()
     return {
         "job_name": job_name,
         "status": "deleted",
         "response": delete_resp,
+        "local_state_updated": local_state_updated,
     }
 
 
@@ -4396,9 +5014,27 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
+            upload_terminal = summary.get("status") in {
+                "completed", "completed_with_errors", "failed",
+            }
+            batch = summary.get("gemini_batch")
+            batch_settled = not isinstance(batch, dict) or batch.get("status") in {
+                "succeeded", "completed_with_errors", "failed", "cancelled",
+                "skipped", "not_started",
+            }
+            available_files = []
+            if upload_terminal and batch_settled:
+                available_files = await _available_reporting_files(
+                    upload_id,
+                    str(summary.get("company_name") or ""),
+                    str(summary.get("pipeline") or PIPELINE_FULL),
+                )
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
                 "websites_not_found": gs["websites_not_found"],
+                "outcome_breakdown": gs["outcome_breakdown"],
+                "error_breakdown": gs["error_breakdown"],
+                "available_files": available_files,
                 "model": gs["model"],
                 "confidence_mode": gs["confidence_mode"],
                 "is_batch": gs["is_batch"],

@@ -27,10 +27,11 @@ class TestChunked(unittest.IsolatedAsyncioTestCase):
 
         # Each create returns a job_name encoding the chunk's keys; get_batch returns done;
         # collect_results returns a pick for chunks 0 and 2, FAILS chunk 1.
-        created = {"n": 0}
+        created = {"n": 0, "display_names": []}
 
         def fake_create(model, items, display_name):
             created["n"] += 1
+            created["display_names"].append(display_name)
             keys = [k for k, _ in items]
             if created["n"] == 2:  # second chunk submitted -> simulate a failed job
                 return {"name": "jobs/FAIL", "_keys": keys}
@@ -67,6 +68,11 @@ class TestChunked(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gb["status"], "completed_with_errors")
         statuses = {c["status"] for c in gb["chunks"]}
         self.assertEqual(statuses, {"succeeded", "failed"})
+        self.assertEqual(created["display_names"], [
+            "gsearch-u1-gen0-chunk0",
+            "gsearch-u1-gen0-chunk1",
+            "gsearch-u1-gen0-chunk2",
+        ])
         # The failed chunk's rows are not-found; succeeded chunks' rows have a URL.
         # Chunk 0 (40 rows) succeeds, chunk 1 (40 rows) fails, chunk 2 (20 rows) succeeds.
         # 40 + 20 = 60 rows should have URLs.

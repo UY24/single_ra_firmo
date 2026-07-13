@@ -83,6 +83,9 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["output_tokens"], 8)
         # total_usd now includes both LLM (0.0002) + SerpWow (3 * 0.00035 = 0.00105)
         self.assertAlmostEqual(kw["cost_usd"], 0.00125, places=6)
+        # LLM/SerpWow are also sent split, so Slack can show both + total.
+        self.assertAlmostEqual(kw["llm_cost_usd"], 0.0002, places=6)
+        self.assertAlmostEqual(kw["serpwow_cost_usd"], 0.00105, places=6)
         # gsearch is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
         self.assertEqual(kw["found"], 1)
         self.assertEqual(kw["not_found"], 0)
@@ -135,6 +138,8 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["output_tokens"], 6)
         # total_usd = LLM (0.0001) + SerpWow (2 * 0.00035 = 0.0007)
         self.assertAlmostEqual(kw["cost_usd"], 0.0008, places=6)
+        self.assertAlmostEqual(kw["llm_cost_usd"], 0.0001, places=6)
+        self.assertAlmostEqual(kw["serpwow_cost_usd"], 0.0007, places=6)
         # gmaps is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
         self.assertEqual(kw["found"], 1)
         self.assertEqual(kw["not_found"], 0)
@@ -147,6 +152,71 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
                         side_effect=RuntimeError("boom")):
             la._notify_slack_terminal({"upload_id": "x", "status": "completed",
                                        "pipeline": "gmaps"})  # must not raise
+
+
+class NotifyRenderTests(unittest.TestCase):
+    """notify_run_complete renders the SerpWow searches·cost cell and the split
+    LLM/Total cost cell; AI-Mode-shaped calls (no split) render as before."""
+
+    def test_signed_zero_cost_uses_standard_zero_format(self):
+        from app.core import notify
+
+        self.assertEqual(notify._fmt_usd(-0.0), "$0.00")
+
+    def test_sub_micro_costs_use_explicit_thresholds(self):
+        from app.core import notify
+
+        self.assertEqual(notify._fmt_usd(0.000001), "$0.000001")
+        self.assertEqual(notify._fmt_usd(-0.000001), "$-0.000001")
+        self.assertEqual(notify._fmt_usd(0.0000001), "<$0.000001")
+        self.assertEqual(notify._fmt_usd(-0.0000001), ">-$0.000001")
+
+    def _fields(self, **kw):
+        from app.core import notify
+        captured = {}
+
+        def fake_post(fallback, blocks):
+            captured["blocks"] = blocks
+            return True
+
+        with mock.patch.object(notify, "_post", side_effect=fake_post):
+            notify.notify_run_complete(**kw)
+        # The two-column field grid is the one block carrying "fields".
+        for b in captured["blocks"]:
+            if b.get("type") == "section" and "fields" in b:
+                return {f["text"].split("\n", 1)[0].strip("* "): f["text"]
+                        for f in b["fields"]}
+        return {}
+
+    def test_serpwow_split_costs_rendered(self):
+        fields = self._fields(
+            pipeline="Google Search", company="ISI", run_ref="UP3",
+            status="completed", found=1, not_found=0, errored=0,
+            searches=3, search_label="SerpWow searches",
+            cost_usd=0.00125, llm_cost_usd=0.0002, serpwow_cost_usd=0.00105,
+        )
+        # SerpWow cell: searches THEN cost, one field.
+        serp = next(v for k, v in fields.items() if "SerpWow searches" in k)
+        self.assertIn("3 searches", serp)
+        self.assertIn("$0.00105", serp)
+        # Cost cell: LLM + Total (SerpWow already shown above), not a bare total.
+        cost = next(v for k, v in fields.items() if "Cost" in k)
+        self.assertIn("LLM $0.0002", cost)
+        self.assertIn("Total $0.00125", cost)
+
+    def test_ai_mode_shaped_call_unchanged(self):
+        # No split cost params (AI Mode / scrape.do flat fee) -> bare count + single cost.
+        fields = self._fields(
+            pipeline="AI Mode", company="ISI", run_ref="UP9",
+            status="completed", found=2, not_found=1,
+            searches=5, search_label="Scrape.do searches", cost_usd=1.23,
+        )
+        serp = next(v for k, v in fields.items() if "Scrape.do searches" in k)
+        self.assertTrue(serp.strip().endswith("5"))  # bare count, no "· $"
+        self.assertNotIn("searches ·", serp)
+        cost = next(v for k, v in fields.items() if "Cost" in k)
+        self.assertIn("$1.23", cost)
+        self.assertNotIn("LLM $", cost)
 
 
 class GsearchBatchDeferralTests(unittest.TestCase):

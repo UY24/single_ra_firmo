@@ -20,21 +20,18 @@ class FakeExchange:
         self.published.append((json.loads(message.body.decode("utf-8")), routing_key))
 
 
+class FakeDeclarationResult:
+    def __init__(self, message_count):
+        self.message_count = message_count
+
+
 class FakeQueue:
     def __init__(self, message_count=7):
         self.bound = []
-        self.message_count = message_count
+        self.declaration_result = FakeDeclarationResult(message_count)
 
     async def bind(self, exchange, routing_key):
         self.bound.append((exchange, routing_key))
-
-    async def declare(self, passive=False):
-        class R:
-            pass
-
-        r = R()
-        r.message_count = self.message_count
-        return r
 
 
 class FakeChannel:
@@ -53,8 +50,11 @@ class FakeChannel:
         self.declared_exchanges.append((name, durable))
         return self.exchange
 
-    async def declare_queue(self, name, durable=False):
-        self.declared_queues.append((name, durable))
+    async def declare_queue(self, name, durable=False, passive=False):
+        # Mirrors aio_pika: non-passive declares are recorded; a passive call is
+        # the depth probe and returns the same queue (declaration_result).
+        if not passive:
+            self.declared_queues.append((name, durable))
         return self.queue
 
     async def close(self):

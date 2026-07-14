@@ -389,12 +389,18 @@ def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
 # Status persistence + accessors
 # --------------------------------------------------------------------------- #
 def _persist_status(run_id: str, run_dir: Path, status: dict) -> None:
-    """Write ``status.json`` for the run and update the in-memory cache."""
+    """Write ``status.json`` for the run and update the in-memory cache.
+
+    Atomic (tmp + os.replace): the file is read cross-process (API UI polls,
+    worker, reconciler) and flushed every ~2s during scraping — a truncating
+    write_text could be torn by a hard kill or read mid-write, wedging the run.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     status["available_files"] = _available_files(run_dir)
-    (run_dir / "status.json").write_text(
-        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    path = run_dir / "status.json"
+    tmp = run_dir / "status.json.tmp"
+    tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
     _RUNS[run_id] = status
 
 
@@ -687,9 +693,13 @@ def scrape_batch_sync(
     try:
         payload = scrapedo_client.search_google_ai_mode(query, extra_params=geo_params)
         seconds = time.perf_counter() - t0
-        raw_path.write_text(
+        # Atomic write (tmp + os.replace): a crash mid-write must never leave a
+        # truncated raw file — existence checks treat the file as "scraped".
+        tmp_path = raw_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        os.replace(tmp_path, raw_path)
         # Stream the scrape to S3 immediately (best-effort).
         s3_sync.mirror_file_to_s3(run_dir, mode.key, raw_path)
         return {
@@ -839,10 +849,17 @@ def run_ai_mode_finish(
     if wall_t0 is None:
         wall_t0 = time.perf_counter()
     run_log = _run_log_path(run_dir)
+    _report_in_progress: StreamingRunReport | None = None
 
     try:
         mode = get_mode(str(status.get("mode") or "ai_bulk"))
-        batch_size = mode.batch_size()
+        # Honor the prepare-time batch size persisted in status.json (the same
+        # value the publisher grouped by) — recomputing from env could regroup
+        # entities differently and misalign answers with the wrong companies.
+        try:
+            batch_size = int(status.get("batch_size") or 0) or mode.batch_size()
+        except (TypeError, ValueError):
+            batch_size = mode.batch_size()
         cfg = build_ai_mode_llm_config()
         llm = make_llm_client(cfg)
 
@@ -1134,7 +1151,7 @@ def run_ai_mode_finish(
         # file from disk, classify, and write it straight into the report.
         # Memory stays O(one batch) — no run-wide results list.
         # ------------------------------------------------------------- #
-        report = StreamingRunReport(run_dir)
+        report = _report_in_progress = StreamingRunReport(run_dir)
         # Recount authoritatively while streaming (the sync path counted
         # provisionally above for incremental UI persists).
         llm_errors = 0
@@ -1397,4 +1414,8 @@ def run_ai_mode_finish(
         except Exception:
             logging.getLogger("ai_mode").warning("slack notify (complete) failed", exc_info=True)
     except Exception as exc:  # never raise to caller
+        # Discard any half-written CSVs so a crashed finish never leaves
+        # truncated found/notFound files served as complete.
+        if _report_in_progress is not None:
+            _report_in_progress.abort()
         _fail_run(run_id, run_dir, status, exc, wall_t0)

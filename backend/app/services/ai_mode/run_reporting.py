@@ -83,10 +83,15 @@ class StreamingRunReport:
         self._entities_cap = _entities_cap()
         self._entities_omitted = False
         self._closed = False
-        self._found_fh = (run_dir / "found.csv").open("w", newline="", encoding="utf-8")
+        # Write to temp names and rename in close(): a crashed finish must never
+        # leave a partial found.csv/notFound.csv where the files API would list
+        # and serve it (and the S3 mirror would upload it) as if complete.
+        self._found_tmp = run_dir / "found.csv.tmp"
+        self._notfound_tmp = run_dir / "notFound.csv.tmp"
+        self._found_fh = self._found_tmp.open("w", newline="", encoding="utf-8")
         self._found = csv.DictWriter(self._found_fh, fieldnames=CSV_COLUMNS)
         self._found.writeheader()
-        self._notfound_fh = (run_dir / "notFound.csv").open("w", newline="", encoding="utf-8")
+        self._notfound_fh = self._notfound_tmp.open("w", newline="", encoding="utf-8")
         self._notfound = csv.DictWriter(self._notfound_fh, fieldnames=CSV_COLUMNS + ["error"])
         self._notfound.writeheader()
 
@@ -124,12 +129,30 @@ class StreamingRunReport:
             self.add_request(request_record)
         self.add_results(entity_results)
 
+    def abort(self) -> None:
+        """Discard the in-progress CSVs (finish crashed) — never raises."""
+        if self._closed:
+            return
+        self._closed = True
+        for fh, tmp in ((self._found_fh, self._found_tmp),
+                        (self._notfound_fh, self._notfound_tmp)):
+            try:
+                fh.close()
+            except Exception:
+                pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def close(self, summary: dict) -> dict[str, Path]:
         if self._closed:
             raise RuntimeError("StreamingRunReport already closed")
         self._closed = True
         self._found_fh.close()
         self._notfound_fh.close()
+        os.replace(self._found_tmp, self.run_dir / "found.csv")
+        os.replace(self._notfound_tmp, self.run_dir / "notFound.csv")
 
         report: dict = {"summary": summary, "requests": self._requests}
         if self._entities_omitted:

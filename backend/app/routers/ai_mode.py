@@ -16,6 +16,10 @@ from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
+# Runs with a resume currently being prepared: two concurrent resume requests
+# could both pass the 409 status gate before either flips the status, then
+# double-publish (and double-bill) every missing batch.
+_resume_in_flight: set[str] = set()
 
 
 def _broker_unavailable_detail() -> str:
@@ -149,17 +153,25 @@ async def resume_ai_mode_upload(run_id: str) -> dict[str, Any]:
             status_code=404,
             detail="AI mode run not found (no local run dir, and nothing in S3 to restore)",
         )
-    status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
-    state = str(status.get("status") or "")
-    if state not in {"failed", "completed_with_errors"}:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"run status is '{state}'; resume only applies to failed or "
-                "completed_with_errors runs"
-            ),
-        )
-    cleared = await asyncio.to_thread(ai_worker.reset_run_for_resume, run_id, run_dir)
+    if run_id in _resume_in_flight:
+        raise HTTPException(status_code=409, detail="resume already in progress for this run")
+    _resume_in_flight.add(run_id)
+    try:
+        status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
+        state = str(status.get("status") or "")
+        if state not in {"failed", "completed_with_errors"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run status is '{state}'; resume only applies to failed or "
+                    "completed_with_errors runs"
+                ),
+            )
+        # reset flips status to running/publishing, so once we leave this block
+        # a late duplicate request also fails the status gate above.
+        cleared = await asyncio.to_thread(ai_worker.reset_run_for_resume, run_id, run_dir)
+    finally:
+        _resume_in_flight.discard(run_id)
     task = asyncio.create_task(
         ai_worker.publish_run_batches(run_id, only_missing=True)
     )

@@ -253,6 +253,57 @@ class TestCountDoneBatches(WorkerHarness):
         raw, err = ai_worker.count_done_batches(self.run_dir)
         self.assertEqual((raw, err), (1, 1))
 
+    def test_same_index_with_raw_and_error_marker_counts_once(self):
+        # A stale error marker alongside a later-landed raw file must not
+        # double-count and satisfy the barrier while another batch is missing.
+        raw_dir = self.run_dir / "raw_responses"
+        (raw_dir / "request_000001.json").write_text("{}", encoding="utf-8")
+        (raw_dir / "request_000001.error.json").write_text("{}", encoding="utf-8")
+        raw, err = ai_worker.count_done_batches(self.run_dir)
+        self.assertEqual((raw, err), (1, 0))
+
+
+class TestCorruptRawResume(WorkerHarness):
+    def test_resume_republishes_batch_with_unparseable_raw_file(self):
+        # Crash mid-write leaves a truncated raw file: resume must retry it,
+        # not skip it (existence alone is not "scraped").
+        raw_dir = self.run_dir / "raw_responses"
+        (raw_dir / "request_000001.json").write_text(
+            json.dumps(RAW_PAYLOAD), encoding="utf-8")
+        (raw_dir / "request_000002.json").write_text("{truncat", encoding="utf-8")
+        published = []
+
+        async def fake_pub(payload):
+            published.append(payload)
+
+        with mock.patch.object(ai_worker.broker, "publish_scrape_job",
+                               side_effect=fake_pub):
+            count = asyncio.run(
+                ai_worker.publish_run_batches(self.run_id, only_missing=True))
+        self.assertEqual(count, 1)
+        scrapes = [p for p in published if p["type"] == "scrape"]
+        self.assertEqual([p["request_index"] for p in scrapes], [2])
+
+
+class TestInfraFailureRetryBudget(WorkerHarness):
+    """Restart-safe poison guard: retries tracked in status.json, not via the
+    broker's redelivered flag (which graceful shutdown also sets)."""
+
+    def test_first_failure_requeues_then_budget_exhausts(self):
+        payload = _payload(self.run_id, 1, self.entities)
+        message = mock.Mock(redelivered=True)  # e.g. requeued by a restart
+        self.assertTrue(asyncio.run(
+            ai_worker._should_requeue_infra_failure(payload, message)))
+        self.assertEqual(self._status()["delivery_failures"], {"1": 1})
+        self.assertFalse(asyncio.run(
+            ai_worker._should_requeue_infra_failure(payload, message)))
+
+    def test_undecodable_payload_falls_back_to_redelivered_flag(self):
+        self.assertTrue(asyncio.run(ai_worker._should_requeue_infra_failure(
+            None, mock.Mock(redelivered=False))))
+        self.assertFalse(asyncio.run(ai_worker._should_requeue_infra_failure(
+            None, mock.Mock(redelivered=True))))
+
 
 if __name__ == "__main__":
     unittest.main()

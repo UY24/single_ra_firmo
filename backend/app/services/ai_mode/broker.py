@@ -95,12 +95,20 @@ async def publish_check(run_id: str) -> None:
 
 
 async def get_queue_depth() -> Optional[int]:
-    """Best-effort ready-message count of the AI Mode queue (None if unknown)."""
-    if ai_mode_queue is None:
+    """Best-effort READY-message count of the AI Mode queue (None if unknown).
+
+    aio_pika's Queue.declare() takes no ``passive`` kwarg — the probe must go
+    through channel.declare_queue(..., passive=True), whose declaration_result
+    carries message_count. Note this counts ready messages only; unacked
+    in-flight deliveries are invisible, which is why reconciler staleness
+    checks look at file activity too.
+    """
+    if ai_mode_channel is None:
         return None
     try:
-        declare_result = await ai_mode_queue.declare(passive=True)
-        count = getattr(declare_result, "message_count", None)
+        probe = await ai_mode_channel.declare_queue(queue_name(), passive=True)
+        result = getattr(probe, "declaration_result", None)
+        count = getattr(result, "message_count", None)
         if count is None:
             return None
         return max(0, int(count))

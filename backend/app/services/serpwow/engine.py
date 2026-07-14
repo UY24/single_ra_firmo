@@ -407,11 +407,15 @@ async def _get_upload_active_row_count(upload_id: str) -> int:
 
 
 async def _get_rabbitmq_queue_depth() -> Optional[int]:
-    if rabbitmq_queue is None:
+    # aio_pika's Queue.declare() takes no `passive` kwarg (it raised TypeError
+    # and this probe silently returned None, disabling the drained-queue gate);
+    # the passive probe must go through channel.declare_queue.
+    if rabbitmq_channel is None:
         return None
     try:
-        declare_result = await rabbitmq_queue.declare(passive=True)
-        count = getattr(declare_result, "message_count", None)
+        queue_name = os.getenv("RABBITMQ_QUEUE", "singleRA_search_jobs")
+        probe = await rabbitmq_channel.declare_queue(queue_name, passive=True)
+        count = getattr(getattr(probe, "declaration_result", None), "message_count", None)
         if count is None:
             return None
         return max(0, int(count))

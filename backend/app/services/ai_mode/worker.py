@@ -80,23 +80,41 @@ def raw_file_path(run_dir: Path, request_index: int) -> Path:
     return run_dir / RAW_RESPONSES_DIRNAME / f"request_{request_index:06d}.json"
 
 
-def count_done_batches(run_dir: Path) -> tuple[int, int]:
-    """(raw_count, error_count) from one directory scan — the barrier's truth."""
-    raw = err = 0
+def _scan_indices(run_dir: Path) -> tuple[set[int], set[int]]:
+    """One directory scan -> (raw_indices, error_indices), deduped by index."""
+    raw_idx: set[int] = set()
+    err_idx: set[int] = set()
     raw_dir = run_dir / RAW_RESPONSES_DIRNAME
     try:
         with os.scandir(raw_dir) as it:
             for entry in it:
                 name = entry.name
-                if not name.startswith("request_"):
+                if not (name.startswith("request_") and name.endswith(".json")):
+                    continue
+                digits = name[len("request_"):].split(".", 1)[0]
+                try:
+                    idx = int(digits)
+                except ValueError:
                     continue
                 if name.endswith(".error.json"):
-                    err += 1
-                elif name.endswith(".json"):
-                    raw += 1
+                    err_idx.add(idx)
+                else:
+                    raw_idx.add(idx)
     except OSError:
-        return 0, 0
-    return raw, err
+        return set(), set()
+    return raw_idx, err_idx
+
+
+def count_done_batches(run_dir: Path) -> tuple[int, int]:
+    """(raw_count, effective_error_count) — the barrier's truth.
+
+    Counts DISTINCT indices (a batch with both a raw file and a stale error
+    marker is one done batch, raw wins), so raw+err == len(raw ∪ err) and the
+    barrier can never be satisfied by a double-counted index while another
+    batch is genuinely missing.
+    """
+    raw_idx, err_idx = _scan_indices(run_dir)
+    return len(raw_idx), len(err_idx - raw_idx)
 
 
 def write_error_marker(
@@ -155,9 +173,9 @@ async def publish_run_batches(run_id: str, *, only_missing: bool = False) -> int
         batch_size = int(status.get("batch_size") or 0) or mode.batch_size()
     except (TypeError, ValueError):
         batch_size = mode.batch_size()
-    raw_csv = await asyncio.to_thread((run_dir / "input.csv").read_bytes)
-    entities = parse_entities_csv(raw_csv).entities
-    groups = list(svc.chunked(entities, batch_size))
+    # CSV parse + grouping is pure CPU — a 1M-row file takes seconds; keep it
+    # off the event loop (this runs as a background task on the API process).
+    groups = await asyncio.to_thread(_load_groups, run_dir, batch_size)
     started_at = utc_now_iso()
 
     status["status"] = "running"
@@ -168,15 +186,28 @@ async def publish_run_batches(run_id: str, *, only_missing: bool = False) -> int
     status["error"] = None
     status["updated_at"] = started_at
     _persist_status(run_id, run_dir, status)
-    svc._supabase_update_run(
-        status.get("run_db_id"), status="running", started_at=status["started_at"]
+    await asyncio.to_thread(
+        svc._supabase_update_run,
+        status.get("run_db_id"), status="running", started_at=status["started_at"],
     )
+    # Seed the S3 write-through (input.csv + the stamped status.json) so a hard
+    # kill mid-scrape on an ephemeral host still leaves a resumable copy in S3
+    # — raw/cleaned files are mirrored as they land, but only if these exist.
+    from app.services.ai_mode import s3_sync
+
+    mode_key = mode.key
+    for seed in ("input.csv", "status.json"):
+        await asyncio.to_thread(
+            s3_sync.mirror_file_to_s3, run_dir, mode_key, run_dir / seed
+        )
 
     company_name = str(status.get("company_name") or "")
     published = 0
     for idx, group in enumerate(groups, start=1):
-        if only_missing and (raw_file_path(run_dir, idx).exists()
-                             or error_marker_path(run_dir, idx).exists()):
+        if only_missing and (
+            await asyncio.to_thread(_raw_parseable, run_dir, idx)
+            or error_marker_path(run_dir, idx).exists()
+        ):
             continue
         payload = {
             "type": "scrape",
@@ -206,6 +237,12 @@ async def publish_run_batches(run_id: str, *, only_missing: bool = False) -> int
     return published
 
 
+def _load_groups(run_dir: Path, batch_size: int) -> list[list[Entity]]:
+    """Parse input.csv and chunk into scrape batches (CPU-bound; call in a thread)."""
+    raw_csv = (run_dir / "input.csv").read_bytes()
+    return list(svc.chunked(parse_entities_csv(raw_csv).entities, batch_size))
+
+
 def reset_run_for_resume(run_id: str, run_dir: Path) -> int:
     """API-side resume prep (call BEFORE republishing missing batches).
 
@@ -231,7 +268,13 @@ def reset_run_for_resume(run_id: str, run_dir: Path) -> int:
             s3_sync.delete_mirrored_file(run_dir, mode_key, path)
     status["gemini_batch_jobs"] = []
     status["requeue_attempts"] = {}
+    status["delivery_failures"] = {}
     status["error"] = None
+    # Flip out of the resumable statuses IMMEDIATELY: a second resume request
+    # racing this one must hit the endpoint's 409 gate, not double-publish
+    # (and double-bill) the missing batches.
+    status["status"] = "running"
+    status["phase"] = "publishing"
     status["updated_at"] = utc_now_iso()
     _persist_status(run_id, run_dir, status)
     return cleared
@@ -436,22 +479,19 @@ def _newest_activity_epoch(run_dir: Path, status: dict) -> Optional[float]:
 
 def _present_indices(run_dir: Path) -> set[int]:
     """Batch indices that already have a raw file OR an error marker."""
-    present: set[int] = set()
-    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    raw_idx, err_idx = _scan_indices(run_dir)
+    return raw_idx | err_idx
+
+
+def _raw_parseable(run_dir: Path, request_index: int) -> bool:
+    """True iff the batch's raw file exists AND parses (a crash mid-write can
+    leave a truncated file; resume must retry those, not skip them)."""
+    path = raw_file_path(run_dir, request_index)
     try:
-        with os.scandir(raw_dir) as it:
-            for entry in it:
-                name = entry.name
-                if not (name.startswith("request_") and name.endswith(".json")):
-                    continue
-                digits = name[len("request_"):].split(".", 1)[0]
-                try:
-                    present.add(int(digits))
-                except ValueError:
-                    continue
-    except OSError:
-        pass
-    return present
+        json.loads(path.read_text(encoding="utf-8"))
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def _build_scrape_payload(
@@ -531,8 +571,7 @@ async def _reconcile_scrape_run(
                     batch_size = int(status.get("batch_size") or 0) or mode.batch_size()
                 except (TypeError, ValueError):
                     batch_size = mode.batch_size()
-                raw_csv = await asyncio.to_thread((run_dir / "input.csv").read_bytes)
-                groups = list(svc.chunked(parse_entities_csv(raw_csv).entities, batch_size))
+                groups = await asyncio.to_thread(_load_groups, run_dir, batch_size)
                 company_name = str(status.get("company_name") or "")
                 for idx in to_republish:
                     if idx > len(groups):
@@ -624,6 +663,45 @@ async def reconcile_ai_mode_runs() -> dict:
 # --------------------------------------------------------------------------- #
 # Consumer loops (mirror of the SerpWow worker's ack/poison policy)
 # --------------------------------------------------------------------------- #
+async def _should_requeue_infra_failure(
+    payload: dict[str, Any] | None, message: Any,
+) -> bool:
+    """Restart-safe retry budget for infrastructure crashes.
+
+    RabbitMQ's ``redelivered`` flag is unusable as a retry counter: graceful
+    shutdown and stop-time nacks set it too, so after any deploy every
+    prefetched in-flight message would lose its retry on the first transient
+    failure. Track attempts durably in status.json (``delivery_failures``,
+    capped at AI_MODE_BATCH_MAX_REQUEUE) instead; fall back to the redelivered
+    flag only when the payload is undecodable/unresolvable.
+    """
+    fallback = not bool(getattr(message, "redelivered", False))
+    try:
+        if not payload or str(payload.get("type") or "scrape") == "check":
+            # check messages are cheap and idempotent; the reconciler re-kicks
+            # completion regardless, so one broker retry is plenty.
+            return fallback
+        request_index = int(payload.get("request_index") or 0)
+        run_dir = _resolve_run_dir(payload)
+        if run_dir is None or request_index <= 0:
+            return fallback
+        run_id = str(payload.get("run_id") or "")
+        max_attempts = max(1, _int_env("AI_MODE_BATCH_MAX_REQUEUE", 1))
+        async with get_run_lock(run_id):
+            status = _read_status(run_id, run_dir)
+            failures = dict(status.get("delivery_failures") or {})
+            count = int(failures.get(str(request_index), 0) or 0)
+            if count >= max_attempts:
+                return False
+            failures[str(request_index)] = count + 1
+            status["delivery_failures"] = failures
+            status["updated_at"] = utc_now_iso()
+            _persist_status(run_id, run_dir, status)
+        return True
+    except Exception:
+        return fallback
+
+
 def _terminalize_failed_payload(payload: dict[str, Any] | None, exc: BaseException) -> None:
     """Poison message dropped after redelivery: leave a durable error marker so
     the run's barrier still resolves instead of wedging forever."""
@@ -670,15 +748,15 @@ async def ai_mode_worker_loop(worker_id: int) -> None:
                         await message.nack(requeue=True)
                         raise
                     except Exception as exc:
-                        redelivered = bool(getattr(message, "redelivered", False))
-                        if not redelivered:
-                            # First failure: one redelivery (transient infra).
+                        if await _should_requeue_infra_failure(payload, message):
+                            # Transient infra failure: retry via redelivery.
                             try:
                                 await message.nack(requeue=True)
                             except Exception:
                                 pass
                         else:
-                            # Second failure: terminalize + drop (poison guard).
+                            # Retry budget exhausted: terminalize + drop
+                            # (poison guard — the barrier still resolves).
                             _terminalize_failed_payload(payload, exc)
                             try:
                                 await message.reject(requeue=False)

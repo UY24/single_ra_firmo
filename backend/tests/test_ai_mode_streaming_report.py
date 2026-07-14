@@ -90,6 +90,17 @@ class TestStreamingRunReport(unittest.TestCase):
             notfound = list(csv.DictReader(io.StringIO((run_dir / "notFound.csv").read_text())))
             self.assertEqual(len(found) + len(notfound), 3)
 
+    def test_abort_discards_partial_csvs(self):
+        # A crashed finish must never leave truncated CSVs served as complete.
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            report = StreamingRunReport(run_dir)
+            report.add_batch({"request_index": 1, "status": "success"}, _results())
+            report.abort()
+            self.assertFalse((run_dir / "found.csv").exists())
+            self.assertFalse((run_dir / "notFound.csv").exists())
+            self.assertFalse((run_dir / "found.csv.tmp").exists())
+
     def test_write_outputs_reimplemented_on_streaming_writer(self):
         # Same signature + same on-disk contract as the classic implementation.
         with tempfile.TemporaryDirectory() as d:

@@ -3798,6 +3798,12 @@ async def periodic_batch_reconciler() -> None:
             break
         await reconcile_pending_gemini_batches()
         await reconcile_stuck_gsearch_rows()
+        try:
+            from app.services.ai_mode import worker as ai_mode_worker
+
+            await ai_mode_worker.reconcile_ai_mode_runs()
+        except Exception as exc:
+            print(f"[ai-mode-reconcile] sweep failed: {exc}")
 
 
 async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
@@ -3829,6 +3835,9 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         from app.services.ai_mode import worker as ai_mode_worker
 
         await ai_mode_worker.start_ai_mode_consumers()
+        # Startup sweep: re-dispatch dead finish tasks, republish lost batches,
+        # and flip phantom-'running' runs left behind by a hard kill.
+        await ai_mode_worker.reconcile_ai_mode_runs()
     except Exception as exc:
         print(f"[ai-mode-worker] consumers failed to start: {exc}")
 

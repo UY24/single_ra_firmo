@@ -4,13 +4,17 @@ Drives the AI Mode pipeline (scrape.do Google AI Mode -> LLM cleanup) for both
 ``ai_bulk`` and ``ai_deep`` modes and writes results under
 ``ai_mode_results/<company_slug>/<run_id>/`` (spec §6).
 
-This module is a pure-sync orchestration layer. ``run_ai_mode_sync`` is intended
-to be invoked from a thread (e.g. ``asyncio.to_thread``); it never raises to the
-caller, instead reflecting any failure in the run's ``status.json``.
+This module is a pure-sync orchestration layer. The scrape phase is driven by
+the RabbitMQ worker (``services/ai_mode/worker.py``) one batch at a time via
+``scrape_batch_sync``; once every batch has a raw file or error marker, the
+worker dispatches ``run_ai_mode_finish`` (Phases 2+3: LLM cleanup + streaming
+assembly). Both are intended to run in a thread (``asyncio.to_thread``) and
+never raise — failures land in the run's ``status.json`` (status="failed").
 
 Public API (other modules depend on these names/signatures):
     prepare_ai_mode_run(raw_csv, filename, *, mode_key, company_name, company_id) -> dict
-    run_ai_mode_sync(run_id) -> None
+    scrape_batch_sync(run_dir, mode, settings, scrapedo_client, request_index, group) -> dict
+    run_ai_mode_finish(run_id, ...) -> None
     list_ai_mode_runs() -> list[dict]
     get_ai_mode_status(run_id) -> dict
     get_ai_mode_result_path(run_id, file_name) -> Path
@@ -25,7 +29,6 @@ import re
 import shutil
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
@@ -705,205 +708,14 @@ def scrape_batch_sync(
 
 
 # --------------------------------------------------------------------------- #
-# run_ai_mode_sync (orchestrator)
-# --------------------------------------------------------------------------- #
-def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
-    """Execute the full scrape.do -> LLM pipeline for a prepared run.
-
-    Synchronous; intended to be called via ``asyncio.to_thread``. Never raises to
-    the caller: any unexpected error is captured in status.json (status="failed").
-    Persists status after every batch so a UI can poll progress.
-
-    When ``resume`` is True (re-running a failed/partial run on the SAME run_id),
-    Phase 1 reuses existing ``raw_responses/`` (no scrape.do re-spend) and Phase 2
-    reuses existing ``cleaned/`` batches, so only the still-failed Gemini work is
-    redone. Phase 2 resume is automatic (the cleaned/ pre-load is harmless on a
-    fresh run); ``resume`` additionally preserves the prior run.log and drops stale
-    batch-job names.
-    """
-    run_dir = run_store.find_run_dir(run_id)
-    if run_dir is None:
-        _ensure_ai_mode_logger().error("[run:%s] run dir not found; cannot run", run_id)
-        return
-    status = _read_status(run_id, run_dir)
-    started_at = utc_now_iso()
-    wall_t0 = time.perf_counter()
-    run_log = _run_log_path(run_dir)
-    if not resume and run_log.exists():
-        try:
-            run_log.unlink()
-        except OSError:
-            pass
-    _ai_log(run_id, run_dir, "AI Mode run resuming" if resume else "AI Mode run starting")
-
-    status["status"] = "running"
-    status["started_at"] = started_at
-    status["updated_at"] = utc_now_iso()
-    status["error"] = None
-    _persist_status(run_id, run_dir, status)
-    _supabase_update_run(status.get("run_db_id"), status="running", started_at=started_at)
-
-    try:
-        mode = get_mode(str(status.get("mode") or "ai_bulk"))
-        batch_size = mode.batch_size()
-
-        settings = build_ai_mode_settings()
-        cfg = build_ai_mode_llm_config()
-        _ai_log(
-            run_id,
-            run_dir,
-            "Settings loaded "
-            f"mode={mode.key} batch_size={batch_size} max_query_chars={settings.scrapedo_max_query_chars} "
-            f"timeout={settings.scrapedo_timeout_seconds}s retries={settings.scrapedo_max_retries} "
-            f"device={settings.scrapedo_device or '-'} hl={settings.scrapedo_hl or '-'} "
-            f"gl={settings.scrapedo_gl or '-'} google_domain={settings.scrapedo_google_domain or '-'} "
-            f"include_html={settings.scrapedo_include_html} llm_provider={cfg.provider} llm_model={cfg.model}",
-        )
-        llm = make_llm_client(cfg)
-        scrapedo_client = ScrapeDoClient(
-            token=settings.scrapedo_token,
-            timeout_seconds=settings.scrapedo_timeout_seconds,
-            max_retries=settings.scrapedo_max_retries,
-            device=settings.scrapedo_device,
-            hl=settings.scrapedo_hl,
-            gl=settings.scrapedo_gl,
-            google_domain=settings.scrapedo_google_domain,
-            safe=settings.scrapedo_safe,
-            include_html=settings.scrapedo_include_html,
-            log=lambda message: _ai_log(run_id, run_dir, message, logging.DEBUG),
-        )
-
-        input_csv = run_dir / "input.csv"
-        entities: list[Entity] = parse_entities_csv(input_csv.read_bytes()).entities
-        _ai_log(
-            run_id,
-            run_dir,
-            f"Loaded entities mode={mode.key} total_entities={len(entities)} input_csv={input_csv}",
-        )
-
-        groups = list(chunked(entities, batch_size))
-        _ai_log(
-            run_id,
-            run_dir,
-            f"Created {len(groups)} Scrape.do batch(es) from batch_size={batch_size}",
-        )
-        status["batches_total"] = len(groups)
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
-
-        raw_dir = run_dir / RAW_RESPONSES_DIRNAME
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        cleaned_dir = run_dir / CLEANED_DIRNAME
-        cleaned_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write-through to S3 as files are produced (mirrors SerpWow's per-row
-        # uploads): stream input.csv/status.json now and each raw/cleaned file as
-        # it lands, so a hard kill (OOM/SIGKILL/spot reclaim) that bypasses the
-        # end-of-run mirror still leaves a resumable copy in S3. The end-of-run
-        # mirror still writes the aggregates (final_report/found/notFound).
-        from app.services.ai_mode import s3_sync
-        for _seed in ("input.csv", "status.json"):
-            s3_sync.mirror_file_to_s3(run_dir, mode.key, run_dir / _seed)
-
-        per_request_records: list[dict] = []
-        usage_total = TokenUsage()
-        entities_without_scrape_data = 0
-        llm_errors = 0
-        scrapedo_seconds_total = 0.0
-        llm_seconds_total = 0.0
-
-        batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
-        concurrency = max(1, _int_env("SCRAPEDO_CONCURRENCY", 5))
-        status["model"] = cfg.model
-        status["is_batch"] = batch_mode
-        _persist_status(run_id, run_dir, status)
-
-        # ------------------------------------------------------------- #
-        # PHASE 1 - scrape every batch (parallel, bounded by concurrency)
-        # ------------------------------------------------------------- #
-        status["phase"] = "scraping"
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
-
-        def _scrape_one(request_index: int, group: list[Entity]) -> dict:
-            # Thin wrapper: the record carries NO payload (1M-row memory safety);
-            # Phases 2/3 re-read raw_responses/ from disk per batch.
-            rec = scrape_batch_sync(
-                run_dir, mode, settings, scrapedo_client, request_index, group
-            )
-            rec["group"] = group
-            rec["group_names"] = [e.company_name for e in group]
-            return rec
-
-        scraped: dict[int, dict] = {}
-        scrape_done = 0
-        scrape_failed = 0
-        flush_sec = max(0.0, _float_env("AI_MODE_STATUS_FLUSH_SEC", 2.0))
-        last_flush = 0.0
-        _ai_log(
-            run_id, run_dir,
-            f"Phase 1 scrape starting batches={len(groups)} concurrency={concurrency}",
-        )
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(_scrape_one, idx, grp): idx
-                for idx, grp in enumerate(groups, start=1)
-            }
-            for fut in as_completed(futures):
-                rec = fut.result()
-                scraped[rec["request_index"]] = rec
-                scrapedo_seconds_total += rec["scrapedo_seconds"]
-                if rec["error"]:
-                    entities_without_scrape_data += len(rec["group"])
-                    scrape_failed += 1
-                scrape_done += 1
-                status["batches_done"] = scrape_done
-                status["scrapedo_request_count"] = scrape_done
-                status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-                status["entities_without_scrape_data"] = entities_without_scrape_data
-                status["scrapedo_failed_requests"] = scrape_failed
-                status["updated_at"] = utc_now_iso()
-                # Throttle status.json rewrites (100k batches would otherwise
-                # persist per completion); always flush the final one.
-                now_mono = time.monotonic()
-                if now_mono - last_flush >= flush_sec or scrape_done == len(groups):
-                    _persist_status(run_id, run_dir, status)
-                    last_flush = now_mono
-        ordered = [scraped[i] for i in sorted(scraped)]
-        ok_batches = [r for r in ordered if r["ok"]]
-        _ai_log(
-            run_id, run_dir,
-            f"Phase 1 scrape complete ok={len(ok_batches)} failed={len(ordered) - len(ok_batches)}",
-        )
-
-    except Exception as exc:  # never raise to caller (Phase-1/setup failure)
-        _fail_run(run_id, run_dir, status, exc, wall_t0)
-        return
-
-    # Hand off to the shared finish engine (Phases 2+3) with exact Phase-1
-    # timings preserved. run_ai_mode_finish never raises.
-    run_ai_mode_finish(
-        run_id,
-        resume=resume,
-        phase1_recs=ordered,
-        started_at=started_at,
-        wall_t0=wall_t0,
-        scrape_stats={
-            "entities_without_scrape_data": entities_without_scrape_data,
-            "scrapedo_seconds_total": scrapedo_seconds_total,
-        },
-    )
-
-
-# --------------------------------------------------------------------------- #
 # Shared failure path + finish engine (Phases 2+3)
 # --------------------------------------------------------------------------- #
 def _fail_run(
     run_id: str, run_dir: Path, status: dict, exc: BaseException, wall_t0: float
 ) -> None:
-    """Terminal-failure bookkeeping shared by run_ai_mode_sync and
-    run_ai_mode_finish: status.json -> failed, Supabase update, S3 mirror of the
-    partial run dir, Slack failure ping. Never raises."""
+    """Terminal-failure bookkeeping for run_ai_mode_finish: status.json ->
+    failed, Supabase update, S3 mirror of the partial run dir, Slack failure
+    ping. Never raises."""
     status["status"] = "failed"
     status["error"] = sanitize_secret_text(str(exc))
     status["updated_at"] = utc_now_iso()
@@ -1274,6 +1086,11 @@ def run_ai_mode_finish(
                     inflight.pop(name, None)
                 if next_shard < len(shards) or inflight:
                     time.sleep(poll_sec)
+                    # Heartbeat: a Gemini batch can take hours — keep updated_at
+                    # fresh so the reconciler's staleness checks (and operators)
+                    # never mistake a healthy long wait for a dead run.
+                    status["updated_at"] = utc_now_iso()
+                    _persist_status(run_id, run_dir, status)
 
             # (Per-batch resolution happens in Phase 3, reading cleaned/ files.)
             llm_seconds_total = time.perf_counter() - clean_t0

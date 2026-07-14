@@ -1,5 +1,4 @@
 """Task 14: /companies router + company-aware run lifecycle (all offline/mocked)."""
-import os
 import unittest
 from unittest import mock
 
@@ -111,11 +110,16 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
     def setUp(self):
         from app.routers.ai_mode import router as ai_mode_router
 
-        # These tests exercise company validation/prepare, not the broker path —
-        # pin the legacy in-process engine so no RabbitMQ is required.
-        self._engine_env = mock.patch.dict(os.environ, {"AI_MODE_ENGINE": "sync"})
-        self._engine_env.start()
-        self.addCleanup(self._engine_env.stop)
+        # These tests exercise company validation/prepare, not the broker — mock
+        # it ready and stub the background publisher so no RabbitMQ is required.
+        for target, repl in (
+            ("app.services.ai_mode.broker.is_ready", mock.Mock(return_value=True)),
+            ("app.services.ai_mode.worker.publish_run_batches",
+             mock.AsyncMock(return_value=0)),
+        ):
+            patcher = mock.patch(target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         app = FastAPI()
         app.include_router(ai_mode_router)
         self.client = TestClient(app)
@@ -158,8 +162,7 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
         with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
                 mock.patch("app.services.ai_mode.ai_mode_service.prepare_ai_mode_run",
                            return_value=info) as prepare, \
-                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id, \
-                mock.patch("app.services.ai_mode.ai_mode_service.run_ai_mode_sync"):
+                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id:
             res = self.client.post(
                 "/uploads/ai-mode", files={"file": self.csv}, data={"company_id": "u1"}
             )
@@ -180,8 +183,7 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
         with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
                 mock.patch("app.services.ai_mode.ai_mode_service.prepare_ai_mode_run",
                            return_value=info), \
-                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id, \
-                mock.patch("app.services.ai_mode.ai_mode_service.run_ai_mode_sync"):
+                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id:
             res = self.client.post(
                 "/uploads/ai-mode", files={"file": self.csv}, data={"company_id": "u1"}
             )

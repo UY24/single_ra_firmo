@@ -1,13 +1,13 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-13. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-07-14. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
 ## Current status
 
-- **Active branch: `uiuximp`** — the "Midnight Ledger" UI/UX redesign + batch-lifecycle hardening + Slack split-cost precision. **COMPLETE and reviewed** (no remaining Critical/Important issues). Working tree clean; **local commits are NOT yet pushed** to `origin/uiuximp`.
-- Full suite: **487/487** passing.
+- **Active branch: `aiModeBroker`** (off `revampCode`; `uiuximp` was merged via PR #8) — the **AI Mode → RabbitMQ broker rework** for 500k–1M-row runs. Code complete in 3 commits (PR1 streaming/memory, PR2 broker engine, PR3 reconciler/resume/legacy-removal); **NOT live-verified, NOT pushed**.
+- Full suite: **532/532** passing.
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -18,13 +18,14 @@ Last updated: 2026-07-13. Read this first if you're picking up this repo. Durabl
 Two independent discovery systems behind one FastAPI app + vanilla-JS UI (see `CLAUDE.md` for the architecture):
 
 - **SerpWow pipelines** — `full`, `url_discovery`, `firmographics`, `gmaps`, `gsearch`, `relationship`. gsearch/gmaps/relationship have confidence scoring + `found.csv`/`notFound.csv`/`report.json`/`run.log` output parity, S3 mirroring, Supabase counters, and run-detail UI.
-- **AI Mode** — `ai_bulk`, `ai_deep` (scrape.do -> LLM cleanup), resume-aware, Gemini Batch API support.
-- Cross-cutting: unified CSV input, per-company/per-pipeline S3 layout, Supabase run tracking, best-effort Slack completion/failure pings (now with split LLM vs SerpWow cost), the redesigned dark UI across all views.
+- **AI Mode** — `ai_bulk`, `ai_deep` (scrape.do -> LLM cleanup), **now broker-driven** (RabbitMQ scrape phase in the worker process, reconciler self-healing, streaming assembly, Gemini Batch API support). See the AI Mode section in `CLAUDE.md`.
+- Cross-cutting: unified CSV input, per-company/per-pipeline S3 layout, Supabase run tracking, best-effort Slack completion/failure pings (with split LLM vs SerpWow cost), the redesigned dark UI across all views.
 
 ## Active risks / unfinished work
 
-- **`uiuximp` is NOT live-verified** — offline tests only. Before relying on it, run a live smoke: one reporting run (row processing -> batch finalization -> files available), one cancel/delete from Operations, one explicit retry, one Slack completion message confirming split costs. **Restart both API server and worker** first — several changes are in `services/serpwow/engine.py`, not static UI only.
-- **`errorTaxonomy` branch (2026-07-10) is NOT merged — user's call.** Introduces the `found`/`not_found`/`error` outcome taxonomy (error source+category, `not_found` becomes `completed`). Reviewed, 416/416 offline, but **not live-verified** (needs a run showing the found/not_found split and a forced SerpWow 429/timeout landing as a real `error/serpwow` rather than a silent not_found). Details in `docs/HISTORY.md` (2026-07-10).
+- **`aiModeBroker` is NOT live-verified** — offline tests only (532/532). Live smoke needed before relying on it (see "Latest completed session" below for the checklist). **AI Mode now REQUIRES RabbitMQ + the worker process** — uploads 503 without the broker; the worker env needs `SCRAPEDO_TOKEN` + LLM keys + S3/Supabase/Slack vars (shared repo-root `.env` covers same-host setups). Run exactly ONE worker process.
+- Known follow-ups from the rework: sync-LLM cleanup in the finish task is still serial (the plan's `AI_MODE_LLM_CONCURRENCY` pool was deferred — at 500k+ the Gemini Batch path is the intended one); the reconciler has no S3 cold-start scan (a wiped host relies on the resume endpoint's rehydrate — per the manual-rerun preference); multi-host workers would need S3-based file-presence checks.
+- **`errorTaxonomy` branch (2026-07-10) is NOT merged — user's call.** Introduces the `found`/`not_found`/`error` outcome taxonomy (error source+category, `not_found` becomes `completed`). Reviewed, 416/416 offline, but **not live-verified**. Details in `docs/HISTORY.md` (2026-07-10).
 - **Other historical branches** (`gmapsfix`, `gsearchFix`, `relationshipMode`) — `relationshipMode` was merged into `revampCode` via PRs #5/#6; the gmaps/gsearch branches carry earlier features that are captured in `CLAUDE.md`. See `docs/HISTORY.md` if you need their state.
 
 ## Run / test commands
@@ -34,9 +35,9 @@ Two independent discovery systems behind one FastAPI app + vanilla-JS UI (see `C
 cd backend && ../.venv/bin/python -m app.main       # or: ../.venv/bin/python ../run.py
 # UI at http://localhost:<API_PORT>/app  (default port 11500; .env overrides)
 
-# SerpWow worker — needed ONLY for SerpWow pipelines, not AI Mode
+# Worker — needed for SerpWow pipelines AND AI Mode (broker-driven since 2026-07-14)
 docker compose up -d rabbitmq                        # broker + mgmt UI on 15672
-python worker.py                                     # from repo root
+python worker.py                                     # from repo root; ONE process only
 
 # Tests (offline, unittest — NOT pytest; -t . is mandatory)
 cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
@@ -44,9 +45,8 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Immediate next steps
 
-1. Decide the source-control move for `uiuximp`: push the remaining local tip and open/refresh the PR, or merge into the chosen base branch.
-2. Run the live smoke test above (restart server + worker first).
-3. Decide whether to merge `errorTaxonomy`, and live-verify it if so.
+1. **Live-smoke `aiModeBroker`** (checklist in the session notes below), then decide merge/push (needs user approval to push).
+2. Decide whether to merge `errorTaxonomy`, and live-verify it if so.
 
 ## Conventions (do not break)
 
@@ -56,7 +56,28 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
-## Latest completed session — 2026-07-13 (Midnight Ledger UI/UX + Slack cost precision, branch `uiuximp`)
+## Latest completed session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
+
+**Status: code complete (3 commits), 532/532 offline, NOT live-verified, NOT pushed.** Full architecture now documented in `CLAUDE.md` (AI Mode engine section). Motivation: 500k–1M-row recurring runs — the old in-process `run_ai_mode_sync` held every scrape payload + all results in RAM (OOM at scale), had no redelivery (a crash meant a manual whole-run re-drive), and a hard kill left runs showing `running` forever with the "Rerun failed" button unreachable.
+
+### What changed (by commit)
+
+1. **PR1 — streaming/memory** (`perf(ai_mode): stream Phase-3 assembly…`): `StreamingRunReport` (incremental CSVs + outcome counters + `AI_MODE_REPORT_ENTITIES_MAX` cap), `classify_one_result` extraction, `scrape_batch_sync` extraction (idempotent one-batch scraper, returns metadata only), per-batch disk reads in Phases 2/3, throttled status flushes. Memory O(one batch).
+2. **PR2 — broker engine** (`feat(ai_mode): RabbitMQ broker engine…`): `ai_mode/broker.py` (own channel/QoS, durable `ai_mode_jobs` queue), `ai_mode/worker.py` (producer `publish_run_batches` + consumers with SerpWow's ack-after-persist/poison policy + file-presence idempotency + recount barrier that dispatches `run_ai_mode_finish` exactly once), `run_ai_mode_finish` extraction (Phases 2+3, never-raises, rebuilds Phase-1 records from disk), router 503 gate + background publisher.
+3. **PR3 — reconciler + resume + legacy removal**: `reconcile_ai_mode_runs` (startup + periodic; republish-missing with `AI_MODE_BATCH_MAX_REQUEUE` cap then error-marker terminalization; finish re-dispatch; **phantom-running flip** for legacy runs so "Rerun failed" appears), Gemini-poll heartbeat, resume endpoint rework (clears `*.error.json` + S3 mirrors via new `s3_sync.delete_mirrored_file`, clears stale bookkeeping, republishes only missing batches), **deleted `run_ai_mode_sync`** + the interim `AI_MODE_ENGINE` flag (broker is the only path), `tests/ai_mode_drive.py` offline harness, `.env.example` §3f + `CLAUDE.md` updates.
+
+### Live smoke checklist (before merge)
+
+1. `docker compose up -d rabbitmq`; start API + `python worker.py` (restart both). Small `ai_deep` upload (10 rows → 4 batches): `ai_mode_jobs` visible in mgmt UI with consumers; raw files land; phase publishing→scraping→cleaning; outputs/Slack/Supabase as before.
+2. `kill -9` the worker mid-scrape → restart → redeliveries skip existing raw files, run completes (no scrape.do re-spend — check run.log).
+3. Kill mid-Gemini-batch (`AI_MODE_LLM_BATCH=true`) → restart → reconciler re-dispatches finish, `cleaned/` reused.
+4. Stop the worker entirely → after `AI_MODE_BATCH_STALE_TIMEOUT_SEC` the reconciler republishes/terminalizes; "Rerun failed" completes the run.
+5. Broker stopped → AI-Mode upload 503s; old completed runs still render.
+6. At 100k+: worker RSS flat; status.json stays ~2KB; scrape.do 429s at high `AI_MODE_WORKER_CONCURRENCY`; found+notFound row counts == total_rows; `final_report.json` has `entities_omitted:true`.
+
+---
+
+## Older session — 2026-07-13 (Midnight Ledger UI/UX + Slack cost precision, branch `uiuximp`)
 
 **Status: COMPLETE and reviewed.** The UI has been fully redesigned in the approved "A - Midnight Ledger" direction: an elegant, lower-density dark interface with clearer hierarchy, fewer boxed metrics, outcome-first run details, responsive navigation, accessible controls, and consistent shared primitives. Final branch review found no remaining Critical/Important issues. Suite **487/487**; notification-focused suite **28/28**.
 

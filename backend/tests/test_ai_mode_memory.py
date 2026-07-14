@@ -126,10 +126,12 @@ class FakeLLMClient:
         return arr, TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
 
 
-class TestSyncPathStreamsFromDisk(unittest.TestCase):
-    """End-to-end sync-LLM run: outputs correct after the streaming rework."""
+class TestBrokerRunStreamsFromDisk(unittest.TestCase):
+    """End-to-end broker-driven run: outputs correct after the streaming rework."""
 
     def setUp(self):
+        from app.services.ai_mode import worker as ai_worker
+
         FakeScrapeDoClient.calls = 0
         self._tmp = tempfile.TemporaryDirectory()
         results_root = Path(self._tmp.name) / "ai_mode_results"
@@ -144,13 +146,19 @@ class TestSyncPathStreamsFromDisk(unittest.TestCase):
             p.start()
         for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE"):
             os.environ.pop(env, None)
+        ai_worker._reset_for_tests()
 
     def tearDown(self):
+        from app.services.ai_mode import worker as ai_worker
+
+        ai_worker._reset_for_tests()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
 
     def test_run_produces_streamed_outputs(self):
+        from tests.ai_mode_drive import drive_run
+
         csv_six = "company_name,country\n" + "".join(
             f"Company {i},Japan\n" for i in range(1, 7)
         )
@@ -159,7 +167,7 @@ class TestSyncPathStreamsFromDisk(unittest.TestCase):
             mode_key="ai_deep", company_name="Acme Corp", company_id="acme-1",
         )
         run_id = info["run_id"]
-        ai_mode_service.run_ai_mode_sync(run_id)
+        drive_run(run_id)
 
         run_dir = run_store.find_run_dir(run_id)
         status = ai_mode_service.get_ai_mode_status(run_id)

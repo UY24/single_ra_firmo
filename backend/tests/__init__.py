@@ -1,7 +1,7 @@
 """Test package init.
 
 Hard safety net: blank every cloud/credential env var for the ENTIRE test
-process so no test that exercises a real run path (run_ai_mode_sync /
+process so no test that exercises a real run path (run_ai_mode_finish /
 persist_upload_state / run_gemini_batch_for_upload) can hit a live endpoint.
 This runs before app.core.config's load_dotenv(override=False), which will NOT
 re-populate these. Tests needing a value set it explicitly via
@@ -10,7 +10,7 @@ mock.patch.dict(os.environ, {...}, clear=True).
 import os
 
 # Hard safety net: blank every cloud/credential env var for the ENTIRE test
-# process so no test that exercises a real run path (run_ai_mode_sync /
+# process so no test that exercises a real run path (run_ai_mode_finish /
 # persist_upload_state / run_gemini_batch_for_upload) can hit a live endpoint.
 # This runs before app.core.config's load_dotenv(override=False), which will NOT
 # re-populate these. Tests needing a value set it explicitly via

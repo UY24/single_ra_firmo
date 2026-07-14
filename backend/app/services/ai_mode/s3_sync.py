@@ -51,6 +51,25 @@ def mirror_file_to_s3(run_dir: Path, mode_key: str, local_path: Path) -> bool:
         return False
 
 
+def delete_mirrored_file(run_dir: Path, mode_key: str, local_path: Path) -> bool:
+    """Best-effort delete of one file's S3 mirror (e.g. error markers cleared on
+    resume, so a later rehydrate can't resurrect them). Never raises."""
+    if not s3.is_configured():
+        return False
+    try:
+        rel = Path(local_path).relative_to(run_dir).as_posix()
+    except ValueError:
+        return False
+    key = f"{s3_key_prefix(run_dir, mode_key)}/{rel}"
+    try:
+        s3.get_s3_client().delete_object(Bucket=s3.bucket_name(), Key=key)
+        return True
+    except Exception as exc:  # never fail the caller on a mirror delete
+        _LOGGER.warning("S3 delete failed for %s: %s: %s",
+                        key, type(exc).__name__, exc)
+        return False
+
+
 def mirror_run_to_s3(run_dir: Path, mode_key: str) -> list[str]:
     if not s3.is_configured():
         _LOGGER.info("S3 not configured; skipping mirror for run %s", run_dir.name)

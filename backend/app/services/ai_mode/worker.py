@@ -206,6 +206,37 @@ async def publish_run_batches(run_id: str, *, only_missing: bool = False) -> int
     return published
 
 
+def reset_run_for_resume(run_id: str, run_dir: Path) -> int:
+    """API-side resume prep (call BEFORE republishing missing batches).
+
+    Deletes terminal ``*.error.json`` markers so those batches are retried
+    (raw and cleaned/ checkpoints are untouched — no scrape.do or LLM re-spend
+    on successes), best-effort deletes each marker's S3 mirror (so a later
+    rehydrate can't resurrect it), and clears stale batch bookkeeping
+    (``gemini_batch_jobs``/``requeue_attempts``). Returns markers cleared.
+    """
+    from app.services.ai_mode import s3_sync
+
+    status = _read_status(run_id, run_dir)
+    mode_key = str(status.get("mode") or "ai_bulk")
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    cleared = 0
+    if raw_dir.is_dir():
+        for path in sorted(raw_dir.glob("request_*.error.json")):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            cleared += 1
+            s3_sync.delete_mirrored_file(run_dir, mode_key, path)
+    status["gemini_batch_jobs"] = []
+    status["requeue_attempts"] = {}
+    status["error"] = None
+    status["updated_at"] = utc_now_iso()
+    _persist_status(run_id, run_dir, status)
+    return cleared
+
+
 # --------------------------------------------------------------------------- #
 # Job processing
 # --------------------------------------------------------------------------- #
@@ -363,6 +394,231 @@ def maybe_start_finish(run_id: str) -> None:
                        exc_info=t.exception())
 
     task.add_done_callback(_cleanup)
+
+
+# --------------------------------------------------------------------------- #
+# Reconciler — the always-on durability backstop (worker process: startup sweep
+# + folded into the engine's periodic_batch_reconciler)
+# --------------------------------------------------------------------------- #
+_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
+
+
+def _parse_iso_epoch(ts: Any) -> Optional[float]:
+    """ISO-8601 timestamp -> epoch seconds (None when missing/malformed)."""
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _newest_activity_epoch(run_dir: Path, status: dict) -> Optional[float]:
+    """Latest sign of life: newest raw/error file mtime, else status updated_at."""
+    newest = _parse_iso_epoch(status.get("updated_at"))
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    try:
+        with os.scandir(raw_dir) as it:
+            for entry in it:
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if newest is None or mtime > newest:
+                    newest = mtime
+    except OSError:
+        pass
+    return newest
+
+
+def _present_indices(run_dir: Path) -> set[int]:
+    """Batch indices that already have a raw file OR an error marker."""
+    present: set[int] = set()
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    try:
+        with os.scandir(raw_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not (name.startswith("request_") and name.endswith(".json")):
+                    continue
+                digits = name[len("request_"):].split(".", 1)[0]
+                try:
+                    present.add(int(digits))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return present
+
+
+def _build_scrape_payload(
+    run_id: str, request_index: int, batches_total: int,
+    mode_key: str, company_name: str, group: list[Entity],
+) -> dict[str, Any]:
+    return {
+        "type": "scrape",
+        "run_id": run_id,
+        "request_index": request_index,
+        "batches_total": batches_total,
+        "mode": mode_key,
+        "company_name": company_name,
+        "entities": [asdict(e) for e in group],
+        "published_at": utc_now_iso(),
+    }
+
+
+async def _flip_phantom_run(run_id: str, run_dir: Path, actions: dict) -> None:
+    """Honest-status fix: a hard-killed run can never flip itself to failed (the
+    except-path needs a live process), so the reconciler does it — which makes
+    the existing "Rerun failed" button appear and the resume endpoint accept."""
+    async with get_run_lock(run_id):
+        status = _read_status(run_id, run_dir)
+        if str(status.get("status") or "") not in {"queued", "running"}:
+            return
+        status["status"] = "failed"
+        status["error"] = (
+            "Run interrupted (server crash or restart). Use 'Rerun failed' to "
+            "resume — already-scraped and already-cleaned batches are reused, "
+            "not re-billed."
+        )
+        status["updated_at"] = utc_now_iso()
+        _persist_status(run_id, run_dir, status)
+    await asyncio.to_thread(
+        svc._supabase_update_run, status.get("run_db_id"),
+        status="failed", error=status["error"], finished_at=status["updated_at"],
+    )
+    actions["phantoms_failed"] += 1
+    _LOG.warning("reconciler flipped phantom run %s to failed", run_id)
+
+
+async def _reconcile_scrape_run(
+    run_id: str, run_dir: Path, actions: dict,
+    *, stale_sec: int, max_requeue: int, now: float,
+) -> None:
+    """Republish lost/stale batches (attempt-capped, then terminalized)."""
+    async with get_run_lock(run_id):
+        status = _read_status(run_id, run_dir)
+        if str(status.get("phase") or "") not in {"publishing", "scraping"}:
+            return
+        total = int(status.get("batches_total") or 0)
+        if total <= 0:
+            return
+        present = await asyncio.to_thread(_present_indices, run_dir)
+        missing = [idx for idx in range(1, total + 1) if idx not in present]
+        if missing:
+            newest = await asyncio.to_thread(_newest_activity_epoch, run_dir, status)
+            if newest is not None and now - newest <= stale_sec:
+                return  # still in-flight; leave it alone
+            mode = get_mode(str(status.get("mode") or "ai_bulk"))
+            attempts_map: dict[str, int] = dict(status.get("requeue_attempts") or {})
+            to_republish = [i for i in missing
+                            if int(attempts_map.get(str(i), 0) or 0) < max_requeue]
+            to_terminalize = [i for i in missing if i not in set(to_republish)]
+            for idx in to_terminalize:
+                attempts = int(attempts_map.get(str(idx), 0) or 0)
+                await asyncio.to_thread(
+                    write_error_marker, run_dir, mode.key, idx,
+                    f"terminalized by reconciler after {attempts} requeue(s) "
+                    f"(message lost/stale > {stale_sec}s)",
+                    note="reconciler",
+                )
+                actions["terminalized"] += 1
+            if to_republish:
+                try:
+                    batch_size = int(status.get("batch_size") or 0) or mode.batch_size()
+                except (TypeError, ValueError):
+                    batch_size = mode.batch_size()
+                raw_csv = await asyncio.to_thread((run_dir / "input.csv").read_bytes)
+                groups = list(svc.chunked(parse_entities_csv(raw_csv).entities, batch_size))
+                company_name = str(status.get("company_name") or "")
+                for idx in to_republish:
+                    if idx > len(groups):
+                        continue
+                    payload = _build_scrape_payload(
+                        run_id, idx, total, mode.key, company_name, groups[idx - 1]
+                    )
+                    try:
+                        await broker.publish_scrape_job(payload)
+                    except Exception:
+                        _LOG.warning("reconciler republish failed run=%s idx=%s",
+                                     run_id, idx, exc_info=True)
+                        continue
+                    attempts_map[str(idx)] = int(attempts_map.get(str(idx), 0) or 0) + 1
+                    actions["republished"] += 1
+            status["requeue_attempts"] = attempts_map
+            status["updated_at"] = utc_now_iso()
+            _persist_status(run_id, run_dir, status)
+            _last_flush[run_id] = time.monotonic()
+    # Outside the lock: recount + flip if everything is terminal now (covers a
+    # missed winner-check and the just-terminalized markers above).
+    if await _completion_check(run_id, run_dir):
+        actions["finish_dispatched"] += 1
+
+
+async def reconcile_ai_mode_runs() -> dict:
+    """Sweep non-terminal AI Mode runs and self-heal (SerpWow-reconciler parity).
+
+    1. broker runs stuck publishing/scraping with lost batches: republish each
+       missing batch up to AI_MODE_BATCH_MAX_REQUEUE times (safe — workers skip
+       existing raw files), then terminalize via error markers so the barrier
+       ALWAYS resolves. Gated on a drained queue, like reconcile_stuck_gsearch_rows.
+    2. broker runs in phase "cleaning" with no live finish task (worker died
+       mid-cleanup): re-dispatch run_ai_mode_finish (resumable via cleaned/).
+    3. legacy sync-engine runs stuck queued/running past AI_MODE_LEGACY_STALE_SEC:
+       flip to failed so the UI's "Rerun failed" button appears (phantom fix).
+    """
+    scan_limit = max(1, _int_env("AI_MODE_RECONCILE_SCAN_LIMIT", 500))
+    stale_sec = max(30, _int_env("AI_MODE_BATCH_STALE_TIMEOUT_SEC", 900))
+    legacy_stale_sec = max(60, _int_env("AI_MODE_LEGACY_STALE_SEC", 3600))
+    max_requeue = max(0, _int_env("AI_MODE_BATCH_MAX_REQUEUE", 1))
+    now = time.time()
+    actions = {"republished": 0, "terminalized": 0,
+               "finish_dispatched": 0, "phantoms_failed": 0}
+
+    for run_dir in run_store.list_run_dirs()[:scan_limit]:
+        status_path = run_dir / "status.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not isinstance(status, dict):
+            continue
+        run_status = str(status.get("status") or "")
+        if not run_status or run_status in _TERMINAL_STATUSES:
+            continue
+        run_id = str(status.get("run_id") or run_dir.name)
+        try:
+            if str(status.get("engine") or "") != "broker":
+                # Legacy in-process run: only the phantom-running flip applies.
+                newest = _parse_iso_epoch(status.get("updated_at"))
+                if newest is not None and now - newest > legacy_stale_sec:
+                    await _flip_phantom_run(run_id, run_dir, actions)
+                continue
+            phase = str(status.get("phase") or "")
+            if phase == "cleaning":
+                existing = _finish_tasks.get(run_id)
+                if existing is None or existing.done():
+                    maybe_start_finish(run_id)
+                    actions["finish_dispatched"] += 1
+                continue
+            if phase in {"publishing", "scraping"}:
+                # Queue-dependent work: act only when the queue is drained, so a
+                # slow-but-alive run is never double-published.
+                depth = await broker.get_queue_depth()
+                if depth is None or depth > 0:
+                    continue
+                await _reconcile_scrape_run(
+                    run_id, run_dir, actions,
+                    stale_sec=stale_sec, max_requeue=max_requeue, now=now,
+                )
+        except Exception:
+            _LOG.warning("reconcile failed for run %s", run_id, exc_info=True)
+    if any(actions.values()):
+        _LOG.info("ai_mode reconcile actions: %s", actions)
+    return actions
 
 
 # --------------------------------------------------------------------------- #

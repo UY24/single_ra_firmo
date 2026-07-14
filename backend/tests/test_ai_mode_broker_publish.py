@@ -138,12 +138,11 @@ class TestUploadEndpointBrokerGate(unittest.TestCase):
         app.include_router(router)
         client = TestClient(app)
         self.assertFalse(broker.is_ready())
-        with mock.patch.dict(os.environ, {"AI_MODE_ENGINE": "broker"}):
-            res = client.post(
-                "/uploads/ai-mode",
-                files={"file": ("input.csv", b"company_name,country\nAcme,US\n", "text/csv")},
-                data={"mode": "ai_bulk", "company_id": "c1"},
-            )
+        res = client.post(
+            "/uploads/ai-mode",
+            files={"file": ("input.csv", b"company_name,country\nAcme,US\n", "text/csv")},
+            data={"mode": "ai_bulk", "company_id": "c1"},
+        )
         self.assertEqual(res.status_code, 503)
         self.assertIn("queue", res.json()["detail"].lower())
 

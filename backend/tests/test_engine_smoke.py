@@ -1,9 +1,10 @@
 # backend/tests/test_engine_smoke.py
 """Offline end-to-end smoke test for the unified two-mode AI engine.
 
-Mocks the module seams (ScrapeDoClient + make_llm_client) so no network access
-is needed, and proves mode-specific batching, the new on-disk layout, and the
-unified output schema.
+Drives the broker engine in-process (tests/ai_mode_drive.py emulates publish ->
+consume -> finish, no RabbitMQ) with the module seams (ScrapeDoClient +
+make_llm_client) mocked so no network access is needed, and proves mode-specific
+batching, the on-disk layout, and the unified output schema.
 """
 import csv
 import json
@@ -15,7 +16,9 @@ from pathlib import Path
 from unittest import mock
 
 from app.services.ai_mode import ai_mode_service, run_store
+from app.services.ai_mode import worker as ai_worker
 from app.services.ai_mode.models import TokenUsage
+from tests.ai_mode_drive import drive_run
 
 CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in range(1, 7))
 
@@ -24,12 +27,12 @@ FAKE_ENV = {
     "GEMINI_API_KEY": "fake-key",
     "AI_MODE_LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
-    "SCRAPEDO_CONCURRENCY": "2",
+    "AI_MODE_STATUS_FLUSH_SEC": "0",
     # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated
-    # .env would otherwise make run_ai_mode_sync attempt a live S3 upload).
+    # .env would otherwise attempt a live S3 upload).
     "S3_BUCKET": "",
-    # Unset so the Slack notifier no-ops (a populated .env would otherwise make
-    # run_ai_mode_sync POST to a live webhook). Notify tests assert the calls.
+    # Unset so the Slack notifier no-ops (a populated .env would otherwise POST
+    # to a live webhook). Notify tests assert the calls.
     "SLACK_WEBHOOK_URL": "",
 }
 
@@ -91,9 +94,11 @@ class TestEngineSmoke(unittest.TestCase):
             p.start()
         for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE"):
             os.environ.pop(env, None)
+        ai_worker._reset_for_tests()
         self.results_root = results_root
 
     def tearDown(self):
+        ai_worker._reset_for_tests()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
@@ -103,7 +108,7 @@ class TestEngineSmoke(unittest.TestCase):
             CSV_SIX.encode("utf-8"), "input.csv",
             mode_key=mode_key, company_name="Acme Corp", company_id="acme-id-1",
         )
-        ai_mode_service.run_ai_mode_sync(info["run_id"])
+        drive_run(info["run_id"])
         return info
 
     def test_ai_bulk_six_entities_one_scrape_call(self):
@@ -198,8 +203,8 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(kw["total_rows"], 6)
 
     def test_notify_run_failed_fires_on_crash(self):
-        # Force the run_ai_mode_sync except-path: assemble (the Phase-3 streaming
-        # report constructor) raises.
+        # Force run_ai_mode_finish's failure path: assemble (the Phase-3
+        # streaming report constructor) raises.
         with mock.patch.object(ai_mode_service, "StreamingRunReport",
                                side_effect=RuntimeError("disk full")), \
                 mock.patch("app.core.notify.notify_run_complete") as done, \

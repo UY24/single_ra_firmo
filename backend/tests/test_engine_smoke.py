@@ -92,7 +92,7 @@ class TestEngineSmoke(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE"):
+        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE"):
             os.environ.pop(env, None)
         ai_worker._reset_for_tests()
         self.results_root = results_root

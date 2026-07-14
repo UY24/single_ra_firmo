@@ -99,7 +99,7 @@ class TestPhase2Resume(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE", "AI_MODE_BATCH_POLL_SEC"):
+        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "AI_MODE_BATCH_POLL_SEC"):
             os.environ.pop(env, None)
         os.environ["AI_MODE_BATCH_POLL_SEC"] = "5"  # min; no sleep happens (single poll, all terminal)
         ai_worker._reset_for_tests()

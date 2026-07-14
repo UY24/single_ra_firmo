@@ -55,7 +55,7 @@ def load_settings(env_file: Path | None = None, batch_size: int | None = None) -
     load_dotenv(env_file or PROJECT_ROOT / ".env")
     settings = Settings(
         scrapedo_token=os.getenv("SCRAPEDO_TOKEN", "").strip(),
-        batch_size=batch_size or _int_env("SCRAPEDO_BATCH_SIZE", 5),
+        batch_size=batch_size or 5,
         scrapedo_timeout_seconds=_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0),
         scrapedo_max_retries=_int_env("SCRAPEDO_MAX_RETRIES", 2),
         scrapedo_max_query_chars=_int_env("SCRAPEDO_MAX_QUERY_CHARS", 6000),

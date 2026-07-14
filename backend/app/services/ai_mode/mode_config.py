@@ -15,19 +15,14 @@ class ModeConfig:
     prompt_file: str
     batch_size_env: str
     default_batch_size: int
-    legacy_env: str | None = None   # ai_bulk honors old SCRAPEDO_BATCH_SIZE for one release
 
     def batch_size(self) -> int:
-        for env in (self.batch_size_env, self.legacy_env):
-            if not env:
-                continue
-            value = os.getenv(env)
-            if value is None or not value.strip():
-                continue
+        value = os.getenv(self.batch_size_env)
+        if value and value.strip():
             try:
                 return max(1, int(value.strip()))
             except ValueError:
-                continue  # malformed value: fall through to next candidate/default
+                pass
         return self.default_batch_size
 
     def search_prompt(self) -> str:
@@ -36,7 +31,7 @@ class ModeConfig:
 
 MODES: dict[str, ModeConfig] = {
     "ai_bulk": ModeConfig("ai_bulk", "AI Mode 1 — Bulk", "ai_bulk_search.txt",
-                          "AI_BULK_BATCH_SIZE", 10, legacy_env="SCRAPEDO_BATCH_SIZE"),
+                          "AI_BULK_BATCH_SIZE", 10),
     "ai_deep": ModeConfig("ai_deep", "AI Mode 2 — Deep Search", "ai_deep_search.txt",
                           "AI_DEEP_BATCH_SIZE", 3),
 }

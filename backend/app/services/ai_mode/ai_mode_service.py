@@ -197,12 +197,12 @@ def build_ai_mode_settings() -> Settings:
     """Build (and validate) scrape.do Settings from the process environment.
 
     Reads website_url_finder's own process env (config.py has already loaded
-    .env); does NOT load any scrape.do .env file. ``batch_size`` here is the
-    legacy env value only; the engine batches by ModeConfig.batch_size().
+    .env); does NOT load any scrape.do .env file. The engine batches by
+    ModeConfig.batch_size().
     """
     settings = Settings(
         scrapedo_token=_str_env("SCRAPEDO_TOKEN"),
-        batch_size=_int_env("SCRAPEDO_BATCH_SIZE", 10),
+        batch_size=10,
         scrapedo_timeout_seconds=_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0),
         scrapedo_max_retries=_int_env("SCRAPEDO_MAX_RETRIES", 2),
         scrapedo_max_query_chars=_int_env("SCRAPEDO_MAX_QUERY_CHARS", 6000),

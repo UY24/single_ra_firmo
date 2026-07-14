@@ -876,6 +876,206 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             f"Phase 1 scrape complete ok={len(ok_batches)} failed={len(ordered) - len(ok_batches)}",
         )
 
+    except Exception as exc:  # never raise to caller (Phase-1/setup failure)
+        _fail_run(run_id, run_dir, status, exc, wall_t0)
+        return
+
+    # Hand off to the shared finish engine (Phases 2+3) with exact Phase-1
+    # timings preserved. run_ai_mode_finish never raises.
+    run_ai_mode_finish(
+        run_id,
+        resume=resume,
+        phase1_recs=ordered,
+        started_at=started_at,
+        wall_t0=wall_t0,
+        scrape_stats={
+            "entities_without_scrape_data": entities_without_scrape_data,
+            "scrapedo_seconds_total": scrapedo_seconds_total,
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Shared failure path + finish engine (Phases 2+3)
+# --------------------------------------------------------------------------- #
+def _fail_run(
+    run_id: str, run_dir: Path, status: dict, exc: BaseException, wall_t0: float
+) -> None:
+    """Terminal-failure bookkeeping shared by run_ai_mode_sync and
+    run_ai_mode_finish: status.json -> failed, Supabase update, S3 mirror of the
+    partial run dir, Slack failure ping. Never raises."""
+    status["status"] = "failed"
+    status["error"] = sanitize_secret_text(str(exc))
+    status["updated_at"] = utc_now_iso()
+    _persist_status(run_id, run_dir, status)
+    _supabase_update_run(
+        status.get("run_db_id"),
+        status="failed",
+        error=status["error"],
+        duration_seconds=round(time.perf_counter() - wall_t0, 3),
+        finished_at=utc_now_iso(),
+    )
+    _ai_log(
+        run_id,
+        run_dir,
+        f"AI Mode run crashed error={status['error']}",
+        logging.ERROR,
+    )
+    # Mirror the failed run dir to S3 too, so raw_responses/run.log are available
+    # for debugging (best-effort; never mask the original failure).
+    try:
+        from app.services.ai_mode.s3_sync import mirror_run_to_s3
+        mode_key = str(status.get("mode") or "ai_bulk")
+        mirrored = mirror_run_to_s3(run_dir, mode_key)
+        if mirrored:
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Mirrored {len(mirrored)} file(s) of the failed run to S3 "
+                f"under {run_dir.parent.name}/{mode_key}/{run_id}",
+            )
+    except Exception:  # never let mirroring obscure the crash
+        pass
+    # Slack ping on failure (best-effort; never mask the original crash).
+    try:
+        from app.core import notify
+        notify.notify_run_failed(
+            pipeline=str(status.get("mode_label") or status.get("mode") or "AI Mode"),
+            company=status.get("company_name"),
+            run_ref=run_id,
+            error=status["error"],
+            total_rows=status.get("total_rows"),
+            duration_seconds=round(time.perf_counter() - wall_t0, 3),
+        )
+    except Exception:
+        logging.getLogger("ai_mode").warning("slack notify (failed) failed", exc_info=True)
+
+
+def _rebuild_phase1_recs(run_dir: Path, groups: list[list[Entity]]) -> list[dict]:
+    """Rebuild Phase-1 batch records from disk (broker worker / crash recovery).
+
+    File presence is the durable truth: a parseable raw file is a scraped batch;
+    an ``request_NNNNNN.error.json`` marker is a terminal scrape failure; neither
+    means the batch was lost (reported as an error so the run still terminalizes).
+    Per-batch scrape timings are not persisted for successes, so they read 0.0 —
+    the run-level total comes from the status.json counter instead.
+    """
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    recs: list[dict] = []
+    for idx, group in enumerate(groups, start=1):
+        raw_name = f"request_{idx:06d}.json"
+        rec = {
+            "request_index": idx,
+            "group": group,
+            "group_names": [e.company_name for e in group],
+            "scrapedo_seconds": 0.0,
+            "geo_debug": {},
+            "reused": True,
+        }
+        ok = False
+        raw_path = raw_dir / raw_name
+        if raw_path.exists():
+            try:
+                json.loads(raw_path.read_text(encoding="utf-8"))
+                ok = True
+            except (ValueError, OSError):
+                ok = False
+        if ok:
+            rec.update(ok=True, error=None,
+                       rel_raw_path=f"{RAW_RESPONSES_DIRNAME}/{raw_name}")
+        else:
+            error = "batch was never scraped (message lost)"
+            seconds = 0.0
+            err_path = raw_dir / f"request_{idx:06d}.error.json"
+            if err_path.exists():
+                try:
+                    marker = json.loads(err_path.read_text(encoding="utf-8"))
+                    error = str(marker.get("error") or error)
+                    seconds = float(marker.get("seconds") or 0.0)
+                except (ValueError, OSError, TypeError):
+                    pass
+            rec.update(ok=False, error=error, rel_raw_path=None,
+                       scrapedo_seconds=seconds)
+        recs.append(rec)
+    return recs
+
+
+def run_ai_mode_finish(
+    run_id: str,
+    *,
+    resume: bool = False,
+    phase1_recs: list[dict] | None = None,
+    started_at: str | None = None,
+    wall_t0: float | None = None,
+    scrape_stats: dict | None = None,
+) -> None:
+    """Phases 2+3: LLM-clean every scraped batch, stream-assemble the outputs.
+
+    Standalone and resumable — the broker worker dispatches this once the scrape
+    barrier resolves (and the reconciler re-dispatches it after a crash); the
+    sync engine calls it with its in-memory ``phase1_recs`` so exact per-batch
+    scrape timings are preserved. When ``phase1_recs`` is None, Phase-1 state is
+    rebuilt from disk (raw files + error markers). Never raises: failures land
+    in status.json (status="failed") via _fail_run.
+    """
+    run_dir = run_store.find_run_dir(run_id)
+    if run_dir is None:
+        _ensure_ai_mode_logger().error("[run:%s] run dir not found; cannot finish", run_id)
+        return
+    status = _read_status(run_id, run_dir)
+    started_at = started_at or str(status.get("started_at") or utc_now_iso())
+    if wall_t0 is None:
+        wall_t0 = time.perf_counter()
+    run_log = _run_log_path(run_dir)
+
+    try:
+        mode = get_mode(str(status.get("mode") or "ai_bulk"))
+        batch_size = mode.batch_size()
+        cfg = build_ai_mode_llm_config()
+        llm = make_llm_client(cfg)
+
+        input_csv = run_dir / "input.csv"
+        entities: list[Entity] = parse_entities_csv(input_csv.read_bytes()).entities
+        groups = list(chunked(entities, batch_size))
+        raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_dir = run_dir / CLEANED_DIRNAME
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        from app.services.ai_mode import s3_sync
+
+        batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
+        status["status"] = "running"
+        status["model"] = cfg.model
+        status["is_batch"] = batch_mode
+        status["batches_total"] = len(groups)
+
+        # Phase-1 records: exact (sync engine) or rebuilt from disk (worker).
+        if phase1_recs is not None:
+            ordered = phase1_recs
+        else:
+            ordered = _rebuild_phase1_recs(run_dir, groups)
+            _ai_log(
+                run_id, run_dir,
+                f"Finish: rebuilt {len(ordered)} Phase-1 record(s) from disk "
+                f"(ok={sum(1 for r in ordered if r['ok'])})",
+            )
+        ok_batches = [r for r in ordered if r["ok"]]
+
+        stats = dict(scrape_stats or {})
+        entities_without_scrape_data = stats.get("entities_without_scrape_data")
+        if entities_without_scrape_data is None:
+            entities_without_scrape_data = sum(
+                len(r["group"]) for r in ordered if not r["ok"]
+            )
+        scrapedo_seconds_total = stats.get("scrapedo_seconds_total")
+        if scrapedo_seconds_total is None:
+            scrapedo_seconds_total = float(status.get("scrapedo_seconds_total") or 0.0)
+
+        per_request_records: list[dict] = []
+        usage_total = TokenUsage()
+        llm_errors = 0
+        llm_seconds_total = 0.0
+
         # ------------------------------------------------------------- #
         # PHASE 2 - clean every scraped batch (sync OR Gemini Batch)
         # ------------------------------------------------------------- #
@@ -1379,51 +1579,5 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             )
         except Exception:
             logging.getLogger("ai_mode").warning("slack notify (complete) failed", exc_info=True)
-
     except Exception as exc:  # never raise to caller
-        status["status"] = "failed"
-        status["error"] = sanitize_secret_text(str(exc))
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
-        _supabase_update_run(
-            status.get("run_db_id"),
-            status="failed",
-            error=status["error"],
-            duration_seconds=round(time.perf_counter() - wall_t0, 3),
-            finished_at=utc_now_iso(),
-        )
-        _ai_log(
-            run_id,
-            run_dir,
-            f"AI Mode run crashed error={status['error']}",
-            logging.ERROR,
-        )
-        # Mirror the failed run dir to S3 too, so raw_responses/run.log are available
-        # for debugging (best-effort; never mask the original failure).
-        try:
-            from app.services.ai_mode.s3_sync import mirror_run_to_s3
-            mode_key = str(status.get("mode") or "ai_bulk")
-            mirrored = mirror_run_to_s3(run_dir, mode_key)
-            if mirrored:
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Mirrored {len(mirrored)} file(s) of the failed run to S3 "
-                    f"under {run_dir.parent.name}/{mode_key}/{run_id}",
-                )
-        except Exception:  # never let mirroring obscure the crash
-            pass
-        # Slack ping on failure (best-effort; never mask the original crash).
-        try:
-            from app.core import notify
-            notify.notify_run_failed(
-                pipeline=str(status.get("mode_label") or status.get("mode") or "AI Mode"),
-                company=status.get("company_name"),
-                run_ref=run_id,
-                error=status["error"],
-                total_rows=status.get("total_rows"),
-                duration_seconds=round(time.perf_counter() - wall_t0, 3),
-            )
-        except Exception:
-            logging.getLogger("ai_mode").warning("slack notify (failed) failed", exc_info=True)
-        return
+        _fail_run(run_id, run_dir, status, exc, wall_t0)

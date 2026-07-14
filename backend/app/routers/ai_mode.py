@@ -2,6 +2,7 @@
 """AI-mode endpoints (ai_bulk / ai_deep unified engine)."""
 import asyncio
 import json
+import os
 from dataclasses import asdict
 from typing import Any
 
@@ -15,6 +16,12 @@ from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
+
+
+def _ai_mode_engine() -> str:
+    """'broker' (RabbitMQ scrape phase, default) or 'sync' (legacy in-process)."""
+    value = (os.getenv("AI_MODE_ENGINE") or "broker").strip().lower()
+    return value if value in {"broker", "sync"} else "broker"
 
 
 def _supabase_not_configured_detail() -> str:
@@ -50,6 +57,17 @@ async def create_ai_mode_upload(
     from app.services.ai_mode import ai_mode_service
     if mode not in MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(MODES)}")
+    engine = _ai_mode_engine()
+    if engine == "broker":
+        from app.services.ai_mode import broker as ai_broker
+
+        # Gate BEFORE prepare so a broker outage never leaves an orphan run dir
+        # (same contract as SerpWow's 503 when RabbitMQ is down).
+        if not ai_broker.is_ready():
+            detail = "AI Mode job queue unavailable (RabbitMQ not connected)"
+            if ai_broker.last_error:
+                detail = f"{detail}: {ai_broker.last_error}"
+            raise HTTPException(status_code=503, detail=detail)
     svc = get_company_service()
     if svc is None:
         raise HTTPException(
@@ -94,9 +112,19 @@ async def create_ai_mode_upload(
     if run_db_id:
         info["run_db_id"] = run_db_id
         await asyncio.to_thread(ai_mode_service.set_run_db_id, info["run_id"], run_db_id)
-    task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
+    if engine == "broker":
+        # Publishing 100k messages takes tens of seconds — return immediately and
+        # publish in the background; the worker process consumes as they land.
+        from app.services.ai_mode import worker as ai_worker
+
+        task = asyncio.create_task(ai_worker.publish_run_batches(info["run_id"]))
+    else:
+        task = asyncio.create_task(
+            asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"])
+        )
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)
+    info["engine"] = engine
     return info
 
 

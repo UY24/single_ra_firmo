@@ -3218,11 +3218,29 @@ async def init_rabbitmq() -> None:
     await rabbitmq_queue.bind(rabbitmq_exchange, routing_key=routing_key)
     rabbitmq_last_error = None
 
+    # AI Mode rides the same connection with its OWN channel/queue (independent
+    # QoS — scrape.do concurrency must not share SerpWow's prefetch). Best-effort:
+    # a failure here 503s AI-Mode uploads (broker.is_ready() False) but must not
+    # take SerpWow down with it.
+    try:
+        from app.services.ai_mode import broker as ai_mode_broker
+
+        await ai_mode_broker.init_ai_mode_broker(rabbitmq_connection)
+    except Exception as exc:
+        print(f"[ai-mode-broker] init failed (SerpWow unaffected): {exc}")
+
 
 async def close_rabbitmq() -> None:
     global rabbitmq_connection, rabbitmq_channel, rabbitmq_exchange, rabbitmq_queue, rabbitmq_consumer_tasks
 
     await stop_worker_consumers()
+
+    try:
+        from app.services.ai_mode import broker as ai_mode_broker
+
+        await ai_mode_broker.close_ai_mode_broker()
+    except Exception:
+        pass
 
     rabbitmq_queue = None
     rabbitmq_exchange = None
@@ -3805,9 +3823,26 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         gemini_batch_reconciler_stop = asyncio.Event()
         gemini_batch_reconciler_task = asyncio.create_task(periodic_batch_reconciler())
 
+    # AI Mode consumers ride the same worker process (own channel/queue/QoS).
+    # Best-effort: an AI-Mode failure must not take the SerpWow consumers down.
+    try:
+        from app.services.ai_mode import worker as ai_mode_worker
+
+        await ai_mode_worker.start_ai_mode_consumers()
+    except Exception as exc:
+        print(f"[ai-mode-worker] consumers failed to start: {exc}")
+
 
 async def stop_worker_consumers() -> None:
     global rabbitmq_consumer_tasks, rabbitmq_stop_event
+
+    try:
+        from app.services.ai_mode import worker as ai_mode_worker
+
+        await ai_mode_worker.stop_ai_mode_consumers()
+    except Exception:
+        pass
+
     if not rabbitmq_consumer_tasks:
         return
 

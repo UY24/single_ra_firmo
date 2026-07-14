@@ -1,4 +1,5 @@
 """Task 14: /companies router + company-aware run lifecycle (all offline/mocked)."""
+import os
 import unittest
 from unittest import mock
 
@@ -110,6 +111,11 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
     def setUp(self):
         from app.routers.ai_mode import router as ai_mode_router
 
+        # These tests exercise company validation/prepare, not the broker path —
+        # pin the legacy in-process engine so no RabbitMQ is required.
+        self._engine_env = mock.patch.dict(os.environ, {"AI_MODE_ENGINE": "sync"})
+        self._engine_env.start()
+        self.addCleanup(self._engine_env.stop)
         app = FastAPI()
         app.include_router(ai_mode_router)
         self.client = TestClient(app)

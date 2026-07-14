@@ -26,6 +26,8 @@ NO_KEY_ENV = {
     "OPENAI_API_KEY": "",
     "AI_MODE_LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
+    # prepare/router tests target the legacy in-process engine (no RabbitMQ).
+    "AI_MODE_ENGINE": "sync",
 }
 
 

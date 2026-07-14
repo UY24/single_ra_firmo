@@ -245,6 +245,41 @@ class TestPublishRunBatches(WorkerHarness):
         self.assertEqual(published[-1]["type"], "check")
 
 
+class TestPublishCrashMarksRunFailed(WorkerHarness):
+    """A crashed background publish must surface as status=failed, never vanish
+    (the router fire-and-forgets the task; the old engine's never-raises
+    contract lives inside publish_run_batches now)."""
+
+    def test_publish_crash_sets_failed_status_and_error(self):
+        (self.run_dir / "input.csv").unlink()  # _load_groups will raise
+        count = asyncio.run(ai_worker.publish_run_batches(self.run_id))  # must not raise
+        self.assertEqual(count, 0)
+        status = self._status()
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("publish", (status.get("error") or "").lower())
+
+
+class TestResumeClearsCorruptCleaned(WorkerHarness):
+    def test_reset_deletes_cleaned_file_with_unparseable_text(self):
+        cleaned_dir = self.run_dir / "cleaned"
+        cleaned_dir.mkdir(exist_ok=True)
+        good = cleaned_dir / "batch-000001.json"
+        good.write_text(json.dumps({"key": "batch-000001",
+                                    "text": json.dumps([{"sno": 1}]), "usage": None}),
+                        encoding="utf-8")
+        corrupt = cleaned_dir / "batch-000002.json"
+        corrupt.write_text(json.dumps({"key": "batch-000002",
+                                       "text": "I could not find any websites, sorry!",
+                                       "usage": None}),
+                           encoding="utf-8")
+        ai_worker.reset_run_for_resume(self.run_id, self.run_dir)
+        # The parseable checkpoint is kept (no LLM re-spend); the garbage one is
+        # cleared so the finish task re-cleans that batch instead of erroring it
+        # forever on every resume.
+        self.assertTrue(good.exists())
+        self.assertFalse(corrupt.exists())
+
+
 class TestCountDoneBatches(WorkerHarness):
     def test_counts_raw_and_error_files_separately(self):
         raw_dir = self.run_dir / "raw_responses"

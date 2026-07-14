@@ -156,13 +156,42 @@ def write_error_marker(
 async def publish_run_batches(run_id: str, *, only_missing: bool = False) -> int:
     """Publish one scrape message per batch (+ one trailing check message).
 
+    NEVER raises — the router fire-and-forgets this as a background task, so an
+    escaped exception would strand the run in queued/failed with no error while
+    the endpoint already answered 200. A crash here marks the run failed
+    (status.json + Supabase), preserving the old engine's never-raises contract.
+
     The pre-publish status stamp is the API side's LAST status.json write —
     single-writer rule: the worker owns status.json from the first publish on.
     Individual publish failures are tolerated (logged, skipped): the reconciler
     republishes any batch with no raw/error file. ``only_missing`` skips batches
     that already have a raw or error file (resume republish).
-    Returns the number of scrape messages published.
+    Returns the number of scrape messages published (0 on crash).
     """
+    try:
+        return await _publish_run_batches(run_id, only_missing=only_missing)
+    except Exception as exc:
+        _LOG.exception("publish_run_batches crashed for %s", run_id)
+        try:
+            run_dir = run_store.find_run_dir(run_id)
+            if run_dir is not None:
+                status = _read_status(run_id, run_dir)
+                status["status"] = "failed"
+                status["error"] = sanitize_secret_text(f"publish failed: {exc}")
+                status["updated_at"] = utc_now_iso()
+                _persist_status(run_id, run_dir, status)
+                await asyncio.to_thread(
+                    svc._supabase_update_run, status.get("run_db_id"),
+                    status="failed", error=status["error"],
+                    finished_at=status["updated_at"],
+                )
+        except Exception:
+            _LOG.warning("failed to mark run %s failed after publish crash",
+                         run_id, exc_info=True)
+        return 0
+
+
+async def _publish_run_batches(run_id: str, *, only_missing: bool = False) -> int:
     run_dir = run_store.find_run_dir(run_id)
     if run_dir is None:
         _LOG.error("publish_run_batches: run dir not found for %s", run_id)
@@ -265,6 +294,26 @@ def reset_run_for_resume(run_id: str, run_dir: Path) -> int:
             except OSError:
                 continue
             cleared += 1
+            s3_sync.delete_mirrored_file(run_dir, mode_key, path)
+    # A cleaned checkpoint whose text is not a parseable JSON array would error
+    # the same batch on every resume (finish skips re-cleaning existing files) —
+    # clear it so the batch is re-cleaned instead of failing forever.
+    from app.services.ai_mode.cleanup import parse_json_array_from_text
+
+    cleaned_dir = run_dir / svc.CLEANED_DIRNAME
+    if cleaned_dir.is_dir():
+        for path in sorted(cleaned_dir.glob("batch-*.json")):
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                text = str(obj.get("text") or "") if isinstance(obj, dict) else ""
+            except (ValueError, OSError):
+                text = ""
+            if text and parse_json_array_from_text(text) is not None:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
             s3_sync.delete_mirrored_file(run_dir, mode_key, path)
     status["gemini_batch_jobs"] = []
     status["requeue_attempts"] = {}

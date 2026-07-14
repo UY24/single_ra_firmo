@@ -2,7 +2,6 @@
 """AI-mode endpoints (ai_bulk / ai_deep unified engine)."""
 import asyncio
 import json
-import os
 from dataclasses import asdict
 from typing import Any
 

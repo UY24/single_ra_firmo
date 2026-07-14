@@ -198,8 +198,9 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(kw["total_rows"], 6)
 
     def test_notify_run_failed_fires_on_crash(self):
-        # Force the run_ai_mode_sync except-path: assemble (write_outputs) raises.
-        with mock.patch.object(ai_mode_service, "write_outputs",
+        # Force the run_ai_mode_sync except-path: assemble (the Phase-3 streaming
+        # report constructor) raises.
+        with mock.patch.object(ai_mode_service, "StreamingRunReport",
                                side_effect=RuntimeError("disk full")), \
                 mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed") as failed:

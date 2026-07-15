@@ -139,6 +139,8 @@ from app.services.serpwow.constants import (
     REPORTING_PIPELINES,
     REL_ERROR_CONFIRMED_URL_INVALID,
     REL_ERROR_NOT_CONFIRMED,
+    REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+    relationship_reason_code,
 )
 from app.services.serpwow.schemas import CrawlRequest, FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
@@ -1847,6 +1849,12 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     rel_flags.extend(gate_flags)
     rel_flags.extend(model_flags)
     relationship["flags"] = rel_flags
+    relationship["reason_code"] = relationship_reason_code(gated_url, status)
+    if relationship["reason_code"] == REL_REASON_CONFIRMED_URL_NOT_VALIDATED:
+        relationship["flags"].append({
+            "flag": REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+            "why": "relationship confirmed but no supplied candidate URL passed validation",
+        })
     context["relationship"] = relationship
 
     result["official_website"] = gated_url

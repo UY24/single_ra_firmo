@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 from app.services.serpwow import engine
 from app.services.serpwow import outcomes as o
-from app.services.serpwow.constants import REL_ERROR_NOT_CONFIRMED
+from app.services.serpwow.constants import (
+    REL_ERROR_CONFIRMED_URL_INVALID,
+    REL_ERROR_NOT_CONFIRMED,
+    REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+    REL_REASON_NOT_CONFIRMED,
+)
 
 
 def _rel_row(row_index=1, status="completed", skip_llm=False,
@@ -102,6 +107,7 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertEqual(row["result"]["official_website"], "https://modal.com")
         ctx = row["result"]["context"]
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
+        self.assertEqual(ctx["relationship"]["reason_code"], "")
         self.assertEqual(ctx["relationship"]["evidence"], [ctx["evidence"][0]])
         self.assertEqual(ctx["gemini_batch_ai"]["raw"], parsed)
         self.assertIsNone(row["error"])
@@ -122,6 +128,10 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertIsNone(row["error_category"])
         self.assertIsNone(row["result"]["official_website"])
         self.assertEqual(row["error"], REL_ERROR_NOT_CONFIRMED)
+        self.assertEqual(
+            row["result"]["context"]["relationship"]["reason_code"],
+            REL_REASON_NOT_CONFIRMED,
+        )
         flags = row["result"]["context"]["relationship"]["flags"]
         self.assertTrue(any(f["flag"] == "url_found_no_relationship" for f in flags))
 
@@ -138,6 +148,20 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(row["outcome"], o.OUTCOME_NOT_FOUND)
         self.assertIsNone(row["result"]["official_website"])
+        relationship = row["result"]["context"]["relationship"]
+        self.assertEqual(row["error"], REL_ERROR_CONFIRMED_URL_INVALID)
+        self.assertEqual(
+            relationship["reason_code"],
+            REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+        )
+        self.assertEqual(
+            relationship["evidence"],
+            [row["result"]["context"]["evidence"][0]],
+        )
+        self.assertTrue(any(
+            flag["flag"] == REL_REASON_CONFIRMED_URL_NOT_VALIDATED
+            for flag in relationship["flags"]
+        ))
 
     def test_candidate_only_citation_cannot_confirm_and_stores_accepted_record(self):
         row = _rel_row()

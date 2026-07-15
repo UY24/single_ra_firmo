@@ -22,7 +22,8 @@ CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
                "confidence", "flags", "attempt_log"]
 
 REL_OUTPUT_COLUMNS = ["website_url", "relationship_status", "relationship_summary",
-                      "confidence", "flags", "attempt_log", "verified_pair"]
+                      "confidence", "reason_code", "supporting_evidence", "flags",
+                      "attempt_log", "verified_pair"]
 
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
@@ -347,6 +348,11 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
             "relationship_status": str(rel.get("status") or ""),
             "relationship_summary": str(rel.get("summary") or ""),
             "confidence": er.confidence,
+            "reason_code": str(rel.get("reason_code") or ""),
+            "supporting_evidence": json.dumps(
+                rel.get("evidence") if isinstance(rel.get("evidence"), list) else [],
+                ensure_ascii=False,
+            ),
             "flags": er.flags_csv(),
             "attempt_log": er.attempt_log_csv(),
             "verified_pair": str(rel.get("verified_pair") or ""),
@@ -388,6 +394,9 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         d = er.to_report_dict()
         d["relationship_status"] = str(rel.get("status") or "")
         d["relationship_summary"] = str(rel.get("summary") or "")
+        d["reason_code"] = str(rel.get("reason_code") or "")
+        d["supporting_evidence"] = (
+            rel.get("evidence") if isinstance(rel.get("evidence"), list) else [])
         d["verified_pair"] = str(rel.get("verified_pair") or "")
         report_rows.append(d)
     report_path = upload_dir / "report.json"
@@ -404,8 +413,10 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
                              f"relationship={rel.get('status')})")
         else:
             tail = f" — {er.error}" if er.error else ""
+            reason = str(rel.get("reason_code") or "")
+            reason_text = f", reason={reason}" if reason else ""
             log_lines.append(f"[{er.sno}] {er.company_name} ({rel.get('verified_pair')}) -> "
-                             f"not found (relationship={rel.get('status')}){tail}")
+                             f"not found (relationship={rel.get('status')}{reason_text}){tail}")
     hdr = [
         f"# relationship run {summary.get('upload_id')} — status={summary.get('status')}",
         f"# original_rows={summary.get('total_rows')} blank={summary.get('blank_rows')} "

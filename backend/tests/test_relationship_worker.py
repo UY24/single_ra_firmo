@@ -8,6 +8,11 @@ from app.services.serpwow.constants import (
     REL_ERROR_NO_EVIDENCE,
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
+    REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+    REL_REASON_MISSING_X,
+    REL_REASON_NOT_CONFIRMED,
+    REL_REASON_NO_EVIDENCE,
+    REL_REASON_UNCLEAR,
 )
 from app.services.serpwow.modes.relationship import execute_relationship_lookup_for_worker
 from app.services.serpwow.outcomes import (
@@ -62,6 +67,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         ctx = resp.context
         self.assertEqual(ctx["pipeline"], "relationship")
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
+        self.assertEqual(ctx["relationship"]["reason_code"], "")
         self.assertEqual(ctx["relationship"]["verified_pair"], "eastlinkcap ↔ Modal")
         self.assertFalse(ctx["skip_llm"])
         self.assertEqual(search.await_count, 1)
@@ -181,8 +187,42 @@ class TestRelationshipExecutor(unittest.TestCase):
                                 input_url="", city="", country="")
         self.assertIsNone(resp.official_website)
         self.assertEqual(resp.context["row_error"], REL_ERROR_NOT_CONFIRMED)
+        self.assertEqual(
+            resp.context["relationship"]["reason_code"],
+            REL_REASON_NOT_CONFIRMED,
+        )
         flags = resp.context["relationship"]["flags"]
         self.assertTrue(any(f["flag"] == "url_found_no_relationship" for f in flags))
+
+    def test_confirmed_without_validated_url_keeps_grounded_relationship(self):
+        search = AsyncMock(return_value=_serp(
+            [], "Eastlink invested in Mødal, a developer platform."))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("confirmed", None, score=83)), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Mødal", x_name="Eastlink",
+                input_url="https://eastlinkcap.com", city="", country="")
+
+        relationship = resp.context["relationship"]
+        self.assertIsNone(resp.official_website)
+        self.assertEqual(relationship["status"], "confirmed")
+        self.assertEqual(relationship["summary"], "summary text")
+        self.assertEqual(
+            relationship["reason_code"],
+            REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+        )
+        self.assertEqual(
+            relationship["evidence"][0]["text"],
+            "Eastlink invested in Mødal, a developer platform.",
+        )
+        self.assertTrue(any(
+            flag["flag"] == REL_REASON_CONFIRMED_URL_NOT_VALIDATED
+            for flag in relationship["flags"]
+        ))
+        self.assertEqual(
+            resp.context["final_url_selection_ai"]["raw"]["confidence_score"], 83)
 
     def test_x_domain_candidates_are_filtered_before_llm(self):
         search = AsyncMock(return_value=_serp(
@@ -213,6 +253,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertTrue(resp.context["skip_llm"])
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_EVIDENCE)
         self.assertEqual(resp.context["relationship"]["status"], "not_confirmed")
+        self.assertEqual(
+            resp.context["relationship"]["reason_code"], REL_REASON_NO_EVIDENCE)
 
     def test_blank_x_short_circuits_without_llm(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "text"))
@@ -224,6 +266,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         llm.assert_not_called()
         self.assertTrue(resp.context["skip_llm"])
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_X)
+        self.assertEqual(
+            resp.context["relationship"]["reason_code"], REL_REASON_MISSING_X)
         self.assertEqual(search.await_count, 0)
         self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 0)
         self.assertEqual(resp.serpwow_cost_usd, 0.0)
@@ -327,6 +371,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertTrue(resp.context["skip_llm"])
         self.assertIsNone(resp.context["row_error"])
         self.assertEqual(resp.context["relationship"]["status"], "unclear")
+        self.assertEqual(resp.context["relationship"]["reason_code"], "")
         self.assertTrue(any(
             flag["flag"] == "all_search_phases_failed"
             for flag in resp.context["relationship"]["flags"]
@@ -341,6 +386,21 @@ class TestRelationshipExecutor(unittest.TestCase):
         )
         self.assertEqual((outcome.outcome, outcome.error_source),
                          (OUTCOME_ERROR, SRC_SERPWOW))
+
+    def test_unclear_without_url_has_unclear_reason(self):
+        search = AsyncMock(return_value=_serp(
+            [], "The search results mention Eastlink and Modal ambiguously."))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("unclear", None, score=42)), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="Eastlink",
+                input_url="https://eastlinkcap.com", city="", country="")
+
+        self.assertIsNone(resp.official_website)
+        self.assertEqual(
+            resp.context["relationship"]["reason_code"], REL_REASON_UNCLEAR)
 
 
 if __name__ == "__main__":

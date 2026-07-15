@@ -27,6 +27,8 @@ from app.services.serpwow.constants import (
     REL_ERROR_NO_EVIDENCE,
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
+    REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+    relationship_reason_code,
 )
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
@@ -102,12 +104,14 @@ async def execute_relationship_lookup_for_worker(
     batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
 
     skip_llm = False
+    technical_failure = False
     row_error: Optional[str] = None
     official_website: Optional[str] = None
     gemini_cost = 0.0
     relationship: dict[str, Any] = {
         "status": "pending", "summary": "",
-        "verified_pair": f"{x_name} ↔ {y_name}", "flags": [],
+        "verified_pair": f"{x_name} ↔ {y_name}", "reason_code": "",
+        "evidence": [], "flags": [],
     }
     final_url_selection_ai: dict[str, Any] = {
         "provider": "google-gemini", "model": None, "used": False,
@@ -125,6 +129,7 @@ async def execute_relationship_lookup_for_worker(
     elif (search_result.request_count > 0
           and search_result.successful_requests == 0):
         skip_llm = True
+        technical_failure = True
         relationship.update(
             status="unclear",
             summary="All relationship search phases failed technically.",
@@ -180,6 +185,18 @@ async def execute_relationship_lookup_for_worker(
             row_error = REL_ERROR_NOT_CONFIRMED if status != "confirmed" else (
                 REL_ERROR_CONFIRMED_URL_INVALID)
     # batch_mode with evidence: leave verdict to the finalization batch.
+
+    relationship["reason_code"] = relationship_reason_code(
+        official_website,
+        relationship.get("status"),
+        row_error,
+        technical_failure=technical_failure,
+    )
+    if relationship["reason_code"] == REL_REASON_CONFIRMED_URL_NOT_VALIDATED:
+        relationship["flags"].append({
+            "flag": REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+            "why": "relationship confirmed but no supplied candidate URL passed validation",
+        })
 
     summary_text = (
         f"Relationship search for pair {x_name!r} ↔ {y_name!r}: "

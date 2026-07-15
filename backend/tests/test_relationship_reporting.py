@@ -6,6 +6,10 @@ import unittest
 from pathlib import Path
 
 from app.services.serpwow import serpwow_reporting
+from app.services.serpwow.constants import (
+    REL_ERROR_CONFIRMED_URL_INVALID,
+    REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+)
 
 
 def _pair_row(row_index, y, x, source_rows, official, rel_status, error=None,
@@ -23,6 +27,11 @@ def _pair_row(row_index, y, x, source_rows, official, rel_status, error=None,
                 "candidates": [official] if official else [],
                 "relationship": {"status": rel_status, "summary": f"summary {y}",
                                  "verified_pair": f"{x} ↔ {y}",
+                                 "reason_code": "" if official else "relationship_not_confirmed",
+                                 "evidence": [{
+                                     "evidence_id": f"relationship-{row_index}",
+                                     "text": f"{x} backed {y}, in Montréal.",
+                                 }],
                                  "flags": list(flags)},
                 "final_url_selection_ai": {
                     "model": "gemini-2.5-flash-lite",
@@ -80,9 +89,12 @@ class TestRelationshipReporting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), _state())
             self.assertIn("skipped.csv", paths)
-            found = list(csv.DictReader(open(paths["found.csv"])))
-            not_found = list(csv.DictReader(open(paths["notFound.csv"])))
-            skipped = list(csv.DictReader(open(paths["skipped.csv"])))
+            with open(paths["found.csv"], encoding="utf-8") as csv_file:
+                found = list(csv.DictReader(csv_file))
+            with open(paths["notFound.csv"], encoding="utf-8") as csv_file:
+                not_found = list(csv.DictReader(csv_file))
+            with open(paths["skipped.csv"], encoding="utf-8") as csv_file:
+                skipped = list(csv.DictReader(csv_file))
             self.assertEqual(len(found), 2)       # both Modal duplicate rows
             self.assertEqual(len(not_found), 1)
             self.assertEqual(len(skipped), 1)
@@ -96,6 +108,10 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(row["relationship_summary"], "summary Modal")
             self.assertEqual(row["confidence"], "88")
             self.assertEqual(row["verified_pair"], "eastlinkcap ↔ Modal")
+            self.assertEqual(row["reason_code"], "")
+            self.assertEqual(json.loads(row["supporting_evidence"])[0]["evidence_id"],
+                             "relationship-1")
+            self.assertIn("Montréal", row["supporting_evidence"])
             self.assertIn("attempt_log", row)
             nf = not_found[0]
             self.assertIn("url_found_no_relationship", nf["flags"])
@@ -148,6 +164,60 @@ class TestRelationshipReporting(unittest.TestCase):
             report = json.loads(Path(paths["report.json"]).read_text())
             self.assertEqual(report["summary"]["unique_pairs"], 2)
             self.assertEqual(report["rows"][0]["relationship_status"], "confirmed")
+            self.assertEqual(report["rows"][0]["reason_code"], "")
+            self.assertIsInstance(report["rows"][0]["supporting_evidence"], list)
+            self.assertEqual(
+                report["rows"][0]["supporting_evidence"][0]["evidence_id"],
+                "relationship-1",
+            )
+
+    def test_confirmed_without_url_is_fully_preserved_in_not_found_artifacts(self):
+        state = _state()
+        pair = state["rows"][1]
+        pair["status"] = "completed"
+        pair["error"] = REL_ERROR_CONFIRMED_URL_INVALID
+        relationship = pair["result"]["context"]["relationship"]
+        relationship.update({
+            "status": "confirmed",
+            "summary": "Dobbs invested in GR TRDCX.",
+            "reason_code": REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+            "evidence": [{
+                "evidence_id": "relationship-confirmed-1",
+                "text": "Dobbs invested in GR TRDCX, Montréal division.",
+            }],
+            "flags": [{
+                "flag": REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+                "why": "relationship confirmed but no supplied candidate URL passed validation",
+            }],
+        })
+        pair["result"]["context"]["final_url_selection_ai"]["raw"]["confidence_score"] = 83
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = serpwow_reporting.write_outputs(Path(td), state)
+            with open(paths["notFound.csv"], encoding="utf-8") as csv_file:
+                not_found = list(csv.DictReader(csv_file))
+            report = json.loads(Path(paths["report.json"]).read_text(encoding="utf-8"))
+            run_log = Path(paths["run.log"]).read_text(encoding="utf-8")
+
+        self.assertEqual(len(not_found), 1)
+        row = not_found[0]
+        self.assertEqual(row["website_url"], "")
+        self.assertEqual(row["relationship_status"], "confirmed")
+        self.assertEqual(row["relationship_summary"], "Dobbs invested in GR TRDCX.")
+        self.assertEqual(row["confidence"], "83")
+        self.assertEqual(row["reason_code"], REL_REASON_CONFIRMED_URL_NOT_VALIDATED)
+        evidence = json.loads(row["supporting_evidence"])
+        self.assertEqual(evidence[0]["evidence_id"], "relationship-confirmed-1")
+        self.assertIn("Montréal division", evidence[0]["text"])
+        self.assertIn(REL_REASON_CONFIRMED_URL_NOT_VALIDATED, row["flags"])
+        self.assertIn("phase1_relationship", row["attempt_log"])
+        self.assertEqual(row["verified_pair"], "dobbs ↔ GR TRDCX")
+        self.assertEqual(row["error"], REL_ERROR_CONFIRMED_URL_INVALID)
+
+        report_row = report["rows"][-1]
+        self.assertEqual(report_row["reason_code"], REL_REASON_CONFIRMED_URL_NOT_VALIDATED)
+        self.assertEqual(report_row["supporting_evidence"], evidence)
+        self.assertIn(REL_REASON_CONFIRMED_URL_NOT_VALIDATED, run_log)
 
     def test_gsearch_state_output_unchanged(self):
         gsearch_state = {

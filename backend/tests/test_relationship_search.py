@@ -264,6 +264,45 @@ class TestExtractCandidateRecords(unittest.TestCase):
             ],
         )
 
+    def test_bare_filenames_are_not_domain_candidates(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": (
+                            "Files: requirements.txt, config.py, and setup.sh. "
+                            "Website: modal.com."
+                        ),
+                    }],
+                },
+            },
+        }
+
+        records = extract_candidate_records(raw_result, "files", "owner.vc")
+
+        self.assertEqual(
+            [(record["url"], record["original_text"]) for record in records],
+            [("https://modal.com", "modal.com")],
+        )
+
+    def test_ip_literal_candidates_are_rejected(self):
+        raw_result = {
+            "raw_response": {
+                "knowledge_graph": {"website": "https://8.8.8.8"},
+                "answer_box": {"link": "https://192.168.1.2"},
+                "organic_results": [
+                    {"link": "https://[2001:4860:4860::8888]"},
+                    {"link": "https://[::1]"},
+                ],
+            },
+            "candidates": ["1.1.1.1", "https://10.0.0.1"],
+        }
+
+        self.assertEqual(
+            extract_candidate_records(raw_result, "ips", "owner.vc"),
+            [],
+        )
+
     def test_modal_f4_snippet_regression_keeps_typed_domain_provenance(self):
         raw_result = {
             "raw_response": {
@@ -353,6 +392,40 @@ class TestExtractEvidenceRecords(unittest.TestCase):
         self.assertEqual(records[0]["evidence_id"], "bounded.overview.0")
         self.assertEqual(records[1]["evidence_id"], "bounded.organic.0")
 
+    def test_non_string_provider_text_is_ignored(self):
+        raw_response = {
+            "ai_overview": {
+                "ai_overview_contents": [
+                    {"text": {"value": "Acme invested in Modal."}},
+                    {"text": ["Acme funded Modal."]},
+                    {"text": "Acme invested in Modal."},
+                ],
+            },
+            "organic_results": [
+                {"snippet": {"value": "funding from Acme"}},
+                {"snippet": ["investment by Acme"]},
+                {"snippet": "Modal received funding from Acme."},
+            ],
+        }
+
+        self.assertEqual(
+            extract_evidence_records(raw_response, "types"),
+            [
+                {
+                    "evidence_id": "types.overview.2",
+                    "phase": "types",
+                    "source_field": "ai_overview.ai_overview_contents[2].text",
+                    "text": "Acme invested in Modal.",
+                },
+                {
+                    "evidence_id": "types.organic.2",
+                    "phase": "types",
+                    "source_field": "organic_results[2].snippet",
+                    "text": "Modal received funding from Acme.",
+                },
+            ],
+        )
+
 
 class TestFinancialEvidenceClassifier(unittest.TestCase):
     def test_financial_marker_families_are_positive(self):
@@ -379,6 +452,8 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Acme is Modal's parent company.",
             "Modal is an Acme subsidiary.",
             "Acme disclosed ownership of Modal.",
+            "Acme led Modal's Series C.",
+            "Acme participated in Modal's Series C.",
         ]
 
         for text in positive_texts:
@@ -397,6 +472,9 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Acme is not the parent company; parent company reports were wrong.",
             "Acme is not Modal's parent company; parent company claims were wrong.",
             "Acme never invested in Modal; investment reports were wrong.",
+            "Acme didn't invest in Modal; investment reports were wrong.",
+            "Modal wasn't acquired by Acme; acquisition reports were wrong.",
+            "Modal isn't backed by Acme; backing reports were wrong.",
         ]
 
         for text in negative_texts:
@@ -407,11 +485,30 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
         nonfinancial_texts = [
             "Acme and Modal announced a strategic partnership together.",
             "The partnership is with Modal, an investment platform.",
+            "The minister backed legislation during the debate.",
+            "The employee acquired skills during training.",
         ]
 
         for text in nonfinancial_texts:
             with self.subTest(text=text):
                 self.assertFalse(has_positive_financial_evidence([{"text": text}]))
+
+    def test_supplied_company_context_requires_both_names_in_positive_record(self):
+        self.assertFalse(has_positive_financial_evidence(
+            [{"text": "Acme invested in Other."}],
+            x_name="Acme",
+            y_name="Modal",
+        ))
+        self.assertFalse(has_positive_financial_evidence(
+            [{"text": "Acme invested in Modal."}],
+            x_name="",
+            y_name="Modal",
+        ))
+        self.assertTrue(has_positive_financial_evidence(
+            [{"text": "Acme invested in Modal."}],
+            x_name="Acme Capital",
+            y_name="Modal Labs",
+        ))
 
     def test_positive_record_is_not_cancelled_by_a_separate_negative_record(self):
         records = [

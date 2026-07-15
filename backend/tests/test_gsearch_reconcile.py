@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.services.serpwow import legacy_app as la
+from app.services.serpwow import engine as la
 
 
 def _write_state(base: str, upload_id: str, pipeline: str, batch_status):

@@ -1,7 +1,17 @@
 // backend/app/static/js/runs.js — runs history with company/pipeline/status filters.
 // The URL hash is the source of truth: Apply rewrites #/runs?… and the router re-renders.
 import { api, el, fmtUsd, fmtNum } from "./api.js";
-import { errorCard, loadingCard, statusBadge, head, cell, shortDate, fmtDuration } from "./ui.js";
+import {
+  cell,
+  emptyState,
+  errorCard,
+  fmtDuration,
+  head,
+  loadingCard,
+  pageIntro,
+  shortDate,
+  statusBadge,
+} from "./ui.js";
 
 const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
                    "firmographics", "url_discovery"];
@@ -19,6 +29,18 @@ const STATUSES = ["queued", "running", "completed", "completed_with_errors", "fa
 const selectCls = "control px-3 py-2 text-sm";
 
 const runCost = (r) => (r.cost && typeof r.cost === "object") ? r.cost.total_usd : r.cost;
+
+function newRunAction() {
+  return el("a", { href: "#/new-run", class: "btn-primary" }, "New run");
+}
+
+function filterField(label, id, control) {
+  control.setAttribute("id", id);
+  return el("div", { class: "filter-field" },
+    el("label", { for: id, class: "filter-label" }, label),
+    control,
+  );
+}
 
 function filterBar(companies, query) {
   const companySel = el("select", { class: selectCls },
@@ -40,6 +62,7 @@ function filterBar(companies, query) {
   statusSel.value = query.status ?? "";
 
   const apply = el("button", {
+    type: "button",
     class: "btn-primary",
     onclick: () => {
       const params = new URLSearchParams();
@@ -51,30 +74,39 @@ function filterBar(companies, query) {
     },
   }, "Apply");
 
-  return el("div", { class: "panel flex flex-wrap items-center gap-3" },
-    companySel, pipelineSel, statusSel, apply);
+  return el("div", { class: "filter-toolbar" },
+    filterField("Company", "runs-company-filter", companySel),
+    filterField("Pipeline", "runs-pipeline-filter", pipelineSel),
+    filterField("Status", "runs-status-filter", statusSel),
+    el("div", { class: "filter-actions" },
+      apply,
+      el("a", { class: "btn-ghost", href: "#/runs" }, "Clear"),
+    ),
+  );
 }
 
 function runsTable(runs, companiesById) {
-  const rows = runs.map((r) =>
-    el("tr", {
-      class: "cursor-pointer hover:bg-indigo-50/40",
-      onclick: () => { window.location.hash = `#/runs/${encodeURIComponent(r.run_ref)}`; },
-    },
+  const rows = runs.map((r) => {
+    const companyName = companiesById.get(r.company_id)?.name ?? "-";
+    return el("tr", { class: "data-row" },
       cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
-      cell(companiesById.get(r.company_id)?.name ?? "-", "font-semibold text-slate-50"),
+      cell(el("a", {
+        class: "table-link",
+        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
+      }, companyName), "font-semibold text-slate-50"),
       cell(PIPELINE_LABELS[r.pipeline] ?? r.pipeline ?? "-"),
       cell(statusBadge(r.status)),
       cell(fmtNum(r.total_rows), "text-right"),
       cell(fmtNum(r.websites_found ?? r.success_count), "text-right"),
       cell(fmtUsd(runCost(r)), "text-right"),
       cell(fmtDuration(r.duration_seconds), "text-right"),
-    ),
-  );
+    );
+  });
 
   return el("div", { class: "table-shell" },
     el("div", { class: "table-scroll" },
-      el("table", { class: "min-w-full divide-y divide-gray-200 text-sm" },
+      el("table", { class: "data-table" },
         el("thead", {},
           el("tr", {},
             head("Created"), head("Company"), head("Pipeline"), head("Status"),
@@ -82,7 +114,7 @@ function runsTable(runs, companiesById) {
             head("Cost", "text-right"), head("Duration", "text-right"),
           ),
         ),
-        el("tbody", { class: "divide-y divide-gray-100" }, ...rows),
+        el("tbody", {}, ...rows),
       ),
     ),
   );
@@ -112,13 +144,19 @@ export async function render(root, params) {
   if (query.status) runs = runs.filter((r) => r.status === query.status); // client-side
 
   root.replaceChildren(
-    filterBar(companies, query),
-    el("div", { class: "mt-4" },
+    el("div", { class: "core-view" },
+      pageIntro(
+        "Execution ledger",
+        "Runs",
+        "Filter and inspect pipeline activity across every company.",
+        newRunAction(),
+      ),
+      filterBar(companies, query),
       runs.length === 0
-        ? el("div", { class: "panel p-10 text-center" },
-            el("p", { class: "section-title" }, "No runs found"),
-            el("p", { class: "mt-1 section-copy" },
-              "Adjust the filters or start a new run."),
+        ? emptyState(
+            "No runs found",
+            "Adjust the filters or start a new run.",
+            newRunAction(),
           )
         : runsTable(runs, companiesById),
     ),

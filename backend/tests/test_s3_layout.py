@@ -1,10 +1,13 @@
 """Offline tests for the SerpWow per-company/per-pipeline S3 key layout."""
 import unittest
 
-from app.services.serpwow import legacy_app as la
+from app.services.serpwow import engine as la
 
 
 class UploadS3PrefixTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        la._s3_run_prefix_cache.clear()
+
     def test_company_and_pipeline(self) -> None:
         self.assertEqual(la._upload_s3_prefix("UP1", "Acme Inc", "gmaps"),
                          "acme-inc/gmaps/UP1")
@@ -27,6 +30,23 @@ class UploadS3PrefixTests(unittest.TestCase):
                          "acme-inc/full/UP1/gemini_batch_input.jsonl")
         self.assertEqual(la._batch_output_json_s3_key("UP1", "Acme Inc", "full"),
                          "acme-inc/full/UP1/gemini_batch_output.json")
+
+    def test_all_artifact_keys_use_resolved_legacy_prefix(self) -> None:
+        la._s3_run_prefix_cache["UP1"] = "Acme_Inc/full/UP1"
+
+        self.assertEqual(la._state_s3_key("UP1", "Acme Inc", "full"),
+                         "Acme_Inc/full/UP1/state.json")
+        self.assertEqual(la._output_s3_key("UP1", "Acme Inc", "full"),
+                         "Acme_Inc/full/UP1/output.json")
+        self.assertEqual(la._batch_input_jsonl_s3_key("UP1", "Acme Inc", "full"),
+                         "Acme_Inc/full/UP1/gemini_batch_input.jsonl")
+        self.assertEqual(la._batch_output_json_s3_key("UP1", "Acme Inc", "full"),
+                         "Acme_Inc/full/UP1/gemini_batch_output.json")
+
+    def test_normalized_key_lookup_does_not_seed_prefix_cache(self) -> None:
+        self.assertEqual(la._state_s3_key("NEW1", "Acme Inc", "full"),
+                         "acme-inc/full/NEW1/state.json")
+        self.assertNotIn("NEW1", la._s3_run_prefix_cache)
 
     def test_output_payload_carries_company_name(self) -> None:
         state = {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gmaps",

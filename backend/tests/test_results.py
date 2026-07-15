@@ -38,7 +38,8 @@ class TestEntityResultSerialization(unittest.TestCase):
     def test_to_report_dict_round_trip_shape(self):
         d = self._result().to_report_dict()
         self.assertEqual(set(d), {"sno", "company_name", "company_local_name", "country",
-                                  "website_url", "confidence", "flags", "attempt_log", "error"})
+                                  "website_url", "confidence", "flags", "attempt_log", "error",
+                                  "error_source", "error_category", "degraded_search"})
         self.assertEqual(d["sno"], 1)
         self.assertEqual(d["company_name"], "Acme KK")
         self.assertEqual(d["company_local_name"], "アクメ")

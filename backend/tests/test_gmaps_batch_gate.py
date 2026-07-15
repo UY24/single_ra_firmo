@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from app.services.serpwow import legacy_app
+from app.services.serpwow import engine as legacy_app
 
 
 class TestGmapsBatchEnabled(unittest.TestCase):

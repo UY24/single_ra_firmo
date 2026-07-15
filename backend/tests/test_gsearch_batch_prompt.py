@@ -6,7 +6,7 @@ prompt text, not just the single official_website stored on the result.
 """
 import unittest
 
-from app.services.serpwow import legacy_app
+from app.services.serpwow import engine as legacy_app
 
 
 class TestBatchPromptIncludesAllCandidates(unittest.TestCase):

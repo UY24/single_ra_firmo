@@ -8,36 +8,164 @@
 // completed/completed_with_errors/failed and is always stopped by the router
 // via the cleanup function this view returns).
 import { api, el, fmtUsd, fmtNum, pollStatus } from "./api.js";
-import { errorCard, loadingCard, statusBadge, fmtDuration, shortDate, copyCell } from "./ui.js";
+import {
+  errorCard,
+  loadingCard,
+  metricItem,
+  sectionHeading,
+  shortDate,
+  statusBadge,
+  fmtDuration,
+} from "./ui.js";
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
+const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
+const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship"]);
+const BATCH_TERMINAL_STATUSES = new Set([
+  "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
+]);
+const STOPPABLE_BATCH_STATUSES = new Set(["waiting_for_rows", "queued", "running"]);
+const PIPELINE_LABELS = {
+  ai_bulk: "Google AI (Bulk)",
+  ai_deep: "Google AI (Deep)",
+  gmaps: "Google Maps",
+  gsearch: "Google Search",
+  relationship: "Financial Relationship",
+  full: "Upload Console",
+  firmographics: "Firmographics",
+  url_discovery: "URL Discovery",
+};
+
+function pipelineLabel(pipeline) {
+  const key = String(pipeline ?? "");
+  return PIPELINE_LABELS[key] ?? (key || "Run");
+}
+
+function deriveLegacyRunState(s) {
+  const status = String(s?.status ?? "");
+  const pipeline = String(s?.pipeline ?? "");
+  const reporting = REPORTING_PIPELINES.has(pipeline);
+  const rowTerminal = ROW_TERMINAL_STATUSES.has(status);
+  const batchStatus = s?.gemini_batch?.status == null
+    ? null
+    : String(s.gemini_batch.status);
+  const batchTerminal = !reporting || batchStatus == null
+    || BATCH_TERMINAL_STATUSES.has(batchStatus);
+  const finalizing = reporting && rowTerminal && !batchTerminal;
+  const pollTerminal = rowTerminal && !finalizing;
+  const filesReady = pollTerminal;
+  const cancellationRequested = status === "cancel_requested" || batchStatus === "cancel_requested";
+  const canStop = !cancellationRequested
+    && (!rowTerminal || (finalizing && STOPPABLE_BATCH_STATUSES.has(batchStatus)));
+  return {
+    reporting,
+    rowTerminal,
+    batchStatus,
+    batchTerminal,
+    finalizing,
+    pollTerminal,
+    filesReady,
+    canStop,
+  };
+}
 
 // ── inline file viewer modal ──────────────────────────────────────────────────
 let _modal = null;
+let _fileRequestToken = 0;
+let _reloadTimer = null;
+
+function _scheduleReload() {
+  if (_reloadTimer != null) clearTimeout(_reloadTimer);
+  _reloadTimer = setTimeout(() => {
+    _reloadTimer = null;
+    window.location.reload();
+  }, 700);
+}
+
+function _clearReloadTimer() {
+  if (_reloadTimer == null) return;
+  clearTimeout(_reloadTimer);
+  _reloadTimer = null;
+}
+
+function _invalidateFileRequest() {
+  _fileRequestToken += 1;
+  if (_modal?.controller) _modal.controller.abort();
+  if (_modal) {
+    _modal.controller = null;
+    _modal.requestToken = _fileRequestToken;
+  }
+}
+
+function closeFileModal() {
+  if (!_modal) return;
+  _invalidateFileRequest();
+  _modal.overlay.classList.add("hidden");
+  const { main, mainState, previousFocus } = _modal;
+  if (main && mainState) {
+    main.inert = mainState.inert;
+    if (mainState.hadInertAttribute) main.setAttribute("inert", "");
+    else main.removeAttribute("inert");
+    if (mainState.ariaHidden == null) main.removeAttribute("aria-hidden");
+    else main.setAttribute("aria-hidden", mainState.ariaHidden);
+  }
+  _modal.main = null;
+  _modal.mainState = null;
+  _modal.previousFocus = null;
+  if (previousFocus?.focus) previousFocus.focus();
+}
+
+function _handleModalKeydown(event) {
+  if (!_modal || _modal.overlay.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeFileModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const first = _modal.dlBtn;
+  const last = _modal.closeBtn;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 function _ensureModal() {
   if (_modal) return _modal;
-  const title = el("span", { class: "truncate text-sm font-semibold text-slate-50" });
+  const title = el("span", {
+    id: "run-file-modal-title",
+    class: "truncate text-sm font-semibold text-slate-50",
+  });
   const dlBtn = el("a", {
-    class: "btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
+    class: "file-modal-action btn-ghost min-h-0 px-3 py-1.5 text-xs shrink-0",
     target: "_blank",
   }, "Download");
   const closeBtn = el("button", {
-    class: "btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
-    onclick: () => overlay.classList.add("hidden"),
-  }, "✕ Close");
+    class: "file-modal-action btn-ghost min-h-0 px-2 py-1 text-xs shrink-0",
+    onclick: closeFileModal,
+  }, "Close");
   const pre = el("pre", {
-    class: "flex-1 overflow-auto whitespace-pre-wrap break-words p-4 text-xs leading-5 text-slate-300 font-mono",
+    class: "code-block flex-1 overflow-auto whitespace-pre-wrap break-words p-4 text-xs leading-5 text-slate-300 font-mono",
   });
   const loadingMsg = el("p", {
     class: "p-6 text-sm text-slate-400",
   }, "Loading…");
   const body = el("div", { class: "flex flex-col overflow-hidden" }, loadingMsg);
   const overlay = el("div", {
-    class: "hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4",
-    onclick: (e) => { if (e.target === overlay) overlay.classList.add("hidden"); },
+    class: "file-modal hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4",
+    onclick: (e) => { if (e.target === overlay) closeFileModal(); },
+    onkeydown: _handleModalKeydown,
   },
-    el("div", { class: "flex flex-col w-full max-w-4xl h-[80vh] rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden" },
+    el("div", {
+      class: "modal-surface flex flex-col w-full max-w-4xl h-[80vh] rounded-xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": "run-file-modal-title",
+    },
       el("div", { class: "flex items-center gap-3 border-b border-slate-700 px-4 py-3 shrink-0" },
         title, dlBtn, closeBtn,
       ),
@@ -45,8 +173,36 @@ function _ensureModal() {
     ),
   );
   document.body.appendChild(overlay);
-  _modal = { overlay, title, dlBtn, pre, loadingMsg, body };
+  _modal = {
+    overlay, title, dlBtn, closeBtn, pre, loadingMsg, body,
+    controller: null, requestToken: 0, main: null, mainState: null, previousFocus: null,
+  };
   return _modal;
+}
+
+function openFileModal(filename, downloadUrl) {
+  const m = _ensureModal();
+  const wasClosed = m.overlay.classList.contains("hidden");
+  if (wasClosed) {
+    m.previousFocus = document.activeElement;
+    m.main = document.querySelector("main");
+    if (m.main) {
+      m.mainState = {
+        inert: Boolean(m.main.inert),
+        hadInertAttribute: m.main.hasAttribute("inert"),
+        ariaHidden: m.main.getAttribute("aria-hidden"),
+      };
+      m.main.inert = true;
+      m.main.setAttribute("inert", "");
+      m.main.setAttribute("aria-hidden", "true");
+    }
+  }
+  m.title.textContent = filename;
+  m.dlBtn.href = downloadUrl;
+  m.body.replaceChildren(m.loadingMsg);
+  m.overlay.classList.remove("hidden");
+  m.closeBtn.focus();
+  return m;
 }
 
 // RFC-4180-ish parser: handles quoted fields, "" escapes, and embedded
@@ -77,16 +233,16 @@ function csvTable(text) {
   const rows = parseCsv(text);
   if (!rows.length) return el("p", { class: "p-6 text-sm text-slate-400" }, "Empty file");
   const [header, ...bodyRows] = rows;
-  const table = el("table", { class: "w-full border-collapse text-xs" },
+  const table = el("table", { class: "data-table w-full border-collapse text-xs" },
     el("thead", {},
-      el("tr", {},
+      el("tr", { class: "data-row" },
         ...header.map((h) => el("th", {
           class: "sticky top-0 z-10 bg-slate-800 border border-slate-700 px-3 py-2 text-left font-semibold text-slate-100 whitespace-nowrap",
         }, h)),
       ),
     ),
     el("tbody", {},
-      ...bodyRows.map((r, ri) => el("tr", { class: ri % 2 ? "bg-slate-900/40" : "" },
+      ...bodyRows.map((r, ri) => el("tr", { class: `data-row ${ri % 2 ? "bg-slate-900/40" : ""}`.trim() },
         ...header.map((_, ci) => el("td", {
           class: "border border-slate-800 px-3 py-2 align-top text-slate-300 whitespace-pre-wrap break-words",
         }, r[ci] ?? "")),
@@ -100,15 +256,21 @@ function csvTable(text) {
 }
 
 async function viewFile(url, filename, downloadUrl) {
-  const m = _ensureModal();
-  m.title.textContent = filename;
-  m.dlBtn.href = downloadUrl;
-  m.body.replaceChildren(m.loadingMsg);
-  m.overlay.classList.remove("hidden");
+  const m = openFileModal(filename, downloadUrl);
+  if (m.controller) m.controller.abort();
+  const controller = typeof AbortController === "undefined" ? null : new AbortController();
+  const requestToken = ++_fileRequestToken;
+  m.controller = controller;
+  m.requestToken = requestToken;
+  const isCurrent = () => m.requestToken === requestToken
+    && m.controller === controller
+    && !m.overlay.classList.contains("hidden");
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, controller ? { signal: controller.signal } : {});
+    if (!isCurrent()) return;
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const text = await res.text();
+    if (!isCurrent()) return;
     if (/\.csv$/i.test(filename)) {
       m.body.replaceChildren(csvTable(text));
     } else {
@@ -116,49 +278,151 @@ async function viewFile(url, filename, downloadUrl) {
       m.body.replaceChildren(m.pre);
     }
   } catch (e) {
+    if (!isCurrent() || e?.name === "AbortError") return;
     m.body.replaceChildren(
-      el("p", { class: "p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),
+      el("p", { class: "detail-error p-6 text-sm text-red-400" }, `Failed to load: ${e.message}`),
     );
+  } finally {
+    if (m.requestToken === requestToken && m.controller === controller) m.controller = null;
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-function statTile(label, value) {
-  return el("div", { class: "metric-card" },
-    el("p", { class: "metric-label" }, label),
-    el("p", { class: "metric-value" }, value),
+function safeCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function outcomeSummary({
+  found,
+  notFound = null,
+  errors = 0,
+  total,
+  skipped = null,
+  failureLabel = "Errors",
+  primaryLabel = "Websites found",
+}) {
+  const safeFound = safeCount(found);
+  const safeNotFound = notFound == null ? null : safeCount(notFound);
+  const safeErrors = safeCount(errors);
+  const safeTotal = safeCount(total);
+  const safeSkipped = skipped == null ? null : safeCount(skipped);
+  const hasDenominator = safeTotal > 0;
+  const rate = hasDenominator ? Math.min(100, Math.round((safeFound / safeTotal) * 100)) : null;
+  const secondary = [];
+  if (safeNotFound != null) secondary.push(metricItem("Not found", fmtNum(safeNotFound), "muted"));
+  secondary.push(metricItem(failureLabel, fmtNum(safeErrors), safeErrors > 0 ? "danger" : "muted"));
+  if (safeSkipped != null) secondary.push(metricItem("Skipped", fmtNum(safeSkipped), "warning"));
+  return el("section", { class: "outcome-summary", "aria-label": "Run outcome" },
+    el("div", { class: "outcome-primary" },
+      el("p", { class: "outcome-label" }, primaryLabel),
+      el("div", { class: "outcome-result" },
+        el("span", { class: "outcome-value" }, hasDenominator
+          ? `${fmtNum(safeFound)} of ${fmtNum(safeTotal)}`
+          : fmtNum(safeFound)),
+        ...(hasDenominator ? [el("span", { class: "outcome-rate" }, `${fmtNum(rate)}%`)] : []),
+      ),
+    ),
+    el("dl", { class: "outcome-secondary" }, ...secondary),
   );
 }
 
-function summaryPair(label, value) {
-  const text = value == null || value === "" ? "-" : String(value);
-  return el("div", { class: "panel-muted p-3" },
-    el("dt", { class: "view-kicker" }, label),
-    el("dd", { class: "mt-1 truncate text-sm font-semibold text-slate-50", title: text }, text),
+function executionStrip(items) {
+  return el("dl", { class: "metric-strip", "aria-label": "Execution details" },
+    ...items
+      .filter(({ value }) => value != null)
+      .map(({ label, value, tone = "default", detail = "" }) =>
+        metricItem(label, value, tone, detail)),
   );
 }
 
-function headerCard(title, subtitle, status, phase) {
+// Small metadata pill (e.g. "Confidence LLM"). `tone` picks a semantic color
+// (good/info/warn/danger/muted) from the shared .pill classes in app.css.
+function chip(label, value, tone = "muted") {
+  const text = String(value);
+  return el("span", { class: `pill pill--${tone}` },
+    el("span", { class: "pill-label" }, label),
+    el("span", { class: "pill-value", title: text }, text),
+  );
+}
+
+// Cost breakdown card: LLM (LLM pipelines only) · SerpWow (+searches) · Total.
+// `g` is serpwow_summary; reads g.cost {llm_usd, serpwow_usd, serpwow_searches, total_usd}.
+function costItem(label, value, sub, extraClass = "") {
+  return el("div", { class: `cost-item ${extraClass}`.trim() },
+    el("span", { class: "cost-label" }, label),
+    el("span", { class: "cost-value" }, value ?? "—"),
+    ...(sub ? [el("span", { class: "cost-sub" }, sub)] : []),
+  );
+}
+
+function costSection(g, {
+  providerLabel = "SerpWow",
+  providerCostKey = "serpwow_usd",
+  searchKey = "serpwow_searches",
+  llmCostKey = "llm_usd",
+  totalCostKey = "total_usd",
+} = {}) {
+  const cost = g.cost || {};
+  const isLlm = g.confidence_mode === "llm" || !!g.model;
+  const items = [];
+  if (isLlm && llmCostKey) items.push(costItem("LLM", fmtUsd(cost[llmCostKey])));
+  items.push(costItem(
+    providerLabel,
+    providerCostKey && cost[providerCostKey] != null ? fmtUsd(cost[providerCostKey]) : null,
+    cost[searchKey] != null ? `${fmtNum(cost[searchKey])} searches` : null,
+  ));
+  if (totalCostKey) {
+    items.push(costItem("Total", fmtUsd(cost[totalCostKey]), null, "cost-item--total"));
+  }
+  return el("section", { class: "detail-section cost-section" },
+    sectionHeading("Cost"),
+    el("div", { class: "detail-section-body cost-card" }, ...items),
+  );
+}
+
+// Relationship verdict breakdown: the real 3-way split (confirmed / not_confirmed
+// / unclear), distinct from the found/not-found story. `rb` is relationship_breakdown.
+function verdictSection(rb) {
+  return el("section", { class: "detail-section verdict-section" },
+    sectionHeading("Relationship verdict"),
+    el("div", { class: "detail-section-body relationship-verdict" },
+      chip("Confirmed", fmtNum(rb.confirmed), "good"),
+      chip("Not confirmed", fmtNum(rb.not_confirmed), "danger"),
+      chip("Unclear", fmtNum(rb.unclear), "warn"),
+    ),
+  );
+}
+
+function headerCard(title, subtitle, status, phase, chips) {
   const bits = [statusBadge(status)];
   if (status === "running" && phase) {
     bits.push(el("span", {
       class: "status-badge",
     }, phase));
   }
-  return el("div", { class: "panel" },
+  const left = el("div", {},
+    el("p", { class: "detail-title text-base font-semibold text-slate-50" }, title),
+    el("p", { class: "detail-subtitle mt-0.5 section-copy" }, subtitle),
+  );
+  if (chips && chips.length) {
+    left.appendChild(el("div", { class: "mt-2 flex flex-wrap items-center gap-1.5" }, ...chips));
+  }
+  return el("header", { class: "detail-header" },
     el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
-      el("div", {},
-        el("p", { class: "text-base font-semibold text-slate-50" }, title),
-        el("p", { class: "mt-0.5 section-copy" }, subtitle),
-      ),
+      left,
       el("div", { class: "flex items-center gap-2" }, ...bits),
     ),
   );
 }
 
-function progressCard(done, total, running) {
+function progressSection(done, total, running) {
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  return el("div", { class: "panel" },
+  return el("div", {
+    class: "detail-section progress-section",
+    role: "group",
+    "aria-label": "Batch progress",
+  },
     el("div", { class: "flex items-center justify-between text-sm" },
       el("span", { class: "section-copy" }, "Batches"),
       el("span", { class: "font-semibold text-slate-50" }, `${fmtNum(done)} / ${fmtNum(total)}`),
@@ -175,37 +439,53 @@ function progressCard(done, total, running) {
 // Shared "Files" card (View + Download per file). `allFiles` is the full list to
 // list; `available` (optional) is the subset that actually exists — others render
 // disabled. `baseUrl(name)` builds the per-file result URL (download appends
-// "&download=true"). Used by both AI Mode and the SerpWow gsearch detail view.
-function filesCard(allFiles, baseUrl, available) {
-  const files = available?.length ? available : allFiles;
-  return el("div", { class: "panel" },
-    el("h2", { class: "section-title" }, "Files"),
-    el("div", { class: "mt-3 flex flex-col gap-2" },
-      ...allFiles.map((name) => {
-        const isAvailable = files.includes(name);
-        return el("div", { class: "flex items-center gap-2" },
-          el("span", { class: `w-40 shrink-0 font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
-          el("button", {
-            class: "btn-ghost min-h-0 px-3 py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
-            ...(isAvailable ? {} : { disabled: "" }),
-            onclick: () => viewFile(baseUrl(name), name, `${baseUrl(name)}&download=true`),
-          }, "View"),
-          el("a", {
-            class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
-            ...(isAvailable ? { href: `${baseUrl(name)}&download=true`, download: name } : {}),
-          }, "Download"),
-        );
-      }),
-    ),
+// "&download=true"). `extras` (optional) are download-only rows {name, href} for
+// files served by a different endpoint (e.g. the full output.json/xlsx). Used by
+// both AI Mode and the SerpWow gsearch/gmaps detail view.
+function filesSection(allFiles, baseUrl, available, extras) {
+  const files = Array.isArray(available) ? available : allFiles;
+  const rows = allFiles.map((name) => {
+    const isAvailable = files.includes(name);
+    return el("div", { class: "file-row" },
+      el("span", { class: `file-name font-mono text-xs ${isAvailable ? "text-slate-300" : "text-slate-600"}` }, name),
+      el("div", { class: "file-actions" },
+        el("button", {
+          class: "btn-ghost min-h-0 px-3 py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed",
+          ...(isAvailable ? {} : { disabled: "" }),
+          onclick: () => viewFile(baseUrl(name), name, `${baseUrl(name)}&download=true`),
+        }, "View"),
+        el("a", {
+          class: `btn-ghost min-h-0 px-3 py-1 text-xs ${isAvailable ? "" : "pointer-events-none opacity-40"}`,
+          ...(isAvailable
+            ? { href: `${baseUrl(name)}&download=true`, download: name }
+            : { "aria-disabled": "true" }),
+        }, "Download"),
+      ),
+    );
+  });
+  for (const ex of extras ?? []) {
+    rows.push(el("div", { class: "file-row" },
+      el("span", { class: "file-name font-mono text-xs text-slate-300" }, ex.name),
+      el("div", { class: "file-actions" },
+        el("a", {
+          class: "btn-ghost min-h-0 px-3 py-1 text-xs",
+          href: ex.href, download: ex.name,
+        }, "Download"),
+      ),
+    ));
+  }
+  return el("section", { class: "detail-section files-section" },
+    sectionHeading("Files"),
+    el("div", { class: "detail-section-body file-list" }, ...rows),
   );
 }
 
-function downloadsCard(ref, available) {
+function downloadsSection(ref, available) {
   const baseUrl = (name) => `/uploads/ai-mode/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-  return filesCard(RESULT_FILES, baseUrl, available);
+  return filesSection(RESULT_FILES, baseUrl, available);
 }
 
-function rerunFailedCard(ref) {
+function rerunFailedSection(ref) {
   const msg = el("div", { class: "mt-3 hidden" });
   const btn = el("button", {
     class: "btn-primary disabled:opacity-50",
@@ -217,21 +497,23 @@ function rerunFailedCard(ref) {
         await api(`/uploads/ai-mode/${encodeURIComponent(ref)}/resume`, { method: "POST" });
         msg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
           "Rerun started. Reloading..."));
-        setTimeout(() => { window.location.reload(); }, 700);
+        _scheduleReload();
       } catch (e) {
         btn.disabled = false; // 404/409 → inline detail
         msg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
       }
     },
   }, "Rerun failed");
-  return el("div", { class: "panel" },
-    el("h2", { class: "section-title" }, "Rerun failed"),
-    el("p", { class: "mt-1 text-xs text-slate-400" },
-      "Re-runs this same run and redoes only what failed: Phase 1 (scrape) re-fetches "
-      + "only batches that failed to scrape, Phase 2 (LLM cleanup) re-does only batches "
-      + "that failed to clean. Successful scrapes and cleaned results are reused — no "
-      + "scrape.do or LLM re-spend on them. (Not-found rows are final; use AI Mode Deep for those.)"),
-    el("div", { class: "mt-3" }, btn), msg,
+  return el("section", { class: "detail-section detail-action" },
+    sectionHeading("Rerun failed"),
+    el("div", { class: "detail-section-body" },
+      el("p", { class: "text-xs text-slate-400" },
+        "Re-runs this same run and redoes only what failed: Phase 1 (scrape) re-fetches "
+        + "only batches that failed to scrape, Phase 2 (LLM cleanup) re-does only batches "
+        + "that failed to clean. Successful scrapes and cleaned results are reused — no "
+        + "scrape.do or LLM re-spend on them. (Not-found rows are final; use AI Mode Deep for those.)"),
+      el("div", { class: "mt-3" }, btn), msg,
+    ),
   );
 }
 
@@ -242,136 +524,202 @@ function warningsNote(warnings) {
 
 function renderAiStatus(root, ref, s) {
   const running = ["queued", "running"].includes(s.status);
-  const tiles = [
-    statTile("Entities processed", `${fmtNum(s.entities_processed)} / ${fmtNum(s.total_rows)}`),
-    statTile("Websites found", fmtNum(s.websites_found)),
-    statTile("Not found", fmtNum(s.websites_not_found)),
-    statTile("LLM errors", fmtNum(s.llm_errors)),
-    statTile("Scrape.do searches / failed",
-      `${fmtNum(s.scrapedo_request_count)} / ${fmtNum(s.failed_request_count)}`),
-    statTile("Input tokens", fmtNum(s.token_usage?.prompt_tokens)),
-    statTile("Output tokens", fmtNum(s.token_usage?.completion_tokens)),
-    statTile("Model", s.model ?? "—"),
-    statTile("Batch mode", s.is_batch == null ? "—" : s.is_batch ? "Yes" : "No"),
-    statTile("Scrape.do searches", fmtNum(s.cost?.scrapedo_searches)),
-    statTile("LLM cost", fmtUsd(s.cost?.total_usd)),
-    statTile("Duration", fmtDuration(s.batch_duration_seconds)),
+  const outcome = s.outcome_breakdown ?? {};
+  const hasOutcome = s.outcome_breakdown != null;
+  const total = s.total_rows ?? s.entities_processed;
+  // Newer AI payloads report an exclusive three-way outcome. Older payloads expose
+  // websites_not_found inclusive of LLM errors, so subtract the error fallback once.
+  const errors = safeCount(hasOutcome ? outcome.errored : s.llm_errors);
+  const found = safeCount(hasOutcome ? outcome.found : s.websites_found);
+  const notFound = hasOutcome
+    ? safeCount(outcome.not_found)
+    : Math.max(safeCount(s.websites_not_found) - errors, 0);
+  const chips = [];
+  if (s.model) chips.push(chip("Model", s.model, "muted"));
+  if (s.is_batch != null) {
+    chips.push(chip("Batch mode", s.is_batch ? "On" : "Off", s.is_batch ? "good" : "muted"));
+  }
+  const execution = [
+    {
+      label: "Total / Processed",
+      value: total != null || s.entities_processed != null
+        ? `${fmtNum(total)} / ${fmtNum(s.entities_processed)}` : null,
+    },
+    { label: "Duration", value: s.batch_duration_seconds == null ? null : fmtDuration(s.batch_duration_seconds) },
+    { label: "Input tokens", value: s.token_usage?.prompt_tokens == null ? null : fmtNum(s.token_usage.prompt_tokens), tone: "muted" },
+    { label: "Output tokens", value: s.token_usage?.completion_tokens == null ? null : fmtNum(s.token_usage.completion_tokens), tone: "muted" },
+    { label: "Batch mode", value: s.is_batch == null ? null : s.is_batch ? "Yes" : "No" },
+    {
+      label: "Scrape.do requests",
+      value: s.scrapedo_request_count == null ? null : fmtNum(s.scrapedo_request_count),
+      detail: s.failed_request_count == null ? "" : `${fmtNum(s.failed_request_count)} failed`,
+    },
   ];
 
   const parts = [
     headerCard(s.company_name || "—",
-      `${s.mode_label ?? s.mode ?? "—"} · run ${ref}`, s.status, s.phase),
-    progressCard(s.batches_done ?? 0, s.batches_total ?? 0, running),
+      `${s.mode_label ?? s.mode ?? "—"} · run ${ref}`, s.status, s.phase, chips),
+    outcomeSummary({
+      found,
+      notFound,
+      errors,
+      total,
+    }),
+    executionStrip(execution),
+    progressSection(s.batches_done ?? 0, s.batches_total ?? 0, running),
   ];
   if ((s.warnings ?? []).length) parts.push(warningsNote(s.warnings));
-  parts.push(el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles));
   if (s.error) {
     parts.push(el("div", { class: "callout callout-red" },
-      el("p", { class: "text-sm" }, s.error)));
+      el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  parts.push(downloadsCard(ref, s.available_files));
-  if (["failed", "completed_with_errors"].includes(s.status)) parts.push(rerunFailedCard(ref));
+  if (s.cost) {
+    parts.push(costSection({ confidence_mode: "llm", model: s.model, cost: s.cost }, {
+      providerLabel: "Scrape.do",
+      providerCostKey: null,
+      searchKey: "scrapedo_searches",
+      llmCostKey: s.cost?.llm_usd != null ? "llm_usd" : "total_usd",
+      totalCostKey: null,
+    }));
+  }
+  // Keep the availability surface visible throughout a run; unavailable files are disabled.
+  parts.push(downloadsSection(ref, s.available_files));
+  if (["failed", "completed_with_errors"].includes(s.status)) parts.push(rerunFailedSection(ref));
 
-  root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
+  root.replaceChildren(el("div", { class: "run-detail space-y-4" }, ...parts));
 }
 
 function renderLegacyStatus(root, ref, s) {
-  const rowsDone = ["completed", "completed_with_errors"].includes(String(s.status ?? ""));
-  // gsearch batch mode: rows finish before the Gemini batch. Treat the run as
-  // "done" only once the batch is terminal so the UI doesn't claim completion early.
-  const batchStatus = s.gemini_batch?.status ?? null;
-  const batchTerminal = batchStatus == null
-    || ["succeeded", "failed", "skipped", "not_started"].includes(String(batchStatus));
-  const gsearchFinalizing = ["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && !batchTerminal;
-  const outputJson = `/uploads/${encodeURIComponent(ref)}/output?download=true`;
-  const outputXlsx = `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true`;
-  const tiles = [
-    statTile("Total rows", fmtNum(s.total_rows)),
-    statTile("Processed", fmtNum(s.processed_rows)),
-    statTile("Succeeded", fmtNum(s.success_rows)),
-    statTile("Failed", fmtNum(s.failed_rows)),
-    statTile("Processing time", fmtDuration(s.processing_seconds_total)),
-    statTile("Avg / row", fmtDuration(s.processing_seconds_avg)),
-  ];
+  const runState = deriveLegacyRunState(s);
   const g = s.serpwow_summary;
-  if (g) {
-    tiles.push(
-      statTile("Websites found", fmtNum(g.websites_found)),
-      statTile("Not found", fmtNum(g.websites_not_found)),
-    );
-    if (g.model) {
-      tiles.push(
-        statTile("Model", g.model),
-        statTile("Batch mode", g.is_batch == null ? "—" : g.is_batch ? "Yes" : "No"),
-        statTile("Input tokens", fmtNum(g.token_usage?.prompt_tokens)),
-        statTile("Output tokens", fmtNum(g.token_usage?.completion_tokens)),
-      );
+  const outcome = g?.outcome_breakdown ?? null;
+
+  // Header chips: confidence mode always (gsearch/gmaps); batch + model only when LLM
+  // (batch is meaningless in heuristic mode). Non-serpwow pipelines get no chips.
+  const chips = [];
+  if (g?.confidence_mode) {
+    const isLlm = g.confidence_mode === "llm";
+    chips.push(chip("Confidence", isLlm ? "LLM" : "Heuristic", isLlm ? "info" : "muted"));
+    if (isLlm) {
+      chips.push(chip("Batch", g.is_batch ? "On" : "Off", g.is_batch ? "good" : "muted"));
+      if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
-    tiles.push(statTile(g.model ? "LLM cost" : "SerpWow cost", fmtUsd(g.cost?.total_usd)));
-    if (g.cost?.serpwow_searches != null) {
-      tiles.push(statTile("SerpWow searches", fmtNum(g.cost.serpwow_searches)));
-    }
-    if (s.gemini_batch?.status) tiles.push(statTile("Batch job", s.gemini_batch.status));
   }
-  const parts = [
-    gsearchFinalizing
-      ? headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, "running", "finalizing")
-      : headerCard(`Upload ${ref}`, `${s.pipeline ?? "—"} (legacy SerpWow pipeline)`, s.status),
-    el("div", { class: "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4" }, ...tiles),
+
+  const isRel = s.pipeline === "relationship";
+  // Relationship totals use original CSV rows; state.total_rows is deduplicated queue work.
+  const total = isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows;
+  // Canonical reporting outcomes are already exclusive and original-row-level.
+  // Older reporting payloads omit the block and expose inclusive not-found counts.
+  const errors = safeCount(outcome ? outcome.errored : s.failed_rows);
+  const found = safeCount(outcome ? outcome.found : (g ? g.websites_found : s.success_rows));
+  const notFound = outcome
+    ? safeCount(outcome.not_found)
+    : (g ? Math.max(safeCount(g.websites_not_found) - errors, 0) : null);
+  const execution = [
+    {
+      label: "Total / Processed",
+      value: total != null || s.processed_rows != null
+        ? `${fmtNum(total)} / ${fmtNum(s.processed_rows)}` : null,
+      detail: isRel ? "Original rows / pairs processed" : "Rows",
+    },
+    { label: "Processing time", value: s.processing_seconds_total == null ? null : fmtDuration(s.processing_seconds_total) },
+    { label: "Avg / row", value: s.processing_seconds_avg == null ? null : fmtDuration(s.processing_seconds_avg) },
+    {
+      label: "Input tokens",
+      value: g?.confidence_mode === "llm" && g.token_usage?.prompt_tokens != null
+        ? fmtNum(g.token_usage.prompt_tokens) : null,
+      tone: "muted",
+    },
+    {
+      label: "Output tokens",
+      value: g?.confidence_mode === "llm" && g.token_usage?.completion_tokens != null
+        ? fmtNum(g.token_usage.completion_tokens) : null,
+      tone: "muted",
+    },
+    { label: "Batch job", value: runState.batchStatus, tone: runState.finalizing ? "warning" : "default" },
+    { label: "Unique pairs", value: isRel && g?.unique_pairs != null ? fmtNum(g.unique_pairs) : null },
   ];
-  const GSEARCH_FILES = ["found.csv", "notFound.csv", "report.json", "run.log"];
-  const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
-  // Same Files card component AI Mode uses. gsearch files are written only once the
-  // batch is terminal, so show it only then (avoids View/Download 404s mid-batch).
-  if (["gsearch", "gmaps"].includes(s.pipeline) && rowsDone && batchTerminal) {
-    parts.push(filesCard(GSEARCH_FILES, resultUrl));
+
+  const timestamp = s.updated_at ?? s.created_at;
+  const timestampLabel = s.updated_at ? "Updated" : "Created";
+  const context = [`Run ${ref}`];
+  if (timestamp) context.push(`${timestampLabel} ${shortDate(timestamp)}`);
+
+  const parts = [
+    headerCard(pipelineLabel(s.pipeline), context.join(" · "),
+      runState.finalizing ? "running" : s.status,
+      runState.finalizing ? "finalizing" : null, chips),
+    outcomeSummary({
+      found,
+      notFound,
+      errors,
+      total,
+      skipped: isRel ? g?.blank_rows ?? 0 : null,
+      failureLabel: g ? "Errors" : "Failed",
+      primaryLabel: g ? "Websites found" : "Succeeded",
+    }),
+    executionStrip(execution),
+  ];
+  if ((s.warnings ?? []).length) parts.push(warningsNote(s.warnings));
+  if (s.error) {
+    parts.push(el("div", { class: "callout callout-red" },
+      el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  const fileLinks = s.file_links && typeof s.file_links === "object" ? s.file_links : null;
-  if (fileLinks) {
-    parts.push(el("div", { class: "panel" },
-      el("h2", { class: "section-title" }, "Artifacts"),
-      el("div", { class: "mt-3 grid grid-cols-1 gap-3 md:grid-cols-2" },
-        ...Object.entries(fileLinks).map(([name, path]) =>
-          el("div", { class: "panel-muted p-3" },
-            el("p", { class: "view-kicker" }, name),
-            copyCell(String(path)),
-          )),
-      ),
-    ));
+  if (g) parts.push(costSection(g));
+  if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
+
+  // Stop button while the run is still doing work (rows in flight, or the
+  // Gemini batch still running). Remaining rows are marked failed; retryable
+  // later via "Retry failed rows".
+  if (runState.canStop) {
+    const stopMsg = el("div", { class: "mt-3" });
+    const stopBtn = el("button", {
+      class: "btn-secondary min-h-0 px-3 py-1.5 text-xs text-red-600 disabled:opacity-50",
+      onclick: async () => {
+        if (!window.confirm(
+          "Stop this run? Rows not yet processed are marked failed "
+          + "(you can retry them later); a running Gemini batch is cancelled.")) return;
+        stopBtn.disabled = true;
+        try {
+          const res = await api(`/uploads/${encodeURIComponent(ref)}/stop`, { method: "POST" });
+          stopMsg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
+            `Stopped: ${fmtNum(res.stopped_rows)} row(s) halted`
+            + `${res.batch_cancelled ? ", batch cancelled" : ""}. Reloading...`));
+          _scheduleReload();
+        } catch (e) {
+          stopBtn.disabled = false;
+          stopMsg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+        }
+      },
+    }, "Stop run");
+    parts.push(el("section", { class: "detail-section detail-action" },
+      sectionHeading("Stop"),
+      el("div", { class: "detail-section-body" },
+        el("p", { class: "text-xs text-slate-400" },
+          "Halts remaining work: unprocessed rows are marked failed (retryable via "
+          + "Retry failed rows), a running Gemini batch is cancelled, and the run "
+          + "finalizes with whatever finished."),
+        el("div", { class: "mt-3" }, stopBtn), stopMsg)));
   }
-  parts.push(el("div", { class: "panel" },
-    el("p", { class: "text-xs text-slate-400" },
-      `SerpWow pipeline run - row-level detail and outputs are available via the API status endpoint at /uploads/${ref}/status.`),
-  ));
-  parts.push(el("div", { class: "panel" },
-    el("div", { class: "flex flex-wrap items-center justify-between gap-3" },
-      el("div", {},
-        el("p", { class: "view-kicker" }, "Run summary"),
-        el("h2", { class: "mt-1 section-title" }, "SerpWow upload snapshot"),
-      ),
-      el("div", { class: "flex flex-wrap gap-2" },
-        rowsDone
-          ? el("a", { class: "btn-ghost min-h-0 px-3 py-1.5 text-xs", href: outputJson }, "Download JSON")
-          : el("span", { class: "text-xs text-slate-500" }, "Downloads available after completion"),
-        rowsDone
-          ? el("a", { class: "btn-ghost min-h-0 px-3 py-1.5 text-xs", href: outputXlsx }, "Download XLSX")
-          : "",
-      ),
-    ),
-    el("dl", { class: "mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4" },
-      summaryPair("Mode", s.pipeline ?? "-"),
-      summaryPair("Status", s.status ?? "-"),
-      summaryPair("Total", fmtNum(s.total_rows)),
-      summaryPair("Processed", fmtNum(s.processed_rows)),
-      summaryPair("Success", fmtNum(s.success_rows)),
-      summaryPair("Failed", fmtNum(s.failed_rows)),
-      summaryPair("Time total", fmtDuration(s.processing_seconds_total)),
-      summaryPair("Avg / row", fmtDuration(s.processing_seconds_avg)),
-      summaryPair("Updated", shortDate(s.updated_at)),
-      summaryPair("Storage", fileLinks ? Object.values(fileLinks).join(" | ") : "-"),
-    ),
-  ));
-  root.replaceChildren(el("div", { class: "space-y-4" }, ...parts));
+
+  // Single file surface: result files (gsearch/gmaps) + output.json/xlsx (all pipelines),
+  // shown once the run is terminal (and, for batch runs, once the batch is terminal too —
+  // result files aren't written until then, so View/Download would 404).
+  if (runState.filesReady) {
+    const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+    const resultFiles = (runState.reporting && runState.batchTerminal)
+      ? (s.pipeline === "relationship"
+          ? ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"]
+          : ["found.csv", "notFound.csv", "report.json", "run.log"])
+      : [];
+    const extras = [
+      { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
+      { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
+    ];
+    parts.push(filesSection(resultFiles, resultUrl, g?.available_files, extras));
+  }
+  root.replaceChildren(el("div", { class: "run-detail space-y-4" }, ...parts));
 }
 
 export async function render(root, params) {
@@ -397,7 +745,12 @@ export async function render(root, params) {
     const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
     try {
       await api(legacyPath); // 404 here too → unknown run
-      stop = pollStatus(legacyPath, (s) => renderLegacyStatus(root, ref, s));
+      stop = pollStatus(
+        legacyPath,
+        (s) => renderLegacyStatus(root, ref, s),
+        2000,
+        (s) => deriveLegacyRunState(s).pollTerminal,
+      );
     } catch (e) {
       root.replaceChildren(errorCard(
         /not found/i.test(e.message) ? `Run "${ref}" was not found.` : e.message));
@@ -409,5 +762,9 @@ export async function render(root, params) {
   }
 
   // The router invokes this before the next view renders — stops the poller.
-  return () => { if (stop) stop(); };
+  return () => {
+    if (stop) stop();
+    _clearReloadTimer();
+    closeFileModal();
+  };
 }

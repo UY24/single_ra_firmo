@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 load_dotenv()
 
-from app.services.serpwow.legacy_app import get_s3_client, read_upload_artifact
+from app.services.serpwow.engine import get_s3_client, read_upload_artifact
 
 async def test():
     upload_id = "fb2884b0-f38c-4776-bf7f-582028f59522"

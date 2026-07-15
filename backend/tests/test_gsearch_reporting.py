@@ -85,10 +85,19 @@ class TestGsearchReporting(unittest.TestCase):
         summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
         self.assertEqual(summary["model"], "gemini-2.5-flash-lite")
         self.assertFalse(summary["is_batch"])
+        # a model ran -> confidence_mode is "llm"
+        self.assertEqual(summary["confidence_mode"], "llm")
         # batch mode: presence of the gemini_batch block flips is_batch
         state["gemini_batch"] = {"status": "succeeded"}
         summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
         self.assertTrue(summary["is_batch"])
+
+    def test_summary_confidence_mode_heuristic(self):
+        # no LLM model surfaced (e.g. gmaps heuristic) -> confidence_mode is "heuristic"
+        state = _state()
+        summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
+        self.assertIsNone(summary["model"])
+        self.assertEqual(summary["confidence_mode"], "heuristic")
 
     def test_write_outputs(self):
         with tempfile.TemporaryDirectory() as d:

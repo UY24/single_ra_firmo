@@ -65,6 +65,18 @@ def _fmt_tokens(n: int | None) -> str | None:
     return str(n)
 
 
+def _fmt_usd(value: int | float) -> str:
+    if value == 0:
+        return "$0.00"
+    if 0 < value < 0.000001:
+        return "<$0.000001"
+    if -0.000001 < value < 0:
+        return ">-$0.000001"
+    if abs(value) < 0.01:
+        return f"${value:,.6f}".rstrip("0").rstrip(".")
+    return f"${value:,.2f}"
+
+
 def _field(label: str, value: str) -> dict:
     """One cell in the two-column Block Kit field grid."""
     return {"type": "mrkdwn", "text": f"*{label}*\n{value}"}
@@ -117,11 +129,13 @@ def _post(text: str, blocks: list[dict] | None = None) -> bool:
 
 def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, status: str,
                         found: int | None = None, not_found: int | None = None,
+                        errored: int | None = None, error_sources: dict | None = None,
                         success: int | None = None, failed: int | None = None,
                         total_rows: int | None = None, searches: int | None = None,
                         search_label: str = "Searches",
                         tokens: int | None = None, input_tokens: int | None = None,
                         output_tokens: int | None = None, cost_usd: float | None = None,
+                        llm_cost_usd: float | None = None, serpwow_cost_usd: float | None = None,
                         duration_seconds: float | None = None,
                         llm_errors: int | None = None) -> bool:
     """Notify that a run reached a terminal completed / completed_with_errors state.
@@ -141,27 +155,43 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         flavor = "🎉 Smooth sailing — all wrapped up!"
 
     fields: list[dict] = []
-    if found is not None or not_found is not None:
+    if errored is not None:
+        fields.append(_field("🎯 Outcome",
+            f"*{found or 0:,}* found\n*{not_found or 0:,}* not found\n*{errored:,}* errored"))
+    elif found is not None or not_found is not None:
         fields.append(_field("🎯 Outcome", f"*{found or 0:,}* found\n*{not_found or 0:,}* not found"))
     else:
         fields.append(_field("🎯 Outcome", f"*{success or 0:,}* succeeded\n*{failed or 0:,}* failed"))
     if isinstance(total_rows, int):
         fields.append(_field("📋 Rows", f"{total_rows:,}"))
+    # SerpWow cell: searches THEN cost in one field when a SerpWow cost is given;
+    # otherwise the bare search count (e.g. AI Mode's scrape.do flat-fee searches).
     if isinstance(searches, int):
-        fields.append(_field(f"🔎 {search_label}", f"{searches:,}"))
+        if isinstance(serpwow_cost_usd, (int, float)):
+            fields.append(_field(f"🔎 {search_label}",
+                                 f"{searches:,} searches · {_fmt_usd(serpwow_cost_usd)}"))
+        else:
+            fields.append(_field(f"🔎 {search_label}", f"{searches:,}"))
     if isinstance(tokens, int):
         val = f"{tokens:,}"
         tin, tout = _fmt_tokens(input_tokens), _fmt_tokens(output_tokens)
         if tin and tout:
             val += f"\n{tin} input / {tout} output"
         fields.append(_field("🪙 Tokens", val))
-    if isinstance(cost_usd, (int, float)) and cost_usd > 0:
-        fields.append(_field("💰 Cost", f"${cost_usd:,.2f}"))
+    # Cost cell: when the LLM/SerpWow split is provided, show LLM + Total (SerpWow
+    # is already in the 🔎 cell above); otherwise a single total.
+    if isinstance(llm_cost_usd, (int, float)) and isinstance(cost_usd, (int, float)):
+        fields.append(_field("💰 Cost", f"LLM {_fmt_usd(llm_cost_usd)}\nTotal {_fmt_usd(cost_usd)}"))
+    elif isinstance(cost_usd, (int, float)) and cost_usd > 0:
+        fields.append(_field("💰 Cost", _fmt_usd(cost_usd)))
     dur = _fmt_dur(duration_seconds)
     if dur:
         fields.append(_field("⏱️ Duration", dur))
     if isinstance(llm_errors, int) and llm_errors > 0:
         fields.append(_field("🚑 LLM errors", f"{llm_errors:,}"))
+    if error_sources:
+        top = ", ".join(f"{v} {k}" for k, v in sorted(error_sources.items(), key=lambda kv: -kv[1]))
+        fields.append(_field("⚠️ Errors", top))
 
     blocks = [
         _header(headline),
@@ -170,7 +200,9 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         _fields_block(fields),
         _context(f"🆔 Run ref: `{run_ref}`"),
     ]
-    if found is not None or not_found is not None:
+    if errored is not None:
+        summary = f"{found or 0:,} found / {not_found or 0:,} not found / {errored:,} errored"
+    elif found is not None or not_found is not None:
         summary = f"{found or 0:,} found / {not_found or 0:,} not found"
     else:
         summary = f"{success or 0:,} succeeded / {failed or 0:,} failed"

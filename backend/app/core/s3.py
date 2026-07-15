@@ -2,7 +2,7 @@
 """Shared S3 helpers — bucket from S3_BUCKET, region from S3_REGION.
 
 Used by AI Mode to mirror a completed run directory to S3. SerpWow keeps its own
-client (see services/serpwow/legacy_app.py); this module is intentionally small.
+client (see services/serpwow/engine.py); this module is intentionally small.
 """
 from __future__ import annotations
 

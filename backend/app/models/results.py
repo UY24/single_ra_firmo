@@ -29,6 +29,10 @@ class EntityResult:
     flags: list[Flag] = field(default_factory=list)
     attempt_log: list[AttemptLogEntry] = field(default_factory=list)
     error: str | None = None
+    # Shared with AI Mode; additive defaults so existing callers are unaffected.
+    error_source: str | None = None
+    error_category: str | None = None
+    degraded_search: bool = False
 
     def flags_csv(self) -> str:
         return "\n".join(f"{f.flag}: {f.why}" for f in self.flags)
@@ -51,6 +55,9 @@ class EntityResult:
             "attempt_log": [{"query": a.query, "result": a.result, "url": a.url}
                             for a in self.attempt_log],
             "error": self.error,
+            "error_source": self.error_source,
+            "error_category": self.error_category,
+            "degraded_search": self.degraded_search,
         }
 
     @classmethod

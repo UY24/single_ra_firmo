@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core import config  # noqa: F401  (loads .env first)
 from app.core.config import STATIC_DIR, TEMPLATES_DIR
-from app.services.serpwow.legacy_app import _get_int_env, app  # the existing FastAPI instance
+from app.services.serpwow.engine import _get_int_env, app  # the existing FastAPI instance
 from app.routers.ai_mode import router as ai_mode_router
 from app.routers.companies import router as companies_router
 

@@ -1,12 +1,46 @@
 """Data-driven search phases for relationship-mode lookups."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Callable, Collection, Literal, Mapping, Sequence
+from typing import Any, Callable, Collection, Literal, Mapping, Sequence
+
+from app.services.serpwow.url_utils import (
+    canonicalize_official_url,
+    is_disallowed_official_url,
+    url_matches_domain,
+)
 
 
 PhaseGoal = Literal["combined", "relationship_evidence", "official_url"]
 SearchPolicy = Literal["adaptive", "sequential"]
+
+_URL_TOKEN_RE = re.compile(
+    r"https?://[^\s<>\"']+|"
+    r"(?<![@\w])(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}(?:/[^\s<>\"']*)?",
+    re.IGNORECASE,
+)
+_TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
+_FINANCIAL_MARKER_RE = re.compile(
+    r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
+    r"\bfund(?:s|ed|ing)?\b|"
+    r"\bfinanc(?:e|ed|ing)\b|"
+    r"\bfinancial\s+backing\b|"
+    r"\bportfolio\s+compan(?:y|ies)\b|"
+    r"\bbacked\b|"
+    r"\bacquisition(?:s)?\b|\bacquired\b|"
+    r"\bparent(?:\s+company)?\b|\bsubsidiar(?:y|ies)\b|\bownership\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_FINANCIAL_RE = re.compile(
+    r"\b(?:no|not|without)\b(?:\s+\w+){0,8}\s+"
+    r"(?:financial\s+relationship|relationship|"
+    r"invest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?|"
+    r"fund(?:s|ed|ing)?|financ(?:e|ed|ing)|backing|"
+    r"acquisition(?:s)?|acquired|ownership)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +65,180 @@ class RelationshipPhase:
     goal: PhaseGoal
     build_query: QueryBuilder
     enabled: bool = True
+
+
+def extract_candidate_records(
+    raw_result: Mapping[str, Any],
+    phase: str,
+    x_domain: str,
+) -> list[dict[str, str]]:
+    """Extract canonical URL candidates with first-seen field provenance."""
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(value: object, source_field: str) -> None:
+        if not isinstance(value, str):
+            return
+        original = value.strip().rstrip(_TRAILING_URL_PUNCTUATION)
+        if (not original or "@" in original or re.search(r"\s", original)
+                or ("://" in original
+                    and not original.lower().startswith(("http://", "https://")))):
+            return
+        canonical = canonicalize_official_url(original)
+        if (not canonical or canonical in seen
+                or is_disallowed_official_url(canonical)
+                or url_matches_domain(canonical, x_domain)):
+            return
+        seen.add(canonical)
+        records.append({
+            "url": canonical,
+            "original_text": original,
+            "phase": phase,
+            "source_field": source_field,
+            "evidence_id": f"{phase}.candidate.{len(records)}",
+        })
+
+    def add_text(value: object, source_field: str) -> None:
+        if not isinstance(value, str):
+            return
+        for match in _URL_TOKEN_RE.finditer(value):
+            add(match.group().rstrip(_TRAILING_URL_PUNCTUATION), source_field)
+
+    raw = raw_result.get("raw_response")
+    if not isinstance(raw, Mapping):
+        raw = {}
+
+    knowledge_graph = raw.get("knowledge_graph")
+    if isinstance(knowledge_graph, Mapping):
+        add(knowledge_graph.get("website"), "knowledge_graph.website")
+
+    answer_box = raw.get("answer_box")
+    if isinstance(answer_box, Mapping):
+        for key in ("link", "url"):
+            add(answer_box.get(key), f"answer_box.{key}")
+
+    ai_overview = raw.get("ai_overview")
+    if isinstance(ai_overview, Mapping):
+        sources = ai_overview.get("ai_overview_sources")
+        if isinstance(sources, list):
+            for index, source in enumerate(sources):
+                if isinstance(source, Mapping):
+                    add(
+                        source.get("source_url"),
+                        f"ai_overview.ai_overview_sources[{index}].source_url",
+                    )
+
+    organic_results = raw.get("organic_results")
+    if isinstance(organic_results, list):
+        for index, result in enumerate(organic_results):
+            if not isinstance(result, Mapping):
+                continue
+            for key in ("link", "url"):
+                add(result.get(key), f"organic_results[{index}].{key}")
+
+    if isinstance(ai_overview, Mapping):
+        contents = ai_overview.get("ai_overview_contents")
+        if isinstance(contents, list):
+            for index, content in enumerate(contents):
+                if isinstance(content, Mapping):
+                    add_text(
+                        content.get("text"),
+                        f"ai_overview.ai_overview_contents[{index}].text",
+                    )
+
+    if isinstance(organic_results, list):
+        for index, result in enumerate(organic_results):
+            if not isinstance(result, Mapping):
+                continue
+            for key in ("displayed_link", "snippet"):
+                add_text(result.get(key), f"organic_results[{index}].{key}")
+
+    candidates = raw_result.get("candidates")
+    if isinstance(candidates, list):
+        for index, candidate in enumerate(candidates):
+            add(candidate, f"candidates[{index}]")
+
+    return records
+
+
+def _has_financial_marker(text: str) -> bool:
+    return bool(_FINANCIAL_MARKER_RE.search(text))
+
+
+def extract_evidence_records(
+    raw_response: Mapping[str, Any],
+    phase: str,
+) -> list[dict[str, str]]:
+    """Collect bounded overview and financially relevant organic evidence."""
+    if not isinstance(raw_response, Mapping):
+        return []
+    records: list[dict[str, str]] = []
+    ai_overview = raw_response.get("ai_overview")
+    if isinstance(ai_overview, Mapping):
+        contents = ai_overview.get("ai_overview_contents")
+        if isinstance(contents, list):
+            for index, content in enumerate(contents):
+                if not isinstance(content, Mapping):
+                    continue
+                text = str(content.get("text") or "").strip()
+                if text:
+                    records.append({
+                        "evidence_id": f"{phase}.overview.{index}",
+                        "phase": phase,
+                        "source_field": (
+                            f"ai_overview.ai_overview_contents[{index}].text"
+                        ),
+                        "text": text[:3000],
+                    })
+
+    organic_results = raw_response.get("organic_results")
+    if isinstance(organic_results, list):
+        for index, result in enumerate(organic_results):
+            if not isinstance(result, Mapping):
+                continue
+            text = str(result.get("snippet") or "").strip()
+            if text and _has_financial_marker(text):
+                records.append({
+                    "evidence_id": f"{phase}.organic.{index}",
+                    "phase": phase,
+                    "source_field": f"organic_results[{index}].snippet",
+                    "text": text[:1500],
+                })
+    return records
+
+
+def has_positive_financial_evidence(
+    records: Sequence[Mapping[str, object]],
+) -> bool:
+    """Return whether one record is financial and not explicitly negative."""
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        text = str(record.get("text") or "").strip()
+        if (_has_financial_marker(text)
+                and not _NEGATIVE_FINANCIAL_RE.search(text)):
+            return True
+    return False
+
+
+def company_y_appears_on_x_site(
+    raw_response: Mapping[str, Any],
+    x_domain: str,
+) -> bool:
+    """Return whether an organic result points to Company X's domain."""
+    if not isinstance(raw_response, Mapping):
+        return False
+    organic_results = raw_response.get("organic_results")
+    if not isinstance(organic_results, list):
+        return False
+    for result in organic_results:
+        if not isinstance(result, Mapping):
+            continue
+        for key in ("link", "url"):
+            canonical = canonicalize_official_url(str(result.get(key) or ""))
+            if canonical and url_matches_domain(canonical, x_domain):
+                return True
+    return False
 
 
 def normalize_search_policy(value: object) -> SearchPolicy:

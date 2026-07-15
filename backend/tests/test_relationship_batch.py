@@ -163,6 +163,79 @@ class TestRelationshipBatchApply(unittest.TestCase):
             for flag in relationship["flags"]
         ))
 
+    def test_reapplied_found_decision_replaces_invalid_url_flags_and_evidence(self):
+        row = _rel_row(candidates=(
+            "https://www.eastlinkcap.com/team",
+            "https://modal.com/",
+        ))
+        context = row["result"]["context"]
+        context["evidence"].append({
+            "evidence_id": "relationship-2",
+            "text": "A later filing confirms Eastlink invested in Modal.",
+            "phase": "phase2", "source_field": "organic.snippet",
+        })
+        first = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Initial relationship decision.",
+            "official_website": "https://www.eastlinkcap.com/team",
+            "confidence_score": 80,
+            "supporting_evidence_ids": ["relationship-1"],
+            "extra_flags": ["initial-model-flag"],
+        }
+        engine._apply_batch_parsed_to_row(row, first, {}, "m")
+        self.assertEqual(
+            context["relationship"]["reason_code"],
+            REL_REASON_CONFIRMED_URL_NOT_VALIDATED,
+        )
+
+        second = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Updated grounded decision.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 92,
+            "supporting_evidence_ids": ["relationship-2"],
+            "extra_flags": [],
+        }
+        engine._apply_batch_parsed_to_row(row, second, {}, "m")
+
+        relationship = context["relationship"]
+        self.assertEqual(row["result"]["official_website"], "https://modal.com")
+        self.assertEqual(row["outcome"], o.OUTCOME_FOUND)
+        self.assertEqual(relationship["reason_code"], "")
+        self.assertEqual(relationship["summary"], "Updated grounded decision.")
+        self.assertEqual(relationship["evidence"], [context["evidence"][1]])
+        self.assertEqual(relationship["flags"], [])
+
+    def test_reapplied_found_decision_replaces_not_confirmed_flags(self):
+        row = _rel_row()
+        first = {
+            "relationship_status": "not_confirmed",
+            "relationship_summary": "No relationship found initially.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 30,
+            "extra_flags": ["initial-model-flag"],
+        }
+        engine._apply_batch_parsed_to_row(row, first, {}, "m")
+        self.assertTrue(any(
+            flag["flag"] == "url_found_no_relationship"
+            for flag in row["result"]["context"]["relationship"]["flags"]
+        ))
+
+        second = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Relationship now confirmed.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 90,
+            "supporting_evidence_ids": ["relationship-1"],
+            "extra_flags": [],
+        }
+        engine._apply_batch_parsed_to_row(row, second, {}, "m")
+
+        relationship = row["result"]["context"]["relationship"]
+        self.assertEqual(row["outcome"], o.OUTCOME_FOUND)
+        self.assertEqual(relationship["reason_code"], "")
+        self.assertEqual(relationship["flags"], [])
+
     def test_candidate_only_citation_cannot_confirm_and_stores_accepted_record(self):
         row = _rel_row()
         parsed = {"relationship_status": "confirmed",

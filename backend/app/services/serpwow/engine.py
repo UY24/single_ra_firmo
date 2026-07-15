@@ -1845,10 +1845,10 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
         supplied_evidence if legacy_response
         else _accepted_relationship_evidence_records(supplied_evidence, accepted_ids)
     )
-    rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
-    rel_flags.extend(gate_flags)
-    rel_flags.extend(model_flags)
-    relationship["flags"] = rel_flags
+    # Batch-eligible rows start with no worker flags; rows with pre-search
+    # short-circuit flags are skip_llm and never enter the batch. Replace any
+    # prior batch decision flags so retries cannot leak stale verdict details.
+    relationship["flags"] = [*gate_flags, *model_flags]
     relationship["reason_code"] = relationship_reason_code(gated_url, status)
     if relationship["reason_code"] == REL_REASON_CONFIRMED_URL_NOT_VALIDATED:
         relationship["flags"].append({

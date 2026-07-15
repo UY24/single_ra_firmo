@@ -6,8 +6,8 @@ Last updated: 2026-07-15. Read this first if you're picking up this repo. Durabl
 
 ## Current status
 
-- **Active branch: `adaptiveRelationshipSearch`**, based on `aiModeBroker`. Adaptive grounded relationship search implementation and focused verification are complete.
-- See the latest completed session below for focused verification and pending full-suite/live-smoke work.
+- **Active branch: `adaptiveRelationshipSearch`**, based on `aiModeBroker`. Adaptive grounded relationship search implementation and offline verification are complete.
+- See the latest completed session below for fresh verification evidence and pending live-smoke work.
 - Commits after `426b3e6` are local-only. Do not push or otherwise change the remote without explicit approval.
 
 ## What works now
@@ -43,9 +43,8 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Immediate next steps
 
-1. Run Task 7's full offline suite (`cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`).
-2. Live-smoke the relationship pipeline against SerpWow; verify adaptive request counts, grounded decisions, and confirmed/no-URL output before deployment.
-3. **Live-smoke `aiModeBroker`** (checklist in the older session notes below), then decide merge/push (needs user approval to push).
+1. Live-smoke the relationship pipeline against SerpWow; verify adaptive request counts, grounded decisions, and confirmed/no-URL output before deployment.
+2. **Live-smoke `aiModeBroker`** (checklist in the older session notes below), then decide merge/push (needs user approval to push).
 
 ## Conventions (do not break)
 
@@ -57,13 +56,13 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Latest completed session — 2026-07-15 (adaptive grounded relationship search, branch `adaptiveRelationshipSearch`)
 
-**Status: implementation and focused verification complete; full suite pending Task 7.** The branch is based on `aiModeBroker`. The focused relationship suite is **158/158**; a live SerpWow smoke is still required.
+**Status: implementation and offline verification complete.** The branch is based on `aiModeBroker`. Fresh Task 7 verification passed the focused relationship suite **158/158** and the full mandatory hermetic suite **621/621**. The historical batch-state baseline failure did not reproduce in the full suite or when rerun individually (**1/1**). A live SerpWow smoke is still required.
 
 - Search is an ordered registry: phase 1 combined relationship + URL, phase 2 financial evidence, phase 3 URL recovery. `RELATIONSHIP_SEARCH_POLICY` defaults to adaptive missing-evidence/missing-candidate routing; `sequential` runs registry order. Provisional evidence plus an admissible non-X candidate can stop search early; Gemini performs final relationship/official-Y validation, subject to the code gate. `RELATIONSHIP_MAX_PHASES` caps actual requests per unique X↔Y pair.
 - Candidate extraction now preserves typed-URL and bare-domain provenance and fixes valid-domain handling seen with Modal while rejecting IP/file/X-domain candidates.
 - Sync and batch share the complete-record-bounded prompt and evidence-ID trust set. The prompt forbids outside knowledge and invention; for structured artifacts, code enforces candidate membership, disallowed/X-domain/status gates, supplied IDs, and a relationship-evidence ID for confirmation. Code does not semantically prove that cited text supports the model narrative; compatibility without IDs is restricted to flagged legacy batch artifacts.
 - Confirmed relationships with no validated Y URL remain `notFound` with reason `confirmed_relationship_url_not_validated` and retain accepted supporting evidence in CSV/report output.
-- Commits after `426b3e6` are local-only; do not push or modify the remote without explicit approval.
+- Commits after remote `426b3e6` are local-only; do not push or modify the remote without explicit approval.
 
 ## Older session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
 

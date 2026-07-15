@@ -21,8 +21,9 @@ _URL_TOKEN_RE = re.compile(
     r"[a-z]{2,63}(?:/[^\s<>\"']*)?",
     re.IGNORECASE,
 )
-_EMAIL_DOMAIN_PREFIX_RE = re.compile(
-    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9-]+\.)*$",
+_EMAIL_RE = re.compile(
+    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+[a-z]{2,63}",
     re.IGNORECASE,
 )
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
@@ -36,8 +37,26 @@ _FINANCIAL_MARKER_RE = re.compile(
     r"\bparent(?:\s+company)?\b|\bsubsidiar(?:y|ies)\b|\bownership\b",
     re.IGNORECASE,
 )
+_POSITIVE_FINANCIAL_RE = re.compile(
+    r"\binvest(?:s|ed|ing)?(?:\s+\w+){0,3}\s+(?:in|into)\b|"
+    r"\binvestor(?:s)?\s+(?:in|of)\b|"
+    r"\binvestment(?:s)?\s+(?:in|into|from|by)\b|"
+    r"\bfund(?:s|ed)\s+\w+\b|\bfund\s+for\b|"
+    r"\bfunding(?:\s+\w+){0,4}\s+(?:from|by|for)\b|"
+    r"\bfinanc(?:e|es|ed)\s+\w+\b|"
+    r"\bfinancing\s+(?:to|from|by|for)\b|"
+    r"\b(?:financial\s+)?backing\s+(?:to|from|by|for)\b|"
+    r"\bbacked\s+(?:by|\w+)\b|\bfinancially\s+backs?\s+\w+\b|"
+    r"\bportfolio\s+compan(?:y|ies)\b|"
+    r"\bin\b[^.;\n]{0,80}\bportfolio\b|"
+    r"\bacquisition(?:s)?\s+(?:of|by)\b|"
+    r"\bacquired\s+(?:by|\w+)\b|"
+    r"\bparent\s+company\b|\bsubsidiar(?:y|ies)\b|"
+    r"\bownership\s+(?:of|in)\b",
+    re.IGNORECASE,
+)
 _NEGATIVE_FINANCIAL_RE = re.compile(
-    r"\b(?:no|not|without)\b(?:\s+\w+){0,8}\s+"
+    r"\b(?:no|not|without|never)\b(?:\s+[\w'’]+){0,8}\s+"
     r"(?:financial\s+relationship|relationship|"
     r"invest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?|"
     r"fund(?:s|ed|ing)?|financ(?:e|es|ed|ing)|backing|backed|"
@@ -105,9 +124,8 @@ def extract_candidate_records(
     def add_text(value: object, source_field: str) -> None:
         if not isinstance(value, str):
             return
-        for match in _URL_TOKEN_RE.finditer(value):
-            if _EMAIL_DOMAIN_PREFIX_RE.search(value[:match.start()]):
-                continue
+        masked = _EMAIL_RE.sub(lambda match: " " * len(match.group()), value)
+        for match in _URL_TOKEN_RE.finditer(masked):
             add(match.group().rstrip(_TRAILING_URL_PUNCTUATION), source_field)
 
     raw = raw_result.get("raw_response")
@@ -221,7 +239,7 @@ def has_positive_financial_evidence(
         if not isinstance(record, Mapping):
             continue
         text = str(record.get("text") or "").strip()
-        if (_has_financial_marker(text)
+        if (_POSITIVE_FINANCIAL_RE.search(text)
                 and not _NEGATIVE_FINANCIAL_RE.search(text)):
             return True
     return False

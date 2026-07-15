@@ -202,6 +202,28 @@ class TestExtractCandidateRecords(unittest.TestCase):
             [("https://modal.com", "organic_results[0].displayed_link")],
         )
 
+    def test_dotted_email_local_part_is_masked_before_domain_scanning(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": (
+                            "Email first.dev@deep.sub.modal.com, then visit "
+                            "orbit.ai."
+                        ),
+                    }],
+                },
+            },
+        }
+
+        records = extract_candidate_records(
+            raw_result, "dotted-email", "owner.vc")
+
+        self.assertEqual(
+            [(record["url"], record["original_text"]) for record in records],
+            [("https://orbit.ai", "orbit.ai")],
+        )
+
     def test_invalid_disallowed_and_company_x_structured_urls_are_rejected(self):
         raw_result = {
             "raw_response": {
@@ -373,6 +395,8 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Modal is not backed by Acme; backed claims were only rumors.",
             "Modal is not a subsidiary of Acme; subsidiary claims were denied.",
             "Acme is not the parent company; parent company reports were wrong.",
+            "Acme is not Modal's parent company; parent company claims were wrong.",
+            "Acme never invested in Modal; investment reports were wrong.",
         ]
 
         for text in negative_texts:
@@ -380,11 +404,14 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
                 self.assertFalse(has_positive_financial_evidence([{"text": text}]))
 
     def test_partnership_and_co_mention_are_not_financial_evidence(self):
-        records = [{
-            "text": "Acme and Modal announced a strategic partnership together.",
-        }]
+        nonfinancial_texts = [
+            "Acme and Modal announced a strategic partnership together.",
+            "The partnership is with Modal, an investment platform.",
+        ]
 
-        self.assertFalse(has_positive_financial_evidence(records))
+        for text in nonfinancial_texts:
+            with self.subTest(text=text):
+                self.assertFalse(has_positive_financial_evidence([{"text": text}]))
 
     def test_positive_record_is_not_cancelled_by_a_separate_negative_record(self):
         records = [

@@ -1,5 +1,6 @@
 # backend/tests/test_relationship_worker.py
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +10,11 @@ from app.services.serpwow.constants import (
     REL_ERROR_NOT_CONFIRMED,
 )
 from app.services.serpwow.modes.relationship import execute_relationship_lookup_for_worker
+from app.services.serpwow.outcomes import (
+    OUTCOME_ERROR,
+    SRC_SERPWOW,
+    classify_finalized_row,
+)
 
 MODPATH = "app.services.serpwow.modes.relationship"
 
@@ -40,7 +46,7 @@ class TestRelationshipExecutor(unittest.TestCase):
 
     def test_confirmed_relationship_yields_url(self):
         search = AsyncMock(return_value=_serp(
-            ["https://modal.com/"], "Eastlink invests in Modal Labs."))
+            ["https://modal.com/"], "eastlinkcap invests in Modal."))
         with patch(f"{MODPATH}.run_serpwow_search", search), \
              patch(f"{MODPATH}.choose_relationship_and_website",
                    return_value=_llm("confirmed", "https://modal.com/")), \
@@ -54,9 +60,14 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
         self.assertEqual(ctx["relationship"]["verified_pair"], "eastlinkcap ↔ Modal")
         self.assertFalse(ctx["skip_llm"])
-        # 3 phases fired (X + input_url present); phase3 was removed.
-        self.assertEqual(search.await_count, 3)
-        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 3)
+        self.assertEqual(search.await_count, 1)
+        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 1)
+        self.assertEqual(ctx["executed_phases"],
+                         ["phase1_relationship_and_url"])
+        self.assertEqual(ctx["candidates"], ["https://modal.com"])
+        self.assertEqual(json.loads(raw_json)["queries"], [
+            ["phase1_relationship_and_url", search.await_args.args[0]],
+        ])
 
     def test_not_confirmed_gates_url_to_none(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "No relation."))
@@ -86,7 +97,7 @@ class TestRelationshipExecutor(unittest.TestCase):
             resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
                                 input_url="https://www.eastlinkcap.com/p", city="", country="")
         self.assertNotIn("https://www.eastlinkcap.com/team", captured["candidates"])
-        self.assertIn("https://modal.com/", captured["candidates"])
+        self.assertIn("https://modal.com", captured["candidates"])
 
     def test_zero_evidence_short_circuits_without_llm(self):
         search = AsyncMock(return_value=_serp([], ""))
@@ -111,12 +122,12 @@ class TestRelationshipExecutor(unittest.TestCase):
         llm.assert_not_called()
         self.assertTrue(resp.context["skip_llm"])
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_X)
-        # no phases fire: phase1/phase2 need X, phase4 needs a domain, and phase3 is
-        # gone. The row short-circuits anyway, so no SerpWow search is wasted.
         self.assertEqual(search.await_count, 0)
+        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 0)
 
     def test_batch_mode_defers_llm_but_gathers_evidence(self):
-        search = AsyncMock(return_value=_serp(["https://modal.com/"], "evidence"))
+        search = AsyncMock(return_value=_serp(
+            ["https://modal.com/"], "eastlinkcap invested in Modal."))
         with patch(f"{MODPATH}.run_serpwow_search", search), \
              patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
              patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}):
@@ -125,15 +136,18 @@ class TestRelationshipExecutor(unittest.TestCase):
         llm.assert_not_called()
         self.assertIsNone(resp.official_website)
         self.assertFalse(resp.context["skip_llm"])
-        self.assertEqual(resp.context["ai_overview_texts"], ["evidence"])
-        self.assertIn("https://modal.com/", resp.context["candidates"])
+        self.assertEqual(resp.context["ai_overview_texts"],
+                         ["eastlinkcap invested in Modal."])
+        self.assertIn("https://modal.com", resp.context["candidates"])
+        self.assertEqual(resp.context["executed_phases"],
+                         ["phase1_relationship_and_url"])
 
     def test_phase_error_captured_not_fatal(self):
-        ok = _serp(["https://modal.com/"], "text")
+        ok = _serp(
+            ["https://modal.com/"], "eastlinkcap invested in Modal.")
 
         async def flaky(query, country=None, client=None):
-            # Fail only the phase2 investment-evidence query; phase1 still succeeds.
-            if "investment OR portfolio" in query:
+            if "Identify the exact Company Y" in query:
                 raise RuntimeError("boom")
             return ok
 
@@ -146,6 +160,78 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(resp.official_website, "https://modal.com/")
         errored = [a for a in resp.context["search_attempts"] if a.get("error")]
         self.assertEqual(len(errored), 1)
+        self.assertEqual(resp.context["executed_phases"], [
+            "phase1_relationship_and_url",
+            "phase2_financial_evidence",
+        ])
+
+    def test_relationship_evidence_without_url_jumps_to_url_recovery(self):
+        search = AsyncMock(side_effect=[
+            _serp([], "eastlinkcap invested in Modal."),
+            _serp(["https://modal.com/"], ""),
+        ])
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("confirmed", "https://modal.com")), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com/portfolio", city="", country="")
+
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(resp.context["executed_phases"], [
+            "phase1_relationship_and_url",
+            "phase3_official_url_recovery",
+        ])
+        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 2)
+
+    def test_missing_relationship_runs_evidence_phase_before_url_recovery(self):
+        search = AsyncMock(side_effect=[
+            _serp([], "Modal makes developer tools."),
+            _serp([], "eastlinkcap funded Modal."),
+            _serp(["https://modal.com"], ""),
+        ])
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("confirmed", "https://modal.com")), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com", city="", country="")
+
+        self.assertEqual(resp.context["executed_phases"], [
+            "phase1_relationship_and_url",
+            "phase2_financial_evidence",
+            "phase3_official_url_recovery",
+        ])
+
+    def test_all_phase_errors_remain_technical_and_skip_llm(self):
+        search = AsyncMock(side_effect=TimeoutError("provider timed out"))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com", city="", country="")
+
+        llm.assert_not_called()
+        self.assertTrue(resp.context["skip_llm"])
+        self.assertIsNone(resp.context["row_error"])
+        self.assertEqual(resp.context["relationship"]["status"], "unclear")
+        self.assertTrue(any(
+            flag["flag"] == "all_search_phases_failed"
+            for flag in resp.context["relationship"]["flags"]
+        ))
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 2)
+        outcome = classify_finalized_row(
+            {"official_website": resp.official_website, "context": resp.context},
+            pipeline="relationship",
+            ctx_row_error=resp.context["row_error"],
+            skip_llm=resp.context["skip_llm"],
+        )
+        self.assertEqual((outcome.outcome, outcome.error_source),
+                         (OUTCOME_ERROR, SRC_SERPWOW))
 
 
 if __name__ == "__main__":

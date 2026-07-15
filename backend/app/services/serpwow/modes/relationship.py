@@ -1,8 +1,8 @@
 # backend/app/services/serpwow/modes/relationship.py
 """relationship mode executor (SerpWow AI Overview, X↔Y financial relationship).
 
-Per unique (X, Y) pair: fire the parallel phase queries, pool candidates
-(X-domain blacklisted) + AI-overview evidence, then either call Gemini per-pair
+Per unique (X, Y) pair: run adaptive search phases, pool canonical candidates
+(X-domain blacklisted) + evidence, then either call Gemini per-pair
 (RELATIONSHIP_LLM_BATCH=false) or leave the verdict to the chunked Gemini batch
 at finalization (=true). The relationship verdict GATES the URL — see
 gemini_llm.apply_relationship_gate.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any, Optional
 
 import httpx
@@ -32,31 +33,16 @@ from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     choose_relationship_and_website,
 )
-from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
-from app.services.serpwow.query_builders import build_relationship_phase_queries
+from app.services.serpwow.outcomes import SRC_GEMINI
+from app.services.serpwow.relationship_search import (
+    RelationshipSearchInput,
+    RelationshipSearchResult,
+    normalize_search_policy,
+    run_relationship_phases,
+)
 from app.services.serpwow.schemas import CrawlResponse
 from app.services.serpwow.serpwow_client import run_serpwow_search
-from app.services.serpwow.url_utils import (
-    dedupe_candidate_urls,
-    is_disallowed_official_url,
-    url_matches_domain,
-    x_domain_from_input_url,
-)
-
-
-def _overview_text(raw_response: Any) -> str:
-    if not isinstance(raw_response, dict):
-        return ""
-    overview = raw_response.get("ai_overview")
-    if not isinstance(overview, dict):
-        return ""
-    contents = overview.get("ai_overview_contents")
-    if not isinstance(contents, list):
-        return ""
-    return " ".join(
-        (item.get("text") or "").strip()
-        for item in contents if isinstance(item, dict)
-    ).strip()
+from app.services.serpwow.url_utils import x_domain_from_input_url
 
 
 async def execute_relationship_lookup_for_worker(
@@ -69,79 +55,44 @@ async def execute_relationship_lookup_for_worker(
     debug_row_index: Optional[int] = None,
 ) -> tuple[CrawlResponse, str]:
     x_domain = x_domain_from_input_url(input_url)
-    max_phases = max(1, _get_int_env("RELATIONSHIP_MAX_PHASES", 4))
-    queries = build_relationship_phase_queries(
-        x_name=x_name, y_name=y_name, city=city, country=country,
-        x_domain=x_domain, max_phases=max_phases)
+    has_x = bool(str(x_name or "").strip())
+    search_input = RelationshipSearchInput(
+        x_name=x_name,
+        y_name=y_name,
+        input_url=input_url,
+        x_domain=x_domain,
+        city=city,
+        country=country,
+    )
+    if has_x:
+        timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            async def search(query: str) -> dict[str, Any]:
+                return await run_serpwow_search(
+                    query, country=country, client=client)
 
-    timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        results = await asyncio.gather(
-            *[run_serpwow_search(q, country=country, client=client)
-              for _, q in queries],
-            return_exceptions=True,
+            search_result = await run_relationship_phases(
+                search,
+                search_input,
+                normalize_search_policy(
+                    os.getenv("RELATIONSHIP_SEARCH_POLICY", "adaptive")),
+                max(1, _get_int_env("RELATIONSHIP_MAX_PHASES", 3)),
+            )
+    else:
+        search_result = RelationshipSearchResult(
+            executed_phases=[], queries=[], candidates=[], candidate_evidence=[],
+            evidence=[], search_attempts=[], formatted_results=[],
+            relationship_evidenced=False, x_site_hit=False,
+            successful_requests=0,
         )
 
-    candidates: list[str] = []
-    seen: set[str] = set()
-    ai_overview_texts: list[str] = []
-    seen_overview_texts: set[str] = set()
-    search_attempts: list[dict[str, Any]] = []
-    formatted_results: list[dict[str, Any]] = []
-    phase4_hit = False
-    serpwow_cost = 0.0
-
-    for (label, query), raw_result in zip(queries, results):
-        if isinstance(raw_result, Exception):
-            raw_result = {
-                "provider": "serpwow", "used": False, "query": query,
-                "official_website": None, "candidates": [], "status_code": None,
-                "search_url": None, "raw_response": None,
-                "error": f"{type(raw_result).__name__}: {raw_result}",
-                "error_category": categorize_http_error(
-                    None, f"{type(raw_result).__name__}: {raw_result}"),
-            }
-        serpwow_cost += 0.02
-        raw_response = raw_result.get("raw_response")
-
-        if label == "phase4_portfolio_anchor":
-            # Phase 4 confirms Y appears on X's own site — relationship EVIDENCE,
-            # never URL candidates (they're X's pages by construction).
-            organic = (raw_response or {}).get("organic_results") if isinstance(raw_response, dict) else None
-            phase4_hit = bool(organic)
-        else:
-            for cand in raw_result.get("candidates") or []:
-                if (cand and cand not in seen
-                        and not is_disallowed_official_url(cand)
-                        and not url_matches_domain(cand, x_domain)):
-                    seen.add(cand)
-                    candidates.append(cand)
-
-        text = _overview_text(raw_response)
-        if text and text not in seen_overview_texts:
-            seen_overview_texts.add(text)
-            ai_overview_texts.append(text)
-
-        formatted_results.append({
-            "phase": label, "query": query,
-            "success": bool(raw_result.get("used")),
-            "error": raw_result.get("error"),
-            "error_category": raw_result.get("error_category"),
-            "status_code": raw_result.get("status_code"),
-            "search_url": raw_result.get("search_url"),
-            "raw_response": raw_response,
-        })
-        search_attempts.append({
-            "attempt": label, "query": query,
-            "search_url": raw_result.get("search_url"),
-            "status": "candidates_found" if raw_result.get("candidates") else "no_candidates",
-            "status_code": raw_result.get("status_code"),
-            "error": raw_result.get("error"),
-        })
-
-    deduped = dedupe_candidate_urls(candidates)
-    has_evidence = bool(deduped or ai_overview_texts)
-    has_x = bool(str(x_name or "").strip())
+    candidates = search_result.candidates
+    ai_overview_texts = [record["text"] for record in search_result.evidence]
+    search_attempts = search_result.search_attempts
+    formatted_results = search_result.formatted_results
+    phase4_hit = search_result.x_site_hit
+    serpwow_cost = search_result.request_count * 0.02
+    has_evidence = bool(candidates or search_result.evidence)
     batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
 
     skip_llm = False
@@ -165,19 +116,30 @@ async def execute_relationship_lookup_for_worker(
                             summary="Company X missing on this row.")
         relationship["flags"].append(
             {"flag": "no_company_x", "why": "row has no Company_Name_X to verify against"})
+    elif (search_result.request_count > 0
+          and search_result.successful_requests == 0):
+        skip_llm = True
+        relationship.update(
+            status="unclear",
+            summary="All relationship search phases failed technically.",
+        )
+        relationship["flags"].append({
+            "flag": "all_search_phases_failed",
+            "why": "no SerpWow request completed successfully",
+        })
     elif not has_evidence:
         # Pure-noise OCR: nothing to judge (spec §3.2).
         skip_llm = True
         row_error = REL_ERROR_NO_EVIDENCE
         relationship.update(status="not_confirmed",
-                            summary="All phases returned no candidates and no AI overview.")
+                            summary="All phases returned no candidates or usable evidence.")
         relationship["flags"].append(
-            {"flag": "no_evidence", "why": "no candidates and no AI-overview text from any phase"})
+            {"flag": "no_evidence", "why": "no candidates or evidence from any phase"})
     elif not batch_mode:
         parsed, error, model, usage = await asyncio.to_thread(
             choose_relationship_and_website,
             x_name, y_name, city, country,
-            deduped, ai_overview_texts, search_attempts, phase4_hit, x_domain)
+            candidates, ai_overview_texts, search_attempts, phase4_hit, x_domain)
         if parsed is None:
             # LLM failure: the gate cannot be guessed — fail the row (retryable).
             # Tag the source so the worker's classify_exception attributes it to
@@ -185,7 +147,8 @@ async def execute_relationship_lookup_for_worker(
             err = RuntimeError(f"relationship LLM error: {error}")
             err.error_source = SRC_GEMINI
             raise err
-        gated_url, status, gate_flags = apply_relationship_gate(parsed, deduped, x_domain)
+        gated_url, status, gate_flags = apply_relationship_gate(
+            parsed, candidates, x_domain)
         gemini_cost = calculate_gemini_cost_usd(usage)
         official_website = gated_url
         relationship.update(
@@ -207,7 +170,7 @@ async def execute_relationship_lookup_for_worker(
 
     summary_text = (
         f"Relationship search for pair {x_name!r} ↔ {y_name!r}: "
-        f"{len(queries)} phase queries, {len(deduped)} candidates, "
+        f"{search_result.request_count} phase queries, {len(candidates)} candidates, "
         f"{len(ai_overview_texts)} AI-overview texts, phase4_hit={phase4_hit}."
     )
     crawl_resp = CrawlResponse(
@@ -233,7 +196,10 @@ async def execute_relationship_lookup_for_worker(
             "x_name": x_name,
             "x_domain": x_domain,
             "phase4_hit": phase4_hit,
-            "candidates": deduped,
+            "executed_phases": search_result.executed_phases,
+            "candidates": candidates,
+            "candidate_evidence": search_result.candidate_evidence,
+            "evidence": search_result.evidence,
             "ai_overview_texts": ai_overview_texts,
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
@@ -246,10 +212,14 @@ async def execute_relationship_lookup_for_worker(
                 "serpwow_cost_usd": serpwow_cost,
                 "gemini_cost_usd": gemini_cost,
                 "total_cost_usd": serpwow_cost + gemini_cost,
-                "serpwow_request_count": len(queries),
+                "serpwow_request_count": search_result.request_count,
             },
         },
     )
-    unified_raw = {"queries": queries, "candidates": deduped,
-                   "results": formatted_results}
+    unified_raw = {
+        "executed_phases": search_result.executed_phases,
+        "queries": search_result.queries,
+        "candidates": candidates,
+        "results": formatted_results,
+    }
     return crawl_resp, json.dumps(unified_raw)

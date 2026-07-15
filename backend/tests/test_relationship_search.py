@@ -10,6 +10,7 @@ from app.services.serpwow.relationship_search import (
     extract_evidence_records,
     has_positive_financial_evidence,
     normalize_search_policy,
+    run_relationship_phases,
     select_next_phase,
 )
 
@@ -914,6 +915,243 @@ class TestNormalizeSearchPolicy(unittest.TestCase):
         for value in ("adaptive", "", None, 123):
             with self.subTest(value=value):
                 self.assertEqual(normalize_search_policy(value), "adaptive")
+
+
+def _search_result(*, candidates=(), text="", used=True, status_code=200,
+                   error=None, organic_results=None):
+    raw_response = {}
+    if text:
+        raw_response["ai_overview"] = {
+            "ai_overview_contents": [{"text": text}],
+        }
+    if organic_results is not None:
+        raw_response["organic_results"] = organic_results
+    return {
+        "provider": "serpwow",
+        "used": used,
+        "query": "provider-query",
+        "official_website": None,
+        "candidates": list(candidates),
+        "status_code": status_code,
+        "search_url": "https://google.example/search",
+        "raw_response": raw_response,
+        "error": error,
+        "error_category": None,
+    }
+
+
+class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
+    async def test_phase_one_relation_and_url_stops_after_one_request(self):
+        calls = []
+
+        async def search(query):
+            calls.append(query)
+            return _search_result(
+                candidates=["https://orbitlabs.ai/"],
+                text="Acme Capital invested in Orbit Labs.",
+            )
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases,
+                         ["phase1_relationship_and_url"])
+        self.assertEqual(result.request_count, 1)
+        self.assertEqual(result.successful_requests, 1)
+        self.assertTrue(result.relationship_evidenced)
+        self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
+        self.assertEqual(len(calls), 1)
+
+    async def test_relation_without_url_jumps_from_phase_one_to_phase_three(self):
+        responses = iter([
+            _search_result(text="Acme Capital invested in Orbit Labs."),
+            _search_result(candidates=["orbitlabs.ai"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase3_official_url_recovery",
+        ])
+        self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
+        self.assertIn("[phase1_relationship_and_url.overview.0]", result.queries[1][1])
+
+    async def test_missing_relation_runs_phase_two_then_phase_three(self):
+        responses = iter([
+            _search_result(),
+            _search_result(text="Acme Capital funded Orbit Labs."),
+            _search_result(candidates=["https://orbitlabs.ai"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase2_financial_evidence",
+            "phase3_official_url_recovery",
+        ])
+        self.assertTrue(result.relationship_evidenced)
+        self.assertEqual(result.request_count, 3)
+
+    async def test_url_without_relation_continues_to_relationship_evidence(self):
+        responses = iter([
+            _search_result(candidates=["https://orbitlabs.ai"]),
+            _search_result(text="Acme Capital acquired Orbit Labs."),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase2_financial_evidence",
+        ])
+        self.assertTrue(result.relationship_evidenced)
+        self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
+
+    async def test_sequential_policy_runs_registry_order_until_both_signals_exist(self):
+        responses = iter([
+            _search_result(),
+            _search_result(text="Acme Capital backed Orbit Labs."),
+            _search_result(candidates=["https://orbitlabs.ai"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 3)
+
+        self.assertEqual(result.executed_phases,
+                         [phase.name for phase in RELATIONSHIP_PHASES])
+        self.assertTrue(result.relationship_evidenced)
+        self.assertEqual(len(result.candidates), 1)
+
+    async def test_max_requests_is_an_actual_request_cap_with_minimum_one(self):
+        calls = []
+
+        async def search(query):
+            calls.append(query)
+            return _search_result()
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 0)
+
+        self.assertEqual(result.request_count, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.executed_phases,
+                         ["phase1_relationship_and_url"])
+
+    async def test_exception_is_recorded_and_later_phase_can_succeed(self):
+        calls = 0
+
+        async def search(query):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("search timed out")
+            return _search_result(
+                candidates=["https://orbitlabs.ai"],
+                text="Acme Capital invested in Orbit Labs.",
+            )
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 3)
+
+        self.assertEqual(result.request_count, 2)
+        self.assertEqual(result.successful_requests, 1)
+        self.assertEqual(result.formatted_results[0]["error_category"], "timeout")
+        self.assertIn("TimeoutError: search timed out",
+                      result.search_attempts[0]["error"])
+        self.assertTrue(result.formatted_results[1]["success"])
+
+    async def test_attempt_status_uses_only_candidates_from_that_phase(self):
+        responses = iter([
+            _search_result(candidates=["https://orbitlabs.ai"]),
+            _search_result(),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 2)
+
+        self.assertEqual(
+            [attempt["status"] for attempt in result.search_attempts],
+            ["candidates_found", "no_candidates"],
+        )
+
+    async def test_dedupes_candidates_but_keeps_all_candidate_evidence(self):
+        responses = iter([
+            _search_result(candidates=["https://orbitlabs.ai/"]),
+            _search_result(candidates=["orbitlabs.ai"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 2)
+
+        self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
+        self.assertEqual(len(result.candidate_evidence), 2)
+        self.assertEqual(
+            [record["phase"] for record in result.candidate_evidence],
+            ["phase1_relationship_and_url", "phase2_financial_evidence"],
+        )
+
+    async def test_records_x_site_hit_without_treating_x_url_as_candidate(self):
+        async def search(query):
+            return _search_result(organic_results=[{
+                "link": "https://acme.example/portfolio/orbit-labs",
+                "snippet": "Acme Capital invested in Orbit Labs.",
+            }])
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 1)
+
+        self.assertTrue(result.x_site_hit)
+        self.assertEqual(result.candidates, [])
+
+    async def test_injected_reordered_registry_drives_queries_and_execution(self):
+        def build(label):
+            return lambda inputs, evidence: f"{label}:{len(evidence)}"
+
+        registry = (
+            RelationshipPhase("synthetic-url", "official_url", build("url")),
+            RelationshipPhase("synthetic-proof", "relationship_evidence", build("proof")),
+            RelationshipPhase("disabled", "combined", build("disabled"), False),
+        )
+        responses = iter([
+            _search_result(candidates=["https://orbitlabs.ai"]),
+            _search_result(text="Acme Capital invested in Orbit Labs."),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "sequential", 5, phases=registry)
+
+        self.assertEqual(result.executed_phases,
+                         ["synthetic-url", "synthetic-proof"])
+        self.assertEqual(result.queries, [
+            ("synthetic-url", "url:0"),
+            ("synthetic-proof", "proof:0"),
+        ])
 
 
 if __name__ == "__main__":

@@ -5,9 +5,10 @@ import re
 from dataclasses import dataclass
 from ipaddress import ip_address
 from socket import inet_aton
-from typing import Any, Callable, Collection, Literal, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Collection, Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.url_utils import (
     canonicalize_official_url,
     is_disallowed_official_url,
@@ -86,6 +87,7 @@ QueryBuilder = Callable[
     [RelationshipSearchInput, Sequence[Mapping[str, object]]],
     str,
 ]
+SearchCallable = Callable[[str], Awaitable[Mapping[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,24 @@ class RelationshipPhase:
     goal: PhaseGoal
     build_query: QueryBuilder
     enabled: bool = True
+
+
+@dataclass
+class RelationshipSearchResult:
+    executed_phases: list[str]
+    queries: list[tuple[str, str]]
+    candidates: list[str]
+    candidate_evidence: list[dict[str, str]]
+    evidence: list[dict[str, str]]
+    search_attempts: list[dict[str, Any]]
+    formatted_results: list[dict[str, Any]]
+    relationship_evidenced: bool
+    x_site_hit: bool
+    successful_requests: int
+
+    @property
+    def request_count(self) -> int:
+        return len(self.queries)
 
 
 def extract_candidate_records(
@@ -449,3 +469,114 @@ RELATIONSHIP_PHASES = (
         _build_official_url_recovery_query,
     ),
 )
+
+
+async def run_relationship_phases(
+    search: SearchCallable,
+    inputs: RelationshipSearchInput,
+    policy: SearchPolicy,
+    max_requests: int,
+    phases: Sequence[RelationshipPhase] = RELATIONSHIP_PHASES,
+) -> RelationshipSearchResult:
+    """Run relationship phases one request at a time until complete or capped."""
+    cap = max(1, int(max_requests))
+    executed_phases: list[str] = []
+    queries: list[tuple[str, str]] = []
+    candidates: list[str] = []
+    candidate_evidence: list[dict[str, str]] = []
+    evidence: list[dict[str, str]] = []
+    search_attempts: list[dict[str, Any]] = []
+    formatted_results: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    relationship_evidenced = False
+    x_site_hit = False
+    successful_requests = 0
+
+    while len(queries) < cap:
+        phase = select_next_phase(
+            phases,
+            executed_phases,
+            normalize_search_policy(policy),
+            relationship_evidenced,
+            bool(candidates),
+        )
+        if phase is None:
+            break
+
+        query = phase.build_query(inputs, evidence)
+        executed_phases.append(phase.name)
+        queries.append((phase.name, query))
+        try:
+            response = await search(query)
+            if not isinstance(response, Mapping):
+                raise TypeError("search result must be a mapping")
+            raw_result = dict(response)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raw_result = {
+                "provider": "serpwow",
+                "used": False,
+                "query": query,
+                "official_website": None,
+                "candidates": [],
+                "status_code": getattr(exc, "status_code", None),
+                "search_url": None,
+                "raw_response": None,
+                "error": error,
+                "error_category": categorize_http_error(
+                    getattr(exc, "status_code", None), error),
+            }
+
+        successful_requests += int(bool(raw_result.get("used")))
+        raw_response = raw_result.get("raw_response")
+        if not isinstance(raw_response, Mapping):
+            raw_response = {}
+
+        phase_candidates = extract_candidate_records(
+            raw_result, phase.name, inputs.x_domain)
+        candidate_evidence.extend(phase_candidates)
+        for record in phase_candidates:
+            url = record["url"]
+            if url not in seen_candidates:
+                seen_candidates.add(url)
+                candidates.append(url)
+
+        evidence.extend(extract_evidence_records(raw_response, phase.name))
+        x_site_hit = x_site_hit or company_y_appears_on_x_site(
+            raw_response, inputs.x_domain)
+        relationship_evidenced = has_positive_financial_evidence(
+            evidence, inputs.x_name, inputs.y_name)
+
+        formatted_results.append({
+            "phase": phase.name,
+            "query": query,
+            "success": bool(raw_result.get("used")),
+            "error": raw_result.get("error"),
+            "error_category": raw_result.get("error_category"),
+            "status_code": raw_result.get("status_code"),
+            "search_url": raw_result.get("search_url"),
+            "raw_response": raw_result.get("raw_response"),
+        })
+        search_attempts.append({
+            "attempt": phase.name,
+            "query": query,
+            "search_url": raw_result.get("search_url"),
+            "status": (
+                "candidates_found" if phase_candidates else "no_candidates"
+            ),
+            "status_code": raw_result.get("status_code"),
+            "error": raw_result.get("error"),
+        })
+
+    return RelationshipSearchResult(
+        executed_phases=executed_phases,
+        queries=queries,
+        candidates=candidates,
+        candidate_evidence=candidate_evidence,
+        evidence=evidence,
+        search_attempts=search_attempts,
+        formatted_results=formatted_results,
+        relationship_evidenced=relationship_evidenced,
+        x_site_hit=x_site_hit,
+        successful_requests=successful_requests,
+    )

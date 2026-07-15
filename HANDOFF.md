@@ -1,17 +1,14 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-14. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-07-15. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
 ## Current status
 
-- **Active branch: `aiModeBroker`** (off `revampCode`; `uiuximp` was merged via PR #8) — the **AI Mode → RabbitMQ broker rework** for 500k–1M-row runs. Code complete in 3 commits (PR1 streaming/memory, PR2 broker engine, PR3 reconciler/resume/legacy-removal); **NOT live-verified, NOT pushed**.
-- Full suite: **532/532** passing.
-  ```bash
-  cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
-  ```
-  (`-t .` is **mandatory** — it makes `tests/__init__.py`'s hermeticity guard run so real cloud creds from `.env` don't leak into tests.)
+- **Active branch: `adaptiveRelationshipSearch`**, based on `aiModeBroker`. Adaptive grounded relationship search implementation and focused verification are complete.
+- Focused relationship suite: **148/148** passing. The full suite is still pending Task 7; do not record a new full-suite count until it runs.
+- Commits after `426b3e6` are local-only. Do not push or otherwise change the remote without explicit approval.
 
 ## What works now
 
@@ -23,7 +20,7 @@ Two independent discovery systems behind one FastAPI app + vanilla-JS UI (see `C
 
 ## Active risks / unfinished work
 
-- **`aiModeBroker` is NOT live-verified** — offline tests only (532/532). Live smoke needed before relying on it (see "Latest completed session" below for the checklist). **AI Mode now REQUIRES RabbitMQ + the worker process** — uploads 503 without the broker; the worker env needs `SCRAPEDO_TOKEN` + LLM keys + S3/Supabase/Slack vars (shared repo-root `.env` covers same-host setups). Run exactly ONE worker process.
+- **`aiModeBroker` is NOT live-verified** — offline tests only (532/532). Live smoke needed before relying on it (see its older session below for the checklist). **AI Mode now REQUIRES RabbitMQ + the worker process** — uploads 503 without the broker; the worker env needs `SCRAPEDO_TOKEN` + LLM keys + S3/Supabase/Slack vars (shared repo-root `.env` covers same-host setups). Run exactly ONE worker process.
 - A high-effort adversarial code review (2026-07-14) found 10 defects; **all fixed** in the 4th commit (dead queue-depth probe — aio_pika has no `Queue.declare(passive=)`, fixed here AND in SerpWow's pre-existing `_get_rabbitmq_queue_depth`; missing S3 seed mirror; barrier double-counting; corrupt-raw-file resume; env-recomputed batch_size; double-resume double-billing; non-atomic status.json/raw writes; redelivered-flag poison guard → durable `delivery_failures` budget; partial CSVs served as complete; CSV parse on the event loop).
 - Known follow-ups from the rework (accepted): sync-LLM cleanup in the finish task is still serial (the plan's `AI_MODE_LLM_CONCURRENCY` pool was deferred — at 500k+ the Gemini Batch path is the intended one); the reconciler has no S3 cold-start scan (a wiped host relies on the resume endpoint's rehydrate — per the manual-rerun preference); multi-host workers would need S3-based file-presence checks; the queue-depth gate counts READY messages only (staleness checks on file activity cover in-flight work); `final_report.json`'s `requests` array is uncapped (~30MB at 100k batches — accepted watchpoint).
 - **`errorTaxonomy` branch (2026-07-10) is NOT merged — user's call.** Introduces the `found`/`not_found`/`error` outcome taxonomy (error source+category, `not_found` becomes `completed`). Reviewed, 416/416 offline, but **not live-verified**. Details in `docs/HISTORY.md` (2026-07-10).
@@ -46,8 +43,9 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Immediate next steps
 
-1. **Live-smoke `aiModeBroker`** (checklist in the session notes below), then decide merge/push (needs user approval to push).
-2. Decide whether to merge `errorTaxonomy`, and live-verify it if so.
+1. Run Task 7's full offline suite (`cd backend && ../.venv/bin/python -m unittest discover -s tests -t .`).
+2. Live-smoke the relationship pipeline against SerpWow; verify adaptive request counts, grounded decisions, and confirmed/no-URL output before deployment.
+3. **Live-smoke `aiModeBroker`** (checklist in the older session notes below), then decide merge/push (needs user approval to push).
 
 ## Conventions (do not break)
 
@@ -57,9 +55,19 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
-## Latest completed session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
+## Latest completed session — 2026-07-15 (adaptive grounded relationship search, branch `adaptiveRelationshipSearch`)
 
-**Status: code complete (3 commits), 532/532 offline, NOT live-verified, NOT pushed.** Full architecture now documented in `CLAUDE.md` (AI Mode engine section). Motivation: 500k–1M-row recurring runs — the old in-process `run_ai_mode_sync` held every scrape payload + all results in RAM (OOM at scale), had no redelivery (a crash meant a manual whole-run re-drive), and a hard kill left runs showing `running` forever with the "Rerun failed" button unreachable.
+**Status: implementation and focused verification complete; full suite pending Task 7.** The branch is based on `aiModeBroker`. The focused relationship suite is **148/148**; a live SerpWow smoke is still required.
+
+- Search is an ordered registry: phase 1 combined relationship + URL, phase 2 financial evidence, phase 3 URL recovery. `RELATIONSHIP_SEARCH_POLICY` defaults to adaptive missing-evidence/missing-URL routing; `sequential` runs registry order. `RELATIONSHIP_MAX_PHASES` caps actual requests per unique X↔Y pair.
+- Candidate extraction now preserves typed-URL and bare-domain provenance and fixes valid-domain handling seen with Modal while rejecting IP/file/X-domain candidates.
+- Gemini is evidence-only in sync and batch modes: the shared, complete-record-bounded evidence set and gate reject outside knowledge, invented URLs, unknown IDs, and confirmations without supplied relationship evidence. Compatibility without evidence IDs is restricted to flagged legacy batch artifacts.
+- Confirmed relationships with no validated Y URL remain `notFound` with reason `confirmed_relationship_url_not_validated` and retain accepted supporting evidence in CSV/report output.
+- Commits after `426b3e6` are local-only; do not push or modify the remote without explicit approval.
+
+## Older session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
+
+**Status at that session: code complete (3 commits), 532/532 offline, NOT live-verified.** Full architecture now documented in `CLAUDE.md` (AI Mode engine section). Motivation: 500k–1M-row recurring runs — the old in-process `run_ai_mode_sync` held every scrape payload + all results in RAM (OOM at scale), had no redelivery (a crash meant a manual whole-run re-drive), and a hard kill left runs showing `running` forever with the "Rerun failed" button unreachable.
 
 ### What changed (by commit)
 

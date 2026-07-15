@@ -53,11 +53,14 @@ class TestBatchApplyOutcome(unittest.TestCase):
 
     def test_relationship_confirmed_is_found_completed(self):
         row = {"company_name": "Y", "result": {"context": {"pipeline": "relationship",
-               "candidates": ["https://y.com"], "x_domain": "x.com"}}}
+               "candidates": ["https://y.com"], "x_domain": "x.com",
+               "evidence": [{"evidence_id": "relationship-1",
+                              "text": "X invested in Y."}]}}}
         status = engine._apply_batch_parsed_to_row(
             row,
             {"relationship_status": "confirmed", "gated_url": "https://y.com",
-             "official_website": "https://y.com"},
+             "official_website": "https://y.com",
+             "supporting_evidence_ids": ["relationship-1"]},
             {},
             "gemini-x",
         )
@@ -107,6 +110,10 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
                        "context": {"pipeline": "relationship", "skip_llm": False,
                                    "x_domain": "eastlinkcap.com",
                                    "candidates": ["https://modal.com/"],
+                                   "evidence": [{
+                                       "evidence_id": "relationship-1",
+                                       "text": "Eastlink invested in Modal.",
+                                   }],
                                    "cost_breakdown": {"serpwow_request_count": 1}}},
         }
         state = {"upload_id": "mix-u1", "company_name": "Co", "pipeline": "relationship",
@@ -130,7 +137,8 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
                 out.append({"key": k, "text": json.dumps(
                     {"relationship_status": "confirmed", "official_website": "https://modal.com/",
                      "relationship_summary": "Eastlink invested in Modal.",
-                     "confidence_score": 90}), "usage": {}})
+                     "confidence_score": 90,
+                     "supporting_evidence_ids": ["relationship-1"]}), "usage": {}})
             return out
 
         with mock.patch.dict("os.environ", {"GSEARCH_GEMINI_CHUNK_SIZE": "100",
@@ -153,7 +161,7 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
         self.assertIsNone(rows[1]["error_category"])
         # The batched row was confirmed -> found.
         self.assertEqual(rows[2]["status"], "completed")
-        self.assertEqual(rows[2]["result"]["official_website"], "https://modal.com/")
+        self.assertEqual(rows[2]["result"]["official_website"], "https://modal.com")
 
 
 if __name__ == "__main__":

@@ -1265,7 +1265,10 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
             city=str(row.get("city") or ""),
             country=str(row.get("country") or ""),
             candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
+            candidate_evidence=[record for record in (_ctx_probe.get("candidate_evidence") or [])
+                                if isinstance(record, dict)],
+            evidence=[record for record in (_ctx_probe.get("evidence") or [])
+                      if isinstance(record, dict)],
             search_attempts=list(_ctx_probe.get("search_attempts") or []),
             phase4_hit=bool(_ctx_probe.get("phase4_hit")),
             x_domain=str(_ctx_probe.get("x_domain") or ""),
@@ -1781,7 +1784,11 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     relationship_status GATES the URL (spec §4). Always returns 'completed' now:
     a not-confirmed / confirmed-but-invalid gate is a business not_found
     (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import apply_relationship_gate
+    from app.services.serpwow.gemini_llm import (
+        _accepted_relationship_evidence_records,
+        _relationship_evidence_gate_inputs,
+        apply_relationship_gate,
+    )
 
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
@@ -1791,13 +1798,23 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
 
     candidates = [c for c in (context.get("candidates") or []) if isinstance(c, str)]
     x_domain = str(context.get("x_domain") or "")
-    gated_url, status, gate_flags = apply_relationship_gate(
-        parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
+    candidate_evidence = [record for record in (context.get("candidate_evidence") or [])
+                          if isinstance(record, dict)]
+    evidence = [record for record in (context.get("evidence") or [])
+                if isinstance(record, dict)]
+    allowed_ids, relationship_ids, supplied_evidence = (
+        _relationship_evidence_gate_inputs(candidate_evidence, evidence)
+    )
+    gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
+        parsed if isinstance(parsed, dict) else {}, candidates, x_domain,
+        allowed_ids, relationship_ids)
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
         "status": "pending", "summary": "", "verified_pair": "", "flags": []}
     relationship["status"] = status
     relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
+    relationship["evidence"] = _accepted_relationship_evidence_records(
+        supplied_evidence, accepted_ids)
     rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
     rel_flags.extend(gate_flags)
     for extra in (parsed or {}).get("extra_flags") or []:

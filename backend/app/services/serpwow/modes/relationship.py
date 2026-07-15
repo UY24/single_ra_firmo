@@ -33,6 +33,8 @@ from app.services.serpwow.cost import (
     calculate_serpwow_cost_usd,
 )
 from app.services.serpwow.gemini_llm import (
+    _accepted_relationship_evidence_records,
+    _relationship_evidence_gate_inputs,
     apply_relationship_gate,
     choose_relationship_and_website,
 )
@@ -142,7 +144,8 @@ async def execute_relationship_lookup_for_worker(
         parsed, error, model, usage = await asyncio.to_thread(
             choose_relationship_and_website,
             x_name, y_name, city, country,
-            candidates, ai_overview_texts, search_attempts, phase4_hit, x_domain)
+            candidates, search_result.candidate_evidence, search_result.evidence,
+            search_attempts, phase4_hit, x_domain)
         if parsed is None:
             # LLM failure: the gate cannot be guessed — fail the row (retryable).
             # Tag the source so the worker's classify_exception attributes it to
@@ -150,14 +153,20 @@ async def execute_relationship_lookup_for_worker(
             err = RuntimeError(f"relationship LLM error: {error}")
             err.error_source = SRC_GEMINI
             raise err
-        gated_url, status, gate_flags = apply_relationship_gate(
-            parsed, candidates, x_domain)
+        allowed_ids, relationship_ids, supplied_evidence = (
+            _relationship_evidence_gate_inputs(
+                search_result.candidate_evidence, search_result.evidence)
+        )
+        gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
+            parsed, candidates, x_domain, allowed_ids, relationship_ids)
         gemini_cost = calculate_gemini_cost_usd(usage)
         official_website = gated_url
         relationship.update(
             status=status,
             summary=str(parsed.get("relationship_summary") or ""),
         )
+        relationship["evidence"] = _accepted_relationship_evidence_records(
+            supplied_evidence, accepted_ids)
         relationship["flags"].extend(gate_flags)
         for extra in parsed.get("extra_flags") or []:
             if isinstance(extra, str) and extra.strip():

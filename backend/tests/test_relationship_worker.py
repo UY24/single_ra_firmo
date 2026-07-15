@@ -32,9 +32,13 @@ def _serp(candidates, overview_text="", official=None):
             "raw_response": raw, "error": None}
 
 
-def _llm(status, url, score=90):
+def _llm(status, url, score=90,
+         evidence_id="phase1_relationship_and_url.overview.0"):
     return ({"relationship_status": status, "relationship_summary": "summary text",
              "official_website": url, "confidence_score": score,
+             "supporting_evidence_ids": (
+                 [evidence_id]
+                 if status == "confirmed" else []),
              "reason": "r", "extra_flags": []},
             None, "gemini-2.5-flash-lite",
             {"promptTokenCount": 10, "candidatesTokenCount": 5})
@@ -54,7 +58,7 @@ class TestRelationshipExecutor(unittest.TestCase):
             resp, raw_json = self._run(
                 y_name="Modal", x_name="eastlinkcap",
                 input_url="https://www.eastlinkcap.com/portfolio/", city="", country="")
-        self.assertEqual(resp.official_website, "https://modal.com/")
+        self.assertEqual(resp.official_website, "https://modal.com")
         ctx = resp.context
         self.assertEqual(ctx["pipeline"], "relationship")
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
@@ -68,6 +72,48 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(json.loads(raw_json)["queries"], [
             ["phase1_relationship_and_url", search.await_args.args[0]],
         ])
+
+    def test_sync_passes_structured_evidence_and_stores_only_accepted_records(self):
+        search = AsyncMock(return_value=_serp(
+            ["https://modal.com/"], "eastlinkcap invests in Modal."))
+        captured = {}
+
+        def fake_llm(x, y, city, country, candidates, candidate_evidence,
+                     evidence, search_attempts, phase4_hit, x_domain):
+            captured["candidate_evidence"] = candidate_evidence
+            captured["evidence"] = evidence
+            return ({
+                "relationship_status": "confirmed",
+                "relationship_summary": "Grounded summary.",
+                "official_website": "https://modal.com/",
+                "confidence_score": 90,
+                "supporting_evidence_ids": [
+                    "phase1_relationship_and_url.overview.0",
+                    "unknown-id",
+                    "phase1_relationship_and_url.candidate.0",
+                ],
+                "extra_flags": [],
+            }, None, "gemini-2.5-flash-lite", {})
+
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website", side_effect=fake_llm), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com/portfolio", city="", country="")
+
+        candidate_record = captured["candidate_evidence"][0]
+        relationship_record = captured["evidence"][0]
+        self.assertEqual(resp.context["relationship"]["evidence"], [
+            candidate_record, relationship_record,
+        ])
+        self.assertEqual(
+            resp.context["final_url_selection_ai"]["raw"]["supporting_evidence_ids"],
+            ["phase1_relationship_and_url.overview.0",
+             "phase1_relationship_and_url.candidate.0"],
+        )
+        flags = resp.context["relationship"]["flags"]
+        self.assertTrue(any(flag["flag"] == "unknown_evidence_id" for flag in flags))
 
     def test_one_request_uses_configured_serpwow_cost_in_all_totals(self):
         search = AsyncMock(return_value=_serp(
@@ -177,11 +223,13 @@ class TestRelationshipExecutor(unittest.TestCase):
 
         with patch(f"{MODPATH}.run_serpwow_search", side_effect=flaky), \
              patch(f"{MODPATH}.choose_relationship_and_website",
-                   return_value=_llm("confirmed", "https://modal.com/")), \
+                   return_value=_llm(
+                       "confirmed", "https://modal.com/",
+                       evidence_id="phase2_financial_evidence.overview.0")), \
              patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
             resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
                                 input_url="", city="", country="")
-        self.assertEqual(resp.official_website, "https://modal.com/")
+        self.assertEqual(resp.official_website, "https://modal.com")
         errored = [a for a in resp.context["search_attempts"] if a.get("error")]
         self.assertEqual(len(errored), 1)
         self.assertEqual(resp.context["executed_phases"], [

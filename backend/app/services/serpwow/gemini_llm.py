@@ -720,7 +720,8 @@ def build_relationship_prompt(
     city: str,
     country: str,
     candidates: list[str],
-    ai_overview_texts: list[str],
+    candidate_evidence: list[dict[str, str]],
+    evidence: list[dict[str, str]],
     search_attempts: list[dict[str, Any]],
     phase4_hit: bool,
     x_domain: str = "",
@@ -746,25 +747,32 @@ def build_relationship_prompt(
         '  "official_website": string|null,\n'
         '  "confidence_score": number,\n'
         '  "reason": string,\n'
+        '  "supporting_evidence_ids": [string],\n'
         '  "extra_flags": [string]\n'
         "}\n"
         "Rules:\n"
+        "- Use only the supplied evidence and Candidate URLs; do not use outside knowledge.\n"
+        "- Do not create company identity, transaction, quotation, URL, or evidence item.\n"
         "- relationship_status is about a FINANCIAL relationship only (investment, portfolio\n"
         "  company, funding round, acquisition, fund backing). Mere similarity or co-mention\n"
         "  without financial context is NOT a relationship.\n"
-        "- 'confirmed' requires explicit supporting evidence in the provided material.\n"
-        "- official_website must be company_y's site, chosen from Candidate URLs ONLY.\n"
-        "  Never invent a URL. Never return company_x's own website.\n"
+        "- 'confirmed' requires explicit Relationship Evidence. If evidence is insufficient,\n"
+        "  return 'unclear' with official_website null.\n"
+        "- official_website must exactly match one Candidate URL or be null.\n"
+        "  Never return company_x's own website.\n"
+        "- supporting_evidence_ids may contain only evidence_id values from Candidate Evidence\n"
+        "  or Supplied Relationship Evidence. Candidate Evidence alone cannot confirm a relationship.\n"
         "- company_x_domain (when present) is company_x's own website domain — never return it as official_website.\n"
         "- Set official_website to null unless relationship_status is 'confirmed'.\n"
         "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
         "- confidence_score is 0-100 for the overall answer (relationship + URL).\n"
-        "- relationship_summary: 1-2 sentences quoting what the evidence says.\n"
+        "- relationship_summary: 1-2 sentences grounded only in supplied evidence.\n"
         "- extra_flags: optional short slugs like \"company_closed\" (evidence says company\n"
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"AI Overview evidence: {json.dumps(list(ai_overview_texts or []), ensure_ascii=True)[:12000]}\n\n"
+        f"Candidate Evidence: {json.dumps(list(candidate_evidence or []), ensure_ascii=True)[:8000]}\n\n"
+        f"Supplied Relationship Evidence: {json.dumps(list(evidence or []), ensure_ascii=True)[:14000]}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
 
@@ -775,7 +783,8 @@ def choose_relationship_and_website(
     city: str,
     country: str,
     candidates: list[str],
-    ai_overview_texts: list[str],
+    candidate_evidence: list[dict[str, str]],
+    evidence: list[dict[str, str]],
     search_attempts: list[dict[str, Any]],
     phase4_hit: bool,
     x_domain: str = "",
@@ -791,7 +800,7 @@ def choose_relationship_and_website(
             ordered_models.append(model_name)
     prompt = build_relationship_prompt(
         x_name, y_name, city, country, candidates,
-        ai_overview_texts, search_attempts, phase4_hit, x_domain)
+        candidate_evidence, evidence, search_attempts, phase4_hit, x_domain)
     last_error: Optional[str] = None
     for model in ordered_models:
         text, usage, error = _gemini_generate_content_json(model, prompt)
@@ -809,14 +818,55 @@ def choose_relationship_and_website(
 _VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}
 
 
+def _relationship_evidence_gate_inputs(
+    candidate_evidence: list[dict[str, str]],
+    evidence: list[dict[str, str]],
+) -> tuple[set[str], set[str], list[dict[str, str]]]:
+    """Build the shared gate ID sets and supplied-order record list."""
+    candidate_records = [record for record in (candidate_evidence or [])
+                         if isinstance(record, dict)]
+    relationship_records = [record for record in (evidence or [])
+                            if isinstance(record, dict)]
+    relationship_ids = {
+        str(record.get("evidence_id") or "").strip()
+        for record in relationship_records
+        if str(record.get("evidence_id") or "").strip()
+    }
+    allowed_ids = relationship_ids | {
+        str(record.get("evidence_id") or "").strip()
+        for record in candidate_records
+        if str(record.get("evidence_id") or "").strip()
+    }
+    return allowed_ids, relationship_ids, candidate_records + relationship_records
+
+
+def _accepted_relationship_evidence_records(
+    supplied_evidence: list[dict[str, str]],
+    accepted_ids: list[str],
+) -> list[dict[str, str]]:
+    """Return one record per accepted ID, in code-supplied order."""
+    wanted = set(accepted_ids)
+    seen: set[str] = set()
+    records: list[dict[str, str]] = []
+    for record in supplied_evidence:
+        evidence_id = str(record.get("evidence_id") or "").strip()
+        if evidence_id in wanted and evidence_id not in seen:
+            seen.add(evidence_id)
+            records.append(record)
+    return records
+
+
 def apply_relationship_gate(
     parsed: dict[str, Any],
     candidates: list[str],
     x_domain: str,
-) -> tuple[Optional[str], str, list[dict[str, str]]]:
+    allowed_evidence_ids: Any = None,
+    relationship_evidence_ids: Any = None,
+) -> tuple[Optional[str], str, list[dict[str, str]], list[str]]:
     """Code-enforced validation of a relationship LLM output (spec §4 rules 1-4).
 
-    Returns (gated_url, relationship_status, gate_flags). gated_url is non-None
+    Returns (gated_url, relationship_status, gate_flags, accepted_evidence_ids).
+    gated_url is non-None
     ONLY when status == "confirmed" AND the URL is in the candidate set AND not
     disallowed AND not on Company X's own domain. A URL that exists but fails
     the gate is preserved in a flag so the evidence isn't lost.
@@ -826,6 +876,43 @@ def apply_relationship_gate(
     if status not in _VALID_REL_STATUSES:
         status = "unclear"
     flags: list[dict[str, str]] = []
+    parsed["relationship_status"] = status
+
+    raw_score = parsed.get("confidence_score", 0)
+    try:
+        confidence_score = 0 if isinstance(raw_score, bool) else int(float(raw_score))
+    except (TypeError, ValueError, OverflowError):
+        confidence_score = 0
+    parsed["confidence_score"] = max(0, min(100, confidence_score))
+
+    allowed_ids = {
+        str(value).strip() for value in (allowed_evidence_ids or [])
+        if str(value or "").strip()
+    }
+    relationship_ids = {
+        str(value).strip() for value in (relationship_evidence_ids or [])
+        if str(value or "").strip()
+    }
+    requested_ids = parsed.get("supporting_evidence_ids")
+    requested_ids = requested_ids if isinstance(requested_ids, list) else []
+    accepted_ids: list[str] = []
+    unknown_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_id in requested_ids:
+        evidence_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not evidence_id or evidence_id in seen_ids:
+            continue
+        seen_ids.add(evidence_id)
+        if evidence_id in allowed_ids:
+            accepted_ids.append(evidence_id)
+        else:
+            unknown_ids.append(evidence_id)
+    parsed["supporting_evidence_ids"] = accepted_ids
+    if unknown_ids:
+        flags.append({
+            "flag": "unknown_evidence_id",
+            "why": f"LLM cited evidence IDs not supplied by code: {', '.join(unknown_ids)}",
+        })
 
     raw_url = parsed.get("official_website")
     url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None
@@ -835,18 +922,33 @@ def apply_relationship_gate(
             _normalize_url_for_compare(c) for c in (candidates or []) if str(c or "").strip()
         }
         normalized_candidates.discard("")
-        if _normalize_url_for_compare(url) not in normalized_candidates:
+        normalized_url = _normalize_url_for_compare(url)
+        if normalized_url not in normalized_candidates:
             flags.append({"flag": "llm_url_out_of_candidates",
                           "why": f"LLM returned {url} which is not in the candidate set"})
             url = None
+            parsed["confidence_score"] = 0
+        else:
+            url = normalized_url
     if url is not None and is_disallowed_official_url(url):
         flags.append({"flag": "disallowed_url_dropped",
                       "why": f"{url} is a directory/social/file URL"})
         url = None
+        parsed["confidence_score"] = 0
     if url is not None and url_matches_domain(url, x_domain):
         flags.append({"flag": "x_domain_candidate_dropped",
                       "why": f"{url} is Company X's own site, never Y's"})
         url = None
+        parsed["confidence_score"] = 0
+
+    if status == "confirmed" and not relationship_ids.intersection(accepted_ids):
+        status = "unclear"
+        parsed["relationship_status"] = status
+        parsed["confidence_score"] = 0
+        flags.append({
+            "flag": "confirmed_without_evidence_id",
+            "why": "confirmed verdict did not cite supplied relationship evidence",
+        })
 
     if status != "confirmed" and url is not None:
         flag_name = ("relationship_unclear" if status == "unclear"
@@ -858,4 +960,5 @@ def apply_relationship_gate(
         flags.append({"flag": "relationship_unclear",
                       "why": "evidence neither confirms nor rules out a financial relationship"})
 
-    return url, status, flags
+    parsed["official_website"] = url
+    return url, status, flags, accepted_ids

@@ -18,6 +18,15 @@ def _rel_row(row_index=1, status="completed", skip_llm=False,
                 "pipeline": "relationship", "skip_llm": skip_llm,
                 "x_domain": "eastlinkcap.com",
                 "candidates": list(candidates),
+                "candidate_evidence": [{
+                    "evidence_id": "candidate-1", "url": candidates[0],
+                    "phase": "phase1", "source_field": "knowledge_graph.website",
+                }] if candidates else [],
+                "evidence": [{
+                    "evidence_id": "relationship-1",
+                    "text": "Eastlink invests in Modal.",
+                    "phase": "phase1", "source_field": "ai_overview",
+                }],
                 "ai_overview_texts": ["Eastlink invests in Modal."],
                 "search_attempts": [{"attempt": "phase1_relationship", "query": "q"}],
                 "phase4_hit": True,
@@ -39,6 +48,10 @@ class TestRelationshipBatchPrompt(unittest.TestCase):
         # Batch parity: the x_domain from context is threaded into the prompt too.
         self.assertIn("eastlinkcap.com", prompt)
         self.assertIn("company_x_domain", prompt)
+        self.assertIn("Candidate Evidence", prompt)
+        self.assertIn("candidate-1", prompt)
+        self.assertIn("Supplied Relationship Evidence", prompt)
+        self.assertIn("relationship-1", prompt)
 
     def test_gsearch_prompt_unchanged(self):
         row = {"row_index": 1, "company_name": "Acme", "country": "US",
@@ -64,13 +77,16 @@ class TestRelationshipBatchApply(unittest.TestCase):
         parsed = {"relationship_status": "confirmed",
                   "relationship_summary": "Eastlink invested in Modal.",
                   "official_website": "https://modal.com/",
-                  "confidence_score": 90, "reason": "r", "extra_flags": []}
+                  "confidence_score": 90, "reason": "r",
+                  "supporting_evidence_ids": ["relationship-1"],
+                  "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(
             row, parsed, {"promptTokenCount": 10, "candidatesTokenCount": 5}, "m")
         self.assertEqual(status, "completed")
-        self.assertEqual(row["result"]["official_website"], "https://modal.com/")
+        self.assertEqual(row["result"]["official_website"], "https://modal.com")
         ctx = row["result"]["context"]
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
+        self.assertEqual(ctx["relationship"]["evidence"], [ctx["evidence"][0]])
         self.assertEqual(ctx["gemini_batch_ai"]["raw"], parsed)
         self.assertIsNone(row["error"])
 
@@ -99,12 +115,53 @@ class TestRelationshipBatchApply(unittest.TestCase):
         parsed = {"relationship_status": "confirmed",
                   "official_website": "https://www.eastlinkcap.com/team",
                   "relationship_summary": "s", "confidence_score": 80,
+                  "supporting_evidence_ids": ["relationship-1"],
                   "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
         self.assertEqual(status, "completed")
         self.assertEqual(row["status"], "completed")
         self.assertEqual(row["outcome"], o.OUTCOME_NOT_FOUND)
         self.assertIsNone(row["result"]["official_website"])
+
+    def test_candidate_only_citation_cannot_confirm_and_stores_accepted_record(self):
+        row = _rel_row()
+        parsed = {"relationship_status": "confirmed",
+                  "relationship_summary": "Unsupported conclusion.",
+                  "official_website": "https://modal.com/",
+                  "confidence_score": 90,
+                  "supporting_evidence_ids": ["candidate-1"],
+                  "reason": "r", "extra_flags": ["model-note"]}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        ctx = row["result"]["context"]
+        self.assertEqual(ctx["relationship"]["status"], "unclear")
+        self.assertIsNone(row["result"]["official_website"])
+        self.assertEqual(parsed["confidence_score"], 0)
+        self.assertEqual(ctx["relationship"]["evidence"], [ctx["candidate_evidence"][0]])
+        self.assertEqual(
+            [flag["flag"] for flag in ctx["relationship"]["flags"]],
+            ["confirmed_without_evidence_id", "relationship_unclear", "model-note"],
+        )
+
+    def test_batch_stores_accepted_records_in_supplied_order(self):
+        row = _rel_row()
+        parsed = {"relationship_status": "confirmed",
+                  "relationship_summary": "Grounded.",
+                  "official_website": "https://modal.com/",
+                  "confidence_score": 90,
+                  "supporting_evidence_ids": [
+                      "relationship-1", "missing", "candidate-1"],
+                  "reason": "r", "extra_flags": []}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        ctx = row["result"]["context"]
+        self.assertEqual(ctx["relationship"]["evidence"], [
+            ctx["candidate_evidence"][0], ctx["evidence"][0],
+        ])
+        self.assertEqual(parsed["supporting_evidence_ids"],
+                         ["relationship-1", "candidate-1"])
+        self.assertTrue(any(
+            flag["flag"] == "unknown_evidence_id"
+            for flag in ctx["relationship"]["flags"]
+        ))
 
 
 if __name__ == "__main__":

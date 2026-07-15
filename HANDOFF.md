@@ -7,7 +7,7 @@ Last updated: 2026-07-15. Read this first if you're picking up this repo. Durabl
 ## Current status
 
 - **Active branch: `adaptiveRelationshipSearch`**, based on `aiModeBroker`. Adaptive grounded relationship search implementation and focused verification are complete.
-- Focused relationship suite: **158/158** passing. The full suite is still pending Task 7; do not record a new full-suite count until it runs.
+- See the latest completed session below for focused verification and pending full-suite/live-smoke work.
 - Commits after `426b3e6` are local-only. Do not push or otherwise change the remote without explicit approval.
 
 ## What works now
@@ -59,9 +59,9 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 **Status: implementation and focused verification complete; full suite pending Task 7.** The branch is based on `aiModeBroker`. The focused relationship suite is **158/158**; a live SerpWow smoke is still required.
 
-- Search is an ordered registry: phase 1 combined relationship + URL, phase 2 financial evidence, phase 3 URL recovery. `RELATIONSHIP_SEARCH_POLICY` defaults to adaptive missing-evidence/missing-URL routing; `sequential` runs registry order. `RELATIONSHIP_MAX_PHASES` caps actual requests per unique X↔Y pair.
+- Search is an ordered registry: phase 1 combined relationship + URL, phase 2 financial evidence, phase 3 URL recovery. `RELATIONSHIP_SEARCH_POLICY` defaults to adaptive missing-evidence/missing-candidate routing; `sequential` runs registry order. Provisional evidence plus an admissible non-X candidate can stop search early; Gemini performs final relationship/official-Y validation, subject to the code gate. `RELATIONSHIP_MAX_PHASES` caps actual requests per unique X↔Y pair.
 - Candidate extraction now preserves typed-URL and bare-domain provenance and fixes valid-domain handling seen with Modal while rejecting IP/file/X-domain candidates.
-- Gemini is evidence-only in sync and batch modes: the shared, complete-record-bounded evidence set and gate reject outside knowledge, invented URLs, unknown IDs, and confirmations without supplied relationship evidence. Compatibility without evidence IDs is restricted to flagged legacy batch artifacts.
+- Sync and batch share the complete-record-bounded prompt and evidence-ID trust set. The prompt forbids outside knowledge and invention; for structured artifacts, code enforces candidate membership, disallowed/X-domain/status gates, supplied IDs, and a relationship-evidence ID for confirmation. Code does not semantically prove that cited text supports the model narrative; compatibility without IDs is restricted to flagged legacy batch artifacts.
 - Confirmed relationships with no validated Y URL remain `notFound` with reason `confirmed_relationship_url_not_validated` and retain accepted supporting evidence in CSV/report output.
 - Commits after `426b3e6` are local-only; do not push or modify the remote without explicit approval.
 

@@ -23,7 +23,8 @@ class TestModeConfig(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AI_BULK_BATCH_SIZE": "ten"}):
             self.assertEqual(get_mode("ai_bulk").batch_size(), 10)
 
-    def test_relationship_search_policy_normalization(self):
+    def test_relationship_env_policy_normalization_regression(self):
+        # Lock the normalizer consumed by RELATIONSHIP_SEARCH_POLICY env wiring.
         for value in ("", "garbage"):
             with self.subTest(value=value):
                 self.assertEqual(normalize_search_policy(value), "adaptive")

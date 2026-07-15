@@ -180,6 +180,27 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(resp.context["relationship"]["status"], "unclear")
         self.assertEqual(resp.context["x_domain"], "eastlinkcap.com")
 
+    def test_sync_noisy_ocr_can_confirm_from_affirmative_source_assertion(self):
+        y_ocr = "YUZU SPARKLINGWE SANZO POMELO"
+        search = AsyncMock(return_value=_serp(
+            ["https://sanzo.com"],
+            "Eastlink Capital invested in Sanzo."))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("confirmed", "https://sanzo.com")), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name=y_ocr, x_name="Eastlink Capital",
+                input_url="https://eastlinkcap.com/portfolio",
+                city="", country="United States")
+
+        self.assertEqual(resp.official_website, "https://sanzo.com")
+        self.assertEqual(resp.context["relationship"]["status"], "confirmed")
+        self.assertEqual(resp.context["executed_phases"], [
+            "phase1_relationship_and_url",
+            "phase2_financial_evidence",
+        ])
+
     def test_ai_overview_texts_excludes_organic_snippets(self):
         response = _serp(
             ["https://modal.com/"], "eastlinkcap invested in Modal.")

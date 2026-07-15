@@ -1,6 +1,7 @@
 import unittest
 
 from app.services.serpwow.engine import canonicalize_official_url, dedupe_candidate_urls
+from app.services.serpwow.url_utils import is_disallowed_official_url
 
 
 class TestCanonicalize(unittest.TestCase):
@@ -31,6 +32,11 @@ class TestCanonicalize(unittest.TestCase):
             "https://example.com/contact", "https://other.com",
         ])
         self.assertEqual(out, ["http://www.example.com/", "https://example.com/contact", "https://other.com"])
+
+    def test_filename_shaped_hosts_are_not_globally_blocked(self):
+        for url in ("https://main.py", "https://report.md", "https://setup.sh"):
+            with self.subTest(url=url):
+                self.assertFalse(is_disallowed_official_url(url))
 
 
 if __name__ == "__main__":

@@ -8,11 +8,11 @@ from app.services.serpwow.relationship_search import (
     company_y_appears_on_x_site,
     extract_candidate_records,
     extract_evidence_records,
+    eligible_relationship_evidence_ids,
     has_positive_financial_evidence,
     normalize_search_policy,
     run_relationship_phases,
     select_next_phase,
-    trusted_positive_record_ids,
 )
 
 
@@ -56,18 +56,11 @@ class TestExtractCandidateRecords(unittest.TestCase):
                 raw_result, "phase1", "owner.vc", y_name="Beta", country=""),
             [
                 {
-                    "url": "https://alpha.io",
-                    "original_text": "http://www.Alpha.io/",
-                    "phase": "phase1",
-                    "source_field": "knowledge_graph.website",
-                    "evidence_id": "phase1.candidate.0",
-                },
-                {
                     "url": "https://beta.dev",
                     "original_text": "https://Beta.dev/",
                     "phase": "phase1",
                     "source_field": "answer_box.url",
-                    "evidence_id": "phase1.candidate.1",
+                    "evidence_id": "phase1.candidate.0",
                 },
             ],
         )
@@ -179,7 +172,7 @@ class TestExtractCandidateRecords(unittest.TestCase):
 
     def test_candidate_bound_official_declaration_forms(self):
         for text in (
-            "Modal official website is getmdl.com.",
+            "Modal's official website is getmdl.com.",
             "Modal official site: getmdl.com.",
             "getmdl.com is the official website for Modal.",
         ):
@@ -221,6 +214,94 @@ class TestExtractCandidateRecords(unittest.TestCase):
                 raw_result, "phase1", "eastlinkcap.com",
                 y_name="Modal", country="United States"),
             [],
+        )
+
+    def test_official_declaration_requires_y_identity_and_no_contradiction(self):
+        for text in (
+            "Unrelated Corp's official website is attacker.com.",
+            "The official website is attacker.com. This is not Modal's site.",
+            "Modal's official website is attacker.com. This is not Modal's site.",
+            "Modal's official website is attacker.com; Modal denied that claim.",
+        ):
+            with self.subTest(text=text):
+                raw_result = {
+                    "raw_response": {
+                        "ai_overview": {
+                            "ai_overview_contents": [{"text": text}],
+                        },
+                    },
+                }
+                self.assertEqual(
+                    extract_candidate_records(
+                        raw_result, "phase1", "eastlinkcap.com",
+                        y_name="Modal", country="United States"),
+                    [],
+                )
+
+    def test_relationship_host_relevance_uses_exact_base_label_aliases(self):
+        cases = [
+            ("IBM", "https://ibm.com", True),
+            ("SAP", "https://sap.co.uk", True),
+            ("Modal", "https://modal.com", True),
+            ("Modal", "https://modalnews.com", False),
+            ("Modal", "https://modal.evil.example", False),
+            ("Ｍｏｄａｌ", "https://modal.com", True),
+            ("三菱", "https://mitsu.example", False),
+        ]
+        for y_name, url, accepted in cases:
+            with self.subTest(y_name=y_name, url=url):
+                raw_result = {"raw_response": {
+                    "organic_results": [{"link": url}],
+                }}
+                records = extract_candidate_records(
+                    raw_result, "phase1", "owner.vc",
+                    y_name=y_name, country="")
+                self.assertEqual(bool(records), accepted)
+
+    def test_kg_entity_metadata_must_match_y(self):
+        cases = [
+            ({"website": "https://unrelated.example"}, False),
+            ({"title": "Modal", "website": "https://getmdl.com"}, True),
+            ({"title": "Modal, Inc.", "website": "https://getmdl.com"}, True),
+            ({"title": "Modal News", "website": "https://getmdl.com"}, False),
+            ({"title": "Unrelated Corp", "website": "https://getmdl.com"}, False),
+            ({"title": "三菱", "website": "https://mitsu.example"}, True),
+        ]
+        for knowledge_graph, accepted in cases:
+            with self.subTest(knowledge_graph=knowledge_graph):
+                records = extract_candidate_records(
+                    {"raw_response": {"knowledge_graph": knowledge_graph}},
+                    "phase1", "owner.vc",
+                    y_name=("三菱" if knowledge_graph.get("title") == "三菱" else "Modal"),
+                    country="",
+                )
+                self.assertEqual(bool(records), accepted)
+
+    def test_answer_box_requires_y_host_or_entity_metadata(self):
+        cases = [
+            ({"link": "https://unrelated.example"}, False),
+            ({"title": "Modal", "link": "https://getmdl.com"}, True),
+            ({"title": "Unrelated Corp", "link": "https://getmdl.com"}, False),
+        ]
+        for answer_box, accepted in cases:
+            with self.subTest(answer_box=answer_box):
+                records = extract_candidate_records(
+                    {"raw_response": {"answer_box": answer_box}},
+                    "phase1", "owner.vc", y_name="Modal", country="")
+                self.assertEqual(bool(records), accepted)
+
+    def test_y_bound_official_declaration_can_allow_bare_cc_tld(self):
+        raw_result = {"raw_response": {"ai_overview": {
+            "ai_overview_contents": [{
+                "text": "Modal's official website is main.py.",
+            }],
+        }}}
+
+        self.assertEqual(
+            [record["url"] for record in extract_candidate_records(
+                raw_result, "phase1", "owner.vc",
+                y_name="Modal", country="")],
+            ["https://main.py"],
         )
 
     def test_text_fields_extract_urls_and_bare_domains_but_not_email_domains(self):
@@ -434,7 +515,9 @@ class TestExtractCandidateRecords(unittest.TestCase):
     def test_explicit_real_py_site_is_preserved_for_matching_company(self):
         raw_result = {
             "raw_response": {
-                "knowledge_graph": {"website": "https://company.py"},
+                "knowledge_graph": {
+                    "title": "Company", "website": "https://company.py",
+                },
             },
         }
 
@@ -445,7 +528,7 @@ class TestExtractCandidateRecords(unittest.TestCase):
             ["https://company.py"],
         )
 
-    def test_fixture_like_filenames_are_rejected_from_every_candidate_source(self):
+    def test_explicit_filename_shaped_hosts_are_not_treated_as_bare_files(self):
         raw_result = {
             "raw_response": {
                 "knowledge_graph": {"website": "requirements.txt"},
@@ -459,7 +542,11 @@ class TestExtractCandidateRecords(unittest.TestCase):
 
         self.assertEqual(
             [(record["url"], record["source_field"]) for record in records],
-            [("https://company.sh", "candidates[1]")],
+            [
+                ("https://config.py", "answer_box.link"),
+                ("https://setup.sh", "organic_results[0].link"),
+                ("https://company.sh", "candidates[1]"),
+            ],
         )
 
     def test_plausible_paraguay_py_domain_is_allowed_when_explicit_or_bare(self):
@@ -733,7 +820,7 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
                 self.assertFalse(has_positive_financial_evidence(
                     [{"text": text}], x_name="Acme", y_name="Modal"))
 
-    def test_trusted_ids_include_only_positive_grounded_records(self):
+    def test_eligible_ids_include_only_positive_assertion_records(self):
         records = [
             {"evidence_id": "negative", "text": "No investment is documented between Eastlink and Modal."},
             {"evidence_id": "nonfinancial", "text": "Eastlink and Modal announced a partnership."},
@@ -741,8 +828,49 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
         ]
 
         self.assertEqual(
-            trusted_positive_record_ids(records, "Eastlink", "Modal"),
+            eligible_relationship_evidence_ids(
+                records, x_name="Eastlink", y_name="Modal"),
             {"positive"},
+        )
+
+    def test_final_evidence_eligibility_allows_noisy_y_without_changing_routing(self):
+        y_ocr = "YUZU SPARKLINGWE SANZO POMELO"
+        records = [{
+            "evidence_id": "positive",
+            "text": "Eastlink Capital invested in Sanzo.",
+        }]
+
+        self.assertFalse(has_positive_financial_evidence(
+            records, x_name="Eastlink Capital", y_name=y_ocr))
+        self.assertEqual(
+            eligible_relationship_evidence_ids(
+                records, x_name="Eastlink Capital", y_name=y_ocr),
+            {"positive"},
+        )
+
+    def test_final_evidence_eligibility_rejects_non_assertions_and_denials(self):
+        records = [
+            {"evidence_id": "question", "text": "Analysts asked whether Acme invested in Modal."},
+            {"evidence_id": "question-mark", "text": "Did Acme invest in Modal?"},
+            {"evidence_id": "rumor", "text": "Rumors claimed Acme invested in Modal."},
+            {"evidence_id": "negative", "text": "Acme did not invest in Modal."},
+            {"evidence_id": "denied", "text": "Acme invested in Modal; later reports denied the investment."},
+            {"evidence_id": "pronoun-denial", "text": "Acme invested in Modal; later reports denied it."},
+            {"evidence_id": "wrong-x", "text": "Other Capital invested in Modal."},
+            {"evidence_id": "positive", "text": "Acme did not disclose terms, but Acme invested in Modal."},
+        ]
+
+        self.assertEqual(
+            eligible_relationship_evidence_ids(
+                records, x_name="Acme", y_name="Modal"),
+            {"positive"},
+        )
+        self.assertEqual(
+            eligible_relationship_evidence_ids(
+                [{"evidence_id": "wrong-x",
+                  "text": "Other Capital invested in Modal."}],
+                x_name="Acme Capital", y_name="Modal"),
+            set(),
         )
 
     def test_partnership_and_co_mention_are_not_financial_evidence(self):
@@ -1222,6 +1350,29 @@ class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
 
         result = await run_relationship_phases(
             search, inputs, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase3_official_url_recovery",
+        ])
+        self.assertEqual(result.candidates, ["https://modal.com"])
+
+    async def test_unrelated_kg_website_does_not_stop_modal_url_recovery(self):
+        inputs = RelationshipSearchInput(
+            x_name="Eastlink", y_name="Modal",
+            input_url="https://eastlinkcap.com/portfolio",
+            x_domain="eastlinkcap.com", city="", country="United States",
+        )
+        first = _search_result(text="Eastlink invested in Modal.")
+        first["raw_response"]["knowledge_graph"] = {
+            "website": "https://unrelated.example",
+        }
+        responses = iter([first, _search_result(candidates=["https://modal.com"])])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(search, inputs, "adaptive", 3)
 
         self.assertEqual(result.executed_phases, [
             "phase1_relationship_and_url",

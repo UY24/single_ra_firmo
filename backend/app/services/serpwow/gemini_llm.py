@@ -9,7 +9,7 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.services.serpwow.relationship_search import trusted_positive_record_ids
+from app.services.serpwow.relationship_search import eligible_relationship_evidence_ids
 from app.services.serpwow.url_utils import (
     _normalize_url_for_compare,
     _official_website_looks_plausible,
@@ -918,7 +918,7 @@ def _relationship_evidence_trust_set(
         candidate_records, _CANDIDATE_EVIDENCE_CHAR_LIMIT)
     relationship_records = _bounded_relationship_evidence_records(
         relationship_records, _RELATIONSHIP_EVIDENCE_CHAR_LIMIT)
-    relationship_ids = trusted_positive_record_ids(
+    relationship_ids = eligible_relationship_evidence_ids(
         relationship_records, x_name=x_name, y_name=y_name)
     allowed_ids = {
         str(record.get("evidence_id") or "").strip()

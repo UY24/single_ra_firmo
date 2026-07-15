@@ -9,19 +9,19 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 from app.services.serpwow.geo import _country_to_gl
 
 
-_FILENAME_HOST_STEMS = frozenset({
+_X_INPUT_FILENAME_STEMS = frozenset({
     "config", "main", "notes", "package", "report", "requirements", "setup",
 })
-_FILENAME_HOST_SUFFIXES = frozenset({
+_X_INPUT_FILENAME_SUFFIXES = frozenset({
     "cfg", "ini", "json", "md", "pdf", "py", "sh", "toml", "txt", "yaml", "yml",
 })
 
 
-def _host_looks_like_filename(host: str) -> bool:
+def _x_input_host_looks_like_filename(host: str) -> bool:
     labels = str(host or "").casefold().split(".")
     return (len(labels) == 2
-            and labels[0] in _FILENAME_HOST_STEMS
-            and labels[1] in _FILENAME_HOST_SUFFIXES)
+            and labels[0] in _X_INPUT_FILENAME_STEMS
+            and labels[1] in _X_INPUT_FILENAME_SUFFIXES)
 
 
 def _normalized_domain(url_or_domain: str) -> str:
@@ -53,8 +53,12 @@ def _normalize_url_for_compare(url: str) -> str:
     return f"{scheme}://{host}{path}"
 
 
-def _meaningful_domain_company_tokens(company_name: str) -> list[str]:
-    return [
+def _candidate_domain_is_plausible_for_company(domain: str, company_name: str, country: str) -> bool:
+    host = _normalized_domain(domain)
+    if not host:
+        return False
+
+    company_tokens = [
         token
         for token in re.findall(r"[a-z0-9]+", (company_name or "").lower())
         if len(token) >= 4
@@ -62,22 +66,6 @@ def _meaningful_domain_company_tokens(company_name: str) -> list[str]:
             "company", "corporation", "limited", "ltd", "group", "trading",
         }
     ]
-
-
-def _candidate_domain_has_company_token(domain: str, company_name: str) -> bool:
-    host = _normalized_domain(domain)
-    if not host:
-        return False
-    return any(
-        token in host for token in _meaningful_domain_company_tokens(company_name))
-
-
-def _candidate_domain_is_plausible_for_company(domain: str, company_name: str, country: str) -> bool:
-    host = _normalized_domain(domain)
-    if not host:
-        return False
-
-    company_tokens = _meaningful_domain_company_tokens(company_name)
     if any(token in host for token in company_tokens):
         return True
 
@@ -109,9 +97,6 @@ def is_disallowed_official_url(url: Optional[str]) -> bool:
     host = (parsed.netloc or "").lower()
     if host.startswith("www."):
         host = host[4:]
-
-    if _host_looks_like_filename(host):
-        return True
 
     if "google." in host or host.endswith(".google"):
         return True
@@ -278,7 +263,7 @@ def x_domain_from_input_url(input_url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     labels = host.split(".")
-    if len(labels) < 2 or not all(labels) or _host_looks_like_filename(host):
+    if len(labels) < 2 or not all(labels) or _x_input_host_looks_like_filename(host):
         return ""
     return host
 

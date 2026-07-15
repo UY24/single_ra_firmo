@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from ipaddress import ip_address
 from socket import inet_aton
@@ -10,9 +11,6 @@ from urllib.parse import urlsplit
 
 from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.url_utils import (
-    _candidate_domain_has_company_token,
-    _candidate_domain_is_plausible_for_company,
-    _host_looks_like_filename,
     canonicalize_official_url,
     is_disallowed_official_url,
     url_matches_domain,
@@ -37,6 +35,20 @@ _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
 _NON_WEB_SUFFIXES = frozenset({"txt"})
 _BARE_FILE_SUFFIXES = frozenset({
     "cfg", "ini", "json", "md", "pdf", "sh", "toml", "txt", "yaml", "yml",
+})
+_FILENAME_STEMS = frozenset({
+    "config", "main", "notes", "package", "report", "requirements", "setup",
+})
+_FILENAME_SUFFIXES = frozenset({
+    "cfg", "ini", "json", "md", "pdf", "py", "sh", "toml", "txt", "yaml", "yml",
+})
+_GENERIC_NAME_TOKENS = frozenset({
+    "co", "company", "corp", "corporation", "group", "inc", "limited", "llc",
+    "ltd", "plc", "trading",
+})
+_COMMON_SECOND_LEVEL_SUFFIXES = frozenset({
+    "ac.uk", "co.in", "co.jp", "co.nz", "co.uk", "com.au", "com.br", "com.cn",
+    "com.mx", "com.sg", "com.tr", "net.au", "org.au", "org.uk",
 })
 _CLAUSE_BOUNDARY_RE = re.compile(
     r"[.;\n]+|,\s*(?:and|then)\b|"
@@ -81,6 +93,15 @@ _POSITIVE_FINANCIAL_RE = re.compile(
 _NEGATION_RE = re.compile(
     r"\b(?:no|not|never|without|cannot|can['’]t|couldn['’]t|won['’]t|"
     r"wouldn['’]t|isn['’]t|wasn['’]t|didn['’]t|doesn['’]t|don['’]t)\b",
+    re.IGNORECASE,
+)
+_NON_ASSERTION_RE = re.compile(
+    r"\b(?:alleg(?:e|ed|edly)|ask(?:ed|s)?|claim(?:ed|s)?|"
+    r"question(?:ed|s)?|rumou?r(?:ed|s)?|speculat(?:e|ed|ion)|whether)\b",
+    re.IGNORECASE,
+)
+_DENIAL_RE = re.compile(
+    r"\b(?:denied|denies|deny|disputed|refuted|rejected)\b",
     re.IGNORECASE,
 )
 
@@ -128,8 +149,84 @@ class RelationshipSearchResult:
         return len(self.queries)
 
 
-def _source_declares_candidate_official(source_text: str, canonical: str) -> bool:
+def _normalized_identity(value: object) -> str:
+    return " ".join(unicodedata.normalize(
+        "NFKC", str(value or "")).casefold().split())
+
+
+def _identity_aliases(value: object) -> set[str]:
+    normalized = _normalized_identity(value)
+    tokens = re.findall(r"[^\W_]+", normalized, re.UNICODE)
+    meaningful = {
+        token for token in tokens
+        if len(token) >= 2 and token not in _GENERIC_NAME_TOKENS
+    }
+    compact = "".join(tokens)
+    if compact:
+        meaningful.add(compact)
+    return meaningful
+
+
+def _identity_key(value: object) -> str:
+    tokens = re.findall(r"[^\W_]+", _normalized_identity(value), re.UNICODE)
+    meaningful = [token for token in tokens if token not in _GENERIC_NAME_TOKENS]
+    return "".join(meaningful or tokens)
+
+
+def _relationship_host_matches_y(canonical: str, y_name: str) -> bool:
+    host = (urlsplit(canonical).hostname or "").casefold().removeprefix("www.")
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    suffix = ".".join(labels[-2:])
+    base = (labels[-3]
+            if suffix in _COMMON_SECOND_LEVEL_SUFFIXES and len(labels) >= 3
+            else labels[-2])
+    normalized_base = "".join(re.findall(r"[a-z0-9]+", base))
+    aliases = {
+        "".join(re.findall(r"[a-z0-9]+", alias))
+        for alias in _identity_aliases(y_name)
+        if alias.isascii() and alias not in _GENERIC_NAME_TOKENS
+    }
+    return bool(normalized_base and normalized_base in aliases)
+
+
+def _entity_metadata_matches_y(source: Mapping[str, object], y_name: str) -> bool:
+    y_key = _identity_key(y_name)
+    if not y_key:
+        return False
+    for key in ("title", "name", "entity_name", "company_name"):
+        value = source.get(key)
+        if isinstance(value, str) and _identity_key(value) == y_key:
+            return True
+    return False
+
+
+def _relationship_token_looks_like_filename(host: str) -> bool:
+    labels = str(host or "").casefold().split(".")
+    return (len(labels) == 2
+            and labels[0] in _FILENAME_STEMS
+            and labels[1] in _FILENAME_SUFFIXES)
+
+
+def _identity_pattern(y_name: str) -> str:
+    aliases = sorted(_identity_aliases(y_name), key=len, reverse=True)
+    return "(?:" + "|".join(
+        rf"(?<!\w){re.escape(alias)}(?!\w)" for alias in aliases) + ")"
+
+
+def _source_declares_candidate_official(
+    source_text: str,
+    canonical: str,
+    y_name: str,
+) -> bool:
     if not source_text or not _OFFICIAL_SITE_RE.search(source_text):
+        return False
+    normalized_text = _normalized_identity(source_text)
+    y = _identity_pattern(y_name)
+    if y == "(?:)":
+        return False
+    if _NEGATION_RE.search(normalized_text) or _DENIAL_RE.search(normalized_text):
         return False
     host = urlsplit(canonical).hostname or ""
     if not host:
@@ -140,9 +237,10 @@ def _source_declares_candidate_official(source_text: str, canonical: str) -> boo
         r"(?=[:/?#\s,.;!?)\]}]|$)(?:/[^\s<>\"']*)?"
     )
     return bool(re.search(
-        rf"(?:{_OFFICIAL_SITE_PATTERN}\s*(?:is\s+|:\s*){candidate}|"
-        rf"{candidate}\s+is\s+the\s+{_OFFICIAL_SITE_PATTERN})",
-        source_text,
+        rf"(?:{y}(?:['’]s)?\s+{_OFFICIAL_SITE_PATTERN}\s*(?:is\s+|:\s*){candidate}|"
+        rf"{candidate}\s+is\s+the\s+{_OFFICIAL_SITE_PATTERN}\s+(?:for|of)\s+{y}|"
+        rf"{_OFFICIAL_SITE_PATTERN}\s+(?:for|of)\s+{y}\s*(?:is\s+|:\s*){candidate})",
+        normalized_text,
         re.IGNORECASE,
     ))
 
@@ -162,9 +260,8 @@ def extract_candidate_records(
         value: object,
         source_field: str,
         *,
-        authoritative: bool = False,
+        entity_relevant: bool = False,
         source_text: str = "",
-        strict_y_host: bool = False,
     ) -> None:
         if not isinstance(value, str):
             return
@@ -184,9 +281,7 @@ def extract_candidate_records(
             labels = host.split(".")
             suffix = labels[-1]
             bare = "://" not in original
-            if (suffix in _NON_WEB_SUFFIXES
-                    or _host_looks_like_filename(host)
-                    or (bare and suffix in _BARE_FILE_SUFFIXES)):
+            if suffix in _NON_WEB_SUFFIXES:
                 return
             try:
                 ip_address(host)
@@ -199,19 +294,18 @@ def extract_candidate_records(
                 else:
                     return
         canonical = canonicalize_official_url(original)
+        declared_official = _source_declares_candidate_official(
+            source_text, canonical, y_name)
         if (not canonical or canonical in seen
                 or is_disallowed_official_url(canonical)
                 or url_matches_domain(canonical, x_domain)):
             return
-        y_host_relevant = (
-            _candidate_domain_has_company_token(canonical, y_name)
-            if strict_y_host
-            else _candidate_domain_is_plausible_for_company(
-                canonical, y_name, country)
-        )
-        if (not authoritative and y_name and not y_host_relevant
-                and not _source_declares_candidate_official(
-                    source_text, canonical)):
+        if (bare and (_relationship_token_looks_like_filename(host)
+                      or suffix in _BARE_FILE_SUFFIXES)
+                and not declared_official):
+            return
+        if (y_name and not _relationship_host_matches_y(canonical, y_name)
+                and not entity_relevant and not declared_official):
             return
         seen.add(canonical)
         records.append({
@@ -228,7 +322,7 @@ def extract_candidate_records(
         masked = _EMAIL_RE.sub(lambda match: " " * len(match.group()), value)
         for match in _URL_TOKEN_RE.finditer(masked):
             token = match.group().rstrip(_TRAILING_URL_PUNCTUATION)
-            add(token, source_field, source_text=value, strict_y_host=True)
+            add(token, source_field, source_text=value)
 
     raw = raw_result.get("raw_response")
     if not isinstance(raw, Mapping):
@@ -236,13 +330,22 @@ def extract_candidate_records(
 
     knowledge_graph = raw.get("knowledge_graph")
     if isinstance(knowledge_graph, Mapping):
-        add(knowledge_graph.get("website"), "knowledge_graph.website",
-            authoritative=True)
+        add(
+            knowledge_graph.get("website"), "knowledge_graph.website",
+            entity_relevant=_entity_metadata_matches_y(knowledge_graph, y_name),
+        )
 
     answer_box = raw.get("answer_box")
     if isinstance(answer_box, Mapping):
+        answer_text = " ".join(
+            str(answer_box.get(key) or "")
+            for key in ("title", "answer", "snippet"))
+        entity_relevant = _entity_metadata_matches_y(answer_box, y_name)
         for key in ("link", "url"):
-            add(answer_box.get(key), f"answer_box.{key}", authoritative=True)
+            add(
+                answer_box.get(key), f"answer_box.{key}",
+                entity_relevant=entity_relevant, source_text=answer_text,
+            )
 
     ai_overview = raw.get("ai_overview")
 
@@ -256,7 +359,7 @@ def extract_candidate_records(
                 for key in ("title", "displayed_link", "snippet"))
             for key in ("link", "url"):
                 add(result.get(key), f"organic_results[{index}].{key}",
-                    source_text=source_text, strict_y_host=True)
+                    source_text=source_text)
 
     if isinstance(ai_overview, Mapping):
         contents = ai_overview.get("ai_overview_contents")
@@ -278,7 +381,7 @@ def extract_candidate_records(
     candidates = raw_result.get("candidates")
     if isinstance(candidates, list):
         for index, candidate in enumerate(candidates):
-            add(candidate, f"candidates[{index}]", strict_y_host=True)
+            add(candidate, f"candidates[{index}]")
 
     return records
 
@@ -387,21 +490,56 @@ def has_positive_financial_evidence(
     return False
 
 
-def trusted_positive_record_ids(
+def _clause_mentions_identity(clause: str, identity: str | None) -> bool:
+    if not identity:
+        return True
+    normalized_clause = _normalized_identity(clause)
+    normalized_identity = _normalized_identity(identity)
+    return bool(normalized_identity and re.search(
+        rf"(?<!\w){re.escape(normalized_identity)}(?!\w)", normalized_clause))
+
+
+def _clause_denies_financial_assertion(clause: str) -> bool:
+    has_financial_language = bool(_FINANCIAL_MARKER_RE.search(clause))
+    return bool(
+        _DENIAL_RE.search(clause)
+        or (has_financial_language and _NEGATION_RE.search(clause))
+    )
+
+
+def eligible_relationship_evidence_ids(
     records: Sequence[Mapping[str, object]],
     x_name: str | None = None,
     y_name: str | None = None,
 ) -> set[str]:
-    """Return unique IDs whose own record positively grounds the relationship."""
-    trusted: set[str] = set()
+    """Return IDs with an affirmative financial assertion involving Company X.
+
+    This final-gate classifier intentionally does not require the full noisy Y OCR
+    value. Provisional search routing remains stricter via
+    ``has_positive_financial_evidence(..., x_name, y_name)``.
+    """
+    eligible: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping):
             continue
         evidence_id = str(record.get("evidence_id") or "").strip()
-        if (evidence_id and has_positive_financial_evidence(
-                [record], x_name=x_name, y_name=y_name)):
-            trusted.add(evidence_id)
-    return trusted
+        text = record.get("text")
+        if not evidence_id or not isinstance(text, str):
+            continue
+        clauses = [
+            clause.strip() for clause in _CLAUSE_BOUNDARY_RE.split(text)
+            if clause.strip()
+        ]
+        if any(_clause_denies_financial_assertion(clause) for clause in clauses):
+            continue
+        for clause in clauses:
+            if ("?" in clause or _NON_ASSERTION_RE.search(clause)
+                    or not _clause_mentions_identity(clause, x_name)):
+                continue
+            if _POSITIVE_FINANCIAL_RE.search(clause):
+                eligible.add(evidence_id)
+                break
+    return eligible
 
 
 def company_y_appears_on_x_site(

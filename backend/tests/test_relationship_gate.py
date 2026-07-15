@@ -92,7 +92,7 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertEqual(parsed["confidence_score"], 0)
         self.assertTrue(any(f["flag"] == "disallowed_url_dropped" for f in flags))
 
-    def test_filename_like_host_cannot_pass_gate(self):
+    def test_explicit_filename_shaped_host_is_not_globally_dropped_at_gate(self):
         parsed = {
             "relationship_status": "confirmed",
             "official_website": "https://report.pdf",
@@ -104,9 +104,9 @@ class TestApplyRelationshipGate(unittest.TestCase):
             parsed, ["https://report.pdf"], "",
             {"relationship-1"}, {"relationship-1"})
 
-        self.assertIsNone(url)
+        self.assertEqual(url, "https://report.pdf")
         self.assertEqual(status, "confirmed")
-        self.assertTrue(any(f["flag"] == "disallowed_url_dropped" for f in flags))
+        self.assertFalse(any(f["flag"] == "disallowed_url_dropped" for f in flags))
 
     def test_unknown_status_treated_as_unclear(self):
         parsed = {"relationship_status": "banana", "official_website": None,

@@ -283,6 +283,30 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertEqual(context["relationship"]["status"], "unclear")
         self.assertEqual(context["relationship"]["evidence"], context["evidence"])
 
+    def test_batch_noisy_ocr_can_confirm_from_affirmative_source_assertion(self):
+        row = _rel_row(candidates=("https://sanzo.com",), x_name="Eastlink Capital")
+        row["company_name"] = "YUZU SPARKLINGWE SANZO POMELO"
+        context = row["result"]["context"]
+        context["evidence"] = [{
+            "evidence_id": "relationship-1",
+            "text": "Eastlink Capital invested in Sanzo.",
+            "phase": "phase1",
+            "source_field": "ai_overview",
+        }]
+        parsed = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Eastlink Capital invested in Sanzo.",
+            "official_website": "https://sanzo.com",
+            "confidence_score": 90,
+            "supporting_evidence_ids": ["relationship-1"],
+            "extra_flags": [],
+        }
+
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+
+        self.assertEqual(row["result"]["official_website"], "https://sanzo.com")
+        self.assertEqual(context["relationship"]["status"], "confirmed")
+
     def test_batch_stores_accepted_records_in_supplied_order(self):
         row = _rel_row()
         parsed = {"relationship_status": "confirmed",

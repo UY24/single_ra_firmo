@@ -213,12 +213,53 @@ class TestSelectNextPhase(unittest.TestCase):
 
         self.assertEqual(selected.name, "evidence-target")
 
+    def test_adaptive_does_not_restart_first_enabled_phase(self):
+        build_query = lambda search_input, evidence: "query"
+        registry = (
+            RelationshipPhase(
+                "disabled-first", "combined", build_query, enabled=False),
+            RelationshipPhase("combined-first-enabled", "combined", build_query),
+            RelationshipPhase("url-already-run", "official_url", build_query),
+            RelationshipPhase(
+                "evidence-target", "relationship_evidence", build_query),
+        )
+
+        selected = select_next_phase(
+            registry, {"url-already-run"}, "adaptive", False, False)
+
+        self.assertEqual(selected.name, "evidence-target")
+
+    def test_adaptive_uses_remaining_combined_phase_for_missing_relationship(self):
+        build_query = lambda search_input, evidence: "query"
+        registry = (
+            RelationshipPhase("combined-already-run", "combined", build_query),
+            RelationshipPhase("combined-fallback", "combined", build_query),
+        )
+
+        selected = select_next_phase(
+            registry, {"combined-already-run"}, "adaptive", False, False)
+
+        self.assertEqual(selected, registry[1])
+
+    def test_adaptive_uses_remaining_combined_phase_for_missing_official_url(self):
+        build_query = lambda search_input, evidence: "query"
+        registry = (
+            RelationshipPhase("combined-already-run", "combined", build_query),
+            RelationshipPhase("combined-fallback", "combined", build_query),
+        )
+
+        selected = select_next_phase(
+            registry, {"combined-already-run"}, "adaptive", True, False)
+
+        self.assertEqual(selected, registry[1])
+
 
 class TestNormalizeSearchPolicy(unittest.TestCase):
     def test_only_case_insensitive_sequential_maps_to_sequential(self):
         self.assertEqual(normalize_search_policy("sequential"), "sequential")
         self.assertEqual(normalize_search_policy("SeQuEnTiAl"), "sequential")
-        for value in ("adaptive", "", " sequential ", None, 123):
+        self.assertEqual(normalize_search_policy(" sequential "), "sequential")
+        for value in ("adaptive", "", None, 123):
             with self.subTest(value=value):
                 self.assertEqual(normalize_search_policy(value), "adaptive")
 

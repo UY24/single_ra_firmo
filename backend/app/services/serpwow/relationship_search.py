@@ -34,7 +34,7 @@ class RelationshipPhase:
 
 
 def normalize_search_policy(value: object) -> SearchPolicy:
-    if isinstance(value, str) and value.lower() == "sequential":
+    if isinstance(value, str) and value.strip().lower() == "sequential":
         return "sequential"
     return "adaptive"
 
@@ -56,10 +56,14 @@ def select_next_phase(
     if not executed:
         return remaining[0]
 
+    remaining = [phase for phase in remaining if phase.name != enabled[0].name]
     target_goal: PhaseGoal = (
         "official_url" if relationship_evidenced else "relationship_evidence"
     )
-    return next((phase for phase in remaining if phase.goal == target_goal), None)
+    return next(
+        (phase for phase in remaining if phase.goal in {target_goal, "combined"}),
+        None,
+    )
 
 
 def _build_relationship_and_url_query(

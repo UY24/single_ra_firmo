@@ -43,8 +43,8 @@ _CLAUSE_BOUNDARY_RE = re.compile(
     r"\b(?:but|however|although|though|yet|whereas)\b",
     re.IGNORECASE,
 )
-_OFFICIAL_SITE_RE = re.compile(
-    r"\b(?:official\s+(?:web)?site|(?:web)?site\s+is)\b", re.IGNORECASE)
+_OFFICIAL_SITE_PATTERN = r"\bofficial\s+(?:web)?site\b"
+_OFFICIAL_SITE_RE = re.compile(_OFFICIAL_SITE_PATTERN, re.IGNORECASE)
 _FINANCIAL_MARKER_RE = re.compile(
     r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
     r"\bfund(?:s|ed|ing)?\b|"
@@ -134,10 +134,14 @@ def _source_declares_candidate_official(source_text: str, canonical: str) -> boo
     host = urlsplit(canonical).hostname or ""
     if not host:
         return False
-    official = r"(?:official\s+(?:web)?site|(?:web)?site\s+is)"
     escaped_host = re.escape(host.removeprefix("www."))
+    candidate = (
+        rf"(?<![\w.-])(?:https?://)?(?:www\.)?{escaped_host}"
+        r"(?=[:/?#\s,.;!?)\]}]|$)(?:/[^\s<>\"']*)?"
+    )
     return bool(re.search(
-        rf"(?:{official}.{{0,80}}{escaped_host}|{escaped_host}.{{0,80}}{official})",
+        rf"(?:{_OFFICIAL_SITE_PATTERN}\s*(?:is\s+|:\s*){candidate}|"
+        rf"{candidate}\s+is\s+the\s+{_OFFICIAL_SITE_PATTERN})",
         source_text,
         re.IGNORECASE,
     ))

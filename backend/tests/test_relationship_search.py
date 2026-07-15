@@ -156,6 +156,73 @@ class TestExtractCandidateRecords(unittest.TestCase):
             ["https://modal.com"],
         )
 
+    def test_official_marker_blesses_only_its_declared_candidate(self):
+        raw_result = {
+            "raw_response": {
+                "organic_results": [{
+                    "link": "https://f4.fund/firms/modal/activity",
+                    "displayed_link": "f4.fund/firms/modal/activity",
+                    "snippet": "Modal official website is modal.com.",
+                }],
+            },
+        }
+
+        records = extract_candidate_records(
+            raw_result, "phase1", "eastlinkcap.com",
+            y_name="Modal", country="United States",
+        )
+
+        self.assertEqual(
+            [record["url"] for record in records],
+            ["https://modal.com"],
+        )
+
+    def test_candidate_bound_official_declaration_forms(self):
+        for text in (
+            "Modal official website is getmdl.com.",
+            "Modal official site: getmdl.com.",
+            "getmdl.com is the official website for Modal.",
+        ):
+            with self.subTest(text=text):
+                raw_result = {
+                    "raw_response": {
+                        "ai_overview": {
+                            "ai_overview_contents": [{"text": text}],
+                        },
+                    },
+                }
+
+                records = extract_candidate_records(
+                    raw_result, "phase1", "eastlinkcap.com",
+                    y_name="Modal", country="United States",
+                )
+
+                self.assertEqual(
+                    [record["url"] for record in records],
+                    ["https://getmdl.com"],
+                )
+
+    def test_unofficial_marker_does_not_bless_candidate(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": (
+                            "Modal official website is unavailable. "
+                            "An unofficial website is getmdl.com."
+                        ),
+                    }],
+                },
+            },
+        }
+
+        self.assertEqual(
+            extract_candidate_records(
+                raw_result, "phase1", "eastlinkcap.com",
+                y_name="Modal", country="United States"),
+            [],
+        )
+
     def test_text_fields_extract_urls_and_bare_domains_but_not_email_domains(self):
         raw_result = {
             "raw_response": {
@@ -1141,7 +1208,10 @@ class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
                 organic_results=[{
                     "link": "https://randomnews.us/modal-funding",
                     "displayed_link": "randomnews.us/modal-funding",
-                    "snippet": "Eastlink invested in Modal.",
+                    "snippet": (
+                        "Eastlink invested in Modal. "
+                        "Modal official website is unavailable."
+                    ),
                 }],
             ),
             _search_result(candidates=["https://modal.com"]),

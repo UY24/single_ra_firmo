@@ -92,6 +92,22 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertEqual(parsed["confidence_score"], 0)
         self.assertTrue(any(f["flag"] == "disallowed_url_dropped" for f in flags))
 
+    def test_filename_like_host_cannot_pass_gate(self):
+        parsed = {
+            "relationship_status": "confirmed",
+            "official_website": "https://report.pdf",
+            "confidence_score": 90,
+            "supporting_evidence_ids": ["relationship-1"],
+        }
+
+        url, status, flags, _ = apply_relationship_gate(
+            parsed, ["https://report.pdf"], "",
+            {"relationship-1"}, {"relationship-1"})
+
+        self.assertIsNone(url)
+        self.assertEqual(status, "confirmed")
+        self.assertTrue(any(f["flag"] == "disallowed_url_dropped" for f in flags))
+
     def test_unknown_status_treated_as_unclear(self):
         parsed = {"relationship_status": "banana", "official_website": None,
                   "confidence_score": 88}
@@ -182,6 +198,29 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertEqual((url, status, accepted_ids), (None, "unclear", []))
         self.assertTrue(any(flag["flag"] == "unknown_evidence_id" for flag in flags))
 
+    def test_negative_and_nonfinancial_records_cannot_confirm(self):
+        evidence = [
+            {"evidence_id": "negative", "text": "No investment is documented between Eastlink and Modal."},
+            {"evidence_id": "nonfinancial", "text": "Eastlink and Modal announced a partnership."},
+        ]
+        allowed, relationship_ids, supplied = _relationship_evidence_gate_inputs(
+            [], evidence, x_name="Eastlink", y_name="Modal")
+        parsed = {
+            "relationship_status": "confirmed",
+            "official_website": "https://modal.com",
+            "confidence_score": 90,
+            "supporting_evidence_ids": ["negative", "nonfinancial"],
+        }
+
+        url, status, _, accepted_ids = apply_relationship_gate(
+            parsed, ["https://modal.com"], "", allowed, relationship_ids)
+
+        self.assertEqual(allowed, {"negative", "nonfinancial"})
+        self.assertEqual(relationship_ids, set())
+        self.assertEqual(supplied, evidence)
+        self.assertEqual((url, status), (None, "unclear"))
+        self.assertEqual(accepted_ids, ["negative", "nonfinancial"])
+
 
 class TestChooseRelationshipAndWebsite(unittest.TestCase):
     def test_happy_path_parses_json_and_returns_usage(self):
@@ -249,6 +288,16 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
         self.assertIn('"company_x_domain": null', prompt)
         self.assertIn("m25vc", prompt)
 
+    def test_prompt_keeps_negative_records_as_contrary_context(self):
+        evidence = [{
+            "evidence_id": "negative",
+            "text": "No investment is documented between Eastlink and Modal.",
+        }]
+        prompt = build_relationship_prompt(
+            "Eastlink", "Modal", "", "", CANDS, [], evidence, [], False, "")
+
+        self.assertIn("No investment is documented", prompt)
+
     def test_prompt_sections_are_complete_bounded_json_and_gate_uses_same_subset(self):
         candidate_records = [
             {"evidence_id": f"candidate-{index}", "url": f"https://{index}.example",
@@ -256,7 +305,8 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
             for index in range(10)
         ]
         relationship_records = [
-            {"evidence_id": f"relationship-{index}", "text": "r" * 2500}
+            {"evidence_id": f"relationship-{index}",
+             "text": "X invested in Y. " + "r" * 2500}
             for index in range(10)
         ]
         prompt = build_relationship_prompt(

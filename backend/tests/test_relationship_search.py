@@ -12,6 +12,7 @@ from app.services.serpwow.relationship_search import (
     normalize_search_policy,
     run_relationship_phases,
     select_next_phase,
+    trusted_positive_record_ids,
 )
 
 
@@ -51,7 +52,8 @@ class TestExtractCandidateRecords(unittest.TestCase):
         }
 
         self.assertEqual(
-            extract_candidate_records(raw_result, "phase1", "owner.vc"),
+            extract_candidate_records(
+                raw_result, "phase1", "owner.vc", y_name="Beta", country=""),
             [
                 {
                     "url": "https://alpha.io",
@@ -67,36 +69,44 @@ class TestExtractCandidateRecords(unittest.TestCase):
                     "source_field": "answer_box.url",
                     "evidence_id": "phase1.candidate.1",
                 },
-                {
-                    "url": "https://gamma.ai/product",
-                    "original_text": "https://www.Gamma.ai/product",
-                    "phase": "phase1",
-                    "source_field": "ai_overview.ai_overview_sources[0].source_url",
-                    "evidence_id": "phase1.candidate.2",
-                },
-                {
-                    "url": "https://delta.co",
-                    "original_text": "https://delta.co/",
-                    "phase": "phase1",
-                    "source_field": "organic_results[0].link",
-                    "evidence_id": "phase1.candidate.3",
-                },
-                {
-                    "url": "https://epsilon.io/about",
-                    "original_text": "https://epsilon.io/about",
-                    "phase": "phase1",
-                    "source_field": "organic_results[0].url",
-                    "evidence_id": "phase1.candidate.4",
-                },
-                {
-                    "url": "https://fallback.net",
-                    "original_text": "fallback.net",
-                    "phase": "phase1",
-                    "source_field": "candidates[0]",
-                    "evidence_id": "phase1.candidate.5",
-                },
             ],
         )
+
+    def test_citations_and_unrelated_provider_links_are_not_y_candidates(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_sources": [{
+                        "source_url": "https://techcrunch.com/2026/modal-funding",
+                    }],
+                    "ai_overview_contents": [{
+                        "text": "Modal's official website is modal.com.",
+                    }],
+                },
+                "organic_results": [
+                    {
+                        "link": "https://f4.fund/firms/modal/activity",
+                        "snippet": "Modal's official website is modal.com.",
+                    },
+                    {"link": "https://x.com/modal"},
+                    {"link": "https://modal.com/about"},
+                ],
+            },
+            "candidates": ["https://techcrunch.com/2026/modal-funding"],
+        }
+
+        records = extract_candidate_records(
+            raw_result, "phase1", "eastlinkcap.com",
+            y_name="Modal", country="United States",
+        )
+
+        self.assertEqual(
+            [record["url"] for record in records],
+            ["https://modal.com/about", "https://modal.com"],
+        )
+        self.assertFalse(any(
+            "ai_overview_sources" in record["source_field"] for record in records
+        ))
 
     def test_text_fields_extract_urls_and_bare_domains_but_not_email_domains(self):
         raw_result = {
@@ -284,6 +294,40 @@ class TestExtractCandidateRecords(unittest.TestCase):
         self.assertEqual(
             [(record["url"], record["original_text"]) for record in records],
             [("https://modal.com", "modal.com")],
+        )
+
+    def test_review_probe_filenames_are_rejected_from_all_candidate_sources(self):
+        probes = ["report.pdf", "package.json", "notes.md", "main.py"]
+        raw_result = {
+            "raw_response": {
+                "knowledge_graph": {"website": probes[0]},
+                "answer_box": {"url": probes[1]},
+                "ai_overview": {
+                    "ai_overview_contents": [{"text": f"Files: {probes[2]} {probes[3]}"}],
+                },
+                "organic_results": [{"link": probes[2], "snippet": probes[3]}],
+            },
+            "candidates": probes,
+        }
+
+        self.assertEqual(
+            extract_candidate_records(
+                raw_result, "review", "owner.vc", y_name="Modal", country=""),
+            [],
+        )
+
+    def test_explicit_real_py_site_is_preserved_for_matching_company(self):
+        raw_result = {
+            "raw_response": {
+                "knowledge_graph": {"website": "https://company.py"},
+            },
+        }
+
+        self.assertEqual(
+            [record["url"] for record in extract_candidate_records(
+                raw_result, "paraguay", "owner.vc",
+                y_name="Company", country="Paraguay")],
+            ["https://company.py"],
         )
 
     def test_fixture_like_filenames_are_rejected_from_every_candidate_source(self):
@@ -545,18 +589,43 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Acme didn't invest in Modal; investment reports were wrong.",
             "Modal wasn't acquired by Acme; acquisition reports were wrong.",
             "Modal isn't backed by Acme; backing reports were wrong.",
-            "Acme invested in Modal but cannot disclose the terms.",
-            "Acme invested in Modal but can't discuss the terms.",
-            "Acme invested in Modal but couldn't disclose the terms.",
-            "Acme invested in Modal but won't disclose the terms.",
-            "Acme invested in Modal but wouldn't disclose the terms.",
-            "Acme invested in Modal but doesn't discuss the terms.",
-            "Acme invested in Modal but don't quote the announcement.",
         ]
 
         for text in negative_texts:
             with self.subTest(text=text):
                 self.assertFalse(has_positive_financial_evidence([{"text": text}]))
+
+    def test_negation_is_scoped_to_the_relationship_clause(self):
+        positive_texts = [
+            "Acme did not disclose terms, but Acme invested in Modal.",
+            "Acme invested in Modal but cannot disclose the terms.",
+            "Acme invested in Modal, although it won't discuss the terms.",
+        ]
+        for text in positive_texts:
+            with self.subTest(text=text):
+                self.assertTrue(has_positive_financial_evidence(
+                    [{"text": text}], x_name="Acme", y_name="Modal"))
+
+        for text in (
+            "Acme did not invest in Modal.",
+            "Acme didn't invest in Modal.",
+            "Modal wasn't acquired by Acme.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(has_positive_financial_evidence(
+                    [{"text": text}], x_name="Acme", y_name="Modal"))
+
+    def test_trusted_ids_include_only_positive_grounded_records(self):
+        records = [
+            {"evidence_id": "negative", "text": "No investment is documented between Eastlink and Modal."},
+            {"evidence_id": "nonfinancial", "text": "Eastlink and Modal announced a partnership."},
+            {"evidence_id": "positive", "text": "Eastlink invested in Modal."},
+        ]
+
+        self.assertEqual(
+            trusted_positive_record_ids(records, "Eastlink", "Modal"),
+            {"positive"},
+        )
 
     def test_partnership_and_co_mention_are_not_financial_evidence(self):
         nonfinancial_texts = [
@@ -980,6 +1049,30 @@ class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
         self.assertIn("[phase1_relationship_and_url.overview.0]", result.queries[1][1])
+
+    async def test_relation_plus_article_recovers_y_url_in_phase_three(self):
+        responses = iter([
+            _search_result(
+                text="Acme Capital did not disclose terms, but Acme Capital invested in Orbit Labs.",
+                organic_results=[{
+                    "link": "https://techcrunch.com/2026/orbit-labs-funding",
+                    "snippet": "Acme Capital invested in Orbit Labs.",
+                }],
+            ),
+            _search_result(candidates=["https://orbitlabs.ai"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, SEARCH_INPUT, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase3_official_url_recovery",
+        ])
+        self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
 
     async def test_missing_relation_runs_phase_two_then_phase_three(self):
         responses = iter([

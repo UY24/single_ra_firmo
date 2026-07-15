@@ -9,12 +9,14 @@ from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.services.serpwow.relationship_search import trusted_positive_record_ids
 from app.services.serpwow.url_utils import (
     _normalize_url_for_compare,
     _official_website_looks_plausible,
     is_disallowed_official_url,
     url_matches_domain,
 )
+
 
 def _parse_json_from_text(raw_text: str) -> Optional[dict[str, Any]]:
     cleaned = raw_text.strip()
@@ -738,7 +740,8 @@ def build_relationship_prompt(
     }
     (bounded_candidate_evidence, bounded_relationship_evidence,
      _, _) = _relationship_evidence_trust_set(
-        candidate_evidence, evidence, legacy_ai_overview_texts)
+        candidate_evidence, evidence, legacy_ai_overview_texts,
+        x_name=x_name, y_name=y_name)
     return (
         "You verify FINANCIAL relationships between companies and identify official websites.\n"
         "company_x is an investment firm; company_y_ocr is OCR text extracted from a logo on\n"
@@ -860,11 +863,15 @@ def _relationship_evidence_gate_inputs(
     candidate_evidence: list[dict[str, str]],
     evidence: Optional[list[dict[str, str]]],
     legacy_ai_overview_texts: Optional[list[str]] = None,
+    *,
+    x_name: str | None = None,
+    y_name: str | None = None,
 ) -> tuple[set[str], set[str], list[dict[str, str]]]:
     """Build bounded prompt/gate records, rejecting every duplicate ID."""
     (candidate_records, relationship_records,
      allowed_ids, relationship_ids) = _relationship_evidence_trust_set(
-        candidate_evidence, evidence, legacy_ai_overview_texts)
+        candidate_evidence, evidence, legacy_ai_overview_texts,
+        x_name=x_name, y_name=y_name)
     return allowed_ids, relationship_ids, candidate_records + relationship_records
 
 
@@ -872,6 +879,9 @@ def _relationship_evidence_trust_set(
     candidate_evidence: list[dict[str, str]],
     evidence: Optional[list[dict[str, str]]],
     legacy_ai_overview_texts: Optional[list[str]] = None,
+    *,
+    x_name: str | None = None,
+    y_name: str | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], set[str], set[str]]:
     """Return the identical bounded records and ID sets used by prompt and gate."""
     candidate_records = [
@@ -908,12 +918,13 @@ def _relationship_evidence_trust_set(
         candidate_records, _CANDIDATE_EVIDENCE_CHAR_LIMIT)
     relationship_records = _bounded_relationship_evidence_records(
         relationship_records, _RELATIONSHIP_EVIDENCE_CHAR_LIMIT)
-    relationship_ids = {
+    relationship_ids = trusted_positive_record_ids(
+        relationship_records, x_name=x_name, y_name=y_name)
+    allowed_ids = {
         str(record.get("evidence_id") or "").strip()
         for record in relationship_records
         if str(record.get("evidence_id") or "").strip()
-    }
-    allowed_ids = relationship_ids | {
+    } | {
         str(record.get("evidence_id") or "").strip()
         for record in candidate_records
         if str(record.get("evidence_id") or "").strip()

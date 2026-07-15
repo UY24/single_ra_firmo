@@ -1824,7 +1824,9 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
         _relationship_evidence_gate_inputs(
             candidate_evidence, evidence,
             [text for text in (context.get("ai_overview_texts") or [])
-             if isinstance(text, str)])
+             if isinstance(text, str)],
+            x_name=str(context.get("x_name") or row.get("x_name") or ""),
+            y_name=str(row.get("company_name") or ""))
     )
     gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
         parsed if isinstance(parsed, dict) else {}, candidates, x_domain,

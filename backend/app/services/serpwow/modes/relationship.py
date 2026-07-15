@@ -95,7 +95,10 @@ async def execute_relationship_lookup_for_worker(
         )
 
     candidates = search_result.candidates
-    ai_overview_texts = [record["text"] for record in search_result.evidence]
+    ai_overview_texts = [
+        record["text"] for record in search_result.evidence
+        if str(record.get("source_field") or "").startswith("ai_overview.")
+    ]
     search_attempts = search_result.search_attempts
     formatted_results = search_result.formatted_results
     phase4_hit = search_result.x_site_hit
@@ -161,7 +164,8 @@ async def execute_relationship_lookup_for_worker(
             raise err
         allowed_ids, relationship_ids, supplied_evidence = (
             _relationship_evidence_gate_inputs(
-                search_result.candidate_evidence, search_result.evidence)
+                search_result.candidate_evidence, search_result.evidence,
+                x_name=x_name, y_name=y_name)
         )
         gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
             parsed, candidates, x_domain, allowed_ids, relationship_ids)

@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.url_utils import (
+    _candidate_domain_is_plausible_for_company,
+    _host_looks_like_filename,
     canonicalize_official_url,
     is_disallowed_official_url,
     url_matches_domain,
@@ -32,10 +34,13 @@ _EMAIL_RE = re.compile(
 )
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
 _NON_WEB_SUFFIXES = frozenset({"txt"})
-_FIXTURE_FILE_STEMS = frozenset({"config", "requirements", "setup"})
-_FIXTURE_FILE_SUFFIXES = frozenset({
-    "cfg", "ini", "json", "md", "py", "sh", "toml", "yaml", "yml",
+_BARE_FILE_SUFFIXES = frozenset({
+    "cfg", "ini", "json", "md", "pdf", "sh", "toml", "txt", "yaml", "yml",
 })
+_CLAUSE_BOUNDARY_RE = re.compile(
+    r"[.;\n]+|\b(?:but|however|although|though|yet|whereas)\b", re.IGNORECASE)
+_OFFICIAL_SITE_RE = re.compile(
+    r"\b(?:official\s+(?:web)?site|(?:web)?site\s+is)\b", re.IGNORECASE)
 _FINANCIAL_MARKER_RE = re.compile(
     r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
     r"\bfund(?:s|ed|ing)?\b|"
@@ -43,7 +48,9 @@ _FINANCIAL_MARKER_RE = re.compile(
     r"\b(?:financial\s+)?backing\b|\bfinancially\s+backs?\b|"
     r"\bportfolio\b|\bbacked\b|"
     r"\bacquisition(?:s)?\b|\bacquired\b|"
-    r"\bparent(?:\s+company)?\b|\bsubsidiar(?:y|ies)\b|\bownership\b|"
+    r"\bparent\s+company\s+of\b|\b\w+['’]s\s+parent\s+company\b|"
+    r"\bsubsidiar(?:y|ies)\s+of\b|\bis\s+(?:an?\s+)?\w+\s+subsidiary\b|"
+    r"\bownership\b|"
     r"\bseries\s+[a-z0-9]+\b",
     re.IGNORECASE,
 )
@@ -61,7 +68,8 @@ _POSITIVE_FINANCIAL_RE = re.compile(
     r"\bin\b[^.;\n]{0,80}\bportfolio\b|"
     r"\bacquisition(?:s)?\s+(?:of|by)\b|"
     r"\bacquired\s+by\b|"
-    r"\bparent\s+company\b|\bsubsidiar(?:y|ies)\b|"
+    r"\bparent\s+company\s+of\b|\b\w+['’]s\s+parent\s+company\b|"
+    r"\bsubsidiar(?:y|ies)\s+of\b|\bis\s+(?:an?\s+)?\w+\s+subsidiary\b|"
     r"\bownership\s+(?:of|in)\b|"
     r"\b(?:led|participated\s+in)\b[^.;\n]{0,80}\bseries\s+[a-z0-9]+\b",
     re.IGNORECASE,
@@ -116,16 +124,39 @@ class RelationshipSearchResult:
         return len(self.queries)
 
 
+def _source_declares_candidate_official(source_text: str, canonical: str) -> bool:
+    if not source_text or not _OFFICIAL_SITE_RE.search(source_text):
+        return False
+    host = urlsplit(canonical).hostname or ""
+    if not host:
+        return False
+    official = r"(?:official\s+(?:web)?site|(?:web)?site\s+is)"
+    escaped_host = re.escape(host.removeprefix("www."))
+    return bool(re.search(
+        rf"(?:{official}.{{0,80}}{escaped_host}|{escaped_host}.{{0,80}}{official})",
+        source_text,
+        re.IGNORECASE,
+    ))
+
+
 def extract_candidate_records(
     raw_result: Mapping[str, Any],
     phase: str,
     x_domain: str,
+    y_name: str = "",
+    country: str = "",
 ) -> list[dict[str, str]]:
     """Extract canonical URL candidates with first-seen field provenance."""
     records: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    def add(value: object, source_field: str) -> None:
+    def add(
+        value: object,
+        source_field: str,
+        *,
+        authoritative: bool = False,
+        source_text: str = "",
+    ) -> None:
         if not isinstance(value, str):
             return
         original = value.strip().rstrip(_TRAILING_URL_PUNCTUATION)
@@ -143,10 +174,10 @@ def extract_candidate_records(
             host = parsed_host.lower()
             labels = host.split(".")
             suffix = labels[-1]
+            bare = "://" not in original
             if (suffix in _NON_WEB_SUFFIXES
-                    or (len(labels) == 2
-                        and labels[0] in _FIXTURE_FILE_STEMS
-                        and suffix in _FIXTURE_FILE_SUFFIXES)):
+                    or _host_looks_like_filename(host)
+                    or (bare and suffix in _BARE_FILE_SUFFIXES)):
                 return
             try:
                 ip_address(host)
@@ -163,6 +194,12 @@ def extract_candidate_records(
                 or is_disallowed_official_url(canonical)
                 or url_matches_domain(canonical, x_domain)):
             return
+        if (not authoritative and y_name
+                and not _candidate_domain_is_plausible_for_company(
+                    canonical, y_name, country)
+                and not _source_declares_candidate_official(
+                    source_text, canonical)):
+            return
         seen.add(canonical)
         records.append({
             "url": canonical,
@@ -178,7 +215,7 @@ def extract_candidate_records(
         masked = _EMAIL_RE.sub(lambda match: " " * len(match.group()), value)
         for match in _URL_TOKEN_RE.finditer(masked):
             token = match.group().rstrip(_TRAILING_URL_PUNCTUATION)
-            add(token, source_field)
+            add(token, source_field, source_text=value)
 
     raw = raw_result.get("raw_response")
     if not isinstance(raw, Mapping):
@@ -186,31 +223,27 @@ def extract_candidate_records(
 
     knowledge_graph = raw.get("knowledge_graph")
     if isinstance(knowledge_graph, Mapping):
-        add(knowledge_graph.get("website"), "knowledge_graph.website")
+        add(knowledge_graph.get("website"), "knowledge_graph.website",
+            authoritative=True)
 
     answer_box = raw.get("answer_box")
     if isinstance(answer_box, Mapping):
         for key in ("link", "url"):
-            add(answer_box.get(key), f"answer_box.{key}")
+            add(answer_box.get(key), f"answer_box.{key}", authoritative=True)
 
     ai_overview = raw.get("ai_overview")
-    if isinstance(ai_overview, Mapping):
-        sources = ai_overview.get("ai_overview_sources")
-        if isinstance(sources, list):
-            for index, source in enumerate(sources):
-                if isinstance(source, Mapping):
-                    add(
-                        source.get("source_url"),
-                        f"ai_overview.ai_overview_sources[{index}].source_url",
-                    )
 
     organic_results = raw.get("organic_results")
     if isinstance(organic_results, list):
         for index, result in enumerate(organic_results):
             if not isinstance(result, Mapping):
                 continue
+            source_text = " ".join(
+                str(result.get(key) or "")
+                for key in ("title", "displayed_link", "snippet"))
             for key in ("link", "url"):
-                add(result.get(key), f"organic_results[{index}].{key}")
+                add(result.get(key), f"organic_results[{index}].{key}",
+                    source_text=source_text)
 
     if isinstance(ai_overview, Mapping):
         contents = ai_overview.get("ai_overview_contents")
@@ -327,17 +360,35 @@ def has_positive_financial_evidence(
         raw_text = record.get("text")
         if not isinstance(raw_text, str):
             continue
-        text = raw_text.strip()
-        if _NEGATION_RE.search(text):
-            continue
-        positive = (
-            bool(grounded_re.search(" ".join(text.casefold().split())))
-            if grounded_re is not None
-            else bool(_POSITIVE_FINANCIAL_RE.search(text))
-        )
-        if positive:
-            return True
+        for clause in _CLAUSE_BOUNDARY_RE.split(raw_text.strip()):
+            clause = clause.strip()
+            if not clause or _NEGATION_RE.search(clause):
+                continue
+            positive = (
+                bool(grounded_re.search(" ".join(clause.casefold().split())))
+                if grounded_re is not None
+                else bool(_POSITIVE_FINANCIAL_RE.search(clause))
+            )
+            if positive:
+                return True
     return False
+
+
+def trusted_positive_record_ids(
+    records: Sequence[Mapping[str, object]],
+    x_name: str | None = None,
+    y_name: str | None = None,
+) -> set[str]:
+    """Return unique IDs whose own record positively grounds the relationship."""
+    trusted: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        evidence_id = str(record.get("evidence_id") or "").strip()
+        if (evidence_id and has_positive_financial_evidence(
+                [record], x_name=x_name, y_name=y_name)):
+            trusted.add(evidence_id)
+    return trusted
 
 
 def company_y_appears_on_x_site(
@@ -533,7 +584,8 @@ async def run_relationship_phases(
             raw_response = {}
 
         phase_candidates = extract_candidate_records(
-            raw_result, phase.name, inputs.x_domain)
+            raw_result, phase.name, inputs.x_domain,
+            y_name=inputs.y_name, country=inputs.country)
         candidate_evidence.extend(phase_candidates)
         for record in phase_candidates:
             url = record["url"]

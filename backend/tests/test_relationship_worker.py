@@ -154,6 +154,71 @@ class TestRelationshipExecutor(unittest.TestCase):
             "Eastlink invested in Modal.",
         )
 
+    def test_sync_negative_overview_citation_cannot_confirm(self):
+        search = AsyncMock(return_value=_serp(
+            ["https://modal.com/"],
+            "No investment is documented between eastlinkcap and Modal."))
+        model_output = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Unsupported conclusion.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 90,
+            "supporting_evidence_ids": [
+                "phase1_relationship_and_url.overview.0",
+            ],
+            "extra_flags": [],
+        }
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=(model_output, None, "m", {})), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="eastlinkcap.com/portfolio", city="", country="")
+
+        self.assertIsNone(resp.official_website)
+        self.assertEqual(resp.context["relationship"]["status"], "unclear")
+        self.assertEqual(resp.context["x_domain"], "eastlinkcap.com")
+
+    def test_ai_overview_texts_excludes_organic_snippets(self):
+        response = _serp(
+            ["https://modal.com/"], "eastlinkcap invested in Modal.")
+        response["raw_response"]["organic_results"] = [{
+            "link": "https://modal.com",
+            "snippet": "Modal received funding from eastlinkcap.",
+        }]
+        search = AsyncMock(return_value=response)
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="eastlinkcap.com/portfolio", city="", country="")
+
+        self.assertEqual(
+            resp.context["ai_overview_texts"],
+            ["eastlinkcap invested in Modal."],
+        )
+        self.assertEqual(len(resp.context["evidence"]), 2)
+
+    def test_bare_x_domain_candidate_is_filtered_before_llm(self):
+        search = AsyncMock(return_value=_serp(
+            ["https://eastlinkcap.com/team", "https://modal.com/"],
+            "eastlinkcap invested in Modal."))
+        captured = {}
+
+        def fake_llm(x, y, city, country, candidates, *args):
+            captured["candidates"] = candidates
+            return _llm("confirmed", "https://modal.com/")
+
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website", side_effect=fake_llm), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="eastlinkcap.com/portfolio", city="", country="")
+
+        self.assertEqual(captured["candidates"], ["https://modal.com"])
+
     def test_one_request_uses_configured_serpwow_cost_in_all_totals(self):
         search = AsyncMock(return_value=_serp(
             ["https://modal.com/"], "eastlinkcap invests in Modal."))

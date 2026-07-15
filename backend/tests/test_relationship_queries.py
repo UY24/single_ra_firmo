@@ -9,8 +9,12 @@ class TestXDomainHelpers(unittest.TestCase):
         self.assertEqual(
             x_domain_from_input_url("https://www.m25vc.com/portfolio"), "m25vc.com")
         self.assertEqual(x_domain_from_input_url("http://eastlinkcap.com"), "eastlinkcap.com")
+        self.assertEqual(
+            x_domain_from_input_url("eastlinkcap.com/portfolio"), "eastlinkcap.com")
+        self.assertEqual(x_domain_from_input_url("www.m25vc.com/p"), "m25vc.com")
         self.assertEqual(x_domain_from_input_url(""), "")
         self.assertEqual(x_domain_from_input_url("not a url"), "")
+        self.assertEqual(x_domain_from_input_url("report.pdf"), "")
 
     def test_url_matches_domain(self):
         self.assertTrue(url_matches_domain("https://m25vc.com/about", "m25vc.com"))

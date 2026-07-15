@@ -30,10 +30,10 @@ def _rel_row(row_index=1, status="completed", skip_llm=False,
                 }] if candidates else [],
                 "evidence": [{
                     "evidence_id": "relationship-1",
-                    "text": "Eastlink invests in Modal.",
+                    "text": "eastlinkcap invests in Modal.",
                     "phase": "phase1", "source_field": "ai_overview",
                 }],
-                "ai_overview_texts": ["Eastlink invests in Modal."],
+                "ai_overview_texts": ["eastlinkcap invests in Modal."],
                 "search_attempts": [{"attempt": "phase1_relationship", "query": "q"}],
                 "phase4_hit": True,
                 "relationship": {"status": "pending", "summary": "",
@@ -80,7 +80,7 @@ class TestRelationshipBatchPrompt(unittest.TestCase):
         self.assertEqual(records, [{
             "evidence_id": "legacy.overview.0",
             "source_field": "ai_overview_texts[0]",
-            "text": "Eastlink invests in Modal.",
+            "text": "eastlinkcap invests in Modal.",
         }])
 
 
@@ -171,7 +171,7 @@ class TestRelationshipBatchApply(unittest.TestCase):
         context = row["result"]["context"]
         context["evidence"].append({
             "evidence_id": "relationship-2",
-            "text": "A later filing confirms Eastlink invested in Modal.",
+            "text": "A later filing confirms eastlinkcap invested in Modal.",
             "phase": "phase2", "source_field": "organic.snippet",
         })
         first = {
@@ -258,6 +258,30 @@ class TestRelationshipBatchApply(unittest.TestCase):
             [flag["flag"] for flag in ctx["relationship"]["flags"]],
             ["confirmed_without_evidence_id", "relationship_unclear"],
         )
+
+    def test_negative_structured_evidence_cannot_confirm_when_cited(self):
+        row = _rel_row()
+        context = row["result"]["context"]
+        context["evidence"] = [{
+            "evidence_id": "negative",
+            "text": "No investment is documented between eastlinkcap and Modal.",
+            "phase": "phase1",
+            "source_field": "ai_overview",
+        }]
+        parsed = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Unsupported conclusion.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 90,
+            "supporting_evidence_ids": ["negative"],
+            "extra_flags": [],
+        }
+
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+
+        self.assertIsNone(row["result"]["official_website"])
+        self.assertEqual(context["relationship"]["status"], "unclear")
+        self.assertEqual(context["relationship"]["evidence"], context["evidence"])
 
     def test_batch_stores_accepted_records_in_supplied_order(self):
         row = _rel_row()

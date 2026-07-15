@@ -41,7 +41,8 @@ class TestBatchApplyOutcome(unittest.TestCase):
         self.assertIsNone(row["error"])
 
     def test_relationship_not_confirmed_is_notfound_completed(self):
-        row = {"company_name": "Y", "result": {"context": {"pipeline": "relationship",
+        row = {"company_name": "Y", "x_name": "X",
+               "result": {"context": {"pipeline": "relationship",
                "candidates": [], "x_domain": ""}}}
         status = engine._apply_batch_parsed_to_row(
             row, {"relationship_status": "not_confirmed"}, {}, "gemini-x")
@@ -52,7 +53,8 @@ class TestBatchApplyOutcome(unittest.TestCase):
         self.assertIsNone(row["error_category"])
 
     def test_relationship_confirmed_is_found_completed(self):
-        row = {"company_name": "Y", "result": {"context": {"pipeline": "relationship",
+        row = {"company_name": "Y", "x_name": "X",
+               "result": {"context": {"pipeline": "relationship",
                "candidates": ["https://y.com"], "x_domain": "x.com",
                "evidence": [{"evidence_id": "relationship-1",
                               "text": "X invested in Y."}]}}}
@@ -112,7 +114,7 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
                                    "candidates": ["https://modal.com/"],
                                    "evidence": [{
                                        "evidence_id": "relationship-1",
-                                       "text": "Eastlink invested in Modal.",
+                                       "text": "eastlinkcap invested in Modal.",
                                    }],
                                    "cost_breakdown": {"serpwow_request_count": 1}}},
         }

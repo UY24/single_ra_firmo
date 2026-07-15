@@ -9,6 +9,21 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 from app.services.serpwow.geo import _country_to_gl
 
 
+_FILENAME_HOST_STEMS = frozenset({
+    "config", "main", "notes", "package", "report", "requirements", "setup",
+})
+_FILENAME_HOST_SUFFIXES = frozenset({
+    "cfg", "ini", "json", "md", "pdf", "py", "sh", "toml", "txt", "yaml", "yml",
+})
+
+
+def _host_looks_like_filename(host: str) -> bool:
+    labels = str(host or "").casefold().split(".")
+    return (len(labels) == 2
+            and labels[0] in _FILENAME_HOST_STEMS
+            and labels[1] in _FILENAME_HOST_SUFFIXES)
+
+
 def _normalized_domain(url_or_domain: str) -> str:
     value = (url_or_domain or "").strip().lower()
     if not value:
@@ -19,6 +34,7 @@ def _normalized_domain(url_or_domain: str) -> str:
     host = (parsed.netloc or parsed.path or "").strip().lower()
     if host.startswith("www."):
         host = host[4:]
+
     return host.split("/")[0]
 
 
@@ -78,6 +94,9 @@ def is_disallowed_official_url(url: Optional[str]) -> bool:
     host = (parsed.netloc or "").lower()
     if host.startswith("www."):
         host = host[4:]
+
+    if _host_looks_like_filename(host):
+        return True
 
     if "google." in host or host.endswith(".google"):
         return True
@@ -229,19 +248,24 @@ def x_domain_from_input_url(input_url: str) -> str:
 
     Used to hard-blacklist X's own site from Y's candidate URLs — the probe's
     worst failure mode was returning X's website as Y's. Returns "" when the
-    input is blank or unparseable (no scheme -> no netloc).
+    input is blank or unparseable.
     """
     value = str(input_url or "").strip()
-    if not value:
+    if not value or re.search(r"\s", value):
+        return ""
+    if "://" in value and not value.lower().startswith(("http://", "https://")):
         return ""
     try:
-        host = (urlparse(value).netloc or "").strip().lower()
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        host = (parsed.hostname or "").strip().lower()
     except ValueError:
         return ""
-    host = host.split("@")[-1].split(":")[0]
     if host.startswith("www."):
         host = host[4:]
-    return host if "." in host else ""
+    labels = host.split(".")
+    if len(labels) < 2 or not all(labels) or _host_looks_like_filename(host):
+        return ""
+    return host
 
 
 def url_matches_domain(url: str, domain: str) -> bool:

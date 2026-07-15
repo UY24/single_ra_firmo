@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from app.services.serpwow.outcomes import categorize_http_error
 from app.services.serpwow.url_utils import (
+    _candidate_domain_has_company_token,
     _candidate_domain_is_plausible_for_company,
     _host_looks_like_filename,
     canonicalize_official_url,
@@ -38,7 +39,10 @@ _BARE_FILE_SUFFIXES = frozenset({
     "cfg", "ini", "json", "md", "pdf", "sh", "toml", "txt", "yaml", "yml",
 })
 _CLAUSE_BOUNDARY_RE = re.compile(
-    r"[.;\n]+|\b(?:but|however|although|though|yet|whereas)\b", re.IGNORECASE)
+    r"[.;\n]+|,\s*(?:and|then)\b|"
+    r"\b(?:but|however|although|though|yet|whereas)\b",
+    re.IGNORECASE,
+)
 _OFFICIAL_SITE_RE = re.compile(
     r"\b(?:official\s+(?:web)?site|(?:web)?site\s+is)\b", re.IGNORECASE)
 _FINANCIAL_MARKER_RE = re.compile(
@@ -156,6 +160,7 @@ def extract_candidate_records(
         *,
         authoritative: bool = False,
         source_text: str = "",
+        strict_y_host: bool = False,
     ) -> None:
         if not isinstance(value, str):
             return
@@ -194,9 +199,13 @@ def extract_candidate_records(
                 or is_disallowed_official_url(canonical)
                 or url_matches_domain(canonical, x_domain)):
             return
-        if (not authoritative and y_name
-                and not _candidate_domain_is_plausible_for_company(
-                    canonical, y_name, country)
+        y_host_relevant = (
+            _candidate_domain_has_company_token(canonical, y_name)
+            if strict_y_host
+            else _candidate_domain_is_plausible_for_company(
+                canonical, y_name, country)
+        )
+        if (not authoritative and y_name and not y_host_relevant
                 and not _source_declares_candidate_official(
                     source_text, canonical)):
             return
@@ -243,7 +252,7 @@ def extract_candidate_records(
                 for key in ("title", "displayed_link", "snippet"))
             for key in ("link", "url"):
                 add(result.get(key), f"organic_results[{index}].{key}",
-                    source_text=source_text)
+                    source_text=source_text, strict_y_host=True)
 
     if isinstance(ai_overview, Mapping):
         contents = ai_overview.get("ai_overview_contents")
@@ -265,7 +274,7 @@ def extract_candidate_records(
     candidates = raw_result.get("candidates")
     if isinstance(candidates, list):
         for index, candidate in enumerate(candidates):
-            add(candidate, f"candidates[{index}]")
+            add(candidate, f"candidates[{index}]", strict_y_host=True)
 
     return records
 

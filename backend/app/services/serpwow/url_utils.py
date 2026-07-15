@@ -53,16 +53,31 @@ def _normalize_url_for_compare(url: str) -> str:
     return f"{scheme}://{host}{path}"
 
 
+def _meaningful_domain_company_tokens(company_name: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", (company_name or "").lower())
+        if len(token) >= 4
+        and token not in {
+            "company", "corporation", "limited", "ltd", "group", "trading",
+        }
+    ]
+
+
+def _candidate_domain_has_company_token(domain: str, company_name: str) -> bool:
+    host = _normalized_domain(domain)
+    if not host:
+        return False
+    return any(
+        token in host for token in _meaningful_domain_company_tokens(company_name))
+
+
 def _candidate_domain_is_plausible_for_company(domain: str, company_name: str, country: str) -> bool:
     host = _normalized_domain(domain)
     if not host:
         return False
 
-    company_tokens = [
-        token
-        for token in re.findall(r"[a-z0-9]+", (company_name or "").lower())
-        if len(token) >= 4 and token not in {"company", "corporation", "limited", "ltd", "group", "trading"}
-    ]
+    company_tokens = _meaningful_domain_company_tokens(company_name)
     if any(token in host for token in company_tokens):
         return True
 

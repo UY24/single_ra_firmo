@@ -108,6 +108,30 @@ class TestExtractCandidateRecords(unittest.TestCase):
             "ai_overview_sources" in record["source_field"] for record in records
         ))
 
+    def test_structured_us_links_require_y_name_relevance(self):
+        raw_result = {
+            "raw_response": {
+                "organic_results": [
+                    {"link": "https://randomnews.us/modal-funding"},
+                    {"link": "https://modal.com/about"},
+                ],
+            },
+            "candidates": [
+                "https://randomnews.us/modal-funding",
+                "https://modal.com/about",
+            ],
+        }
+
+        records = extract_candidate_records(
+            raw_result, "phase1", "eastlinkcap.com",
+            y_name="Modal", country="United States",
+        )
+
+        self.assertEqual(
+            [record["url"] for record in records],
+            ["https://modal.com/about"],
+        )
+
     def test_text_fields_extract_urls_and_bare_domains_but_not_email_domains(self):
         raw_result = {
             "raw_response": {
@@ -598,8 +622,11 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
     def test_negation_is_scoped_to_the_relationship_clause(self):
         positive_texts = [
             "Acme did not disclose terms, but Acme invested in Modal.",
+            "Acme did not disclose terms, and Acme invested in Modal.",
+            "Acme did not disclose terms, then Acme invested in Modal.",
             "Acme invested in Modal but cannot disclose the terms.",
             "Acme invested in Modal, although it won't discuss the terms.",
+            "Acme invested in Modal and backed Modal.",
         ]
         for text in positive_texts:
             with self.subTest(text=text):
@@ -1073,6 +1100,39 @@ class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
             "phase3_official_url_recovery",
         ])
         self.assertEqual(result.candidates, ["https://orbitlabs.ai"])
+
+    async def test_us_news_link_does_not_stop_modal_url_recovery(self):
+        inputs = RelationshipSearchInput(
+            x_name="Eastlink",
+            y_name="Modal",
+            input_url="https://eastlinkcap.com/portfolio",
+            x_domain="eastlinkcap.com",
+            city="",
+            country="United States",
+        )
+        responses = iter([
+            _search_result(
+                candidates=["https://randomnews.us/modal-funding"],
+                text="Eastlink invested in Modal.",
+                organic_results=[{
+                    "link": "https://randomnews.us/modal-funding",
+                    "snippet": "Eastlink invested in Modal.",
+                }],
+            ),
+            _search_result(candidates=["https://modal.com"]),
+        ])
+
+        async def search(query):
+            return next(responses)
+
+        result = await run_relationship_phases(
+            search, inputs, "adaptive", 3)
+
+        self.assertEqual(result.executed_phases, [
+            "phase1_relationship_and_url",
+            "phase3_official_url_recovery",
+        ])
+        self.assertEqual(result.candidates, ["https://modal.com"])
 
     async def test_missing_relation_runs_phase_two_then_phase_three(self):
         responses = iter([

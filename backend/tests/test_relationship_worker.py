@@ -115,6 +115,39 @@ class TestRelationshipExecutor(unittest.TestCase):
         flags = resp.context["relationship"]["flags"]
         self.assertTrue(any(flag["flag"] == "unknown_evidence_id" for flag in flags))
 
+    def test_grounding_downgrade_hides_unsupported_summary_and_model_flags(self):
+        search = AsyncMock(return_value=_serp(
+            ["https://modal.com/"], "Modal makes developer tools."))
+        model_output = {
+            "relationship_status": "confirmed",
+            "relationship_summary": "Eastlink invested in Modal.",
+            "official_website": "https://modal.com/",
+            "confidence_score": 90,
+            "supporting_evidence_ids": [],
+            "extra_flags": ["invented_transaction"],
+        }
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=(model_output, None, "m", {})), \
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com", city="", country="")
+
+        relationship = resp.context["relationship"]
+        self.assertEqual(relationship["status"], "unclear")
+        self.assertEqual(
+            relationship["summary"],
+            "Confirmation was rejected because no supplied relationship evidence was cited.",
+        )
+        self.assertFalse(any(
+            flag["flag"] == "invented_transaction" for flag in relationship["flags"]
+        ))
+        self.assertEqual(
+            resp.context["final_url_selection_ai"]["raw"]["relationship_summary"],
+            "Eastlink invested in Modal.",
+        )
+
     def test_one_request_uses_configured_serpwow_cost_in_all_totals(self):
         search = AsyncMock(return_value=_serp(
             ["https://modal.com/"], "eastlinkcap invests in Modal."))

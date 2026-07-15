@@ -721,10 +721,11 @@ def build_relationship_prompt(
     country: str,
     candidates: list[str],
     candidate_evidence: list[dict[str, str]],
-    evidence: list[dict[str, str]],
+    evidence: Optional[list[dict[str, str]]],
     search_attempts: list[dict[str, Any]],
     phase4_hit: bool,
     x_domain: str = "",
+    legacy_ai_overview_texts: Optional[list[str]] = None,
 ) -> str:
     """Prompt for the relationship pipeline (spec §4). Shared by the per-row
     call (choose_relationship_and_website) and the Gemini-batch item builder so
@@ -735,6 +736,9 @@ def build_relationship_prompt(
         "city": city or None, "country": country or None,
         "company_y_appears_on_company_x_site": bool(phase4_hit),
     }
+    (bounded_candidate_evidence, bounded_relationship_evidence,
+     _, _) = _relationship_evidence_trust_set(
+        candidate_evidence, evidence, legacy_ai_overview_texts)
     return (
         "You verify FINANCIAL relationships between companies and identify official websites.\n"
         "company_x is an investment firm; company_y_ocr is OCR text extracted from a logo on\n"
@@ -771,8 +775,8 @@ def build_relationship_prompt(
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"Candidate Evidence: {json.dumps(list(candidate_evidence or []), ensure_ascii=True)[:8000]}\n\n"
-        f"Supplied Relationship Evidence: {json.dumps(list(evidence or []), ensure_ascii=True)[:14000]}\n\n"
+        f"Candidate Evidence: {_serialize_relationship_evidence(bounded_candidate_evidence)}\n\n"
+        f"Supplied Relationship Evidence: {_serialize_relationship_evidence(bounded_relationship_evidence)}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
 
@@ -816,17 +820,94 @@ def choose_relationship_and_website(
 
 
 _VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}
+_CANDIDATE_EVIDENCE_CHAR_LIMIT = 8000
+_RELATIONSHIP_EVIDENCE_CHAR_LIMIT = 14000
+
+
+def _serialize_relationship_evidence(records: list[dict[str, str]]) -> str:
+    return json.dumps(records, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _bounded_relationship_evidence_records(
+    records: list[dict[str, str]],
+    char_limit: int,
+) -> list[dict[str, str]]:
+    """Keep a supplied-order prefix whose serialized JSON array stays complete."""
+    selected: list[dict[str, str]] = []
+    for record in records:
+        candidate = selected + [record]
+        if len(_serialize_relationship_evidence(candidate)) > char_limit:
+            break
+        selected.append(record)
+    return selected
+
+
+def _legacy_relationship_evidence_records(
+    ai_overview_texts: Optional[list[str]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "evidence_id": f"legacy.overview.{index}",
+            "source_field": f"ai_overview_texts[{index}]",
+            "text": text.strip(),
+        }
+        for index, text in enumerate(ai_overview_texts or [])
+        if isinstance(text, str) and text.strip()
+    ]
 
 
 def _relationship_evidence_gate_inputs(
     candidate_evidence: list[dict[str, str]],
-    evidence: list[dict[str, str]],
+    evidence: Optional[list[dict[str, str]]],
+    legacy_ai_overview_texts: Optional[list[str]] = None,
 ) -> tuple[set[str], set[str], list[dict[str, str]]]:
-    """Build the shared gate ID sets and supplied-order record list."""
-    candidate_records = [record for record in (candidate_evidence or [])
-                         if isinstance(record, dict)]
-    relationship_records = [record for record in (evidence or [])
-                            if isinstance(record, dict)]
+    """Build bounded prompt/gate records, rejecting every duplicate ID."""
+    (candidate_records, relationship_records,
+     allowed_ids, relationship_ids) = _relationship_evidence_trust_set(
+        candidate_evidence, evidence, legacy_ai_overview_texts)
+    return allowed_ids, relationship_ids, candidate_records + relationship_records
+
+
+def _relationship_evidence_trust_set(
+    candidate_evidence: list[dict[str, str]],
+    evidence: Optional[list[dict[str, str]]],
+    legacy_ai_overview_texts: Optional[list[str]] = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], set[str], set[str]]:
+    """Return the identical bounded records and ID sets used by prompt and gate."""
+    candidate_records = [
+        {**record, "evidence_id": str(record["evidence_id"]).strip()}
+        for record in (candidate_evidence or [])
+        if isinstance(record, dict)
+        and isinstance(record.get("evidence_id"), str)
+        and str(record.get("evidence_id") or "").strip()
+    ]
+    relationship_source = (
+        _legacy_relationship_evidence_records(legacy_ai_overview_texts)
+        if evidence is None else evidence
+    )
+    relationship_records = [
+        {**record, "evidence_id": str(record["evidence_id"]).strip()}
+        for record in (relationship_source or [])
+        if isinstance(record, dict)
+        and isinstance(record.get("evidence_id"), str)
+        and str(record.get("evidence_id") or "").strip()
+    ]
+    id_counts: dict[str, int] = {}
+    for record in candidate_records + relationship_records:
+        evidence_id = str(record["evidence_id"]).strip()
+        id_counts[evidence_id] = id_counts.get(evidence_id, 0) + 1
+    candidate_records = [
+        record for record in candidate_records
+        if id_counts[str(record["evidence_id"]).strip()] == 1
+    ]
+    relationship_records = [
+        record for record in relationship_records
+        if id_counts[str(record["evidence_id"]).strip()] == 1
+    ]
+    candidate_records = _bounded_relationship_evidence_records(
+        candidate_records, _CANDIDATE_EVIDENCE_CHAR_LIMIT)
+    relationship_records = _bounded_relationship_evidence_records(
+        relationship_records, _RELATIONSHIP_EVIDENCE_CHAR_LIMIT)
     relationship_ids = {
         str(record.get("evidence_id") or "").strip()
         for record in relationship_records
@@ -837,7 +918,7 @@ def _relationship_evidence_gate_inputs(
         for record in candidate_records
         if str(record.get("evidence_id") or "").strip()
     }
-    return allowed_ids, relationship_ids, candidate_records + relationship_records
+    return candidate_records, relationship_records, allowed_ids, relationship_ids
 
 
 def _accepted_relationship_evidence_records(
@@ -856,12 +937,34 @@ def _accepted_relationship_evidence_records(
     return records
 
 
+_REJECTED_CONFIRMATION_SUMMARY = (
+    "Confirmation was rejected because no supplied relationship evidence was cited."
+)
+
+
+def _relationship_narrative_and_flags(
+    parsed: dict[str, Any],
+    gate_flags: list[dict[str, str]],
+) -> tuple[str, list[dict[str, str]]]:
+    grounding_downgraded = any(
+        flag.get("flag") == "confirmed_without_evidence_id" for flag in gate_flags)
+    if grounding_downgraded:
+        return _REJECTED_CONFIRMATION_SUMMARY, []
+    extra_flags = [
+        {"flag": extra.strip(), "why": "reported by LLM"}
+        for extra in (parsed.get("extra_flags") or [])
+        if isinstance(extra, str) and extra.strip()
+    ]
+    return str(parsed.get("relationship_summary") or ""), extra_flags
+
+
 def apply_relationship_gate(
     parsed: dict[str, Any],
     candidates: list[str],
     x_domain: str,
     allowed_evidence_ids: Any = None,
     relationship_evidence_ids: Any = None,
+    allow_legacy_confirmed_without_evidence_ids: bool = False,
 ) -> tuple[Optional[str], str, list[dict[str, str]], list[str]]:
     """Code-enforced validation of a relationship LLM output (spec §4 rules 1-4).
 
@@ -873,7 +976,8 @@ def apply_relationship_gate(
     """
     parsed = parsed if isinstance(parsed, dict) else {}
     status = str(parsed.get("relationship_status") or "").strip().lower()
-    if status not in _VALID_REL_STATUSES:
+    invalid_status = status not in _VALID_REL_STATUSES
+    if invalid_status:
         status = "unclear"
     flags: list[dict[str, str]] = []
     parsed["relationship_status"] = status
@@ -884,6 +988,8 @@ def apply_relationship_gate(
     except (TypeError, ValueError, OverflowError):
         confidence_score = 0
     parsed["confidence_score"] = max(0, min(100, confidence_score))
+    if invalid_status:
+        parsed["confidence_score"] = 0
 
     allowed_ids = {
         str(value).strip() for value in (allowed_evidence_ids or [])
@@ -941,7 +1047,9 @@ def apply_relationship_gate(
         url = None
         parsed["confidence_score"] = 0
 
-    if status == "confirmed" and not relationship_ids.intersection(accepted_ids):
+    if (status == "confirmed"
+            and not relationship_ids.intersection(accepted_ids)
+            and not allow_legacy_confirmed_without_evidence_ids):
         status = "unclear"
         parsed["relationship_status"] = status
         parsed["confidence_score"] = 0

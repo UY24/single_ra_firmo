@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from app.services.serpwow.gemini_llm import (
+    _relationship_evidence_gate_inputs,
     apply_relationship_gate,
     build_relationship_prompt,
     choose_relationship_and_website,
@@ -18,6 +19,12 @@ RELATIONSHIP_EVIDENCE = [{
     "evidence_id": "relationship-1", "text": "Eastlink invested in Modal.",
     "phase": "phase1", "source_field": "ai_overview",
 }]
+
+
+def _prompt_section(prompt, label):
+    start = prompt.index(f"{label}: ") + len(label) + 2
+    end = prompt.index("\n\n", start)
+    return json.loads(prompt[start:end])
 
 
 class TestApplyRelationshipGate(unittest.TestCase):
@@ -86,11 +93,13 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertTrue(any(f["flag"] == "disallowed_url_dropped" for f in flags))
 
     def test_unknown_status_treated_as_unclear(self):
-        parsed = {"relationship_status": "banana", "official_website": None}
+        parsed = {"relationship_status": "banana", "official_website": None,
+                  "confidence_score": 88}
         url, status, flags, accepted_ids = apply_relationship_gate(parsed, CANDS, "")
         self.assertIsNone(url)
         self.assertEqual(status, "unclear")
         self.assertEqual(parsed["relationship_status"], "unclear")
+        self.assertEqual(parsed["confidence_score"], 0)
 
     def test_confirmed_with_candidate_only_evidence_is_downgraded(self):
         parsed = {"relationship_status": "confirmed",
@@ -149,6 +158,29 @@ class TestApplyRelationshipGate(unittest.TestCase):
             parsed, CANDS, "", {"relationship-1"}, {"relationship-1"})
         self.assertEqual((url, status, accepted_ids), (None, "not_confirmed", []))
         self.assertFalse(any(f["flag"] == "confirmed_without_evidence_id" for f in flags))
+
+    def test_confirmed_without_url_keeps_relationship_confidence(self):
+        parsed = {"relationship_status": "confirmed",
+                  "official_website": None, "confidence_score": 86,
+                  "supporting_evidence_ids": ["relationship-1"]}
+        url, status, flags, accepted_ids = apply_relationship_gate(
+            parsed, CANDS, "", {"relationship-1"}, {"relationship-1"})
+        self.assertEqual((url, status), (None, "confirmed"))
+        self.assertEqual(parsed["confidence_score"], 86)
+
+    def test_candidate_relationship_id_collision_is_rejected_from_trust_set(self):
+        candidate = [{"evidence_id": "collision", "url": "https://modal.com"}]
+        relationship = [{"evidence_id": "collision", "text": "X invested in Y."}]
+        allowed, relationship_ids, supplied = _relationship_evidence_gate_inputs(
+            candidate, relationship)
+        parsed = {"relationship_status": "confirmed",
+                  "official_website": "https://modal.com", "confidence_score": 90,
+                  "supporting_evidence_ids": ["collision"]}
+        url, status, flags, accepted_ids = apply_relationship_gate(
+            parsed, ["https://modal.com"], "", allowed, relationship_ids)
+        self.assertEqual((allowed, relationship_ids, supplied), (set(), set(), []))
+        self.assertEqual((url, status, accepted_ids), (None, "unclear", []))
+        self.assertTrue(any(flag["flag"] == "unknown_evidence_id" for flag in flags))
 
 
 class TestChooseRelationshipAndWebsite(unittest.TestCase):
@@ -216,6 +248,42 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
         self.assertIn("company_x_domain", prompt)
         self.assertIn('"company_x_domain": null', prompt)
         self.assertIn("m25vc", prompt)
+
+    def test_prompt_sections_are_complete_bounded_json_and_gate_uses_same_subset(self):
+        candidate_records = [
+            {"evidence_id": f"candidate-{index}", "url": f"https://{index}.example",
+             "original_text": "c" * 1800}
+            for index in range(10)
+        ]
+        relationship_records = [
+            {"evidence_id": f"relationship-{index}", "text": "r" * 2500}
+            for index in range(10)
+        ]
+        prompt = build_relationship_prompt(
+            "X", "Y", "", "", CANDS, candidate_records,
+            relationship_records, [], False, "")
+        prompt_candidates = _prompt_section(prompt, "Candidate Evidence")
+        prompt_relationship = _prompt_section(prompt, "Supplied Relationship Evidence")
+        allowed, relationship_ids, supplied = _relationship_evidence_gate_inputs(
+            candidate_records, relationship_records)
+
+        self.assertLessEqual(len(json.dumps(
+            prompt_candidates, ensure_ascii=True, sort_keys=True,
+            separators=(",", ":"))), 8000)
+        self.assertLessEqual(len(json.dumps(
+            prompt_relationship, ensure_ascii=True, sort_keys=True,
+            separators=(",", ":"))), 14000)
+        self.assertEqual(
+            allowed,
+            {record["evidence_id"] for record in prompt_candidates + prompt_relationship},
+        )
+        self.assertEqual(
+            relationship_ids,
+            {record["evidence_id"] for record in prompt_relationship},
+        )
+        self.assertNotIn("candidate-9", allowed)
+        self.assertNotIn("relationship-9", relationship_ids)
+        self.assertEqual(supplied, prompt_candidates + prompt_relationship)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ from app.services.serpwow.cost import (
 )
 from app.services.serpwow.gemini_llm import (
     _accepted_relationship_evidence_records,
+    _relationship_narrative_and_flags,
     _relationship_evidence_gate_inputs,
     apply_relationship_gate,
     choose_relationship_and_website,
@@ -159,18 +160,18 @@ async def execute_relationship_lookup_for_worker(
         )
         gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
             parsed, candidates, x_domain, allowed_ids, relationship_ids)
+        relationship_summary, model_flags = _relationship_narrative_and_flags(
+            parsed, gate_flags)
         gemini_cost = calculate_gemini_cost_usd(usage)
         official_website = gated_url
         relationship.update(
             status=status,
-            summary=str(parsed.get("relationship_summary") or ""),
+            summary=relationship_summary,
         )
         relationship["evidence"] = _accepted_relationship_evidence_records(
             supplied_evidence, accepted_ids)
         relationship["flags"].extend(gate_flags)
-        for extra in parsed.get("extra_flags") or []:
-            if isinstance(extra, str) and extra.strip():
-                relationship["flags"].append({"flag": extra.strip(), "why": "reported by LLM"})
+        relationship["flags"].extend(model_flags)
         final_url_selection_ai = {
             "provider": "google-gemini", "model": model, "used": True,
             "error": None, "usage": usage or {}, "raw": parsed,

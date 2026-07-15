@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +62,21 @@ class TestRelationshipBatchPrompt(unittest.TestCase):
                                       "candidates": ["https://acme.com/"]}}}
         prompt = engine._build_batch_prompt_for_row(row)
         self.assertIn("company website resolver", prompt)
+
+    def test_legacy_context_synthesizes_structured_prompt_evidence(self):
+        row = _rel_row()
+        context = row["result"]["context"]
+        context.pop("candidate_evidence")
+        context.pop("evidence")
+        prompt = engine._build_batch_prompt_for_row(row)
+        marker = "Supplied Relationship Evidence: "
+        start = prompt.index(marker) + len(marker)
+        records = json.loads(prompt[start:prompt.index("\n\n", start)])
+        self.assertEqual(records, [{
+            "evidence_id": "legacy.overview.0",
+            "source_field": "ai_overview_texts[0]",
+            "text": "Eastlink invests in Modal.",
+        }])
 
 
 class TestRelationshipBatchItems(unittest.TestCase):
@@ -134,12 +150,16 @@ class TestRelationshipBatchApply(unittest.TestCase):
         engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
         ctx = row["result"]["context"]
         self.assertEqual(ctx["relationship"]["status"], "unclear")
+        self.assertEqual(
+            ctx["relationship"]["summary"],
+            "Confirmation was rejected because no supplied relationship evidence was cited.",
+        )
         self.assertIsNone(row["result"]["official_website"])
         self.assertEqual(parsed["confidence_score"], 0)
         self.assertEqual(ctx["relationship"]["evidence"], [ctx["candidate_evidence"][0]])
         self.assertEqual(
             [flag["flag"] for flag in ctx["relationship"]["flags"]],
-            ["confirmed_without_evidence_id", "relationship_unclear", "model-note"],
+            ["confirmed_without_evidence_id", "relationship_unclear"],
         )
 
     def test_batch_stores_accepted_records_in_supplied_order(self):
@@ -161,6 +181,80 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertTrue(any(
             flag["flag"] == "unknown_evidence_id"
             for flag in ctx["relationship"]["flags"]
+        ))
+
+    def test_tail_evidence_not_in_bounded_prompt_is_rejected_by_batch_gate(self):
+        row = _rel_row()
+        context = row["result"]["context"]
+        context["evidence"] = [
+            {"evidence_id": f"relationship-{index}", "text": "r" * 2500}
+            for index in range(10)
+        ]
+        parsed = {"relationship_status": "confirmed",
+                  "relationship_summary": "Unsupported tail claim.",
+                  "official_website": "https://modal.com/",
+                  "confidence_score": 90,
+                  "supporting_evidence_ids": ["relationship-9"],
+                  "extra_flags": []}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        relationship = row["result"]["context"]["relationship"]
+        self.assertEqual(relationship["status"], "unclear")
+        self.assertEqual(relationship["evidence"], [])
+        self.assertTrue(any(
+            flag["flag"] == "unknown_evidence_id"
+            for flag in relationship["flags"]
+        ))
+
+    def test_legacy_batch_response_without_ids_keeps_old_confirmed_gate(self):
+        row = _rel_row()
+        context = row["result"]["context"]
+        context.pop("candidate_evidence")
+        context.pop("evidence")
+        parsed = {"relationship_status": "confirmed",
+                  "relationship_summary": "Eastlink invested in Modal.",
+                  "official_website": "https://modal.com/",
+                  "confidence_score": 90, "extra_flags": []}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        relationship = row["result"]["context"]["relationship"]
+        self.assertEqual(relationship["status"], "confirmed")
+        self.assertEqual(row["result"]["official_website"], "https://modal.com")
+        self.assertEqual(
+            relationship["evidence"][0]["evidence_id"], "legacy.overview.0")
+        self.assertTrue(any(
+            flag["flag"] == "legacy_response_without_evidence_ids"
+            for flag in relationship["flags"]
+        ))
+
+    def test_legacy_batch_response_still_rejects_invented_url(self):
+        row = _rel_row()
+        context = row["result"]["context"]
+        context.pop("candidate_evidence")
+        context.pop("evidence")
+        parsed = {"relationship_status": "confirmed",
+                  "official_website": "https://invented.example/",
+                  "confidence_score": 90}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        self.assertIsNone(row["result"]["official_website"])
+        self.assertEqual(parsed["confidence_score"], 0)
+        self.assertTrue(any(
+            flag["flag"] == "llm_url_out_of_candidates"
+            for flag in row["result"]["context"]["relationship"]["flags"]
+        ))
+
+    def test_legacy_batch_response_still_rejects_x_domain_url(self):
+        row = _rel_row(candidates=("https://eastlinkcap.com/team",))
+        context = row["result"]["context"]
+        context.pop("candidate_evidence")
+        context.pop("evidence")
+        parsed = {"relationship_status": "confirmed",
+                  "official_website": "https://eastlinkcap.com/team",
+                  "confidence_score": 90}
+        engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
+        self.assertIsNone(row["result"]["official_website"])
+        self.assertEqual(parsed["confidence_score"], 0)
+        self.assertTrue(any(
+            flag["flag"] == "x_domain_candidate_dropped"
+            for flag in row["result"]["context"]["relationship"]["flags"]
         ))
 
 

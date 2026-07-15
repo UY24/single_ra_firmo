@@ -1259,6 +1259,11 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
                   if isinstance((row.get("result") or {}).get("context"), dict) else {})
     if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
         from app.services.serpwow.gemini_llm import build_relationship_prompt
+        structured_evidence = (
+            [record for record in (_ctx_probe.get("evidence") or [])
+             if isinstance(record, dict)]
+            if "evidence" in _ctx_probe else None
+        )
         return build_relationship_prompt(
             x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
             y_name=str(row.get("company_name") or ""),
@@ -1267,11 +1272,13 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
             candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
             candidate_evidence=[record for record in (_ctx_probe.get("candidate_evidence") or [])
                                 if isinstance(record, dict)],
-            evidence=[record for record in (_ctx_probe.get("evidence") or [])
-                      if isinstance(record, dict)],
+            evidence=structured_evidence,
             search_attempts=list(_ctx_probe.get("search_attempts") or []),
             phase4_hit=bool(_ctx_probe.get("phase4_hit")),
             x_domain=str(_ctx_probe.get("x_domain") or ""),
+            legacy_ai_overview_texts=[
+                text for text in (_ctx_probe.get("ai_overview_texts") or [])
+                if isinstance(text, str)],
         )
     input_obj = {
         "company_name": row.get("company_name"),
@@ -1787,6 +1794,7 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     from app.services.serpwow.gemini_llm import (
         _accepted_relationship_evidence_records,
         _relationship_evidence_gate_inputs,
+        _relationship_narrative_and_flags,
         apply_relationship_gate,
     )
 
@@ -1800,26 +1808,44 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     x_domain = str(context.get("x_domain") or "")
     candidate_evidence = [record for record in (context.get("candidate_evidence") or [])
                           if isinstance(record, dict)]
-    evidence = [record for record in (context.get("evidence") or [])
-                if isinstance(record, dict)]
+    evidence = (
+        [record for record in (context.get("evidence") or [])
+         if isinstance(record, dict)]
+        if "evidence" in context else None
+    )
+    legacy_response = (
+        "candidate_evidence" not in context
+        and "evidence" not in context
+        and "supporting_evidence_ids" not in parsed
+    )
     allowed_ids, relationship_ids, supplied_evidence = (
-        _relationship_evidence_gate_inputs(candidate_evidence, evidence)
+        _relationship_evidence_gate_inputs(
+            candidate_evidence, evidence,
+            [text for text in (context.get("ai_overview_texts") or [])
+             if isinstance(text, str)])
     )
     gated_url, status, gate_flags, accepted_ids = apply_relationship_gate(
         parsed if isinstance(parsed, dict) else {}, candidates, x_domain,
-        allowed_ids, relationship_ids)
+        allowed_ids, relationship_ids, legacy_response)
+    if legacy_response:
+        gate_flags.append({
+            "flag": "legacy_response_without_evidence_ids",
+            "why": "legacy batch response predates structured supporting evidence IDs",
+        })
+    relationship_summary, model_flags = _relationship_narrative_and_flags(
+        parsed, gate_flags)
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
         "status": "pending", "summary": "", "verified_pair": "", "flags": []}
     relationship["status"] = status
-    relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
-    relationship["evidence"] = _accepted_relationship_evidence_records(
-        supplied_evidence, accepted_ids)
+    relationship["summary"] = relationship_summary
+    relationship["evidence"] = (
+        supplied_evidence if legacy_response
+        else _accepted_relationship_evidence_records(supplied_evidence, accepted_ids)
+    )
     rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
     rel_flags.extend(gate_flags)
-    for extra in (parsed or {}).get("extra_flags") or []:
-        if isinstance(extra, str) and extra.strip():
-            rel_flags.append({"flag": extra.strip(), "why": "reported by LLM"})
+    rel_flags.extend(model_flags)
     relationship["flags"] = rel_flags
     context["relationship"] = relationship
 

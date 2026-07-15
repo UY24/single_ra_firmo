@@ -21,8 +21,11 @@ from app.models.results import AttemptLogEntry, EntityResult, Flag
 CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
                "confidence", "flags", "attempt_log"]
 
-REL_OUTPUT_COLUMNS = ["website_url", "relationship_status", "relationship_summary",
-                      "confidence", "flags", "attempt_log", "verified_pair"]
+REL_OUTPUT_COLUMNS = ["website_url", "resolved_company_y_name",
+                      "relationship_status", "relationship_summary",
+                      "relationship_evidence", "relationship_confidence",
+                      "website_confidence", "confidence", "phases_used",
+                      "flags", "attempt_log", "verified_pair"]
 
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
@@ -78,7 +81,8 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     for fr in ctx.get("formatted_results") or []:
         if not isinstance(fr, dict):
             continue
-        outcome = "ok" if fr.get("success") else (fr.get("error") or "no result")
+        outcome = (fr.get("result") or
+                   ("ok" if fr.get("success") else (fr.get("error") or "no result")))
         attempts.append(AttemptLogEntry(
             query=f"[{fr.get('phase')}] {fr.get('query')}",
             result=str(outcome), url=fr.get("search_url")))
@@ -340,13 +344,28 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
     paths: dict[str, Path] = {}
 
     def _out_row(er: EntityResult, original: dict[str, Any], pair_row: dict[str, Any]) -> dict[str, Any]:
-        rel = _relationship_block((pair_row or {}).get("result") or {})
+        result = (pair_row or {}).get("result") or {}
+        rel = _relationship_block(result)
+        raw = _confidence_raw(result)
+        evidence = rel.get("evidence") or raw.get("relationship_evidence") or []
+        context = result.get("context") if isinstance(result.get("context"), dict) else {}
         row = {h: str(original.get(h, "") or "") for h in header}
         row.update({
             "website_url": er.website_url or "",
+            "resolved_company_y_name": str(
+                rel.get("resolved_company_y_name")
+                or raw.get("resolved_company_y_name") or ""),
             "relationship_status": str(rel.get("status") or ""),
             "relationship_summary": str(rel.get("summary") or ""),
+            "relationship_evidence": "\n".join(str(item) for item in evidence if str(item).strip()),
+            "relationship_confidence": int(
+                rel.get("relationship_confidence_score")
+                or raw.get("relationship_confidence_score") or 0),
+            "website_confidence": int(
+                rel.get("website_confidence_score")
+                or raw.get("website_confidence_score") or 0),
             "confidence": er.confidence,
+            "phases_used": len(context.get("formatted_results") or []),
             "flags": er.flags_csv(),
             "attempt_log": er.attempt_log_csv(),
             "verified_pair": str(rel.get("verified_pair") or ""),
@@ -388,6 +407,14 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         d = er.to_report_dict()
         d["relationship_status"] = str(rel.get("status") or "")
         d["relationship_summary"] = str(rel.get("summary") or "")
+        d["resolved_company_y_name"] = str(rel.get("resolved_company_y_name") or "")
+        d["relationship_evidence"] = list(rel.get("evidence") or [])
+        d["relationship_confidence"] = int(
+            rel.get("relationship_confidence_score") or 0)
+        d["website_confidence"] = int(rel.get("website_confidence_score") or 0)
+        result = (pair_row or {}).get("result") or {}
+        ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
+        d["phases_used"] = len(ctx.get("formatted_results") or [])
         d["verified_pair"] = str(rel.get("verified_pair") or "")
         report_rows.append(d)
     report_path = upload_dir / "report.json"

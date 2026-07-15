@@ -1262,12 +1262,12 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
         return build_relationship_prompt(
             x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
             y_name=str(row.get("company_name") or ""),
+            input_url=str(row.get("input_url") or ""),
             city=str(row.get("city") or ""),
             country=str(row.get("country") or ""),
             candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
+            ai_overview_evidence=list(_ctx_probe.get("ai_overview_evidence") or []),
             search_attempts=list(_ctx_probe.get("search_attempts") or []),
-            phase4_hit=bool(_ctx_probe.get("phase4_hit")),
             x_domain=str(_ctx_probe.get("x_domain") or ""),
         )
     input_obj = {
@@ -1781,7 +1781,10 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     relationship_status GATES the URL (spec §4). Always returns 'completed' now:
     a not-confirmed / confirmed-but-invalid gate is a business not_found
     (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import apply_relationship_gate
+    from app.services.serpwow.gemini_llm import (
+        apply_relationship_gate,
+        update_relationship_block,
+    )
 
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
@@ -1796,15 +1799,8 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
         "status": "pending", "summary": "", "verified_pair": "", "flags": []}
-    relationship["status"] = status
-    relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
-    rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
-    rel_flags.extend(gate_flags)
-    for extra in (parsed or {}).get("extra_flags") or []:
-        if isinstance(extra, str) and extra.strip():
-            rel_flags.append({"flag": extra.strip(), "why": "reported by LLM"})
-    relationship["flags"] = rel_flags
-    context["relationship"] = relationship
+    context["relationship"] = update_relationship_block(
+        relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
 
     result["official_website"] = gated_url
     result["gemini_cost_usd"] = updated_gemini
@@ -4271,18 +4267,14 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     pairs = parsed["pairs"]
     total = len(parsed["original_rows"])
     blank = len(parsed["blank_row_indices"])
-    duplicates = (total - blank) - len(pairs)
+    duplicates = total - len(pairs)
     warnings: list[str] = []
-    if blank:
-        warnings.append(
-            f"{blank} row(s) have a blank Company_Name_Y — skipped for free (they land in skipped.csv)."
-        )
     if duplicates > 0:
         warnings.append(
             f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
         )
     if not pairs:
-        warnings.append("No searchable rows — every Company_Name_Y is blank; the upload would be rejected.")
+        warnings.append("No searchable rows — the CSV contains no data rows.")
 
     return {
         "total_rows": total,

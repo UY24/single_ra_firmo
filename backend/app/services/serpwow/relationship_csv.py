@@ -1,10 +1,9 @@
 """CSV parsing for the relationship pipeline (spec §2).
 
-Input: OCR-results CSV with a required Company_Name_Y column, an expected
-Company_Name_X column, optional city/country, and arbitrary passthrough
-columns. Blank-Y rows are skipped (never searched). Searchable rows are
-deduped into unique (X, Y) pairs; each pair remembers which original row
-indices it fans back out to at reporting time.
+Input: OCR-results CSV with required Input_URL, Company_Name_X, and
+Company_Name_Y values on every row, optional city/country, and arbitrary
+passthrough columns. Rows are deduped into unique (X, Y) pairs; each pair
+remembers which original row indices it fans back out to at reporting time.
 """
 from __future__ import annotations
 
@@ -56,14 +55,16 @@ def parse_relationship_csv(raw: bytes) -> dict:
         )
     x_col = _find_column(normalized, _X_ALIASES)
     if x_col is None:
-        # The relationship verdict is judged against X — without the column the
-        # whole file would short-circuit to not_confirmed, which is never what
-        # the user meant. Individual blank X cells are still tolerated per-row.
         raise InvalidRelationshipCSV(
             "Missing required column Company_Name_X "
             f"(accepted aliases: {', '.join(_X_ALIASES)}). Found: {header}"
         )
     url_col = _find_column(normalized, _URL_ALIASES)
+    if url_col is None:
+        raise InvalidRelationshipCSV(
+            "Missing required column Input_URL. "
+            f"Found: {header}"
+        )
     city_col = _find_column(normalized, _CITY_ALIASES)
     country_col = _find_column(normalized, _COUNTRY_ALIASES)
 
@@ -76,10 +77,17 @@ def parse_relationship_csv(raw: bytes) -> dict:
         clean = {h: (row.get(h) or "").strip() for h in header}
         original_rows.append(clean)
         y_name = clean.get(y_col, "")
-        if not y_name:
-            blank_row_indices.append(idx)
-            continue
-        x_name = clean.get(x_col, "") if x_col else ""
+        x_name = clean.get(x_col, "")
+        input_url = clean.get(url_col, "")
+        missing = [name for name, value in (
+            ("Input_URL", input_url),
+            ("Company_Name_X", x_name),
+            ("Company_Name_Y", y_name),
+        ) if not value]
+        if missing:
+            raise InvalidRelationshipCSV(
+                f"CSV row {idx + 2} missing required value(s): {', '.join(missing)}"
+            )
         key = _pair_key(x_name, y_name)
         pair = pair_by_key.get(key)
         if pair is None:
@@ -87,7 +95,7 @@ def parse_relationship_csv(raw: bytes) -> dict:
                 "pair_index": len(pairs) + 1,
                 "x_name": x_name,
                 "y_name": y_name,
-                "input_url": clean.get(url_col, "") if url_col else "",
+                "input_url": input_url,
                 "city": clean.get(city_col, "") if city_col else "",
                 "country": clean.get(country_col, "") if country_col else "",
                 "source_row_indices": [],

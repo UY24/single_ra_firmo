@@ -26,10 +26,9 @@ const _FIRMO_COLS = [
   { name: "full_address",     req: false, hint: "address, fulladdress, input_full_address" },
 ];
 const _REL_COLS = [
-  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR text ok; blank rows -> skipped.csv)" },
+  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR-derived text is accepted)" },
   { name: "Company_Name_X", req: true,  hint: "the investor firm — the relationship is verified against it" },
-  { name: "Input_URL",      req: false, hint: "Company X's page URL; its domain powers the site:<X-domain> phase + blocks X's own site from results" },
-  { name: "city / country", req: false, hint: "added to the plain \"Y official website\" phase" },
+  { name: "Input_URL",      req: true,  hint: "Company X's full official page URL; also prevents returning X's own site" },
 ];
 
 const PIPELINES = [
@@ -141,13 +140,11 @@ function previewTables(preview) {
       el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.total_rows)),
       " rows detected."),
   ];
-  // Relationship preview: surface the search plan (pairs/blanks) up front.
+  // Relationship preview: surface the search plan up front.
   if (preview.unique_pairs != null) {
     parts.push(el("p", { class: "section-copy" },
       el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.unique_pairs)),
-      " unique (X, Y) pairs will be searched · ",
-      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.blank_rows)),
-      " blank rows skipped."));
+      " unique (X, Y) pairs will be searched across 3 phases each."));
   }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));

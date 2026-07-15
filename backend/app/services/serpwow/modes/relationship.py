@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any, Optional
 
 import httpx
@@ -18,7 +19,6 @@ import httpx
 from app.services.common.env import (
     get_bool_env as _get_bool_env,
     get_float_env as _get_float_env,
-    get_int_env as _get_int_env,
 )
 from app.services.serpwow.constants import (
     PIPELINE_RELATIONSHIP,
@@ -31,6 +31,7 @@ from app.services.serpwow.cost import calculate_gemini_cost_usd
 from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     choose_relationship_and_website,
+    update_relationship_block,
 )
 from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
 from app.services.serpwow.query_builders import build_relationship_phase_queries
@@ -53,10 +54,50 @@ def _overview_text(raw_response: Any) -> str:
     contents = overview.get("ai_overview_contents")
     if not isinstance(contents, list):
         return ""
-    return " ".join(
-        (item.get("text") or "").strip()
-        for item in contents if isinstance(item, dict)
-    ).strip()
+    lines: list[str] = []
+
+    def _append(item: Any, prefix: str = "") -> None:
+        if not isinstance(item, dict):
+            return
+        text = item.get("text") or item.get("snippet")
+        if isinstance(text, str) and text.strip():
+            clean = " ".join(text.split())
+            lines.append(f"{prefix} {clean}" if prefix else clean)
+        nested = item.get("list")
+        if isinstance(nested, list):
+            for index, child in enumerate(nested, start=1):
+                _append(child, f"{prefix}{index}.")
+
+    for item in contents:
+        _append(item)
+    return "\n".join(lines)
+
+
+def _overview_sources(raw_response: Any) -> list[dict[str, str]]:
+    overview = raw_response.get("ai_overview") if isinstance(raw_response, dict) else None
+    sources = overview.get("ai_overview_sources") if isinstance(overview, dict) else None
+    out: list[dict[str, str]] = []
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        url = str(source.get("source_url") or "").strip()
+        if not url:
+            continue
+        name = str(source.get("source_name") or source.get("source_title")
+                   or source.get("source_domain") or url).strip()
+        out.append({"name": name, "url": url})
+    return out
+
+
+def _extract_https_urls(text: str) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in re.findall(r'https://[^\s<>"\']+', text or ""):
+        url = match.rstrip(".,;:!?)]}")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 async def execute_relationship_lookup_for_worker(
@@ -69,10 +110,8 @@ async def execute_relationship_lookup_for_worker(
     debug_row_index: Optional[int] = None,
 ) -> tuple[CrawlResponse, str]:
     x_domain = x_domain_from_input_url(input_url)
-    max_phases = max(1, _get_int_env("RELATIONSHIP_MAX_PHASES", 4))
     queries = build_relationship_phase_queries(
-        x_name=x_name, y_name=y_name, city=city, country=country,
-        x_domain=x_domain, max_phases=max_phases)
+        x_name=x_name, y_name=y_name, input_url=input_url)
 
     timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
@@ -84,11 +123,9 @@ async def execute_relationship_lookup_for_worker(
 
     candidates: list[str] = []
     seen: set[str] = set()
-    ai_overview_texts: list[str] = []
-    seen_overview_texts: set[str] = set()
+    ai_overview_evidence: list[dict[str, Any]] = []
     search_attempts: list[dict[str, Any]] = []
     formatted_results: list[dict[str, Any]] = []
-    phase4_hit = False
     serpwow_cost = 0.0
 
     for (label, query), raw_result in zip(queries, results):
@@ -103,24 +140,39 @@ async def execute_relationship_lookup_for_worker(
             }
         serpwow_cost += 0.02
         raw_response = raw_result.get("raw_response")
+        phase_candidates: list[str] = []
 
-        if label == "phase4_portfolio_anchor":
-            # Phase 4 confirms Y appears on X's own site — relationship EVIDENCE,
-            # never URL candidates (they're X's pages by construction).
-            organic = (raw_response or {}).get("organic_results") if isinstance(raw_response, dict) else None
-            phase4_hit = bool(organic)
-        else:
-            for cand in raw_result.get("candidates") or []:
-                if (cand and cand not in seen
-                        and not is_disallowed_official_url(cand)
-                        and not url_matches_domain(cand, x_domain)):
+        for cand in raw_result.get("candidates") or []:
+            if (cand and not is_disallowed_official_url(cand)
+                    and not url_matches_domain(cand, x_domain)):
+                if cand not in phase_candidates:
+                    phase_candidates.append(cand)
+                if cand not in seen:
                     seen.add(cand)
                     candidates.append(cand)
 
         text = _overview_text(raw_response)
-        if text and text not in seen_overview_texts:
-            seen_overview_texts.add(text)
-            ai_overview_texts.append(text)
+        if text:
+            ai_overview_evidence.append({
+                "phase": label,
+                "query": query,
+                "text": text,
+                "sources": _overview_sources(raw_response),
+            })
+            for cand in _extract_https_urls(text):
+                if (not is_disallowed_official_url(cand)
+                        and not url_matches_domain(cand, x_domain)):
+                    if cand not in phase_candidates:
+                        phase_candidates.append(cand)
+                    if cand not in seen:
+                        seen.add(cand)
+                        candidates.append(cand)
+
+        result_summary = (
+            str(raw_result.get("error")) if raw_result.get("error")
+            else f"{'AI overview returned' if text else 'No AI overview'}; "
+                 f"{len(phase_candidates)} candidate(s)"
+        )
 
         formatted_results.append({
             "phase": label, "query": query,
@@ -129,18 +181,25 @@ async def execute_relationship_lookup_for_worker(
             "error_category": raw_result.get("error_category"),
             "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
+            "result": result_summary,
+            "ai_overview_present": bool(text),
+            "candidate_count": len(phase_candidates),
             "raw_response": raw_response,
         })
         search_attempts.append({
             "attempt": label, "query": query,
             "search_url": raw_result.get("search_url"),
-            "status": "candidates_found" if raw_result.get("candidates") else "no_candidates",
+            "status": ("error" if raw_result.get("error") else
+                       "candidates_found" if phase_candidates else "no_candidates"),
             "status_code": raw_result.get("status_code"),
             "error": raw_result.get("error"),
+            "result": result_summary,
+            "ai_overview_present": bool(text),
+            "candidate_count": len(phase_candidates),
         })
 
     deduped = dedupe_candidate_urls(candidates)
-    has_evidence = bool(deduped or ai_overview_texts)
+    has_evidence = bool(deduped or ai_overview_evidence)
     has_x = bool(str(x_name or "").strip())
     batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
 
@@ -176,8 +235,8 @@ async def execute_relationship_lookup_for_worker(
     elif not batch_mode:
         parsed, error, model, usage = await asyncio.to_thread(
             choose_relationship_and_website,
-            x_name, y_name, city, country,
-            deduped, ai_overview_texts, search_attempts, phase4_hit, x_domain)
+            x_name, y_name, input_url, city, country,
+            deduped, ai_overview_evidence, search_attempts, x_domain)
         if parsed is None:
             # LLM failure: the gate cannot be guessed — fail the row (retryable).
             # Tag the source so the worker's classify_exception attributes it to
@@ -188,14 +247,8 @@ async def execute_relationship_lookup_for_worker(
         gated_url, status, gate_flags = apply_relationship_gate(parsed, deduped, x_domain)
         gemini_cost = calculate_gemini_cost_usd(usage)
         official_website = gated_url
-        relationship.update(
-            status=status,
-            summary=str(parsed.get("relationship_summary") or ""),
-        )
-        relationship["flags"].extend(gate_flags)
-        for extra in parsed.get("extra_flags") or []:
-            if isinstance(extra, str) and extra.strip():
-                relationship["flags"].append({"flag": extra.strip(), "why": "reported by LLM"})
+        relationship = update_relationship_block(
+            relationship, parsed, status, gate_flags)
         final_url_selection_ai = {
             "provider": "google-gemini", "model": model, "used": True,
             "error": None, "usage": usage or {}, "raw": parsed,
@@ -208,7 +261,7 @@ async def execute_relationship_lookup_for_worker(
     summary_text = (
         f"Relationship search for pair {x_name!r} ↔ {y_name!r}: "
         f"{len(queries)} phase queries, {len(deduped)} candidates, "
-        f"{len(ai_overview_texts)} AI-overview texts, phase4_hit={phase4_hit}."
+        f"{len(ai_overview_evidence)} AI-overview evidence blocks."
     )
     crawl_resp = CrawlResponse(
         company_name=y_name,
@@ -232,9 +285,8 @@ async def execute_relationship_lookup_for_worker(
             "used_proxy": False, "blocked": False,
             "x_name": x_name,
             "x_domain": x_domain,
-            "phase4_hit": phase4_hit,
             "candidates": deduped,
-            "ai_overview_texts": ai_overview_texts,
+            "ai_overview_evidence": ai_overview_evidence,
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "skip_llm": skip_llm,

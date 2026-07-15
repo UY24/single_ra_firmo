@@ -360,17 +360,21 @@ function costSection(g, {
   providerLabel = "SerpWow",
   providerCostKey = "serpwow_usd",
   searchKey = "serpwow_searches",
+  failedSearchCount = null,
   llmCostKey = "llm_usd",
   totalCostKey = "total_usd",
 } = {}) {
   const cost = g.cost || {};
   const isLlm = g.confidence_mode === "llm" || !!g.model;
+  const searchSub = cost[searchKey] == null ? null
+    : `${fmtNum(cost[searchKey])} searches`
+      + (failedSearchCount ? ` · ${fmtNum(failedSearchCount)} failed` : "");
   const items = [];
   if (isLlm && llmCostKey) items.push(costItem("LLM", fmtUsd(cost[llmCostKey])));
   items.push(costItem(
     providerLabel,
     providerCostKey && cost[providerCostKey] != null ? fmtUsd(cost[providerCostKey]) : null,
-    cost[searchKey] != null ? `${fmtNum(cost[searchKey])} searches` : null,
+    searchSub,
   ));
   if (totalCostKey) {
     items.push(costItem("Total", fmtUsd(cost[totalCostKey]), null, "cost-item--total"));
@@ -578,6 +582,7 @@ function renderAiStatus(root, ref, s) {
       providerLabel: "Scrape.do",
       providerCostKey: null,
       searchKey: "scrapedo_searches",
+      failedSearchCount: s.scrapedo_failed_requests ?? s.failed_request_count ?? null,
       llmCostKey: s.cost?.llm_usd != null ? "llm_usd" : "total_usd",
       totalCostKey: null,
     }));

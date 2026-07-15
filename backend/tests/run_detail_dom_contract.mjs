@@ -444,11 +444,16 @@ async function completedAiMode() {
 async function erroredAiMode() {
   const ref = "ai errors";
   const payload = aiPayload("completed_with_errors", 1);
+  payload.failed_request_count = 1;
+  payload.scrapedo_failed_requests = 1;
   assertProductionTerminalAiShape(payload);
   const { root } = await renderStatus(ref, payload, { ai: true });
   assertOutcomeFirst(root, "4 of 6");
   assert(labelValue(root, "Not found") === "1", "AI inclusive not-found double counted errors");
   assert(labelValue(root, "Errors") === "1", "AI Mode outcome errors wrong");
+  const scrapeCost = byClass(root, "cost-item").find((item) => item.children[0]?.textContent === "Scrape.do");
+  assert(scrapeCost?.textContent.includes("5 searches") && scrapeCost.textContent.includes("1 failed"),
+    "AI scrape.do cost did not show failed search count");
   const rerun = byText(root, "button", "Rerun failed");
   assert(rerun?.listeners.click, "AI Mode rerun action missing");
   await rerun.click();

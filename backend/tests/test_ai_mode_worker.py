@@ -104,6 +104,11 @@ class TestProcessScrapeJob(WorkerHarness):
         status = self._status()
         self.assertEqual(status["batches_done"], 1)
         self.assertEqual(status["scrapedo_failed_requests"], 0)
+        log = (self.run_dir / "run.log").read_text(encoding="utf-8")
+        self.assertIn("scrape batch 1 started", log)
+        self.assertIn("scrape batch 1 finished status=success", log)
+        self.assertIn("started_at=", log)
+        self.assertIn("finished_at=", log)
 
     def test_existing_raw_file_is_not_rescraped(self):
         raw = self.run_dir / "raw_responses" / "request_000001.json"

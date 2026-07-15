@@ -382,9 +382,27 @@ async def process_scrape_job(payload: dict[str, Any]) -> None:
     )
     # scrape_batch_sync is idempotent (reuses a parseable raw file) and never
     # raises for a scrape.do failure — that comes back as ok=False.
+    started_at = utc_now_iso()
+    scrape_t0 = time.perf_counter()
+    svc._ai_log(
+        run_id, run_dir,
+        f"scrape batch {request_index} started started_at={started_at} "
+        f"entities={len(group)}",
+    )
     rec = await asyncio.to_thread(
         svc.scrape_batch_sync, run_dir, mode, settings, scrapedo_client,
         request_index, group,
+    )
+    finished_at = utc_now_iso()
+    status_word = "success" if rec["ok"] else "error"
+    if rec.get("reused"):
+        status_word = "reused"
+    svc._ai_log(
+        run_id, run_dir,
+        f"scrape batch {request_index} finished status={status_word} "
+        f"started_at={started_at} finished_at={finished_at} "
+        f"duration={time.perf_counter() - scrape_t0:.3f}s",
+        logging.ERROR if not rec["ok"] else logging.INFO,
     )
     if not rec["ok"]:
         # A scrape.do failure is a RESULT (SerpWow-parity taxonomy): terminalize

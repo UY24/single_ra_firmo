@@ -28,7 +28,10 @@ from app.services.serpwow.constants import (
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
 )
-from app.services.serpwow.cost import calculate_gemini_cost_usd
+from app.services.serpwow.cost import (
+    calculate_gemini_cost_usd,
+    calculate_serpwow_cost_usd,
+)
 from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     choose_relationship_and_website,
@@ -91,7 +94,7 @@ async def execute_relationship_lookup_for_worker(
     search_attempts = search_result.search_attempts
     formatted_results = search_result.formatted_results
     phase4_hit = search_result.x_site_hit
-    serpwow_cost = search_result.request_count * 0.02
+    serpwow_cost = calculate_serpwow_cost_usd(search_result.request_count)
     has_evidence = bool(candidates or search_result.evidence)
     batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
 

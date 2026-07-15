@@ -69,6 +69,29 @@ class TestRelationshipExecutor(unittest.TestCase):
             ["phase1_relationship_and_url", search.await_args.args[0]],
         ])
 
+    def test_one_request_uses_configured_serpwow_cost_in_all_totals(self):
+        search = AsyncMock(return_value=_serp(
+            ["https://modal.com/"], "eastlinkcap invests in Modal."))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website",
+                   return_value=_llm("confirmed", "https://modal.com/")), \
+             patch.dict("os.environ", {
+                 "RELATIONSHIP_LLM_BATCH": "false",
+                 "SERPWOW_USD_PER_SEARCH": "0.00035",
+             }, clear=False):
+            resp, _ = self._run(
+                y_name="Modal", x_name="eastlinkcap",
+                input_url="https://eastlinkcap.com/portfolio", city="", country="")
+
+        costs = resp.context["cost_breakdown"]
+        self.assertEqual(search.await_count, 1)
+        self.assertEqual(costs["serpwow_request_count"], 1)
+        self.assertEqual(resp.serpwow_cost_usd, 0.00035)
+        self.assertEqual(costs["serpwow_cost_usd"], 0.00035)
+        self.assertEqual(resp.total_cost_usd,
+                         resp.serpwow_cost_usd + resp.gemini_cost_usd)
+        self.assertEqual(costs["total_cost_usd"], resp.total_cost_usd)
+
     def test_not_confirmed_gates_url_to_none(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "No relation."))
         with patch(f"{MODPATH}.run_serpwow_search", search), \
@@ -124,6 +147,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_X)
         self.assertEqual(search.await_count, 0)
         self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 0)
+        self.assertEqual(resp.serpwow_cost_usd, 0.0)
 
     def test_batch_mode_defers_llm_but_gathers_evidence(self):
         search = AsyncMock(return_value=_serp(
@@ -173,7 +197,10 @@ class TestRelationshipExecutor(unittest.TestCase):
         with patch(f"{MODPATH}.run_serpwow_search", search), \
              patch(f"{MODPATH}.choose_relationship_and_website",
                    return_value=_llm("confirmed", "https://modal.com")), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+             patch.dict("os.environ", {
+                 "RELATIONSHIP_LLM_BATCH": "false",
+                 "SERPWOW_USD_PER_SEARCH": "0.00035",
+             }, clear=False):
             resp, _ = self._run(
                 y_name="Modal", x_name="eastlinkcap",
                 input_url="https://eastlinkcap.com/portfolio", city="", country="")
@@ -184,6 +211,7 @@ class TestRelationshipExecutor(unittest.TestCase):
             "phase3_official_url_recovery",
         ])
         self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 2)
+        self.assertEqual(resp.serpwow_cost_usd, 0.0007)
 
     def test_missing_relationship_runs_evidence_phase_before_url_recovery(self):
         search = AsyncMock(side_effect=[

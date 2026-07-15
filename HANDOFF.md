@@ -7,7 +7,7 @@ Last updated: 2026-07-15. Read this first if you're picking up this repo. Durabl
 ## Current status
 
 - **Active branch: `adaptiveRelationshipSearch`**, based on `aiModeBroker`. Adaptive grounded relationship search implementation and focused verification are complete.
-- Focused relationship suite: **148/148** passing. The full suite is still pending Task 7; do not record a new full-suite count until it runs.
+- Focused relationship suite: **158/158** passing. The full suite is still pending Task 7; do not record a new full-suite count until it runs.
 - Commits after `426b3e6` are local-only. Do not push or otherwise change the remote without explicit approval.
 
 ## What works now
@@ -57,7 +57,7 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Latest completed session — 2026-07-15 (adaptive grounded relationship search, branch `adaptiveRelationshipSearch`)
 
-**Status: implementation and focused verification complete; full suite pending Task 7.** The branch is based on `aiModeBroker`. The focused relationship suite is **148/148**; a live SerpWow smoke is still required.
+**Status: implementation and focused verification complete; full suite pending Task 7.** The branch is based on `aiModeBroker`. The focused relationship suite is **158/158**; a live SerpWow smoke is still required.
 
 - Search is an ordered registry: phase 1 combined relationship + URL, phase 2 financial evidence, phase 3 URL recovery. `RELATIONSHIP_SEARCH_POLICY` defaults to adaptive missing-evidence/missing-URL routing; `sequential` runs registry order. `RELATIONSHIP_MAX_PHASES` caps actual requests per unique X↔Y pair.
 - Candidate extraction now preserves typed-URL and bare-domain provenance and fixes valid-domain handling seen with Modal while rejecting IP/file/X-domain candidates.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from ipaddress import ip_address
+from socket import inet_aton
 from typing import Any, Callable, Collection, Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -29,15 +30,10 @@ _EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
-_BARE_FILE_SUFFIXES = frozenset({
-    "7z", "css", "csv", "doc", "docx", "gz", "htm", "html", "js", "json",
-    "jsx", "md", "pdf", "ppt", "pptx", "py", "rar", "rtf", "sh", "tar",
-    "ts", "tsx", "txt", "xls", "xlsx", "xml", "yaml", "yml", "zip",
-})
-_NAME_STOPWORDS = frozenset({
-    "capital", "co", "company", "corp", "corporation", "group", "holding",
-    "holdings", "inc", "incorporated", "lab", "labs", "limited", "llc",
-    "ltd", "partners", "plc", "technologies", "technology",
+_NON_WEB_SUFFIXES = frozenset({"py", "txt"})
+_FIXTURE_FILE_STEMS = frozenset({"config", "requirements", "setup"})
+_FIXTURE_FILE_SUFFIXES = frozenset({
+    "cfg", "ini", "json", "md", "sh", "toml", "yaml", "yml",
 })
 _FINANCIAL_MARKER_RE = re.compile(
     r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
@@ -47,7 +43,7 @@ _FINANCIAL_MARKER_RE = re.compile(
     r"\bportfolio\b|\bbacked\b|"
     r"\bacquisition(?:s)?\b|\bacquired\b|"
     r"\bparent(?:\s+company)?\b|\bsubsidiar(?:y|ies)\b|\bownership\b|"
-    r"\b(?:led|participated\s+in)\b[^.;\n]{0,80}\bseries\s+[a-z0-9]+\b",
+    r"\bseries\s+[a-z0-9]+\b",
     re.IGNORECASE,
 )
 _POSITIVE_FINANCIAL_RE = re.compile(
@@ -69,19 +65,9 @@ _POSITIVE_FINANCIAL_RE = re.compile(
     r"\b(?:led|participated\s+in)\b[^.;\n]{0,80}\bseries\s+[a-z0-9]+\b",
     re.IGNORECASE,
 )
-_GROUNDED_ACTIVE_FINANCIAL_RE = re.compile(
-    r"\b(?:acquired|backed)\s+\w+\b",
-    re.IGNORECASE,
-)
-_NEGATIVE_FINANCIAL_RE = re.compile(
-    r"\b(?:no|not|without|never|"
-    r"(?:did|was|is|has|have|were|are|do|does)n['’]t)\b"
-    r"(?:\s+[\w'’]+){0,8}\s+"
-    r"(?:financial\s+relationship|relationship|"
-    r"invest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?|"
-    r"fund(?:s|ed|ing)?|financ(?:e|es|ed|ing)|backing|backed|"
-    r"financially\s+backs?|portfolio|acquisition(?:s)?|acquired|"
-    r"parent(?:\s+company)?|subsidiar(?:y|ies)|ownership)\b",
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|without|cannot|can['’]t|couldn['’]t|won['’]t|"
+    r"wouldn['’]t|isn['’]t|wasn['’]t|didn['’]t|doesn['’]t|don['’]t)\b",
     re.IGNORECASE,
 )
 
@@ -131,11 +117,28 @@ def extract_candidate_records(
             parsed_host = urlsplit(
                 original if "://" in original else f"https://{original}"
             ).hostname
-            if parsed_host:
-                ip_address(parsed_host)
-                return
         except ValueError:
-            pass
+            return
+        if parsed_host:
+            host = parsed_host.lower()
+            labels = host.split(".")
+            suffix = labels[-1]
+            if (suffix in _NON_WEB_SUFFIXES
+                    or (len(labels) == 2
+                        and labels[0] in _FIXTURE_FILE_STEMS
+                        and suffix in _FIXTURE_FILE_SUFFIXES)):
+                return
+            try:
+                ip_address(host)
+                return
+            except ValueError:
+                if re.fullmatch(r"\d+(?:\.\d+){1,3}", host):
+                    try:
+                        inet_aton(host)
+                    except OSError:
+                        pass
+                    else:
+                        return
         canonical = canonicalize_official_url(original)
         if (not canonical or canonical in seen
                 or is_disallowed_official_url(canonical)
@@ -156,10 +159,6 @@ def extract_candidate_records(
         masked = _EMAIL_RE.sub(lambda match: " " * len(match.group()), value)
         for match in _URL_TOKEN_RE.finditer(masked):
             token = match.group().rstrip(_TRAILING_URL_PUNCTUATION)
-            if not token.lower().startswith(("http://", "https://")):
-                host = token.split("/", 1)[0].lower()
-                if host.rsplit(".", 1)[-1] in _BARE_FILE_SUFFIXES:
-                    continue
             add(token, source_field)
 
     raw = raw_result.get("raw_response")
@@ -267,15 +266,6 @@ def extract_evidence_records(
     return records
 
 
-def _meaningful_name_tokens(value: object) -> set[str]:
-    if not isinstance(value, str):
-        return set()
-    return {
-        token for token in re.findall(r"[a-z0-9]+", value.lower())
-        if len(token) >= 2 and token not in _NAME_STOPWORDS
-    }
-
-
 def has_positive_financial_evidence(
     records: Sequence[Mapping[str, object]],
     x_name: str | None = None,
@@ -283,10 +273,34 @@ def has_positive_financial_evidence(
 ) -> bool:
     """Return whether one record is financial and not explicitly negative."""
     grounding_required = x_name is not None or y_name is not None
-    x_tokens = _meaningful_name_tokens(x_name) if grounding_required else set()
-    y_tokens = _meaningful_name_tokens(y_name) if grounding_required else set()
-    if grounding_required and (not x_tokens or not y_tokens):
-        return False
+    grounded_re: re.Pattern[str] | None = None
+    if grounding_required:
+        if not isinstance(x_name, str) or not isinstance(y_name, str):
+            return False
+        x_folded = " ".join(x_name.casefold().split())
+        y_folded = " ".join(y_name.casefold().split())
+        if not x_folded or not y_folded:
+            return False
+        x = rf"(?<!\w){re.escape(x_folded)}(?!\w)"
+        y = rf"(?<!\w){re.escape(y_folded)}(?!\w)"
+        possessive = r"['’]s"
+        series_round = r"[\w-]+"
+        grounded_re = re.compile("|".join((
+            rf"{x}\s+(?:invested|invests)\s+in\s+{y}",
+            rf"{x}\s+is\s+(?:an?\s+)?investor\s+in\s+{y}",
+            rf"{y}\s+(?:(?:was|is)\s+)?(?:funded|financed|backed)\s+by\s+{x}",
+            rf"{x}\s+(?:funded|financed|backed|acquired)\s+{y}",
+            rf"{y}\s+(?:was\s+)?acquired\s+by\s+{x}",
+            rf"{x}\s+(?:led|participated\s+in)\s+{y}{possessive}\s+series\s+{series_round}",
+            rf"{y}{possessive}\s+series\s+{series_round}"
+            rf"[^.;\n]{{0,60}}\b(?:led|participation)\s+by\s+{x}",
+            rf"{y}\s+is\s+(?:a\s+)?portfolio\s+company\s+of\s+{x}",
+            rf"{x}(?:{possessive})?\s+portfolio\s+includes\s+{y}",
+            rf"{x}\s+is\s+(?:the\s+)?parent(?:\s+company)?\s+of\s+{y}",
+            rf"{y}\s+is\s+(?:a\s+)?subsidiary\s+of\s+{x}",
+            rf"{x}\s+is\s+{y}{possessive}\s+parent\s+company",
+            rf"{y}\s+is\s+{x}{possessive}\s+subsidiary",
+        )))
 
     for record in records:
         if not isinstance(record, Mapping):
@@ -295,13 +309,14 @@ def has_positive_financial_evidence(
         if not isinstance(raw_text, str):
             continue
         text = raw_text.strip()
-        if grounding_required:
-            text_tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
-            if not (x_tokens & text_tokens and y_tokens & text_tokens):
-                continue
-        if ((_POSITIVE_FINANCIAL_RE.search(text)
-             or (grounding_required and _GROUNDED_ACTIVE_FINANCIAL_RE.search(text)))
-                and not _NEGATIVE_FINANCIAL_RE.search(text)):
+        if _NEGATION_RE.search(text):
+            continue
+        positive = (
+            bool(grounded_re.search(" ".join(text.casefold().split())))
+            if grounded_re is not None
+            else bool(_POSITIVE_FINANCIAL_RE.search(text))
+        )
+        if positive:
             return True
     return False
 

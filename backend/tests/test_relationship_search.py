@@ -302,6 +302,31 @@ class TestExtractCandidateRecords(unittest.TestCase):
             [("https://company.sh", "candidates[1]")],
         )
 
+    def test_plausible_paraguay_py_domain_is_allowed_when_explicit_or_bare(self):
+        cases = [
+            {
+                "raw_response": {
+                    "knowledge_graph": {"website": "https://company.py"},
+                },
+            },
+            {
+                "raw_response": {
+                    "ai_overview": {
+                        "ai_overview_contents": [{"text": "Visit company.py."}],
+                    },
+                },
+            },
+        ]
+
+        for raw_result in cases:
+            with self.subTest(raw_result=raw_result):
+                records = extract_candidate_records(
+                    raw_result, "paraguay", "owner.vc")
+                self.assertEqual(
+                    [record["url"] for record in records],
+                    ["https://company.py"],
+                )
+
     def test_ip_literal_candidates_are_rejected(self):
         raw_result = {
             "raw_response": {
@@ -319,6 +344,33 @@ class TestExtractCandidateRecords(unittest.TestCase):
             extract_candidate_records(raw_result, "ips", "owner.vc"),
             [],
         )
+
+    def test_legacy_hex_ipv4_is_rejected_from_every_candidate_source(self):
+        cases = [
+            {"raw_response": {
+                "knowledge_graph": {"website": "http://0x7f.1"},
+            }},
+            {"raw_response": {
+                "answer_box": {"url": "http://0x7f.1"},
+            }},
+            {"raw_response": {"ai_overview": {
+                "ai_overview_sources": [{"source_url": "http://0x7f.1"}],
+            }}},
+            {"raw_response": {
+                "organic_results": [{"link": "http://0x7f.1"}],
+            }},
+            {"raw_response": {"ai_overview": {
+                "ai_overview_contents": [{"text": "Visit http://0x7f.1."}],
+            }}},
+            {"raw_response": {}, "candidates": ["http://0x7f.1"]},
+        ]
+
+        for raw_result in cases:
+            with self.subTest(raw_result=raw_result):
+                self.assertEqual(
+                    extract_candidate_records(raw_result, "legacy-ip", "owner.vc"),
+                    [],
+                )
 
     def test_modal_f4_snippet_regression_keeps_typed_domain_provenance(self):
         raw_result = {

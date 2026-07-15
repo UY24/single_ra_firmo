@@ -30,10 +30,10 @@ _EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
-_NON_WEB_SUFFIXES = frozenset({"py", "txt"})
+_NON_WEB_SUFFIXES = frozenset({"txt"})
 _FIXTURE_FILE_STEMS = frozenset({"config", "requirements", "setup"})
 _FIXTURE_FILE_SUFFIXES = frozenset({
-    "cfg", "ini", "json", "md", "sh", "toml", "yaml", "yml",
+    "cfg", "ini", "json", "md", "py", "sh", "toml", "yaml", "yml",
 })
 _FINANCIAL_MARKER_RE = re.compile(
     r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
@@ -132,13 +132,12 @@ def extract_candidate_records(
                 ip_address(host)
                 return
             except ValueError:
-                if re.fullmatch(r"\d+(?:\.\d+){1,3}", host):
-                    try:
-                        inet_aton(host)
-                    except OSError:
-                        pass
-                    else:
-                        return
+                try:
+                    inet_aton(host)
+                except (OSError, UnicodeError):
+                    pass
+                else:
+                    return
         canonical = canonicalize_official_url(original)
         if (not canonical or canonical in seen
                 or is_disallowed_official_url(canonical)

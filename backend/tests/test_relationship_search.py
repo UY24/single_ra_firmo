@@ -90,6 +90,18 @@ class TestRelationshipPhaseRegistry(unittest.TestCase):
         self.assertEqual(len(evidence_text), 6000)
         self.assertTrue(evidence_text.startswith("[ev] "))
 
+    def test_phase_three_omits_evidence_without_an_id(self):
+        query = RELATIONSHIP_PHASES[2].build_query(
+            SEARCH_INPUT,
+            [
+                {"text": "This missing-ID evidence must not appear."},
+                {"evidence_id": "ev-valid", "text": "Valid evidence."},
+            ],
+        )
+
+        self.assertNotIn("missing-ID evidence", query)
+        self.assertIn("[ev-valid] Valid evidence.", query)
+
     def test_models_are_frozen(self):
         with self.assertRaises(FrozenInstanceError):
             SEARCH_INPUT.x_name = "Changed"
@@ -186,6 +198,20 @@ class TestSelectNextPhase(unittest.TestCase):
                 registry, {"recover-first"}, "sequential", False, False).name,
             "prove-second",
         )
+
+    def test_adaptive_does_not_restart_first_phase_after_another_phase_ran(self):
+        build_query = lambda search_input, evidence: "query"
+        registry = (
+            RelationshipPhase("combined-first", "combined", build_query),
+            RelationshipPhase("url-already-run", "official_url", build_query),
+            RelationshipPhase(
+                "evidence-target", "relationship_evidence", build_query),
+        )
+
+        selected = select_next_phase(
+            registry, {"url-already-run"}, "adaptive", False, False)
+
+        self.assertEqual(selected.name, "evidence-target")
 
 
 class TestNormalizeSearchPolicy(unittest.TestCase):

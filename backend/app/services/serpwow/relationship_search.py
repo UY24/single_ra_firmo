@@ -53,9 +53,8 @@ def select_next_phase(
     if policy == "sequential":
         return remaining[0]
 
-    first_phase = enabled[0]
-    if first_phase.name not in executed:
-        return first_phase
+    if not executed:
+        return remaining[0]
 
     target_goal: PhaseGoal = (
         "official_url" if relationship_evidenced else "relationship_evidence"
@@ -102,9 +101,9 @@ def _build_official_url_recovery_query(
 ) -> str:
     entries = []
     for record in evidence:
+        evidence_id = str(record.get("evidence_id") or "").strip()
         text = str(record.get("text") or "").strip()
-        if text:
-            evidence_id = str(record.get("evidence_id") or "").strip()
+        if evidence_id and text:
             entries.append(f"[{evidence_id}] {text}")
     relationship_evidence = "\n".join(entries)[:6000]
 

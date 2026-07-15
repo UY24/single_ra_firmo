@@ -147,6 +147,61 @@ class TestExtractCandidateRecords(unittest.TestCase):
             ],
         )
 
+    def test_email_subdomains_do_not_leak_suffix_domain_candidates(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [
+                        {"text": "Contact team@sub.modal.com for details."},
+                        {"text": "Write to team@deep.sub.orbit.ai instead."},
+                    ],
+                },
+            },
+        }
+
+        self.assertEqual(
+            extract_candidate_records(raw_result, "email", "owner.vc"),
+            [],
+        )
+
+    def test_explicit_domain_after_subdomain_email_is_still_extracted(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": "Email team@sub.modal.com or visit modal.com.",
+                    }],
+                },
+            },
+        }
+
+        records = extract_candidate_records(raw_result, "same-text", "owner.vc")
+
+        self.assertEqual(
+            [(record["url"], record["original_text"]) for record in records],
+            [("https://modal.com", "modal.com")],
+        )
+
+    def test_explicit_domain_in_different_text_survives_email_filter(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": "Email team@deep.sub.modal.com.",
+                    }],
+                },
+                "organic_results": [{"displayed_link": "modal.com"}],
+            },
+        }
+
+        records = extract_candidate_records(
+            raw_result, "different-text", "owner.vc")
+
+        self.assertEqual(
+            [(record["url"], record["source_field"]) for record in records],
+            [("https://modal.com", "organic_results[0].displayed_link")],
+        )
+
     def test_invalid_disallowed_and_company_x_structured_urls_are_rejected(self):
         raw_result = {
             "raw_response": {
@@ -289,10 +344,14 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Modal announced new funding from Acme.",
             "Acme will finance Modal.",
             "Acme financed Modal.",
+            "Acme finances Modal.",
             "Acme provided financing to Modal.",
             "Modal received financial backing from Acme.",
             "Modal is an Acme portfolio company.",
+            "Modal is in Eastlink's portfolio.",
             "Modal is backed by Acme.",
+            "Eastlink provides backing to Modal.",
+            "Eastlink financially backs Modal.",
             "Acme announced an acquisition of Modal.",
             "Modal was acquired by Acme.",
             "Acme is Modal's parent company.",
@@ -310,6 +369,10 @@ class TestFinancialEvidenceClassifier(unittest.TestCase):
             "Acme did not invest in Modal, although an investment was discussed.",
             "Modal has funding without any funding relationship with Acme.",
             "There was no acquisition; acquisition speculation followed.",
+            "There is no evidence of investment by Acme in Modal.",
+            "Modal is not backed by Acme; backed claims were only rumors.",
+            "Modal is not a subsidiary of Acme; subsidiary claims were denied.",
+            "Acme is not the parent company; parent company reports were wrong.",
         ]
 
         for text in negative_texts:

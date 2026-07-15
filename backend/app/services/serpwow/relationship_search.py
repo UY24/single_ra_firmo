@@ -21,14 +21,17 @@ _URL_TOKEN_RE = re.compile(
     r"[a-z]{2,63}(?:/[^\s<>\"']*)?",
     re.IGNORECASE,
 )
+_EMAIL_DOMAIN_PREFIX_RE = re.compile(
+    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9-]+\.)*$",
+    re.IGNORECASE,
+)
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}"
 _FINANCIAL_MARKER_RE = re.compile(
     r"\binvest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?\b|"
     r"\bfund(?:s|ed|ing)?\b|"
-    r"\bfinanc(?:e|ed|ing)\b|"
-    r"\bfinancial\s+backing\b|"
-    r"\bportfolio\s+compan(?:y|ies)\b|"
-    r"\bbacked\b|"
+    r"\bfinanc(?:e|es|ed|ing)\b|"
+    r"\b(?:financial\s+)?backing\b|\bfinancially\s+backs?\b|"
+    r"\bportfolio\b|\bbacked\b|"
     r"\bacquisition(?:s)?\b|\bacquired\b|"
     r"\bparent(?:\s+company)?\b|\bsubsidiar(?:y|ies)\b|\bownership\b",
     re.IGNORECASE,
@@ -37,8 +40,9 @@ _NEGATIVE_FINANCIAL_RE = re.compile(
     r"\b(?:no|not|without)\b(?:\s+\w+){0,8}\s+"
     r"(?:financial\s+relationship|relationship|"
     r"invest(?:s|ed|ing|ment(?:s)?|or(?:s)?)?|"
-    r"fund(?:s|ed|ing)?|financ(?:e|ed|ing)|backing|"
-    r"acquisition(?:s)?|acquired|ownership)\b",
+    r"fund(?:s|ed|ing)?|financ(?:e|es|ed|ing)|backing|backed|"
+    r"financially\s+backs?|portfolio|acquisition(?:s)?|acquired|"
+    r"parent(?:\s+company)?|subsidiar(?:y|ies)|ownership)\b",
     re.IGNORECASE,
 )
 
@@ -102,6 +106,8 @@ def extract_candidate_records(
         if not isinstance(value, str):
             return
         for match in _URL_TOKEN_RE.finditer(value):
+            if _EMAIL_DOMAIN_PREFIX_RE.search(value[:match.start()]):
+                continue
             add(match.group().rstrip(_TRAILING_URL_PUNCTUATION), source_field)
 
     raw = raw_result.get("raw_response")

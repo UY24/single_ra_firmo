@@ -224,7 +224,7 @@ def extract_candidate_records(
         masked = _EMAIL_RE.sub(lambda match: " " * len(match.group()), value)
         for match in _URL_TOKEN_RE.finditer(masked):
             token = match.group().rstrip(_TRAILING_URL_PUNCTUATION)
-            add(token, source_field, source_text=value)
+            add(token, source_field, source_text=value, strict_y_host=True)
 
     raw = raw_result.get("raw_response")
     if not isinstance(raw, Mapping):

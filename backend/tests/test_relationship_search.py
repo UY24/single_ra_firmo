@@ -132,6 +132,30 @@ class TestExtractCandidateRecords(unittest.TestCase):
             ["https://modal.com/about"],
         )
 
+    def test_overview_text_urls_require_y_name_relevance(self):
+        raw_result = {
+            "raw_response": {
+                "ai_overview": {
+                    "ai_overview_contents": [{
+                        "text": (
+                            "Coverage: randomnews.us/modal-funding. "
+                            "Modal website: modal.com."
+                        ),
+                    }],
+                },
+            },
+        }
+
+        records = extract_candidate_records(
+            raw_result, "phase1", "eastlinkcap.com",
+            y_name="Modal", country="United States",
+        )
+
+        self.assertEqual(
+            [record["url"] for record in records],
+            ["https://modal.com"],
+        )
+
     def test_text_fields_extract_urls_and_bare_domains_but_not_email_domains(self):
         raw_result = {
             "raw_response": {
@@ -1116,6 +1140,7 @@ class TestRunRelationshipPhases(unittest.IsolatedAsyncioTestCase):
                 text="Eastlink invested in Modal.",
                 organic_results=[{
                     "link": "https://randomnews.us/modal-funding",
+                    "displayed_link": "randomnews.us/modal-funding",
                     "snippet": "Eastlink invested in Modal.",
                 }],
             ),

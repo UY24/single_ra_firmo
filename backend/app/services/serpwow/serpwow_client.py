@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -19,6 +20,35 @@ SERPWOW_API_URL = "https://api.serpwow.com/live/search"
 # Set by engine.startup_event() (API and worker both go through it); when set,
 # caps concurrent SerpWow HTTP fetches. None means no throttling.
 search_fetch_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def sanitize_serpwow_error_text(value: Any) -> str:
+    safe = re.sub(
+        r"([?&]api_key=)[^&'\"\s]+", r"\1[REDACTED]", str(value or ""))
+    match = re.search(r"Server error '(\d+) ([^']+)'", safe)
+    if match:
+        return f"SerpWow failed (HTTP {match.group(1)}): {match.group(2)}."
+    return safe
+
+
+def _safe_serpwow_error(exc: Exception, response: Any = None) -> str:
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        payload: Any = None
+        try:
+            payload = response.json()
+        except Exception:
+            pass
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or payload.get("error") or "").strip()
+            retry_after = payload.get("retry_after") or payload.get("retry after")
+            if message:
+                error = f"SerpWow failed (HTTP {status}): {message.rstrip('.')}."
+                if retry_after:
+                    error += f" Retry after {retry_after} seconds."
+                return error
+        return f"SerpWow failed (HTTP {status})."
+    return sanitize_serpwow_error_text(exc)
 
 def _extract_official_website_from_serpwow(data: dict[str, Any]) -> Optional[str]:
     knowledge_graph = data.get("knowledge_graph")
@@ -221,7 +251,7 @@ async def run_serpwow_search(
             "status_code": status,
             "search_url": None,
             "raw_response": None,
-            "error": str(exc),
+            "error": _safe_serpwow_error(exc, resp_local),
             "error_category": categorize_http_error(status, f"{type(exc).__name__}: {exc}"),
         }
 

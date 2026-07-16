@@ -26,6 +26,15 @@ def _serp(candidates, overview_text="", official=None):
             "raw_response": raw, "error": None}
 
 
+def _failed_serp(status=503):
+    return {"provider": "serpwow", "used": False, "query": "q",
+            "official_website": None, "candidates": [],
+            "status_code": status, "search_url": None,
+            "raw_response": None,
+            "error": f"SerpWow failed (HTTP {status}).",
+            "error_category": "http_5xx"}
+
+
 def _llm(status, url, score=90):
     return ({"resolved_company_y_name": "Modal Labs",
              "relationship_status": status, "relationship_summary": "summary text",
@@ -165,11 +174,34 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(resp.context["row_error"], REL_ERROR_NO_EVIDENCE)
         self.assertEqual(resp.context["relationship"]["status"], "not_confirmed")
 
+    def test_failed_serpwow_attempts_are_not_billed(self):
+        search = AsyncMock(return_value=_failed_serp(503))
+        with patch(f"{MODPATH}.run_serpwow_search", search), \
+             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
+             patch.dict("os.environ", {
+                 "RELATIONSHIP_LLM_BATCH": "false",
+                 "SERPWOW_USD_PER_SEARCH": "0.00035",
+             }):
+            resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
+                                input_url="https://eastlinkcap.com/portfolio",
+                                city="", country="")
+        llm.assert_not_called()
+        self.assertEqual(resp.serpwow_cost_usd, 0.0)
+        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 3)
+        self.assertEqual(
+            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 0)
+        self.assertEqual(resp.context["relationship"]["summary"],
+                         "SerpWow failed (HTTP 503).")
+        self.assertTrue(any(
+            flag["flag"] == "serpwow_failed"
+            for flag in resp.context["relationship"]["flags"]))
+
     def test_blank_x_short_circuits_without_llm(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "text"))
         with patch(f"{MODPATH}.run_serpwow_search", search), \
              patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
+             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false",
+                                        "SERPWOW_USD_PER_SEARCH": "0.00035"}):
             resp, _ = self._run(y_name="Modal", x_name="",
                                 input_url="", city="", country="")
         llm.assert_not_called()
@@ -215,6 +247,9 @@ class TestRelationshipExecutor(unittest.TestCase):
         errored = [a for a in resp.context["search_attempts"] if a.get("error")]
         self.assertEqual(len(errored), 1)
         self.assertEqual(errored[0]["status"], "error")
+        self.assertEqual(
+            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 2)
+        self.assertAlmostEqual(resp.serpwow_cost_usd, 0.0007)
 
 
 if __name__ == "__main__":

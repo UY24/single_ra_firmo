@@ -40,6 +40,27 @@ class TestGsearchWorker(unittest.TestCase):
         self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 91)
         self.assertGreater(resp.gemini_cost_usd, 0.0)
 
+    def test_failed_serpwow_attempts_are_not_billed(self):
+        async def failed_search(query, country=None, client=None):
+            return {"provider": "serpwow", "used": False, "query": query,
+                    "official_website": None, "candidates": [],
+                    "status_code": 502, "search_url": None, "raw_response": None,
+                    "error": "SerpWow failed (HTTP 502).",
+                    "error_category": "http_5xx"}
+
+        with mock.patch.object(gsearch_mode, "run_serpwow_search", failed_search), \
+             mock.patch.dict("os.environ", {
+                 "GSEARCH_LLM_BATCH": "false",
+                 "SERPWOW_USD_PER_SEARCH": "0.00035",
+             }):
+            resp, _ = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
+                company_name="Acme Motors", country="us", phase="phase1"))
+
+        self.assertGreater(resp.context["cost_breakdown"]["serpwow_request_count"], 0)
+        self.assertEqual(
+            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 0)
+        self.assertEqual(resp.serpwow_cost_usd, 0.0)
+
     def test_per_row_gemini_failure_produces_degraded_found(self):
         # PRODUCER-level test: the real gsearch worker, when the per-row Gemini
         # selection genuinely fails (output=None + error), must STILL emit a website

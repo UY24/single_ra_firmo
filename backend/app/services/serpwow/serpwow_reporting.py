@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models.results import AttemptLogEntry, EntityResult, Flag
+from app.services.serpwow.serpwow_client import sanitize_serpwow_error_text
 
 CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
                "confidence", "flags", "attempt_log"]
@@ -25,7 +26,7 @@ REL_OUTPUT_COLUMNS = ["website_url", "resolved_company_y_name",
                       "relationship_status", "relationship_summary",
                       "relationship_evidence", "relationship_confidence",
                       "website_confidence", "confidence", "phases_used",
-                      "flags", "attempt_log", "verified_pair"]
+                      "flags", "attempt_log", "verified_pair", "error_reason"]
 
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
@@ -81,8 +82,9 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
     for fr in ctx.get("formatted_results") or []:
         if not isinstance(fr, dict):
             continue
-        outcome = (fr.get("result") or
-                   ("ok" if fr.get("success") else (fr.get("error") or "no result")))
+        outcome = sanitize_serpwow_error_text(
+            fr.get("result") or
+            ("ok" if fr.get("success") else (fr.get("error") or "no result")))
         attempts.append(AttemptLogEntry(
             query=f"[{fr.get('phase')}] {fr.get('query')}",
             result=str(outcome), url=fr.get("search_url")))
@@ -96,7 +98,8 @@ def row_to_entity_result(row: dict[str, Any], sno: int) -> EntityResult:
         confidence=confidence,
         flags=flags,
         attempt_log=attempts,
-        error=row.get("error"),
+        error=(sanitize_serpwow_error_text(row.get("error"))
+               if row.get("error") else None),
         error_source=row.get("error_source"),
         error_category=row.get("error_category"),
         degraded_search=bool(row.get("degraded_search")),
@@ -155,15 +158,17 @@ def state_to_entity_results(state: dict[str, Any]) -> list[EntityResult]:
     return [row_to_entity_result(r, i + 1) for i, r in enumerate(state.get("rows", []))]
 
 
-def _build_cost(llm_usd: float, serpwow_searches: int) -> dict[str, Any]:
+def _build_cost(llm_usd: float, serpwow_searches: int,
+                billable_searches: int) -> dict[str, Any]:
     try:
         rate = float(os.getenv("SERPWOW_USD_PER_SEARCH", "") or 0.0)
     except (TypeError, ValueError):
         rate = 0.0
-    serpwow_usd = serpwow_searches * rate
+    serpwow_usd = billable_searches * rate
     return {
         "llm_usd": round(llm_usd, 6),
         "serpwow_searches": serpwow_searches,
+        "serpwow_billable_searches": billable_searches,
         "serpwow_usd": round(serpwow_usd, 6),
         "total_usd": round(llm_usd + serpwow_usd, 6),
     }
@@ -189,6 +194,7 @@ def _derive_outcome(row: dict[str, Any]) -> Any:
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
+    billable_searches = 0
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
@@ -197,7 +203,17 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         result = row.get("result") or {}
         ctx = result.get("context") or {}
         cb = ctx.get("cost_breakdown") or {}
-        serpwow_searches += int(cb.get("serpwow_request_count") or 0)
+        request_count = int(cb.get("serpwow_request_count") or 0)
+        serpwow_searches += request_count
+        if "serpwow_billable_request_count" in cb:
+            billable_searches += int(cb.get("serpwow_billable_request_count") or 0)
+        else:
+            formatted = ctx.get("formatted_results")
+            billable_searches += (
+                sum(1 for item in formatted
+                    if isinstance(item, dict) and item.get("success"))
+                if isinstance(formatted, list) and formatted else request_count
+            )
         llm_usd += float(result.get("gemini_cost_usd") or 0.0)
         for key in ("final_url_selection_ai", "gemini_batch_ai"):
             obj = ctx.get(key)
@@ -230,7 +246,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
-        "cost": _build_cost(llm_usd, serpwow_searches),
+        "cost": _build_cost(llm_usd, serpwow_searches, billable_searches),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
     # Outcome/error breakdown is original-row-level. Relationship state rows are
@@ -369,6 +385,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
             "flags": er.flags_csv(),
             "attempt_log": er.attempt_log_csv(),
             "verified_pair": str(rel.get("verified_pair") or ""),
+            "error_reason": er.error or "",
         })
         return row
 
@@ -416,6 +433,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
         d["phases_used"] = len(ctx.get("formatted_results") or [])
         d["verified_pair"] = str(rel.get("verified_pair") or "")
+        d["error_reason"] = er.error or ""
         report_rows.append(d)
     report_path = upload_dir / "report.json"
     report_path.write_text(json.dumps({"summary": summary, "rows": report_rows},

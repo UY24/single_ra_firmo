@@ -304,11 +304,14 @@ async function completedWithErrorsBatchIsTerminal() {
       outcome_breakdown: { found: 2, not_found: 0, errored: 1 },
       error_breakdown: { by_source: { gemini: 1 }, by_category: { llm_error: 1 } },
       available_files: ["found.csv", "notFound.csv", "report.json", "run.log"],
-      cost: {},
+      cost: { serpwow_searches: 15, serpwow_billable_searches: 0,
+              serpwow_usd: 0, total_usd: 0 },
     },
   });
   assert(byClass(root, "files-section").length === 1,
     "completed_with_errors batch must be terminal and expose files");
+  assert(root.textContent.includes("15 searches") && root.textContent.includes("15 failed"),
+    "SerpWow failed attempts were not visible beside cost");
 }
 
 async function fullPipelineIgnoresBatchState() {

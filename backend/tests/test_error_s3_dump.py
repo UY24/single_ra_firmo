@@ -8,6 +8,24 @@ from app.services.serpwow import outcomes as o
 
 
 class TestErrorDump(unittest.TestCase):
+    def test_serpwow_error_dump_redacts_key_and_shows_http_failure(self):
+        unsafe = (
+            "Server error '503 Service Unavailable' for url "
+            "'https://api.serpwow.com/live/search?api_key=secret-key&q=x'")
+        row = {"row_index": 1, "company_name": "Bad Co", "status": "failed",
+               "outcome": o.OUTCOME_ERROR, "error_source": o.SRC_SERPWOW,
+               "error_category": o.CAT_HTTP_5XX, "error": unsafe,
+               "result": {"context": {"formatted_results": [{
+                   "phase": "p1", "success": False, "error": unsafe,
+                   "status_code": 503, "error_category": o.CAT_HTTP_5XX}]}}}
+        with tempfile.TemporaryDirectory() as d:
+            paths = engine._write_error_dumps(Path(d), {"rows": [row]})
+            data = json.loads(next(iter(paths.values())).read_text())
+        expected = "SerpWow failed (HTTP 503): Service Unavailable."
+        self.assertEqual(data["error_detail"], expected)
+        self.assertEqual(data["phases"][0]["error"], expected)
+        self.assertNotIn("secret-key", json.dumps(data))
+
     def test_writes_error_json_per_error_row(self):
         with tempfile.TemporaryDirectory() as d:
             rows = [

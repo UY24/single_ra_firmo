@@ -27,7 +27,10 @@ from app.services.serpwow.constants import (
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
 )
-from app.services.serpwow.cost import calculate_gemini_cost_usd
+from app.services.serpwow.cost import (
+    calculate_gemini_cost_usd,
+    calculate_serpwow_cost_usd,
+)
 from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     choose_relationship_and_website,
@@ -126,7 +129,7 @@ async def execute_relationship_lookup_for_worker(
     ai_overview_evidence: list[dict[str, Any]] = []
     search_attempts: list[dict[str, Any]] = []
     formatted_results: list[dict[str, Any]] = []
-    serpwow_cost = 0.0
+    billable_requests = 0
 
     for (label, query), raw_result in zip(queries, results):
         if isinstance(raw_result, Exception):
@@ -138,7 +141,8 @@ async def execute_relationship_lookup_for_worker(
                 "error_category": categorize_http_error(
                     None, f"{type(raw_result).__name__}: {raw_result}"),
             }
-        serpwow_cost += 0.02
+        if raw_result.get("used"):
+            billable_requests += 1
         raw_response = raw_result.get("raw_response")
         phase_candidates: list[str] = []
 
@@ -198,9 +202,14 @@ async def execute_relationship_lookup_for_worker(
             "candidate_count": len(phase_candidates),
         })
 
+    serpwow_cost = calculate_serpwow_cost_usd(billable_requests)
     deduped = dedupe_candidate_urls(candidates)
     has_evidence = bool(deduped or ai_overview_evidence)
     has_x = bool(str(x_name or "").strip())
+    provider_failed = bool(formatted_results) and all(
+        not item.get("success") for item in formatted_results)
+    provider_error = next(
+        (str(item.get("error")) for item in formatted_results if item.get("error")), "")
     batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
 
     skip_llm = False
@@ -228,10 +237,16 @@ async def execute_relationship_lookup_for_worker(
         # Pure-noise OCR: nothing to judge (spec §3.2).
         skip_llm = True
         row_error = REL_ERROR_NO_EVIDENCE
-        relationship.update(status="not_confirmed",
-                            summary="All phases returned no candidates and no AI overview.")
-        relationship["flags"].append(
-            {"flag": "no_evidence", "why": "no candidates and no AI-overview text from any phase"})
+        relationship.update(
+            status="not_confirmed",
+            summary=(provider_error if provider_failed else
+                     "All phases returned no candidates and no AI overview."),
+        )
+        relationship["flags"].append({
+            "flag": "serpwow_failed" if provider_failed else "no_evidence",
+            "why": (provider_error if provider_failed else
+                    "no candidates and no AI-overview text from any phase"),
+        })
     elif not batch_mode:
         parsed, error, model, usage = await asyncio.to_thread(
             choose_relationship_and_website,
@@ -299,6 +314,7 @@ async def execute_relationship_lookup_for_worker(
                 "gemini_cost_usd": gemini_cost,
                 "total_cost_usd": serpwow_cost + gemini_cost,
                 "serpwow_request_count": len(queries),
+                "serpwow_billable_request_count": billable_requests,
             },
         },
     )

@@ -549,7 +549,7 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
             {
                 "phase": fr.get("phase"),
                 "used": fr.get("success"),
-                "error": fr.get("error"),
+                "error": serpwow_client.sanitize_serpwow_error_text(fr.get("error")),
                 "status_code": fr.get("status_code"),
                 "error_category": fr.get("error_category"),
             }
@@ -576,7 +576,11 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
                 "company_name": company_name,
                 "error_source": row.get("error_source"),
                 "error_category": row.get("error_category"),
-                "error_detail": row.get("error"),
+                "error_detail": (
+                    serpwow_client.sanitize_serpwow_error_text(row.get("error"))
+                    if row.get("error_source") == _outcomes.SRC_SERPWOW
+                    else row.get("error")
+                ),
                 "http_status": http_status,
                 "phases": phases,
             }

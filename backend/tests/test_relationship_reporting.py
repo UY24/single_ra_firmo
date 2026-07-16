@@ -194,6 +194,42 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(report["summary"]["unique_pairs"], 2)
             self.assertEqual(report["rows"][0]["relationship_status"], "confirmed")
 
+    def test_provider_error_reason_is_clear_and_redacted_in_viewable_files(self):
+        state = _state()
+        state["relationship"]["original_rows"] = [
+            {"Input_URL": "https://eastlinkcap.com/p",
+             "Company_Name_X": "eastlinkcap", "Box_No": "2",
+             "Company_Name_Y": "Modal", "OCR_Status": "SUCCESS"}]
+        state["relationship"].update(
+            row_count_original=1, blank_row_indices=[], blank_rows=0)
+        unsafe = (
+            "Server error '503 Service Unavailable' for url "
+            "'https://api.serpwow.com/live/search?api_key=secret-key&q=x'")
+        row = _pair_row(1, "Modal", "eastlinkcap", [0], None,
+                        "not_confirmed", error=unsafe, skip_llm=True)
+        row.update(outcome="error", error_source="serpwow",
+                   error_category="http_5xx")
+        row["result"]["context"]["formatted_results"] = [{
+            "phase": "phase1_relationship_and_url", "query": "q1",
+            "success": False, "status_code": 503, "error": unsafe,
+            "result": unsafe, "search_url": None}]
+        state["rows"] = [row]
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = serpwow_reporting.write_outputs(Path(td), state)
+            with Path(paths["notFound.csv"]).open() as fh:
+                not_found = list(csv.DictReader(fh))[0]
+            report = json.loads(Path(paths["report.json"]).read_text())
+            run_log = Path(paths["run.log"]).read_text()
+
+        expected = "SerpWow failed (HTTP 503): Service Unavailable."
+        self.assertEqual(not_found["error_reason"], expected)
+        self.assertEqual(not_found["error"], expected)
+        self.assertEqual(report["rows"][0]["error_reason"], expected)
+        self.assertIn(expected, run_log)
+        self.assertNotIn("secret-key", json.dumps(report))
+        self.assertNotIn("secret-key", not_found["attempt_log"])
+
     def test_gsearch_state_output_unchanged(self):
         gsearch_state = {
             "upload_id": "g1", "company_name": "Acme", "pipeline": "gsearch",

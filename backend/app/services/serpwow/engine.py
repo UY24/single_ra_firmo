@@ -1705,8 +1705,11 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
         ctx = ((row.get("result") or {}).get("context")
                if isinstance((row.get("result") or {}).get("context"), dict) else {})
         if ctx.get("skip_llm"):
-            # relationship short-circuit rows (no evidence / no X) were already
-            # finalized by the worker — never seed them into the batch.
+            # Worker-decided short-circuit rows were already finalized.
+            continue
+        if ctx.get("pipeline") == PIPELINE_GSEARCH and not ctx.get("candidates"):
+            # Defense for legacy/in-flight rows created before gsearch persisted
+            # skip_llm: Gemini cannot select a URL from an empty candidate set.
             continue
         row_index = int(row.get("row_index", 0) or 0)
         key = f"row-{row_index}"

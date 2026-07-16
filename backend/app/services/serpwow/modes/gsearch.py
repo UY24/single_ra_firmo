@@ -176,6 +176,7 @@ async def execute_gsearch_lookup_for_worker(
     serpwow_cost = calculate_serpwow_cost_usd(billable_requests)
     best_candidate = candidates[0] if candidates else None
     official_website = best_candidate
+    skip_llm = not candidates
 
     final_url_selection_ai = {
         "provider": "google-gemini", "model": None, "used": False,
@@ -247,6 +248,7 @@ async def execute_gsearch_lookup_for_worker(
             "used_proxy": False,
             "blocked": False,
             "candidates": deduped,
+            "skip_llm": skip_llm,
             "search_attempts": search_attempts,
             "formatted_results": formatted_results,
             "final_url_selection_ai": final_url_selection_ai,

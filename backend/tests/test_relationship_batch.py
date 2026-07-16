@@ -31,6 +31,17 @@ def _rel_row(row_index=1, status="completed", skip_llm=False,
     }
 
 
+def _gsearch_row(candidates=(), row_index=1):
+    return {
+        "row_index": row_index, "company_name": "Acme", "country": "US",
+        "status": "failed", "error": "SerpWow failed (HTTP 503).",
+        "result": {"official_website": None, "context": {
+            "pipeline": "gsearch", "candidates": list(candidates),
+            "formatted_results": [{"success": False, "status_code": 503}],
+        }},
+    }
+
+
 class TestRelationshipBatchPrompt(unittest.TestCase):
     def test_prompt_dispatches_to_relationship_builder(self):
         prompt = engine._build_batch_prompt_for_row(_rel_row())
@@ -57,6 +68,24 @@ class TestRelationshipBatchItems(unittest.TestCase):
         state = {"rows": [_rel_row(1), _rel_row(2, status="failed", skip_llm=True)]}
         items, by_key = engine._build_batch_items_for_state(state)
         self.assertEqual([k for k, _ in items], ["row-1"])
+        self.assertEqual(by_key, {"row-1": 1})
+
+    def test_legacy_gsearch_row_without_candidates_is_not_seeded(self):
+        items, by_key = engine._build_batch_items_for_state(
+            {"rows": [_gsearch_row()]})
+        self.assertEqual(items, [])
+        self.assertEqual(by_key, {})
+
+    def test_gsearch_row_with_candidates_remains_eligible(self):
+        items, by_key = engine._build_batch_items_for_state({
+            "rows": [_gsearch_row(candidates=("https://acme.com/",))]})
+        self.assertEqual([key for key, _ in items], ["row-1"])
+        self.assertEqual(by_key, {"row-1": 1})
+
+    def test_relationship_evidence_without_url_candidate_remains_eligible(self):
+        items, by_key = engine._build_batch_items_for_state({
+            "rows": [_rel_row(candidates=())]})
+        self.assertEqual([key for key, _ in items], ["row-1"])
         self.assertEqual(by_key, {"row-1": 1})
 
 

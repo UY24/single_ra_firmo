@@ -39,6 +39,7 @@ class TestGsearchWorker(unittest.TestCase):
         self.assertTrue(ctx["final_url_selection_ai"]["used"])
         self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 91)
         self.assertGreater(resp.gemini_cost_usd, 0.0)
+        self.assertFalse(ctx["skip_llm"])
 
     def test_failed_serpwow_attempts_are_not_billed(self):
         async def failed_search(query, country=None, client=None):
@@ -49,6 +50,7 @@ class TestGsearchWorker(unittest.TestCase):
                     "error_category": "http_5xx"}
 
         with mock.patch.object(gsearch_mode, "run_serpwow_search", failed_search), \
+             mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
              mock.patch.dict("os.environ", {
                  "GSEARCH_LLM_BATCH": "false",
                  "SERPWOW_USD_PER_SEARCH": "0.00035",
@@ -60,6 +62,30 @@ class TestGsearchWorker(unittest.TestCase):
         self.assertEqual(
             resp.context["cost_breakdown"]["serpwow_billable_request_count"], 0)
         self.assertEqual(resp.serpwow_cost_usd, 0.0)
+        self.assertEqual(resp.context["candidates"], [])
+        self.assertTrue(resp.context["skip_llm"])
+        chooser.assert_not_called()
+
+    def test_successful_search_without_candidates_skips_llm_as_not_found(self):
+        async def no_result(query, country=None, client=None):
+            return {"provider": "serpwow", "used": True, "query": query,
+                    "official_website": None, "candidates": [],
+                    "status_code": 200, "search_url": "https://search.example",
+                    "raw_response": {}, "error": None, "error_category": None}
+
+        with mock.patch.object(gsearch_mode, "run_serpwow_search", no_result), \
+             mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
+             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false"}):
+            resp, _ = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
+                company_name="Acme Motors", country="us", phase="phase1"))
+
+        chooser.assert_not_called()
+        self.assertTrue(resp.context["skip_llm"])
+        from app.services.serpwow import outcomes as o
+        info = o.classify_finalized_row(
+            {"official_website": None, "context": resp.context},
+            pipeline="gsearch", ctx_row_error=None, skip_llm=True)
+        self.assertEqual(info.outcome, o.OUTCOME_NOT_FOUND)
 
     def test_per_row_gemini_failure_produces_degraded_found(self):
         # PRODUCER-level test: the real gsearch worker, when the per-row Gemini

@@ -717,12 +717,12 @@ def choose_final_website_with_gemini(
 def build_relationship_prompt(
     x_name: str,
     y_name: str,
+    input_url: str,
     city: str,
     country: str,
     candidates: list[str],
-    ai_overview_texts: list[str],
+    ai_overview_evidence: list[dict[str, Any]],
     search_attempts: list[dict[str, Any]],
-    phase4_hit: bool,
     x_domain: str = "",
 ) -> str:
     """Prompt for the relationship pipeline (spec §4). Shared by the per-row
@@ -730,21 +730,41 @@ def build_relationship_prompt(
     both modes judge with identical instructions."""
     input_obj = {
         "company_x": x_name, "company_x_domain": x_domain or None,
-        "company_y_ocr": y_name,
+        "company_x_official_portfolio_page": input_url,
+        "company_y": y_name,
         "city": city or None, "country": country or None,
-        "company_y_appears_on_company_x_site": bool(phase4_hit),
     }
+    evidence_sections: list[str] = []
+    for item in ai_overview_evidence or []:
+        if not isinstance(item, dict):
+            continue
+        lines = [f"[{item.get('phase') or 'unknown_phase'}]"]
+        if item.get("query"):
+            lines.append(f"Query: {item['query']}")
+        if item.get("text"):
+            lines.append(str(item["text"]))
+        sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+        if sources:
+            lines.append("Sources:")
+            for source in sources:
+                if isinstance(source, dict) and source.get("url"):
+                    lines.append(f"- {source.get('name') or source['url']}: {source['url']}")
+        evidence_sections.append("\n".join(lines))
+    evidence_text = "\n\n".join(evidence_sections)
     return (
         "You verify FINANCIAL relationships between companies and identify official websites.\n"
-        "company_x is an investment firm; company_y_ocr is OCR text extracted from a logo on\n"
-        "company_x's portfolio page — it may be garbled, truncated, or contain noise around\n"
+        "company_y is OCR-derived text from a logo on company_x's official portfolio page;\n"
+        "it may be garbled, truncated, or contain noise around\n"
         "the real company name (e.g. 'YUZU SPARKLINGWE SANZO POMELO' contains 'SANZO').\n"
         "Return strict JSON only with this schema:\n"
         "{\n"
+        '  "resolved_company_y_name": string|null,\n'
         '  "relationship_status": "confirmed"|"not_confirmed"|"unclear",\n'
         '  "relationship_summary": string,\n'
+        '  "relationship_evidence": [string],\n'
         '  "official_website": string|null,\n'
-        '  "confidence_score": number,\n'
+        '  "relationship_confidence_score": number,\n'
+        '  "website_confidence_score": number,\n'
         '  "reason": string,\n'
         '  "extra_flags": [string]\n'
         "}\n"
@@ -758,13 +778,16 @@ def build_relationship_prompt(
         "- company_x_domain (when present) is company_x's own website domain — never return it as official_website.\n"
         "- Set official_website to null unless relationship_status is 'confirmed'.\n"
         "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
-        "- confidence_score is 0-100 for the overall answer (relationship + URL).\n"
+        "- relationship_confidence_score is 0-100 for the financial-relationship verdict.\n"
+        "- website_confidence_score is 0-100 for the Company Y URL; use 0 when no URL is found.\n"
+        "- resolved_company_y_name must be evidence-backed; otherwise return null.\n"
         "- relationship_summary: 1-2 sentences quoting what the evidence says.\n"
+        "- relationship_evidence: at most 3 concise statements from the supplied evidence.\n"
         "- extra_flags: optional short slugs like \"company_closed\" (evidence says company\n"
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"AI Overview evidence: {json.dumps(list(ai_overview_texts or []), ensure_ascii=True)[:12000]}\n\n"
+        f"Normalized AI Overview evidence:\n{evidence_text}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
 
@@ -772,12 +795,12 @@ def build_relationship_prompt(
 def choose_relationship_and_website(
     x_name: str,
     y_name: str,
+    input_url: str,
     city: str,
     country: str,
     candidates: list[str],
-    ai_overview_texts: list[str],
+    ai_overview_evidence: list[dict[str, Any]],
     search_attempts: list[dict[str, Any]],
-    phase4_hit: bool,
     x_domain: str = "",
 ) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
     """Per-pair relationship verdict + URL pick. Returns (parsed, error, model, usage)
@@ -790,8 +813,8 @@ def choose_relationship_and_website(
         if model_name and model_name not in ordered_models:
             ordered_models.append(model_name)
     prompt = build_relationship_prompt(
-        x_name, y_name, city, country, candidates,
-        ai_overview_texts, search_attempts, phase4_hit, x_domain)
+        x_name, y_name, input_url, city, country, candidates,
+        ai_overview_evidence, search_attempts, x_domain)
     last_error: Optional[str] = None
     for model in ordered_models:
         text, usage, error = _gemini_generate_content_json(model, prompt)
@@ -807,6 +830,39 @@ def choose_relationship_and_website(
 
 
 _VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}
+
+
+def update_relationship_block(
+    relationship: dict[str, Any],
+    parsed: dict[str, Any],
+    status: str,
+    gate_flags: list[dict[str, str]],
+) -> dict[str, Any]:
+    relationship["status"] = status
+    relationship["summary"] = str(parsed.get("relationship_summary") or "")
+    relationship["resolved_company_y_name"] = str(
+        parsed.get("resolved_company_y_name") or "")
+    evidence = parsed.get("relationship_evidence") or []
+    if isinstance(evidence, str):
+        evidence = [evidence]
+    elif not isinstance(evidence, list):
+        evidence = []
+    relationship["evidence"] = [str(item) for item in evidence[:3]
+                                if str(item).strip()]
+    relationship["relationship_confidence_score"] = int(
+        parsed.get("relationship_confidence_score") or 0)
+    relationship["website_confidence_score"] = int(
+        parsed.get("website_confidence_score") or 0)
+    flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
+    flags.extend(gate_flags)
+    extra_flags = parsed.get("extra_flags") or []
+    if isinstance(extra_flags, str):
+        extra_flags = [extra_flags]
+    for extra in extra_flags if isinstance(extra_flags, list) else []:
+        if isinstance(extra, str) and extra.strip():
+            flags.append({"flag": extra.strip(), "why": "reported by LLM"})
+    relationship["flags"] = flags
+    return relationship
 
 
 def apply_relationship_gate(
@@ -825,10 +881,26 @@ def apply_relationship_gate(
     status = str(parsed.get("relationship_status") or "").strip().lower()
     if status not in _VALID_REL_STATUSES:
         status = "unclear"
+    parsed["relationship_status"] = status
     flags: list[dict[str, str]] = []
+
+    def _score(value: Any) -> int:
+        try:
+            return max(0, min(100, int(float(value or 0))))
+        except (TypeError, ValueError):
+            return 0
+
+    legacy_score = _score(parsed.get("confidence_score"))
+    relationship_score = _score(
+        parsed.get("relationship_confidence_score", legacy_score))
+    website_score = _score(parsed.get("website_confidence_score", legacy_score))
+    parsed["relationship_confidence_score"] = relationship_score
+    parsed["website_confidence_score"] = website_score
 
     raw_url = parsed.get("official_website")
     url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None
+    if url is None:
+        parsed["website_confidence_score"] = 0
 
     if url is not None:
         normalized_candidates = {
@@ -839,14 +911,17 @@ def apply_relationship_gate(
             flags.append({"flag": "llm_url_out_of_candidates",
                           "why": f"LLM returned {url} which is not in the candidate set"})
             url = None
+            parsed["website_confidence_score"] = 0
     if url is not None and is_disallowed_official_url(url):
         flags.append({"flag": "disallowed_url_dropped",
                       "why": f"{url} is a directory/social/file URL"})
         url = None
+        parsed["website_confidence_score"] = 0
     if url is not None and url_matches_domain(url, x_domain):
         flags.append({"flag": "x_domain_candidate_dropped",
                       "why": f"{url} is Company X's own site, never Y's"})
         url = None
+        parsed["website_confidence_score"] = 0
 
     if status != "confirmed" and url is not None:
         flag_name = ("relationship_unclear" if status == "unclear"
@@ -857,5 +932,14 @@ def apply_relationship_gate(
     elif status == "unclear":
         flags.append({"flag": "relationship_unclear",
                       "why": "evidence neither confirms nor rules out a financial relationship"})
+
+    if status == "confirmed" and url is None:
+        flags.append({"flag": "relationship_confirmed_url_missing",
+                      "why": "financial relationship confirmed but no valid Company Y URL passed the evidence gate"})
+
+    parsed["confidence_score"] = (
+        min(relationship_score, parsed["website_confidence_score"])
+        if status == "confirmed" and url is not None else 0
+    )
 
     return url, status, flags

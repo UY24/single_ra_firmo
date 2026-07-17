@@ -9,7 +9,6 @@ from app.services.serpwow import engine
 
 CSV = (
     "Input_URL,Company_Name_X,Box_No,Image_URL,Company_Name_Y,OCR_Status\n"
-    "https://www.m25vc.com/p,m25vc,50.0,img1,,NO_TEXT\n"
     "https://www.eastlinkcap.com/p,eastlinkcap,2.0,img2,Modal,SUCCESS\n"
     "https://www.eastlinkcap.com/p,eastlinkcap,3.0,img3,Modal,SUCCESS\n"
 ).encode()
@@ -42,7 +41,7 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             patch.object(engine, "_upload_dir", MagicMock()),
         ]
 
-    def test_happy_path_groups_pairs_and_reports_blanks(self):
+    def test_happy_path_groups_duplicate_pairs(self):
         patches = self._happy_patches()
         for p in patches:
             p.start()
@@ -51,17 +50,17 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, resp.text)
             body = resp.json()
             self.assertEqual(body["total_rows"], 1)      # 1 unique pair
-            self.assertEqual(body["blank_rows"], 1)
+            self.assertEqual(body["blank_rows"], 0)
             self.assertEqual(body["unique_pairs"], 1)
             # state carries the relationship block + pair-row extras
             state = engine.persist_upload_state.call_args[0][1]
             self.assertEqual(state["pipeline"], "relationship")
-            self.assertEqual(state["relationship"]["blank_rows"], 1)
-            self.assertEqual(state["relationship"]["row_count_original"], 3)
+            self.assertEqual(state["relationship"]["blank_rows"], 0)
+            self.assertEqual(state["relationship"]["row_count_original"], 2)
             row = state["rows"][0]
             self.assertEqual(row["company_name"], "Modal")
             self.assertEqual(row["x_name"], "eastlinkcap")
-            self.assertEqual(row["source_row_indices"], [1, 2])
+            self.assertEqual(row["source_row_indices"], [0, 1])
             # job carries the same extras
             job = engine.publish_job.call_args[0][0]
             self.assertEqual(job["x_name"], "eastlinkcap")
@@ -97,14 +96,17 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             for p in patches:
                 p.stop()
 
-    def test_all_blank_rows_is_400(self):
+    def test_blank_required_value_is_400(self):
         patches = self._happy_patches()
         for p in patches:
             p.start()
         try:
-            resp = self._post(csv_bytes=b"Company_Name_X,Company_Name_Y\nm25vc,\n")
+            resp = self._post(csv_bytes=(
+                b"Input_URL,Company_Name_X,Company_Name_Y\n"
+                b"https://m25vc.com/p,m25vc,\n"
+            ))
             self.assertEqual(resp.status_code, 400)
-            self.assertIn("searchable", resp.json()["detail"])
+            self.assertIn("Company_Name_Y", resp.json()["detail"])
         finally:
             for p in patches:
                 p.stop()
@@ -253,8 +255,8 @@ class TestRelationshipPreviewEndpoint(unittest.TestCase):
         resp = self._preview()
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
-        self.assertEqual(body["total_rows"], 3)
-        self.assertEqual(body["blank_rows"], 1)
+        self.assertEqual(body["total_rows"], 2)
+        self.assertEqual(body["blank_rows"], 0)
         self.assertEqual(body["unique_pairs"], 1)
         self.assertEqual(body["columns_detected"]["company_name_y"], "Company_Name_Y")
         self.assertEqual(body["columns_detected"]["input_url"], "Input_URL")
@@ -265,17 +267,16 @@ class TestRelationshipPreviewEndpoint(unittest.TestCase):
         self.assertEqual(sample["company_name_y"], "Modal")
         self.assertEqual(sample["csv_rows"], 2)
         self.assertEqual(body["sample_columns"][0], "company_name_x")
-        # one blank warning + one duplicate warning
-        self.assertEqual(len(body["warnings"]), 2)
+        self.assertEqual(len(body["warnings"]), 1)  # duplicate-pair warning
 
     def test_preview_missing_x_column_is_400(self):
-        resp = self._preview(b"Company_Name_Y,Other\nSanzo,z\n")
+        resp = self._preview(
+            b"Input_URL,Company_Name_Y,Other\nhttps://m25vc.com/p,Sanzo,z\n")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Company_Name_X", resp.json()["detail"])
 
-    def test_preview_all_blank_warns_but_200(self):
-        resp = self._preview(b"Company_Name_X,Company_Name_Y\nm25vc,\n")
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["unique_pairs"], 0)
-        self.assertTrue(any("No searchable rows" in w for w in body["warnings"]))
+    def test_preview_blank_required_value_is_400(self):
+        resp = self._preview(
+            b"Input_URL,Company_Name_X,Company_Name_Y\nhttps://m25vc.com/p,m25vc,\n")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Company_Name_Y", resp.json()["detail"])

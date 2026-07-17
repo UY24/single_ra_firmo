@@ -366,9 +366,13 @@ function costSection(g, {
 } = {}) {
   const cost = g.cost || {};
   const isLlm = g.confidence_mode === "llm" || !!g.model;
+  const failed = failedSearchCount ?? (
+    cost[searchKey] != null && cost.serpwow_billable_searches != null
+      ? Math.max(0, Number(cost[searchKey]) - Number(cost.serpwow_billable_searches))
+      : 0);
   const searchSub = cost[searchKey] == null ? null
     : `${fmtNum(cost[searchKey])} searches`
-      + (failedSearchCount ? ` · ${fmtNum(failedSearchCount)} failed` : "");
+      + (failed ? ` · ${fmtNum(failed)} failed` : "");
   const items = [];
   if (isLlm && llmCostKey) items.push(costItem("LLM", fmtUsd(cost[llmCostKey])));
   items.push(costItem(

@@ -22,18 +22,29 @@ def _pair_row(row_index, y, x, source_rows, official, rel_status, error=None,
                 "pipeline": "relationship", "skip_llm": skip_llm,
                 "candidates": [official] if official else [],
                 "relationship": {"status": rel_status, "summary": f"summary {y}",
+                                 "resolved_company_y_name": f"Resolved {y}",
+                                 "evidence": [f"evidence {y} one", f"evidence {y} two"],
+                                 "relationship_confidence_score": 96,
+                                 "website_confidence_score": 88 if official else 0,
                                  "verified_pair": f"{x} ↔ {y}",
                                  "flags": list(flags)},
                 "final_url_selection_ai": {
                     "model": "gemini-2.5-flash-lite",
                     "usage": {"promptTokenCount": 10, "candidatesTokenCount": 5},
                     "raw": {"confidence_score": 88, "confidence": "high",
+                            "relationship_confidence_score": 96,
+                            "website_confidence_score": 88 if official else 0,
                             "reason": "why"},
                 },
                 "formatted_results": [
                     {"phase": "phase1_relationship", "query": "q1", "success": True,
-                     "error": None, "search_url": "https://g/1"}],
-                "cost_breakdown": {"serpwow_request_count": 4},
+                     "error": None, "search_url": "https://g/1",
+                     "result": "AI overview returned; 1 candidate(s)"},
+                    {"phase": "phase2_financial_event_evidence", "query": "q2",
+                     "success": True, "error": None, "search_url": "https://g/2"},
+                    {"phase": "phase3_portfolio_identity", "query": "q3",
+                     "success": True, "error": None, "search_url": "https://g/3"}],
+                "cost_breakdown": {"serpwow_request_count": 3},
             },
         },
     }
@@ -80,9 +91,12 @@ class TestRelationshipReporting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), _state())
             self.assertIn("skipped.csv", paths)
-            found = list(csv.DictReader(open(paths["found.csv"])))
-            not_found = list(csv.DictReader(open(paths["notFound.csv"])))
-            skipped = list(csv.DictReader(open(paths["skipped.csv"])))
+            with Path(paths["found.csv"]).open() as fh:
+                found = list(csv.DictReader(fh))
+            with Path(paths["notFound.csv"]).open() as fh:
+                not_found = list(csv.DictReader(fh))
+            with Path(paths["skipped.csv"]).open() as fh:
+                skipped = list(csv.DictReader(fh))
             self.assertEqual(len(found), 2)       # both Modal duplicate rows
             self.assertEqual(len(not_found), 1)
             self.assertEqual(len(skipped), 1)
@@ -94,13 +108,44 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(row["website_url"], "https://modal.com/")
             self.assertEqual(row["relationship_status"], "confirmed")
             self.assertEqual(row["relationship_summary"], "summary Modal")
+            self.assertEqual(row["resolved_company_y_name"], "Resolved Modal")
+            self.assertEqual(row["relationship_evidence"],
+                             "evidence Modal one\nevidence Modal two")
+            self.assertEqual(row["relationship_confidence"], "96")
+            self.assertEqual(row["website_confidence"], "88")
+            self.assertEqual(row["phases_used"], "3")
             self.assertEqual(row["confidence"], "88")
             self.assertEqual(row["verified_pair"], "eastlinkcap ↔ Modal")
             self.assertIn("attempt_log", row)
+            self.assertIn("AI overview returned; 1 candidate(s)", row["attempt_log"])
             nf = not_found[0]
             self.assertIn("url_found_no_relationship", nf["flags"])
             self.assertIn("error", nf)
             self.assertEqual(skipped[0]["skip_reason"], "blank_company_name_y")
+
+    def test_confirmed_relationship_without_url_keeps_evidence_in_not_found(self):
+        state = _state()
+        state["relationship"]["original_rows"] = [
+            {"Input_URL": "https://eastlinkcap.com/p", "Company_Name_X": "eastlinkcap",
+             "Box_No": "2", "Company_Name_Y": "Modal", "OCR_Status": "SUCCESS"}]
+        state["relationship"]["row_count_original"] = 1
+        state["relationship"]["blank_row_indices"] = []
+        state["relationship"]["blank_rows"] = 0
+        state["rows"] = [_pair_row(
+            1, "Modal", "eastlinkcap", [0], None, "confirmed",
+            error="Financial relationship confirmed, but no valid Company Y website URL was found.")]
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = serpwow_reporting.write_outputs(Path(td), state)
+            with Path(paths["notFound.csv"]).open() as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["relationship_status"], "confirmed")
+        self.assertEqual(rows[0]["resolved_company_y_name"], "Resolved Modal")
+        self.assertEqual(rows[0]["relationship_confidence"], "96")
+        self.assertEqual(rows[0]["website_confidence"], "0")
+        self.assertIn("evidence Modal one", rows[0]["relationship_evidence"])
 
     def test_summary_gains_relationship_fields(self):
         state = _state()
@@ -115,7 +160,7 @@ class TestRelationshipReporting(unittest.TestCase):
         self.assertEqual(summary["relationship_breakdown"],
                          {"confirmed": 2, "not_confirmed": 1, "unclear": 0})
         self.assertEqual(summary["confidence_mode"], "llm")
-        self.assertEqual(summary["cost"]["serpwow_searches"], 8)
+        self.assertEqual(summary["cost"]["serpwow_searches"], 6)
 
     def test_outcomes_fan_out_to_searchable_original_rows(self):
         state = _state()
@@ -148,6 +193,42 @@ class TestRelationshipReporting(unittest.TestCase):
             report = json.loads(Path(paths["report.json"]).read_text())
             self.assertEqual(report["summary"]["unique_pairs"], 2)
             self.assertEqual(report["rows"][0]["relationship_status"], "confirmed")
+
+    def test_provider_error_reason_is_clear_and_redacted_in_viewable_files(self):
+        state = _state()
+        state["relationship"]["original_rows"] = [
+            {"Input_URL": "https://eastlinkcap.com/p",
+             "Company_Name_X": "eastlinkcap", "Box_No": "2",
+             "Company_Name_Y": "Modal", "OCR_Status": "SUCCESS"}]
+        state["relationship"].update(
+            row_count_original=1, blank_row_indices=[], blank_rows=0)
+        unsafe = (
+            "Server error '503 Service Unavailable' for url "
+            "'https://api.serpwow.com/live/search?api_key=secret-key&q=x'")
+        row = _pair_row(1, "Modal", "eastlinkcap", [0], None,
+                        "not_confirmed", error=unsafe, skip_llm=True)
+        row.update(outcome="error", error_source="serpwow",
+                   error_category="http_5xx")
+        row["result"]["context"]["formatted_results"] = [{
+            "phase": "phase1_relationship_and_url", "query": "q1",
+            "success": False, "status_code": 503, "error": unsafe,
+            "result": unsafe, "search_url": None}]
+        state["rows"] = [row]
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = serpwow_reporting.write_outputs(Path(td), state)
+            with Path(paths["notFound.csv"]).open() as fh:
+                not_found = list(csv.DictReader(fh))[0]
+            report = json.loads(Path(paths["report.json"]).read_text())
+            run_log = Path(paths["run.log"]).read_text()
+
+        expected = "SerpWow failed (HTTP 503): Service Unavailable."
+        self.assertEqual(not_found["error_reason"], expected)
+        self.assertEqual(not_found["error"], expected)
+        self.assertEqual(report["rows"][0]["error_reason"], expected)
+        self.assertIn(expected, run_log)
+        self.assertNotIn("secret-key", json.dumps(report))
+        self.assertNotIn("secret-key", not_found["attempt_log"])
 
     def test_gsearch_state_output_unchanged(self):
         gsearch_state = {

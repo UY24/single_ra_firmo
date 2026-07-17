@@ -557,41 +557,39 @@ def build_selected_phase_queries(
 def build_relationship_phase_queries(
     x_name: str,
     y_name: str,
-    city: str,
-    country: str,
-    x_domain: str,
-    max_phases: int = 4,
+    input_url: str,
 ) -> list[tuple[str, str]]:
-    """Parallel phase queries for the relationship pipeline (spec §3).
-
-    Y is used VERBATIM (noisy OCR included) — Google tolerates the noise and
-    algorithmic cleanup risks destroying signal. EVERY phase anchors to Company X
-    (name and/or domain) so a query can never surface an unrelated company that
-    merely shares Y's name (e.g. example.com vs the X-related example.org). Phases
-    1/2 need X's name; phase 4 needs X's domain (from Input_URL). When X's domain is
-    present it is added to phases 1/2 as context — NOT a site: restriction, so
-    external evidence still surfaces — while phase 4 uses it as a site: anchor.
-    (There is no phase 3: the old Y-only "official website" search had no tie to X
-    and could return a same-named but unrelated company, so it was removed.)
-    """
+    """Three parallel AI-Overview questions for one X↔Y relationship pair."""
     x = str(x_name or "").strip()
     y = str(y_name or "").strip()
-    xd = str(x_domain or "").strip()
-    queries: list[tuple[str, str]] = []
-    if x:
-        x_ident = f'"{x}" (website: {xd})' if xd else f'"{x}"'
-        queries.append((
-            "phase1_relationship",
-            f'What is the financial relationship between {x_ident} and "{y}"? '
-            f'What is the official website of "{y}"? give actual url',
-        ))
-        x_terms = f'"{x}" "{xd}"' if xd else f'"{x}"'
-        queries.append((
-            "phase2_investment_evidence",
-            f'{x_terms} "{y}" investment OR portfolio OR funding OR acquisition',
-        ))
-    if xd:
-        anchor = f'"{x}" "{y}" site:{xd}' if x else f'"{y}" site:{xd}'
-        queries.append(("phase4_portfolio_anchor", anchor))
-    cap = max(1, int(max_phases))
-    return queries[:cap]
+    url = str(input_url or "").strip()
+    if not (x and y and url):
+        return []
+    url_instruction = (
+        "Type Company Y's official website as one complete plain-text URL "
+        "beginning with https://. Do not use hyperlink text. "
+        "Do not return Company X's website."
+    )
+    return [
+        (
+            "phase1_relationship_and_url",
+            f'Company X is "{x}" and its official portfolio page is "{url}". '
+            f'What documented financial relationship exists between Company X and '
+            f'the company identified as "{y}"? Identify the exact Company Y. '
+            f'{url_instruction} If no financial relationship is documented, say so explicitly.',
+        ),
+        (
+            "phase2_financial_event_evidence",
+            f'What documented investment, funding, portfolio, acquisition, ownership, '
+            f'or financial-backing event connects Company X "{x}" at "{url}" with '
+            f'the company identified as "{y}"? State the exact relationship and evidence. '
+            f'Identify the exact Company Y. {url_instruction}',
+        ),
+        (
+            "phase3_portfolio_identity",
+            f'The company name candidate "{y}" was extracted from a company logo displayed '
+            f'on Company X "{x}"\'s official portfolio page "{url}". Identify the exact '
+            f'company represented by this name and verify its documented financial relationship '
+            f'with Company X. {url_instruction}',
+        ),
+    ]

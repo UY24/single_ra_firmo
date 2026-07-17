@@ -549,7 +549,7 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
             {
                 "phase": fr.get("phase"),
                 "used": fr.get("success"),
-                "error": fr.get("error"),
+                "error": serpwow_client.sanitize_serpwow_error_text(fr.get("error")),
                 "status_code": fr.get("status_code"),
                 "error_category": fr.get("error_category"),
             }
@@ -576,7 +576,11 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
                 "company_name": company_name,
                 "error_source": row.get("error_source"),
                 "error_category": row.get("error_category"),
-                "error_detail": row.get("error"),
+                "error_detail": (
+                    serpwow_client.sanitize_serpwow_error_text(row.get("error"))
+                    if row.get("error_source") == _outcomes.SRC_SERPWOW
+                    else row.get("error")
+                ),
                 "http_status": http_status,
                 "phases": phases,
             }
@@ -1262,12 +1266,12 @@ def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
         return build_relationship_prompt(
             x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
             y_name=str(row.get("company_name") or ""),
+            input_url=str(row.get("input_url") or ""),
             city=str(row.get("city") or ""),
             country=str(row.get("country") or ""),
             candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
+            ai_overview_evidence=list(_ctx_probe.get("ai_overview_evidence") or []),
             search_attempts=list(_ctx_probe.get("search_attempts") or []),
-            phase4_hit=bool(_ctx_probe.get("phase4_hit")),
             x_domain=str(_ctx_probe.get("x_domain") or ""),
         )
     input_obj = {
@@ -1701,8 +1705,11 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
         ctx = ((row.get("result") or {}).get("context")
                if isinstance((row.get("result") or {}).get("context"), dict) else {})
         if ctx.get("skip_llm"):
-            # relationship short-circuit rows (no evidence / no X) were already
-            # finalized by the worker — never seed them into the batch.
+            # Worker-decided short-circuit rows were already finalized.
+            continue
+        if ctx.get("pipeline") == PIPELINE_GSEARCH and not ctx.get("candidates"):
+            # Defense for legacy/in-flight rows created before gsearch persisted
+            # skip_llm: Gemini cannot select a URL from an empty candidate set.
             continue
         row_index = int(row.get("row_index", 0) or 0)
         key = f"row-{row_index}"
@@ -1781,7 +1788,10 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
     relationship_status GATES the URL (spec §4). Always returns 'completed' now:
     a not-confirmed / confirmed-but-invalid gate is a business not_found
     (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import apply_relationship_gate
+    from app.services.serpwow.gemini_llm import (
+        apply_relationship_gate,
+        update_relationship_block,
+    )
 
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
@@ -1796,15 +1806,8 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
         "status": "pending", "summary": "", "verified_pair": "", "flags": []}
-    relationship["status"] = status
-    relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
-    rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
-    rel_flags.extend(gate_flags)
-    for extra in (parsed or {}).get("extra_flags") or []:
-        if isinstance(extra, str) and extra.strip():
-            rel_flags.append({"flag": extra.strip(), "why": "reported by LLM"})
-    relationship["flags"] = rel_flags
-    context["relationship"] = relationship
+    context["relationship"] = update_relationship_block(
+        relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
 
     result["official_website"] = gated_url
     result["gemini_cost_usd"] = updated_gemini
@@ -4271,18 +4274,14 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     pairs = parsed["pairs"]
     total = len(parsed["original_rows"])
     blank = len(parsed["blank_row_indices"])
-    duplicates = (total - blank) - len(pairs)
+    duplicates = total - len(pairs)
     warnings: list[str] = []
-    if blank:
-        warnings.append(
-            f"{blank} row(s) have a blank Company_Name_Y — skipped for free (they land in skipped.csv)."
-        )
     if duplicates > 0:
         warnings.append(
             f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
         )
     if not pairs:
-        warnings.append("No searchable rows — every Company_Name_Y is blank; the upload would be rejected.")
+        warnings.append("No searchable rows — the CSV contains no data rows.")
 
     return {
         "total_rows": total,

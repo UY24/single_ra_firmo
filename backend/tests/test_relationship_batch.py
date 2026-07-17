@@ -18,14 +18,27 @@ def _rel_row(row_index=1, status="completed", skip_llm=False,
                 "pipeline": "relationship", "skip_llm": skip_llm,
                 "x_domain": "eastlinkcap.com",
                 "candidates": list(candidates),
-                "ai_overview_texts": ["Eastlink invests in Modal."],
-                "search_attempts": [{"attempt": "phase1_relationship", "query": "q"}],
-                "phase4_hit": True,
+                "ai_overview_evidence": [{
+                    "phase": "phase1_relationship_and_url", "query": "q",
+                    "text": "Eastlink invests in Modal.", "sources": [],
+                }],
+                "search_attempts": [{"attempt": "phase1_relationship_and_url", "query": "q"}],
                 "relationship": {"status": "pending", "summary": "",
                                  "verified_pair": "eastlinkcap ↔ Modal", "flags": []},
-                "cost_breakdown": {"serpwow_request_count": 4},
+                "cost_breakdown": {"serpwow_request_count": 3},
             },
         },
+    }
+
+
+def _gsearch_row(candidates=(), row_index=1):
+    return {
+        "row_index": row_index, "company_name": "Acme", "country": "US",
+        "status": "failed", "error": "SerpWow failed (HTTP 503).",
+        "result": {"official_website": None, "context": {
+            "pipeline": "gsearch", "candidates": list(candidates),
+            "formatted_results": [{"success": False, "status_code": 503}],
+        }},
     }
 
 
@@ -57,20 +70,47 @@ class TestRelationshipBatchItems(unittest.TestCase):
         self.assertEqual([k for k, _ in items], ["row-1"])
         self.assertEqual(by_key, {"row-1": 1})
 
+    def test_legacy_gsearch_row_without_candidates_is_not_seeded(self):
+        items, by_key = engine._build_batch_items_for_state(
+            {"rows": [_gsearch_row()]})
+        self.assertEqual(items, [])
+        self.assertEqual(by_key, {})
+
+    def test_gsearch_row_with_candidates_remains_eligible(self):
+        items, by_key = engine._build_batch_items_for_state({
+            "rows": [_gsearch_row(candidates=("https://acme.com/",))]})
+        self.assertEqual([key for key, _ in items], ["row-1"])
+        self.assertEqual(by_key, {"row-1": 1})
+
+    def test_relationship_evidence_without_url_candidate_remains_eligible(self):
+        items, by_key = engine._build_batch_items_for_state({
+            "rows": [_rel_row(candidates=())]})
+        self.assertEqual([key for key, _ in items], ["row-1"])
+        self.assertEqual(by_key, {"row-1": 1})
+
 
 class TestRelationshipBatchApply(unittest.TestCase):
     def test_confirmed_result_completes_row_with_url(self):
         row = _rel_row()
         parsed = {"relationship_status": "confirmed",
+                  "resolved_company_y_name": "Modal Labs",
                   "relationship_summary": "Eastlink invested in Modal.",
+                  "relationship_evidence": ["Series A investment"],
                   "official_website": "https://modal.com/",
-                  "confidence_score": 90, "reason": "r", "extra_flags": []}
+                  "relationship_confidence_score": 95,
+                  "website_confidence_score": 90,
+                  "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(
             row, parsed, {"promptTokenCount": 10, "candidatesTokenCount": 5}, "m")
         self.assertEqual(status, "completed")
         self.assertEqual(row["result"]["official_website"], "https://modal.com/")
         ctx = row["result"]["context"]
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
+        self.assertEqual(ctx["relationship"]["resolved_company_y_name"], "Modal Labs")
+        self.assertEqual(ctx["relationship"]["evidence"], ["Series A investment"])
+        self.assertEqual(ctx["relationship"]["relationship_confidence_score"], 95)
+        self.assertEqual(ctx["relationship"]["website_confidence_score"], 90)
+        self.assertEqual(parsed["confidence_score"], 90)
         self.assertEqual(ctx["gemini_batch_ai"]["raw"], parsed)
         self.assertIsNone(row["error"])
 
@@ -81,7 +121,9 @@ class TestRelationshipBatchApply(unittest.TestCase):
         parsed = {"relationship_status": "not_confirmed",
                   "relationship_summary": "No relation found.",
                   "official_website": "https://modal.com/",
-                  "confidence_score": 30, "reason": "r", "extra_flags": []}
+                  "relationship_confidence_score": 30,
+                  "website_confidence_score": 90,
+                  "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
         self.assertEqual(status, "completed")
         self.assertEqual(row["status"], "completed")
@@ -98,7 +140,9 @@ class TestRelationshipBatchApply(unittest.TestCase):
         row = _rel_row(candidates=("https://www.eastlinkcap.com/team",))
         parsed = {"relationship_status": "confirmed",
                   "official_website": "https://www.eastlinkcap.com/team",
-                  "relationship_summary": "s", "confidence_score": 80,
+                  "relationship_summary": "s",
+                  "relationship_confidence_score": 80,
+                  "website_confidence_score": 80,
                   "reason": "r", "extra_flags": []}
         status = engine._apply_batch_parsed_to_row(row, parsed, {}, "m")
         self.assertEqual(status, "completed")

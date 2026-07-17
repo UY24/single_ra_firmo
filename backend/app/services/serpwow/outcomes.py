@@ -128,13 +128,14 @@ def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
         # llm_selection_failed flag + errors/ dump carry the detail.
         degraded_search = degraded or bool(((result or {}).get("context") or {}).get("llm_error"))
         return OutcomeInfo(OUTCOME_FOUND, degraded_search=degraded_search)
-    # Known business "not found" sentinels (e.g. relationship not-confirmed / no-evidence)
-    if ctx_row_error and ctx_row_error.strip() in NOT_FOUND_SENTINELS:
-        return OutcomeInfo(OUTCOME_NOT_FOUND, degraded_search=degraded)
     # "We couldn't look": phases ran and every one errored -> a real SerpWow error.
     if total > 0 and succeeded == 0:
         return OutcomeInfo(OUTCOME_ERROR, SRC_SERPWOW,
                            dominant_cat or CAT_INTERNAL,
                            error_detail=first_detail or "all SerpWow phases errored")
+    # Known business "not found" sentinels (e.g. relationship not-confirmed / no-evidence).
+    # Checked after provider failure so "no evidence" cannot mask that we never looked.
+    if ctx_row_error and ctx_row_error.strip() in NOT_FOUND_SENTINELS:
+        return OutcomeInfo(OUTCOME_NOT_FOUND, degraded_search=degraded)
     # Otherwise we looked and found nothing.
     return OutcomeInfo(OUTCOME_NOT_FOUND, degraded_search=degraded)

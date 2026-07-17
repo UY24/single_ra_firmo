@@ -7,27 +7,66 @@ from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     build_relationship_prompt,
     choose_relationship_and_website,
+    update_relationship_block,
 )
 
 CANDS = ["https://modal.com/", "https://example.org/"]
+EVIDENCE = [{
+    "phase": "phase1_relationship_and_url",
+    "query": "q1",
+    "text": "Eastlink invested in Modal.\n1. Website: https://modal.com/",
+    "sources": [{"name": "Funding report", "url": "https://news.example/modal"}],
+}]
 
 
 class TestApplyRelationshipGate(unittest.TestCase):
     def test_confirmed_in_candidates_keeps_url(self):
         parsed = {"relationship_status": "confirmed",
-                  "official_website": "https://modal.com/", "confidence_score": 90}
+                  "official_website": "https://modal.com/",
+                  "relationship_confidence_score": 95,
+                  "website_confidence_score": 88}
         url, status, flags = apply_relationship_gate(parsed, CANDS, "eastlinkcap.com")
         self.assertEqual(url, "https://modal.com/")
         self.assertEqual(status, "confirmed")
+        self.assertEqual(parsed["confidence_score"], 88)
+
+    def test_legacy_batch_confidence_populates_both_new_scores(self):
+        parsed = {"relationship_status": "confirmed",
+                  "official_website": "https://modal.com/",
+                  "confidence_score": 83}
+        url, status, _flags = apply_relationship_gate(parsed, CANDS, "")
+        self.assertEqual(url, "https://modal.com/")
+        self.assertEqual(status, "confirmed")
+        self.assertEqual(parsed["relationship_confidence_score"], 83)
+        self.assertEqual(parsed["website_confidence_score"], 83)
+        self.assertEqual(parsed["confidence_score"], 83)
 
     def test_unconfirmed_strips_url_into_flag(self):
         parsed = {"relationship_status": "not_confirmed",
-                  "official_website": "https://modal.com/", "confidence_score": 40}
+                  "official_website": "https://modal.com/",
+                  "relationship_confidence_score": 30,
+                  "website_confidence_score": 87}
         url, status, flags = apply_relationship_gate(parsed, CANDS, "")
         self.assertIsNone(url)
         self.assertEqual(status, "not_confirmed")
         self.assertTrue(any(f["flag"] == "url_found_no_relationship" and
                             "modal.com" in f["why"] for f in flags))
+        self.assertEqual(parsed["relationship_confidence_score"], 30)
+        self.assertEqual(parsed["website_confidence_score"], 87)
+        self.assertEqual(parsed["confidence_score"], 0)
+
+    def test_confirmed_without_url_preserves_relationship_confidence(self):
+        parsed = {"relationship_status": "confirmed", "official_website": None,
+                  "relationship_confidence_score": 96,
+                  "website_confidence_score": 55}
+        url, status, flags = apply_relationship_gate(parsed, CANDS, "")
+        self.assertIsNone(url)
+        self.assertEqual(status, "confirmed")
+        self.assertEqual(parsed["relationship_confidence_score"], 96)
+        self.assertEqual(parsed["website_confidence_score"], 0)
+        self.assertEqual(parsed["confidence_score"], 0)
+        self.assertTrue(any(f["flag"] == "relationship_confirmed_url_missing"
+                            for f in flags))
 
     def test_unclear_strips_url_into_flag(self):
         parsed = {"relationship_status": "unclear",
@@ -36,6 +75,18 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertIsNone(url)
         self.assertEqual(status, "unclear")
         self.assertTrue(any(f["flag"] == "relationship_unclear" for f in flags))
+
+    def test_relationship_block_treats_single_string_fields_as_one_item(self):
+        parsed = {"relationship_summary": "summary",
+                  "relationship_evidence": "one evidence statement",
+                  "relationship_confidence_score": 90,
+                  "website_confidence_score": 0,
+                  "extra_flags": "company_closed"}
+        relationship = update_relationship_block(
+            {"flags": []}, parsed, "confirmed", [])
+        self.assertEqual(relationship["evidence"], ["one evidence statement"])
+        self.assertEqual(relationship["flags"], [{
+            "flag": "company_closed", "why": "reported by LLM"}])
 
     def test_out_of_candidate_url_is_nulled(self):
         parsed = {"relationship_status": "confirmed",
@@ -62,19 +113,23 @@ class TestApplyRelationshipGate(unittest.TestCase):
 class TestChooseRelationshipAndWebsite(unittest.TestCase):
     def test_happy_path_parses_json_and_returns_usage(self):
         llm_json = json.dumps({
+            "resolved_company_y_name": "Modal Labs",
             "relationship_status": "confirmed",
             "relationship_summary": "Eastlink is an investor in Modal Labs.",
+            "relationship_evidence": ["Eastlink participated in Modal's Series A."],
             "official_website": "https://modal.com/",
-            "confidence_score": 92, "reason": "AI overview names both parties.",
+            "relationship_confidence_score": 96,
+            "website_confidence_score": 92,
+            "reason": "AI overview names both parties.",
             "extra_flags": [],
         })
         usage = {"promptTokenCount": 100, "candidatesTokenCount": 50}
         with patch("app.services.serpwow.gemini_llm._gemini_generate_content_json",
                    return_value=(llm_json, usage, None)) as seam:
             parsed, error, model, out_usage = choose_relationship_and_website(
-                "eastlinkcap", "Modal", "", "",
-                CANDS, ["Eastlink Capital is an investor in Modal Labs."],
-                [{"attempt": "phase1_relationship", "query": "q"}], True,
+                "eastlinkcap", "Modal", "https://eastlinkcap.com/portfolio", "", "",
+                CANDS, EVIDENCE,
+                [{"attempt": "phase1_relationship_and_url", "query": "q"}],
                 "eastlinkcap.com")
         self.assertIsNone(error)
         self.assertEqual(parsed["relationship_status"], "confirmed")
@@ -85,12 +140,15 @@ class TestChooseRelationshipAndWebsite(unittest.TestCase):
         self.assertIn("modal.com", prompt_sent)
         self.assertIn("eastlinkcap.com", prompt_sent)
         self.assertIn("company_x_domain", prompt_sent)
+        self.assertIn("official portfolio page", prompt_sent)
+        self.assertIn("1. Website: https://modal.com/", prompt_sent)
+        self.assertNotIn('"type"', prompt_sent)
 
     def test_http_error_surfaces(self):
         with patch("app.services.serpwow.gemini_llm._gemini_generate_content_json",
                    return_value=(None, None, "Gemini HTTPError: 500")):
             parsed, error, model, usage = choose_relationship_and_website(
-                "x", "y", "", "", CANDS, [], [], False)
+                "x", "y", "https://x.test/p", "", "", CANDS, [], [], "x.test")
         self.assertIsNone(parsed)
         self.assertIn("500", error)
 
@@ -98,20 +156,23 @@ class TestChooseRelationshipAndWebsite(unittest.TestCase):
 class TestBuildRelationshipPrompt(unittest.TestCase):
     def test_prompt_contains_contract_and_evidence(self):
         prompt = build_relationship_prompt(
-            "m25vc", "Sanzo", "NYC", "US", CANDS,
-            ["overview text A"], [{"attempt": "phase1_relationship", "query": "q1"}], True,
+            "m25vc", "Sanzo", "https://m25vc.com/portfolio", "NYC", "US", CANDS,
+            EVIDENCE, [{"attempt": "phase1_relationship_and_url", "query": "q1"}],
             "eastlinkcap.com")
         for needle in ("relationship_status", "confirmed", "not_confirmed", "unclear",
-                       "official_website", "confidence_score", "extra_flags",
-                       "overview text A", "m25vc", "Sanzo", "financial",
+                       "official_website", "relationship_confidence_score",
+                       "website_confidence_score", "resolved_company_y_name",
+                       "relationship_evidence", "extra_flags",
+                       "Eastlink invested in Modal", "Funding report",
+                       "m25vc", "Sanzo", "financial",
                        "company_x_domain", "eastlinkcap.com"):
             self.assertIn(needle, prompt)
 
     def test_prompt_falls_back_to_name_when_no_domain(self):
         # No domain: company_x_domain serializes to null but the X name is still present.
         prompt = build_relationship_prompt(
-            "m25vc", "Sanzo", "NYC", "US", CANDS,
-            ["overview text A"], [{"attempt": "phase1_relationship", "query": "q1"}], True,
+            "m25vc", "Sanzo", "https://m25vc.com/portfolio", "NYC", "US", CANDS,
+            EVIDENCE, [{"attempt": "phase1_relationship_and_url", "query": "q1"}],
             "")
         self.assertIn("company_x_domain", prompt)
         self.assertIn('"company_x_domain": null', prompt)

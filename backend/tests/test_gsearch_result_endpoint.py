@@ -16,7 +16,7 @@ class TestFileLinks(unittest.TestCase):
 
     def test_non_gsearch_links_unchanged(self):
         with unittest.mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}):
-            links = legacy_app._upload_file_links("up1", "Acme", legacy_app.PIPELINE_FULL)
+            links = legacy_app._upload_file_links("up1", "Acme", legacy_app.PIPELINE_FIRMOGRAPHICS)
         self.assertNotIn("report.json", links)
         self.assertIn("state.json", links)
 

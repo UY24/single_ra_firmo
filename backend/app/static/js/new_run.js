@@ -42,8 +42,6 @@ const PIPELINES = [
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",
     desc: "Verifies an X↔Y financial relationship and returns Y's website only when confirmed.", csvCols: _REL_COLS },
-  { key: "full", label: "Upload Console", endpoint: "/uploads",
-    desc: "Discovery, crawl, extraction, and post-processing in one run.", csvCols: _SW_COLS },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
     desc: "Enrichment for rows that already have a website.", csvCols: _FIRMO_COLS },
 ];

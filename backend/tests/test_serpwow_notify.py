@@ -46,7 +46,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertEqual(kw["total_rows"], 3)
 
     def test_failed_routes_to_failed(self):
-        state = {"upload_id": "UP2", "company_name": "Acme Inc", "pipeline": "full",
+        state = {"upload_id": "UP2", "company_name": "Acme Inc", "pipeline": "firmographics",
                  "status": "failed", "total_rows": 5, "success_rows": 0,
                  "failed_rows": 5, "error": "queue down"}
         with mock.patch("app.core.notify.notify_run_complete") as done, \
@@ -54,7 +54,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
             la._notify_slack_terminal(state)
         done.assert_not_called()
         kw = failed.call_args.kwargs
-        self.assertEqual(kw["pipeline"], "Upload Console")
+        self.assertEqual(kw["pipeline"], "Firmographics")
         self.assertEqual(kw["error"], "queue down")
 
     def test_gsearch_includes_searches_tokens_cost(self):
@@ -94,8 +94,8 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertNotIn("failed", kw)
 
     def test_non_gsearch_omits_search_token_cost(self):
-        # `full` has no serpwow_reporting-style cost/token tracking -> omitted.
-        state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "full",
+        # firmographics has no serpwow_reporting-style cost/token tracking -> omitted.
+        state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "firmographics",
                  "status": "completed", "total_rows": 2, "success_rows": 2, "failed_rows": 0}
         with mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed"):

@@ -314,14 +314,14 @@ async function completedWithErrorsBatchIsTerminal() {
     "SerpWow failed attempts were not visible beside cost");
 }
 
-async function fullPipelineIgnoresBatchState() {
-  const { root } = await renderStatus("full-batch", {
-    pipeline: "full", status: "completed", total_rows: 2, processed_rows: 2,
+async function nonReportingPipelineIgnoresBatchState() {
+  const { root } = await renderStatus("firmo-batch", {
+    pipeline: "firmographics", status: "completed", total_rows: 2, processed_rows: 2,
     success_rows: 2, failed_rows: 0, gemini_batch: { status: "running" },
   });
-  assert(timers.length === 0, "full pipeline silently kept polling irrelevant batch state");
-  assert(!root.textContent.includes("finalizing"), "full pipeline showed reporting finalizing state");
-  assert(byClass(root, "files-section").length === 1, "terminal full pipeline files missing");
+  assert(timers.length === 0, "non-reporting pipeline silently kept polling irrelevant batch state");
+  assert(!root.textContent.includes("finalizing"), "non-reporting pipeline showed reporting finalizing state");
+  assert(byClass(root, "files-section").length === 1, "terminal non-reporting pipeline files missing");
 }
 
 async function failedReportingRunShowsFiles() {
@@ -377,7 +377,7 @@ async function cancelledBatchTerminalizes() {
 
 async function legacyCompatibility() {
   const { root } = await renderStatus("legacy", {
-    pipeline: "full", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
+    pipeline: "firmographics", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
     success_rows: 5, failed_rows: 2, processing_seconds_total: 14, processing_seconds_avg: 2,
     updated_at: "2026-07-12T10:30:00Z",
   });
@@ -388,7 +388,7 @@ async function legacyCompatibility() {
   assert(labelValue(root, "Failed") === "2", "legacy failed rows must use Failed label");
   const title = byClass(root, "detail-title")[0]?.textContent;
   const subtitle = byClass(root, "detail-subtitle")[0]?.textContent;
-  assert(title === "Upload Console", "legacy header exposed raw pipeline code or upload reference");
+  assert(title === "Firmographics", "legacy header exposed raw pipeline code or upload reference");
   assert(subtitle?.includes("Run legacy") && subtitle.includes("Updated") && subtitle.includes("Jul"),
     "legacy header omitted the human-readable run context timestamp");
   assert(byClass(root, "files-section").length === 1, "legacy terminal files missing");
@@ -632,7 +632,7 @@ await completedGmapsHeuristic();
 await completedRelationship();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
-await fullPipelineIgnoresBatchState();
+await nonReportingPipelineIgnoresBatchState();
 await failedReportingRunShowsFiles();
 await cancelledBatchTerminalizes();
 await legacyCompatibility();

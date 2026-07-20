@@ -139,7 +139,7 @@ async function terminalAndActionContract() {
   reset();
   queue("/uploads?limit=200", { uploads: [
     {
-      upload_id: "partial", pipeline: "full", status: "completed_with_errors",
+      upload_id: "partial", pipeline: "gmaps", status: "completed_with_errors",
       gemini_batch: { status: "completed_with_errors" }, file_links: {},
     },
     {

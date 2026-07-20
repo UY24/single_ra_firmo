@@ -127,8 +127,6 @@ const HISTORY_PIPELINES = [
   { key: "relationship", label: "Relationship" },
   { key: "gmaps", label: "Google Maps" },
   { key: "gsearch", label: "Google Search" },
-  { key: "full", label: "Full" },
-  { key: "url_discovery", label: "URL Discovery" },
   { key: "firmographics", label: "Firmographics" },
 ];
 

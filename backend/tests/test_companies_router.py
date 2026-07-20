@@ -357,7 +357,7 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
         return svc
 
     def test_old_company_mode_csv_rejected_400(self):
-        for path in ("/uploads", "/uploads/gmaps"):
+        for path in ("/uploads/gsearch", "/uploads/gmaps"):
             with mock.patch(
                 "app.services.companies.get_company_service", return_value=self._svc()
             ):
@@ -376,7 +376,7 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
             "app.services.companies.get_company_service", return_value=self._svc()
         ), mock.patch.object(self.legacy_app, "rabbitmq_exchange", None):
             res = self.client.post(
-                "/uploads", files={"file": self.CANONICAL_CSV}, data={"company_id": "u1"}
+                "/uploads/gsearch", files={"file": self.CANONICAL_CSV}, data={"company_id": "u1"}
             )
         self.assertEqual(res.status_code, 503)
         self.assertIn("RabbitMQ", res.json()["detail"])

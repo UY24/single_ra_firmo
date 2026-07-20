@@ -25,9 +25,9 @@ class TestFinalizeOutcome(unittest.TestCase):
                          (o.OUTCOME_ERROR, o.SRC_SERPWOW, "failed"))
 
     def test_out_of_scope_pipeline_keeps_failed_for_notfound(self):
-        # full/url_discovery/firmographics: no remap — not_found stays "failed"
+        # firmographics: no serpwow_reporting remap — not_found stays "failed"
         info, status = engine._finalize_row_outcome(_result(phases=[{"used": True}]),
-                                                     pipeline="full", batch_postprocess_enabled=False)
+                                                     pipeline="firmographics", batch_postprocess_enabled=False)
         self.assertEqual(status, "failed")
 
     def test_found_is_completed(self):

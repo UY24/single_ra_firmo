@@ -557,39 +557,37 @@ def build_selected_phase_queries(
 def build_relationship_phase_queries(
     x_name: str,
     y_name: str,
-    input_url: str,
+    x_domain: str,
 ) -> list[tuple[str, str]]:
-    """Three parallel AI-Overview questions for one X↔Y relationship pair."""
+    """Keyword search queries for one X↔Y relationship pair.
+
+    These are sent as `q=` to SerpWow's `engine=google` web search, so they MUST be
+    keyword/boolean queries (prose questions return ~no organic_results → 0 candidates).
+    Goal is to maximize candidate recall into organic_results; the downstream LLM gate
+    handles precision (it requires confirmed financial evidence and picks the website
+    from the candidate set only). `include_ai_overview=true` still fires on these, so
+    AI-overview evidence keeps flowing to the gate as a bonus.
+    """
     x = str(x_name or "").strip()
     y = str(y_name or "").strip()
-    url = str(input_url or "").strip()
-    if not (x and y and url):
+    xd = str(x_domain or "").strip()
+    # Both are required: Y is the search target; X is what the gate verifies the
+    # relationship against — the executor short-circuits a blank X (REL_ERROR_NO_X)
+    # before the LLM, so searching Y alone would be wasted spend.
+    if not (x and y):
         return []
-    url_instruction = (
-        "Type Company Y's official website as one complete plain-text URL "
-        "beginning with https://. Do not use hyperlink text. "
-        "Do not return Company X's website."
-    )
-    return [
+    queries: list[tuple[str, str]] = [
+        # Direct site-finding: surfaces Y's homepage as a top organic result (recall).
+        ("phase1_official_website", f'"{y}" official website'),
+        # X-anchored financial evidence: disambiguates same-named companies and yields
+        # portfolio/news candidate URLs. Boolean OR keeps organic_results rich.
         (
-            "phase1_relationship_and_url",
-            f'Company X is "{x}" and its official portfolio page is "{url}". '
-            f'What documented financial relationship exists between Company X and '
-            f'the company identified as "{y}"? Identify the exact Company Y. '
-            f'{url_instruction} If no financial relationship is documented, say so explicitly.',
-        ),
-        (
-            "phase2_financial_event_evidence",
-            f'What documented investment, funding, portfolio, acquisition, ownership, '
-            f'or financial-backing event connects Company X "{x}" at "{url}" with '
-            f'the company identified as "{y}"? State the exact relationship and evidence. '
-            f'Identify the exact Company Y. {url_instruction}',
-        ),
-        (
-            "phase3_portfolio_identity",
-            f'The company name candidate "{y}" was extracted from a company logo displayed '
-            f'on Company X "{x}"\'s official portfolio page "{url}". Identify the exact '
-            f'company represented by this name and verify its documented financial relationship '
-            f'with Company X. {url_instruction}',
+            "phase2_financial_evidence",
+            f'"{x}" "{y}" investment OR portfolio OR funding OR '
+            f'acquisition OR investor OR backed',
         ),
     ]
+    if xd:
+        # Portfolio-page anchor on X's own domain: confirms Y appears on X's site.
+        queries.append(("phase3_portfolio_anchor", f'"{x}" "{y}" site:{xd}'))
+    return queries

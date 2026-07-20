@@ -114,7 +114,7 @@ async def execute_relationship_lookup_for_worker(
 ) -> tuple[CrawlResponse, str]:
     x_domain = x_domain_from_input_url(input_url)
     queries = build_relationship_phase_queries(
-        x_name=x_name, y_name=y_name, input_url=input_url)
+        x_name=x_name, y_name=y_name, x_domain=x_domain)
 
     timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
     async with httpx.AsyncClient(timeout=timeout_sec) as client:

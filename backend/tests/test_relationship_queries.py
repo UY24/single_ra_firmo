@@ -23,35 +23,35 @@ class TestXDomainHelpers(unittest.TestCase):
 
 class TestBuildRelationshipPhaseQueries(unittest.TestCase):
     def test_three_phases_with_full_inputs(self):
-        input_url = "https://www.m25vc.com/portfolio"
-        qs = build_relationship_phase_queries("m25vc", "Sanzo", input_url)
+        qs = build_relationship_phase_queries("m25vc", "Sanzo", "m25vc.com")
         labels = [label for label, _ in qs]
         self.assertEqual(labels, [
-            "phase1_relationship_and_url",
-            "phase2_financial_event_evidence",
-            "phase3_portfolio_identity",
+            "phase1_official_website",
+            "phase2_financial_evidence",
+            "phase3_portfolio_anchor",
         ])
         for _label, query in qs:
-            self.assertIn('"m25vc"', query)
             self.assertIn('"Sanzo"', query)
-            self.assertIn(input_url, query)
-            self.assertIn("plain-text", query)
-            self.assertIn("https://", query)
-            self.assertIn("Do not return Company X", query)
+            # Keyword queries, not prose questions — a "?" collapses organic_results.
+            self.assertNotIn("?", query)
 
         by = dict(qs)
-        self.assertIn("documented financial relationship",
-                      by["phase1_relationship_and_url"])
-        for term in ("investment", "funding", "portfolio", "acquisition",
-                     "ownership", "financial-backing"):
-            self.assertIn(term, by["phase2_financial_event_evidence"])
-        self.assertIn("extracted from a company logo",
-                      by["phase3_portfolio_identity"])
+        self.assertIn("official website", by["phase1_official_website"])
+        self.assertIn('"Sanzo"', by["phase1_official_website"])
+        for term in ("investment", "portfolio", "acquisition", " OR "):
+            self.assertIn(term, by["phase2_financial_evidence"])
+        self.assertIn('"m25vc"', by["phase2_financial_evidence"])
+        self.assertIn("site:m25vc.com", by["phase3_portfolio_anchor"])
 
-    def test_missing_required_input_yields_no_queries(self):
-        self.assertEqual(build_relationship_phase_queries("", "Sanzo", "https://x.test"), [])
-        self.assertEqual(build_relationship_phase_queries("X", "", "https://x.test"), [])
-        self.assertEqual(build_relationship_phase_queries("X", "Y", ""), [])
+    def test_degraded_inputs(self):
+        # No x_domain (Input_URL not a parseable host) → phase3 anchor dropped,
+        # phase1 + phase2 still run.
+        no_domain = build_relationship_phase_queries("m25vc", "Sanzo", "")
+        self.assertEqual([l for l, _ in no_domain],
+                         ["phase1_official_website", "phase2_financial_evidence"])
+        # Both X and Y are required (X is what the gate verifies against).
+        self.assertEqual(build_relationship_phase_queries("", "Sanzo", "m25vc.com"), [])
+        self.assertEqual(build_relationship_phase_queries("m25vc", "", "m25vc.com"), [])
 
 
 if __name__ == "__main__":

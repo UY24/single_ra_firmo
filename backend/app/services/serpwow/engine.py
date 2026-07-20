@@ -130,8 +130,6 @@ from app.services.serpwow.gemini_llm import (
     choose_final_website_with_gemini,
 )
 from app.services.serpwow.constants import (
-    PIPELINE_FULL,
-    PIPELINE_URL_DISCOVERY,
     PIPELINE_FIRMOGRAPHICS,
     PIPELINE_GMAPS,
     PIPELINE_GSEARCH,
@@ -140,7 +138,7 @@ from app.services.serpwow.constants import (
     REL_ERROR_CONFIRMED_URL_INVALID,
     REL_ERROR_NOT_CONFIRMED,
 )
-from app.services.serpwow.schemas import CrawlRequest, FirmographicsRequest, CrawlResponse
+from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
     _now_iso,
     _short_text,
@@ -157,7 +155,6 @@ from app.services.serpwow.modes.relationship import (
 )
 from app.services.serpwow.modes.gmaps import execute_gmaps_lookup
 from app.services.serpwow.modes.firmographics import execute_firmographic_extraction
-from app.services.serpwow.modes.full import execute_company_lookup
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -291,11 +288,10 @@ _get_bool_env = get_bool_env
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     """True when Gemini batch confidence scoring applies to this pipeline.
 
-    full    -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
     gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
     """
-    pipe = str(pipeline or PIPELINE_FULL)
+    pipe = str(pipeline or "")
     if pipe == PIPELINE_GSEARCH:
         return _get_bool_env("GSEARCH_LLM_BATCH", False)
     if pipe == PIPELINE_GMAPS:
@@ -303,8 +299,6 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
         return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
     if pipe == PIPELINE_RELATIONSHIP:
         return _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
-    if pipe == PIPELINE_FULL:
-        return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
 
 
@@ -316,7 +310,7 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     reports completion once with final numbers — like AI Mode. The `full`
     pipeline is intentionally left unchanged.
     """
-    pipe = str(state.get("pipeline") or PIPELINE_FULL)
+    pipe = str(state.get("pipeline") or "")
     if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}:
         return False
     if not _batch_postprocess_enabled_for(pipe):
@@ -848,7 +842,7 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
         company_name = str(data.get("company_name") or "")
-        pipeline = str(data.get("pipeline") or PIPELINE_FULL)
+        pipeline = str(data.get("pipeline") or "")
         key = (
             _state_s3_key(upload_id, company_name, pipeline)
             if name == "state"
@@ -934,7 +928,7 @@ def _batch_deletion_tombstone_s3_key(upload_id: str, state: dict[str, Any]) -> s
     prefix = _resolved_upload_s3_prefix(
         upload_id,
         str(state.get("company_name") or ""),
-        str(state.get("pipeline") or PIPELINE_FULL),
+        str(state.get("pipeline") or ""),
     )
     return f"{prefix}/batch_deleted_by_user.json"
 
@@ -1220,7 +1214,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "upload_id": state["upload_id"],
         "company_name": state.get("company_name") or "",
-        "pipeline": state.get("pipeline") or PIPELINE_FULL,
+        "pipeline": state.get("pipeline") or "",
         "status": state["status"],
         "gemini_batch": state.get("gemini_batch"),
         "created_at": state.get("created_at"),
@@ -2127,7 +2121,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
 
 
 async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return
     if state.get("stopped_by_user_at"):
         # /uploads/{id}/stop terminalizes the upload; don't launch a batch for it.
@@ -2159,7 +2153,7 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
 
 
 async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     status = str(gemini_batch_meta.get("status") or "")
@@ -2175,7 +2169,7 @@ async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, 
 
 
 async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return state
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     local_status = str(gemini_batch_meta.get("status") or "").strip()
@@ -2300,8 +2294,6 @@ def build_processing_timing_summary(rows: Any) -> dict[str, Any]:
 
 
 def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
-    if not state.get("pipeline"):
-        state["pipeline"] = PIPELINE_FULL
     rows = state.get("rows", [])
     total = len(rows)
     processed = sum(1 for r in rows if r.get("status") in {"completed", "failed"})
@@ -2540,8 +2532,8 @@ async def _available_reporting_files(
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
-        state_pipeline = str(summary.get("pipeline") or PIPELINE_FULL)
-        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL))
+        state_pipeline = str(summary.get("pipeline") or "")
+        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or ""))
         upload_summaries_cache[upload_id] = {
             "upload_id": summary.get("upload_id"),
             "pipeline": state_pipeline,
@@ -2583,7 +2575,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         if svc is None:
             return False
         upload_id = str(state.get("upload_id") or "")
-        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
+        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or ""))
         extra: dict[str, Any] = {}
         success_count = state.get("success_rows")
         failed_count = state.get("failed_rows")
@@ -2686,7 +2678,7 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
         from app.core import notify
 
         status = str(state.get("status") or "")
-        pipeline = notify.pipeline_label(state.get("pipeline") or PIPELINE_FULL)
+        pipeline = notify.pipeline_label(state.get("pipeline") or "")
         # relationship state counters/total_rows are PAIR-level; the Slack ping
         # should match the CSVs the user downloads (ORIGINAL-ROW-level), so use
         # the original row count when this is a relationship upload.
@@ -2970,9 +2962,7 @@ async def update_row_state(
 async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any]) -> dict[str, Any]:
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return state
-    if str(state.get("pipeline") or PIPELINE_FULL) not in {
-        PIPELINE_FULL,
-        PIPELINE_URL_DISCOVERY,
+    if str(state.get("pipeline") or "") not in {
         PIPELINE_FIRMOGRAPHICS,
         PIPELINE_GMAPS,
         PIPELINE_GSEARCH,
@@ -3007,7 +2997,7 @@ async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any])
         if age_sec < cooldown_sec:
             return state
 
-    pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+    pipeline = str(state.get("pipeline") or "")
     phase = str(state.get("phase") or "all")
     upload_company_name = str(state.get("company_name") or "")
     jobs = [_build_row_job_payload(upload_id, row, pipeline, phase, upload_company_name=upload_company_name) for row in queued_rows]
@@ -3310,7 +3300,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
     input_industry = str(job.get("industry") or "") or None
     input_full_address = str(job.get("full_address") or "") or None
     official_website_input = str(job.get("official_website") or "") or None
-    pipeline = str(job.get("pipeline") or PIPELINE_FULL).strip() or PIPELINE_FULL
+    pipeline = str(job.get("pipeline") or "").strip() or ""
     started_monotonic = asyncio.get_event_loop().time()
     _log_row_stage(
         "worker.row_start",
@@ -3393,16 +3383,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 debug_row_index=row_index,
             )
         else:
-            crawl_response, serpwow_raw_json = await execute_company_lookup(
-                company_name=company_name,
-                country=country,
-                firm_id=firm_id,
-                input_industry=input_industry,
-                input_full_address=input_full_address,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-                include_firmographics=(pipeline != PIPELINE_URL_DISCOVERY),
-            )
+            raise ValueError(f"unknown pipeline {pipeline!r}")
 
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
             upload_id=upload_id,
@@ -3664,7 +3645,7 @@ async def reconcile_pending_gemini_batches() -> None:
             upload_id = str(state.get("upload_id") or "").strip()
             if not upload_id:
                 continue
-            if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+            if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
                 continue
             gb = state.get("gemini_batch")
             if not isinstance(gb, dict):
@@ -3715,7 +3696,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
         for state in states:
             if not isinstance(state, dict):
                 continue
-            _rec_pipe = str(state.get("pipeline") or PIPELINE_FULL)
+            _rec_pipe = str(state.get("pipeline") or "")
             # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
             # only in batch mode, where a stuck row blocks the finalization batch from
             # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
@@ -3737,7 +3718,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
                 stuck.append(row)
             if not stuck:
                 continue
-            pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+            pipeline = str(state.get("pipeline") or "")
             phase = str(state.get("phase") or "all")
             upload_company_name = str(state.get("company_name") or "")
             async with get_upload_lock(upload_id):
@@ -3942,49 +3923,6 @@ async def get_url(url: str) -> dict[str, str]:
     return {"message": f"Successfully received URL: {url}", "url": url}
 
 
-@app.get("/crawl", response_model=CrawlResponse)
-async def crawl_url_get(
-    company_name: str,
-    country: str,
-    firm_id: Optional[str] = None,
-    industry: Optional[str] = None,
-    full_address: Optional[str] = None,
-) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name,
-        country,
-        firm_id=firm_id,
-        input_industry=industry,
-        input_full_address=full_address,
-    )
-    return response
-
-
-@app.post("/crawl", response_model=CrawlResponse)
-async def crawl_url_post(payload: CrawlRequest) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name=payload.company_name,
-        country=payload.country,
-        firm_id=payload.firm_id,
-        input_industry=payload.industry,
-        input_full_address=payload.full_address,
-    )
-    return response
-
-
-@app.post("/crawl/url-discovery", response_model=CrawlResponse)
-async def crawl_url_discovery_post(payload: CrawlRequest) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name=payload.company_name,
-        country=payload.country,
-        firm_id=payload.firm_id,
-        input_industry=payload.industry,
-        input_full_address=payload.full_address,
-        include_firmographics=False,
-    )
-    return response
-
-
 @app.post("/crawl/firmographics", response_model=CrawlResponse)
 async def crawl_firmographics_post(payload: FirmographicsRequest) -> CrawlResponse:
     response, _ = await execute_firmographic_extraction(
@@ -4168,40 +4106,6 @@ async def _create_upload_with_rows(
         "output_url": f"/uploads/{upload_id}/output",
         "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
     }
-
-
-@app.post("/uploads")
-async def create_upload(
-    file: UploadFile = File(...),
-    company_id: str = Form(...),
-    company_name: str = Form(""),
-) -> dict[str, Any]:
-    raw = await file.read()
-    _validate_canonical_upload_csv(raw)
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_FULL, company_id=company_id, company_name=company_name
-    )
-
-
-@app.post("/uploads/url-discovery")
-async def create_url_discovery_upload(
-    file: UploadFile = File(...),
-    company_id: str = Form(...),
-    company_name: str = Form(""),
-) -> dict[str, Any]:
-    raw = await file.read()
-    _validate_canonical_upload_csv(raw)
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_URL_DISCOVERY, company_id=company_id, company_name=company_name
-    )
 
 
 @app.post("/uploads/firmographics")
@@ -4406,7 +4310,7 @@ async def retry_failed_rows(
                 raise HTTPException(status_code=404, detail="Upload ID not found") from exc
             raise
 
-        pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+        pipeline = str(state.get("pipeline") or "")
         phase = str(state.get("phase") or "all")
         # Retrying a stopped upload re-opens it: clear the stop marker so the
         # batch post-process can run again once the retried rows finish.
@@ -4603,7 +4507,7 @@ async def uploads_list(
     pipeline_value = None
     if pipeline:
         candidate = str(pipeline).strip().lower()
-        if candidate in {PIPELINE_FULL, PIPELINE_URL_DISCOVERY, PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}:
+        if candidate in {PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}:
             pipeline_value = candidate
     items = await list_upload_summaries(limit, pipeline=pipeline_value)
     return {"count": len(items), "uploads": items}
@@ -4616,8 +4520,8 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
     local_by_job: dict[str, dict[str, Any]] = {}
     local_by_upload: dict[str, dict[str, Any]] = {}
     for item in items:
-        if str(item.get("pipeline") or PIPELINE_FULL) not in {
-            PIPELINE_FULL, PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
+        if str(item.get("pipeline") or "") not in {
+            PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
         }:
             continue
         batch_meta = item.get("gemini_batch") if isinstance(item.get("gemini_batch"), dict) else {}
@@ -5058,7 +4962,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     # batch mode, found counts, cost, tokens) so the run-detail UI can show the
     # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
     serpwow_summary = None
-    if (summary.get("pipeline") or PIPELINE_FULL) in REPORTING_PIPELINES:
+    if (summary.get("pipeline") or "") in REPORTING_PIPELINES:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
@@ -5075,7 +4979,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 available_files = await _available_reporting_files(
                     upload_id,
                     str(summary.get("company_name") or ""),
-                    str(summary.get("pipeline") or PIPELINE_FULL),
+                    str(summary.get("pipeline") or ""),
                 )
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
@@ -5096,7 +5000,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
             serpwow_summary = None
     return {
         "upload_id": summary["upload_id"],
-        "pipeline": summary.get("pipeline") or PIPELINE_FULL,
+        "pipeline": summary.get("pipeline") or "",
         "status": summary["status"],
         "gemini_batch": summary.get("gemini_batch"),
         "serpwow_summary": serpwow_summary,
@@ -5110,7 +5014,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
         "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
         "processing_seconds_count": summary.get("processing_seconds_count", 0),
-        "file_links": _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL)),
+        "file_links": _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or "")),
         "rows": [
             {
                 "row_index": row["row_index"],

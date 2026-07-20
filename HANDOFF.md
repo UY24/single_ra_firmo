@@ -17,7 +17,7 @@ Last updated: 2026-07-20. Read this first if you're picking up this repo. Durabl
 
 Two independent discovery systems behind one FastAPI app + vanilla-JS UI (see `CLAUDE.md` for the architecture):
 
-- **SerpWow pipelines** — `full`, `url_discovery`, `firmographics`, `gmaps`, `gsearch`, `relationship`. gsearch/gmaps/relationship have confidence scoring + `found.csv`/`notFound.csv`/`report.json`/`run.log` output parity, S3 mirroring, Supabase counters, and run-detail UI.
+- **SerpWow pipelines** — `firmographics`, `gmaps`, `gsearch`, `relationship` (the legacy `full`/`url_discovery` modes were removed 2026-07-20). gsearch/gmaps/relationship have confidence scoring + `found.csv`/`notFound.csv`/`report.json`/`run.log` output parity, S3 mirroring, Supabase counters, and run-detail UI.
 - **AI Mode** — `ai_bulk`, `ai_deep` (scrape.do -> LLM cleanup), **now broker-driven** (RabbitMQ scrape phase in the worker process, reconciler self-healing, streaming assembly, Gemini Batch API support). See the AI Mode section in `CLAUDE.md`.
 - Cross-cutting: unified CSV input, per-company/per-pipeline S3 layout, Supabase run tracking, best-effort Slack completion/failure pings (with split LLM vs SerpWow cost), the redesigned dark UI across all views.
 
@@ -57,7 +57,41 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
-## Latest completed session — 2026-07-20 (relationship search-query regression fix + Runs-page pipeline dropdown, branch `aiModeBroker`)
+## Latest completed session — 2026-07-20 (remove `full` + `url_discovery` pipelines, branch `remove-full-url-discovery` off `aiModeBroker`)
+
+**Status: code complete, 556/556 offline, NOT live-verified, NOT pushed.** Removed the two
+legacy SerpWow pipelines completely; gsearch-all-phases supersedes them for URL discovery.
+`firmographics`/`gmaps`/`gsearch`/`relationship` + AI-mode are the surviving pipelines.
+
+What changed:
+- **Deleted** `services/serpwow/modes/full.py` (the shared `execute_company_lookup` executor — no
+  other module imported anything from it) and the two full-only ops scripts
+  (`scripts/push_processed_rows_to_gemini_batch.py`, `scripts/requeue_wait_and_push_remaining_to_gemini_batch.py`).
+- **Constants** (`serpwow/constants.py`): removed `PIPELINE_FULL` + `PIPELINE_URL_DISCOVERY`.
+- **Routes** (`engine.py`): removed `GET/POST /crawl`, `POST /crawl/url-discovery`,
+  `POST /uploads` (the bare full creator) and `POST /uploads/url-discovery`. Kept
+  `/crawl/firmographics`, `/uploads/firmographics|gmaps|gsearch|relationship|ai-mode`.
+- **`PIPELINE_FULL` purged, no replacement default** (per user: pipeline is always set explicitly
+  at upload, so the old `... or PIPELINE_FULL` sentinel never fired on a real run). All ~24 sites
+  became `... or ""`; the **worker dispatch `else` now `raise ValueError(f"unknown pipeline …")`**
+  (fail-loud) instead of routing to the removed executor. Removed the `full`→`ENABLE_GEMINI_BATCH_POSTPROCESS`
+  branch in `_batch_postprocess_enabled_for` (that env flag is now dead — dropped from `.env.example`).
+  Trimmed full/url_discovery from the 3 pipeline allow-list sets and `notify._PIPELINE_LABELS`.
+- **Frontend**: dropped the "Upload Console" card in `new_run.js`, the two entries in `ui.js`
+  (`PIPELINES`/`PIPELINE_LABELS`) and in `operations.js` `HISTORY_PIPELINES`.
+- **Tests**: no dedicated test files existed; updated shared tests that used `"full"` as an example
+  to a surviving pipeline, deleted `test_full_uses_enable_flag`, updated 2 `.mjs` DOM contracts.
+- **Docs**: `CLAUDE.md`, `readme.md`, this file. (Left the immutable applied SQL migration comment and
+  the historical `impplan.md` as-is.)
+
+Accepted consequence: legacy `full`/`url_discovery` runs already in S3/Supabase are **not migrated** —
+they render with the raw pipeline key as label and their old S3 folder path; a replayed legacy queue
+message fails loudly. Live smoke still needed: New Run has no "Upload Console" card, and a `gsearch` +
+`firmographics` run still complete end-to-end.
+
+---
+
+## Recent session — 2026-07-20 (relationship search-query regression fix + Runs-page pipeline dropdown, branch `aiModeBroker`)
 
 Two independent fixes.
 

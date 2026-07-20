@@ -24,9 +24,7 @@ _PIPELINE_LABELS = {
     "ai_deep": "Google AI (Deep)",
     "gmaps": "Google Maps",
     "gsearch": "Google Search",
-    "full": "Upload Console",
     "firmographics": "Firmographics",
-    "url_discovery": "URL Discovery",
 }
 
 

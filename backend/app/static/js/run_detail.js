@@ -12,6 +12,7 @@ import {
   errorCard,
   loadingCard,
   metricItem,
+  pipelineLabel,
   sectionHeading,
   shortDate,
   statusBadge,
@@ -25,22 +26,6 @@ const BATCH_TERMINAL_STATUSES = new Set([
   "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
 ]);
 const STOPPABLE_BATCH_STATUSES = new Set(["waiting_for_rows", "queued", "running"]);
-const PIPELINE_LABELS = {
-  ai_bulk: "Google AI (Bulk)",
-  ai_deep: "Google AI (Deep)",
-  gmaps: "Google Maps",
-  gsearch: "Google Search",
-  relationship: "Financial Relationship",
-  full: "Upload Console",
-  firmographics: "Firmographics",
-  url_discovery: "URL Discovery",
-};
-
-function pipelineLabel(pipeline) {
-  const key = String(pipeline ?? "");
-  return PIPELINE_LABELS[key] ?? (key || "Run");
-}
-
 function deriveLegacyRunState(s) {
   const status = String(s?.status ?? "");
   const pipeline = String(s?.pipeline ?? "");

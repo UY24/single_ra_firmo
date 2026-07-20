@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-14. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-07-20. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
@@ -57,7 +57,25 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
-## Latest completed session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
+## Latest completed session — 2026-07-20 (relationship search-query regression fix + Runs-page pipeline dropdown, branch `aiModeBroker`)
+
+Two independent fixes.
+
+### 1. Relationship mode found 0 websites on every row — search-query regression (committed `4bd3b03`)
+
+**Root cause:** commit `6c4df1c` (2026-07-15, "Improve relationship search evidence and reporting") rewrote `build_relationship_phase_queries` (`serpwow/query_builders.py`) from keyword/boolean Google queries into three ~300-char **prose "AI-Overview question"** strings — but the transport (`serpwow_client.run_serpwow_search`) still sends the query as `q=` to `engine=google` **organic** search. Google returns ~0 `organic_results` for a prose paragraph, so the candidate-URL pool in `modes/relationship.py` collapsed to ~0 on every row. With no candidates, the LLM gate (picks `official_website` **from candidates only**) can never emit → `websites_found` always 0. The gate/counting/CSV logic was all correct; only the query shape was wrong.
+
+**Fix:** `build_relationship_phase_queries(x_name, y_name, x_domain)` now emits keyword/boolean queries — phase1 `"{y}" official website` (direct site-finding, the recall win the pre-`6c4df1c` set lacked), phase2 `"{x}" "{y}" investment OR portfolio OR funding OR acquisition OR investor OR backed`, phase3 `"{x}" "{y}" site:{x_domain}` (dropped when the Input_URL yields no host). Requires **both x and y** (blank X can't confirm a relationship — the executor short-circuits it via `REL_ERROR_NO_X` before the LLM, so a Y-only search is wasted). `include_ai_overview=true` still fires, so overview evidence keeps flowing as a bonus; precision is left to the gate. Call site in `modes/relationship.py` now passes the already-computed `x_domain`. Tests updated: `tests/test_relationship_queries.py`, `tests/test_relationship_worker.py`. **NOT live-verified** — needs a small relationship CSV smoke (confirm `websites_found > 0` and per-phase `candidate_count > 0` in `run.log`).
+
+Deliberately **out of scope** (noted, not done): the LLM JSON parsers (`ai_mode/gemini_batch.parse_json_from_text`, `serpwow/gemini_llm._parse_json_from_text`) only strip code fences then `json.loads`, silently becoming not-confirmed on any wrapping — a latent second 0-found path if `GEMINI_BATCH_MODEL` moves to a gemini-3.x thinking model that wraps JSON.
+
+### 2. Runs page pipeline-filter dropdown missing `relationship` (UNCOMMITTED, JS only)
+
+`static/js/runs.js` kept its **own** copy of `PIPELINES`/`PIPELINE_LABELS` that omitted `relationship`, so the pipeline filter dropdown had no "Financial Relationship" option (couldn't filter those runs; a `?pipeline=relationship` hash silently reset to "All") and the runs table showed the raw `relationship` key. Root cause was duplicated label maps drifting from `run_detail.js`/`new_run.js`. **Fix:** moved `PIPELINES` + `PIPELINE_LABELS` + `pipelineLabel()` into `static/js/ui.js` as the single source of truth; `runs.js` and `run_detail.js` now import them (each dropped its local duplicate). `new_run.js` keeps its own card labels (different UX vocabulary — "AI Mode 1 - Bulk" etc.). Verified via `node --check`; browser smoke still pending (needs Supabase + broker to render the Runs list).
+
+---
+
+## Older session — 2026-07-14 (AI Mode → RabbitMQ broker rework, branch `aiModeBroker`)
 
 **Status: code complete (3 commits), 532/532 offline, NOT live-verified, NOT pushed.** Full architecture now documented in `CLAUDE.md` (AI Mode engine section). Motivation: 500k–1M-row recurring runs — the old in-process `run_ai_mode_sync` held every scrape payload + all results in RAM (OOM at scale), had no redelivery (a crash meant a manual whole-run re-drive), and a hard kill left runs showing `running` forever with the "Rerun failed" button unreachable.
 

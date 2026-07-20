@@ -9,21 +9,12 @@ import {
   head,
   loadingCard,
   pageIntro,
+  PIPELINE_LABELS,
+  PIPELINES,
   shortDate,
   statusBadge,
 } from "./ui.js";
 
-const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
-                   "firmographics", "url_discovery"];
-const PIPELINE_LABELS = {
-  ai_bulk: "Google AI (Bulk)",
-  ai_deep: "Google AI (Deep)",
-  gmaps: "Google Maps",
-  gsearch: "Google Search",
-  full: "Upload Console",
-  firmographics: "Firmographics",
-  url_discovery: "URL Discovery",
-};
 const STATUSES = ["queued", "running", "completed", "completed_with_errors", "failed"];
 
 const selectCls = "control px-3 py-2 text-sm";

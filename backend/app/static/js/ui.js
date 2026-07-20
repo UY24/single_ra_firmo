@@ -1,6 +1,26 @@
 // backend/app/static/js/ui.js — shared UI helpers (cards, badges, table cells, dates).
 import { el } from "./api.js";
 
+// Single source of truth for pipeline order + display labels (runs list + run detail).
+// Keep in sync with the backend pipeline keys; add new pipelines here, not per-view.
+export const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "relationship",
+                          "full", "firmographics", "url_discovery"];
+export const PIPELINE_LABELS = {
+  ai_bulk: "Google AI (Bulk)",
+  ai_deep: "Google AI (Deep)",
+  gmaps: "Google Maps",
+  gsearch: "Google Search",
+  relationship: "Financial Relationship",
+  full: "Upload Console",
+  firmographics: "Firmographics",
+  url_discovery: "URL Discovery",
+};
+
+export function pipelineLabel(pipeline) {
+  const key = String(pipeline ?? "");
+  return PIPELINE_LABELS[key] ?? (key || "Run");
+}
+
 export function copyText(text) {
   if (!text || text === "-" || text === "—") return;
   navigator.clipboard.writeText(text).catch(() => {});

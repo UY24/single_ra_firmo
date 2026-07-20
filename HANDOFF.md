@@ -57,7 +57,21 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
-## Latest completed session — 2026-07-20 (remove `full` + `url_discovery` pipelines, branch `remove-full-url-discovery` off `aiModeBroker`)
+## Latest completed session — 2026-07-20 (relationship mode → AI-Overview prose search + confirmed/notconfirmed outputs, branch `relationship-ai-overview` off `aiModeBroker`)
+
+**Status: code complete, 556/556 offline, NOT live-verified, NOT pushed.** Reworked the
+relationship pipeline around SerpWow AI-Overview searches per user direction.
+
+- **Searches are now 3 parallel PROSE AI-Overview questions** (`query_builders.build_relationship_phase_queries`, still `(x_name, y_name, x_domain)`): phase1 relationship+URL (the user's proven "what is the financial relationship between X (domain) and Y? type out Y's website…" shape), phase2 financial-evidence, phase3 website-resolver — each asks for a **typed-out plain-text https:// URL, not a hyperlink** (extracted from the AI-overview text; `ai_overview_sources[].source_url` is the structured backstop). X identified by `name (domain)`, Y verbatim (OCR noise kept). Replaces the keyword queries. Parallel now; chaining (phase1→phase2 like gsearch phase5) deferred.
+- **No unique-(X,Y) dedup** — `relationship_csv.parse_relationship_csv` now makes each CSV row its own "pair" (`source_row_indices == [idx]`); one row in → one row out. Downstream pair/fan-out machinery untouched (now trivially 1:1). CSV requires exactly `Input_URL`, `Company_Name_X`, `Company_Name_Y`.
+- **Outputs renamed + split by RELATIONSHIP STATUS** (not URL presence): `confirmed_relation.csv` (`confirmed`) and `notconfirmed_relation.csv` (everything else = `not_confirmed` + `unclear` + any error, via the `!= "confirmed"` catch-all). `found.csv`/`notFound.csv`/`skipped.csv` gone for relationship (gsearch/gmaps still use found/notFound). `report.json` summary + `/status` + run-detail page still show BOTH count sets — `confirmed`/`not_confirmed`/`unclear` **and** `websites_found`/`websites_not_found` — just no found/notFound files.
+- **Dedup-era UI/fields removed**: preview no longer returns `unique_pairs`/`duplicates`/`csv_rows` (adds `relationship: true`); `build_summary` drops `unique_pairs`/`searchable_rows`; run-detail drops the "Unique pairs" tile and blank-row "Skipped"; New Run launch gate uses `total_rows > 0` for all pipelines.
+- Files touched: `query_builders.py`, `relationship_csv.py`, `serpwow_reporting.py`, `engine.py` (`_upload_file_links`/`_reporting_result_names`/`_GSEARCH_RESULT_FILES`/preview endpoint), `static/js/{new_run,run_detail}.js`, and the relationship test suite (queries/csv/endpoint/gates/reporting/worker + 2 `.mjs` DOM contracts).
+- **Live smoke still needed** (needs SerpWow + worker): run `smallrel20.csv`; confirm the AI Overview actually triggers via SerpWow for the prose phrasing (the main risk — it fired in the user's browser but SerpWow may differ), that confirmed rows carry a typed-out URL, and that `confirmed_relation.csv`/`notconfirmed_relation.csv` + the 5 counts populate.
+
+---
+
+## Older session — 2026-07-20 (remove `full` + `url_discovery` pipelines, merged to `aiModeBroker` via PR #12)
 
 **Status: code complete, 556/556 offline, NOT live-verified, NOT pushed.** Removed the two
 legacy SerpWow pipelines completely; gsearch-all-phases supersedes them for URL discovery.

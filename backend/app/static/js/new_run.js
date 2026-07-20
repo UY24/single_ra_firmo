@@ -139,10 +139,9 @@ function previewTables(preview) {
       " rows detected."),
   ];
   // Relationship preview: surface the search plan up front.
-  if (preview.unique_pairs != null) {
+  if (preview.relationship) {
     parts.push(el("p", { class: "section-copy" },
-      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.unique_pairs)),
-      " unique (X, Y) pairs will be searched across 3 phases each."));
+      "Each row is searched across 3 AI-Overview phases (relationship + website)."));
   }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));
@@ -194,9 +193,7 @@ function summaryItem(label, valueNode) {
 
 export function previewCanLaunch(preview, pipeline) {
   if (!preview || !pipeline) return false;
-  return pipeline.key === "relationship"
-    ? Number(preview.unique_pairs ?? 0) > 0
-    : Number(preview.total_rows ?? 0) > 0;
+  return Number(preview.total_rows ?? 0) > 0;
 }
 
 export async function render(root) {

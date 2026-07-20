@@ -220,7 +220,9 @@ s3_client = None
 
 # Pipeline id constants live in constants.py; re-imported at the top of this module.
 
-_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log",
+_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv",
+                         "confirmed_relation.csv", "notconfirmed_relation.csv",
+                         "skipped.csv", "report.json", "run.log",
                          "output.json", "state.json"}
 
 
@@ -2444,10 +2446,11 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
     names = ["state.json", "output.json"]
-    if pipe in REPORTING_PIPELINES:
-        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if pipe == PIPELINE_RELATIONSHIP:
-        names += ["skipped.csv"]
+        names += ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                  "report.json", "run.log"]
+    elif pipe in REPORTING_PIPELINES:
+        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -2456,12 +2459,12 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
 
 
 def _reporting_result_names(pipeline: str) -> list[str]:
+    if pipeline == PIPELINE_RELATIONSHIP:
+        return ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                "report.json", "run.log"]
     if pipeline not in REPORTING_PIPELINES:
         return []
-    names = ["found.csv", "notFound.csv"]
-    if pipeline == PIPELINE_RELATIONSHIP:
-        names.append("skipped.csv")
-    return [*names, "report.json", "run.log"]
+    return ["found.csv", "notFound.csv", "report.json", "run.log"]
 
 
 def _list_available_reporting_files_s3_sync(
@@ -4161,8 +4164,8 @@ async def create_gsearch_upload(
 
 @app.post("/uploads/relationship/preview")
 async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Dry-run parse for the New Run preview: header mapping, blank/dedupe
-    counts, and a sample of the pairs that would actually be searched.
+    """Dry-run parse for the New Run preview: header mapping, row count, and a
+    sample of the rows that would be searched (one row in → one row out, no dedup).
     Costs nothing — no state, no queue, no Supabase."""
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
@@ -4175,25 +4178,18 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    pairs = parsed["pairs"]
+    rows = parsed["pairs"]  # one entry per CSV data row (no dedup)
     total = len(parsed["original_rows"])
-    blank = len(parsed["blank_row_indices"])
-    duplicates = total - len(pairs)
     warnings: list[str] = []
-    if duplicates > 0:
-        warnings.append(
-            f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
-        )
-    if not pairs:
+    if not rows:
         warnings.append("No searchable rows — the CSV contains no data rows.")
 
     return {
         "total_rows": total,
-        "blank_rows": blank,
-        "unique_pairs": len(pairs),
+        "relationship": True,
         "warnings": warnings,
         "columns_detected": parsed["columns_detected"],
-        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country", "csv_rows"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country"],
         "sample_rows": [
             {
                 "company_name_x": p["x_name"],
@@ -4201,9 +4197,8 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
                 "input_url": p["input_url"],
                 "city": p["city"],
                 "country": p["country"],
-                "csv_rows": len(p["source_row_indices"]),
             }
-            for p in pairs[:5]
+            for p in rows[:5]
         ],
     }
 

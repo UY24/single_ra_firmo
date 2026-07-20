@@ -251,20 +251,19 @@ async function completedGmapsHeuristic() {
 
 async function completedRelationship() {
   const { root } = await renderStatus("relationship", {
-    pipeline: "relationship", status: "completed", total_rows: 2, processed_rows: 2,
+    pipeline: "relationship", status: "completed", total_rows: 5, processed_rows: 5,
     processing_seconds_total: 5, processing_seconds_avg: 2.5,
     serpwow_summary: {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
-      total_rows_original: 5, websites_found: 3, websites_not_found: 1, blank_rows: 1,
-      outcome_breakdown: { found: 3, not_found: 1, errored: 0 }, unique_pairs: 2,
-      available_files: ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"],
+      websites_found: 3, websites_not_found: 2,
+      outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
   });
   assertOutcomeFirst(root, "3 of 5");
-  assert(labelValue(root, "Skipped") === "1", "relationship skipped outcome missing");
-  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1", "Unique pairs"]) {
+  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1"]) {
     assert(root.textContent.includes(text), `relationship detail missing ${text}`);
   }
 }

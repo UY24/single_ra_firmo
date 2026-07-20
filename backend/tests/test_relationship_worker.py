@@ -147,7 +147,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertNotIn("https://eastlinkcap.com/portfolio", captured["candidates"])
         self.assertEqual(len(captured["evidence"]), 3)
         self.assertEqual(captured["evidence"][0]["phase"],
-                         "phase1_official_website")
+                         "phase1_relationship_and_url")
         self.assertIn("2. Investor:", captured["evidence"][0]["text"])
         self.assertEqual(captured["evidence"][0]["sources"], [{
             "name": "Funding report", "url": "https://news.example/modal"}])
@@ -231,8 +231,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         ok = _serp(["https://modal.com/"], "text")
 
         async def flaky(query, country=None, client=None):
-            # Fail only the phase2 investment-evidence query; phase1 still succeeds.
-            if "investment OR portfolio" in query:
+            # Fail only the phase2 financial-evidence query; phase1 still succeeds.
+            if "invested in, funded, acquired, or backed" in query:
                 raise RuntimeError("boom")
             return ok
 

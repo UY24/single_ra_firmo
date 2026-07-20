@@ -601,8 +601,7 @@ function renderLegacyStatus(root, ref, s) {
   }
 
   const isRel = s.pipeline === "relationship";
-  // Relationship totals use original CSV rows; state.total_rows is deduplicated queue work.
-  const total = isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows;
+  const total = s.total_rows;
   // Canonical reporting outcomes are already exclusive and original-row-level.
   // Older reporting payloads omit the block and expose inclusive not-found counts.
   const errors = safeCount(outcome ? outcome.errored : s.failed_rows);
@@ -615,7 +614,7 @@ function renderLegacyStatus(root, ref, s) {
       label: "Total / Processed",
       value: total != null || s.processed_rows != null
         ? `${fmtNum(total)} / ${fmtNum(s.processed_rows)}` : null,
-      detail: isRel ? "Original rows / pairs processed" : "Rows",
+      detail: "Rows",
     },
     { label: "Processing time", value: s.processing_seconds_total == null ? null : fmtDuration(s.processing_seconds_total) },
     { label: "Avg / row", value: s.processing_seconds_avg == null ? null : fmtDuration(s.processing_seconds_avg) },
@@ -632,7 +631,6 @@ function renderLegacyStatus(root, ref, s) {
       tone: "muted",
     },
     { label: "Batch job", value: runState.batchStatus, tone: runState.finalizing ? "warning" : "default" },
-    { label: "Unique pairs", value: isRel && g?.unique_pairs != null ? fmtNum(g.unique_pairs) : null },
   ];
 
   const timestamp = s.updated_at ?? s.created_at;
@@ -649,7 +647,7 @@ function renderLegacyStatus(root, ref, s) {
       notFound,
       errors,
       total,
-      skipped: isRel ? g?.blank_rows ?? 0 : null,
+      skipped: null,
       failureLabel: g ? "Errors" : "Failed",
       primaryLabel: g ? "Websites found" : "Succeeded",
     }),
@@ -704,7 +702,7 @@ function renderLegacyStatus(root, ref, s) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
     const resultFiles = (runState.reporting && runState.batchTerminal)
       ? (s.pipeline === "relationship"
-          ? ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"]
+          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
       : [];
     const extras = [

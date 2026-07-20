@@ -15,27 +15,20 @@ CSV_OK = (
 
 
 class TestParseRelationshipCSV(unittest.TestCase):
-    def test_happy_path_groups_pairs_and_counts_blanks(self):
+    def test_every_row_becomes_its_own_pair_no_dedup(self):
         parsed = parse_relationship_csv(CSV_OK)
         self.assertEqual(parsed["header"][0], "Input_URL")
         self.assertEqual(len(parsed["original_rows"]), 4)
         self.assertEqual(parsed["blank_row_indices"], [])
-        # (eastlinkcap, Modal) deduped across rows 0+1; (othervc, Modal) separate.
-        self.assertEqual(len(parsed["pairs"]), 3)
-        by_key = {(p["x_name"], p["y_name"]): p for p in parsed["pairs"]}
-        self.assertEqual(by_key[("eastlinkcap", "Modal")]["source_row_indices"], [0, 1])
-        self.assertEqual(by_key[("othervc", "Modal")]["source_row_indices"], [2])
-        self.assertEqual(by_key[("xvc", "Sanzo")]["source_row_indices"], [3])
-        # pair_index is 1-based and unique
-        self.assertEqual(sorted(p["pair_index"] for p in parsed["pairs"]), [1, 2, 3])
-        # Input_URL captured for the phase-4 anchor
-        self.assertEqual(by_key[("eastlinkcap", "Modal")]["input_url"],
+        # No (X, Y) dedup: 4 rows in → 4 pairs out, each with its own single index.
+        self.assertEqual(len(parsed["pairs"]), 4)
+        for i, p in enumerate(parsed["pairs"]):
+            self.assertEqual(p["source_row_indices"], [i])
+            self.assertEqual(p["pair_index"], i + 1)
+        # Per-row whitespace is trimmed (row 1's Y was "  Modal ").
+        self.assertEqual(parsed["pairs"][1]["y_name"], "Modal")
+        self.assertEqual(parsed["pairs"][0]["input_url"],
                          "https://www.eastlinkcap.com/portfolio/")
-
-    def test_dedupe_key_is_case_and_whitespace_insensitive_but_originals_kept(self):
-        parsed = parse_relationship_csv(CSV_OK)
-        modal = next(p for p in parsed["pairs"] if p["x_name"] == "eastlinkcap")
-        self.assertEqual(modal["y_name"], "Modal")  # first-seen original, trimmed
 
     def test_optional_city_country_columns(self):
         raw = (

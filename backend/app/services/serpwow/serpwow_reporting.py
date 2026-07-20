@@ -283,9 +283,6 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
             if status in breakdown:
                 breakdown[status] += n_sources
         summary["total_rows"] = int(meta.get("row_count_original") or 0)
-        summary["blank_rows"] = int(meta.get("blank_rows") or 0)
-        summary["searchable_rows"] = summary["total_rows"] - summary["blank_rows"]
-        summary["unique_pairs"] = len(state.get("rows", []))
         summary["relationship_breakdown"] = breakdown
     return summary
 
@@ -389,34 +386,27 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         })
         return row
 
-    for name, keep, extra in (
-        ("found.csv", lambda er: bool(er.website_url), []),
-        ("notFound.csv", lambda er: not er.website_url, ["error"]),
+    # Split by RELATIONSHIP STATUS (not URL presence): confirmed vs everything else
+    # (not_confirmed + unclear, plus any error/pending row → caught by the != branch,
+    # so no row is ever dropped). website_url stays in the row so you can see which
+    # confirmed rows also resolved a URL; the found/not-found URL counts live in the
+    # report.json summary (websites_found / websites_not_found).
+    def _status_of(pair_row: dict[str, Any]) -> str:
+        return str(_relationship_block((pair_row or {}).get("result") or {}).get("status") or "")
+
+    for name, keep in (
+        ("confirmed_relation.csv", lambda s: s == "confirmed"),
+        ("notconfirmed_relation.csv", lambda s: s != "confirmed"),
     ):
         path = upload_dir / name
         with path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=header + REL_OUTPUT_COLUMNS + extra)
+            writer = csv.DictWriter(fh, fieldnames=header + REL_OUTPUT_COLUMNS)
             writer.writeheader()
             for er, original, pair_row in expanded:
-                if not keep(er):
+                if not keep(_status_of(pair_row)):
                     continue
-                row = _out_row(er, original, pair_row)
-                if extra:
-                    row["error"] = er.error or ""
-                writer.writerow(row)
+                writer.writerow(_out_row(er, original, pair_row))
         paths[name] = path
-
-    skipped_path = upload_dir / "skipped.csv"
-    with skipped_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=header + ["skip_reason"])
-        writer.writeheader()
-        for idx in meta.get("blank_row_indices") or []:
-            i = int(idx)
-            original = original_rows[i] if 0 <= i < len(original_rows) else {}
-            row = {h: str(original.get(h, "") or "") for h in header}
-            row["skip_reason"] = "blank_company_name_y"
-            writer.writerow(row)
-    paths["skipped.csv"] = skipped_path
 
     report_rows = []
     for er, _original, pair_row in expanded:
@@ -453,8 +443,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
                              f"not found (relationship={rel.get('status')}){tail}")
     hdr = [
         f"# relationship run {summary.get('upload_id')} — status={summary.get('status')}",
-        f"# original_rows={summary.get('total_rows')} blank={summary.get('blank_rows')} "
-        f"pairs={summary.get('unique_pairs')} found={summary.get('websites_found')} "
+        f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
         f"not_found={summary.get('websites_not_found')}",
         f"# relationship: {json.dumps(summary.get('relationship_breakdown'))}",
         f"# cost: llm_usd={summary['cost']['llm_usd']} serpwow_usd={summary['cost']['serpwow_usd']} "

@@ -51,6 +51,7 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Conventions (do not break)
 
+- **Always use ponytail for coding** — the `ponytail` plugin/skill (installed: `ponytail@ponytail`) is the required mode for any coding work here (writing, refactoring, reviewing, choosing deps). Laziest solution that actually works: question whether it needs to exist (YAGNI), reuse what's here, stdlib/native before new deps, shortest correct diff — but never shortcut understanding the problem first.
 - **Never** add a `Co-Authored-By: Claude` (or any AI-attribution) trailer to commits — tell any committing subagent the same.
 - **Never** `git push` or query the production Supabase DB without explicit user approval.
 - `docs/` is **gitignored** — specs/plans/handoff-history there are on-disk only; code under `backend/` commits normally.

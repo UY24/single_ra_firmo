@@ -138,9 +138,9 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertFalse((run_dir / "report.json").exists())
         self.assertFalse((run_dir / "ai_mode_debug.log").exists())
 
-        with (run_dir / "found.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "found.csv").open(newline="", encoding="utf-8-sig") as fh:
             found_rows = list(csv.DictReader(fh))
-        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
             notfound_reader = csv.DictReader(fh)
             notfound_fields = notfound_reader.fieldnames
             notfound_rows = list(notfound_reader)
@@ -226,7 +226,7 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(status["status"], "completed_with_errors")
         self.assertEqual(status["failed_request_count"], 2)
         run_dir = self.results_root / "acme-corp" / run_id
-        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(len(rows), 6)
         self.assertIn("scrape.do error", rows[0]["error"])

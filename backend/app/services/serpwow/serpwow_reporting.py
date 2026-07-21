@@ -306,7 +306,7 @@ def write_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
     for name, rows, extra in (("found.csv", [r for r in results if r.website_url], []),
                               ("notFound.csv", [r for r in results if not r.website_url], ["error"])):
         path = upload_dir / name
-        with path.open("w", newline="", encoding="utf-8") as fh:
+        with path.open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS + extra)
             writer.writeheader()
             for r in rows:
@@ -350,7 +350,6 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
     upload_dir.mkdir(parents=True, exist_ok=True)
     meta = state.get("relationship") or {}
     header = [h for h in (meta.get("header") or []) if h]
-    original_rows = meta.get("original_rows") or []
     expanded = _relationship_expanded(state)
     results = [er for er, _o, _p in expanded]
     summary = build_summary(state, results)
@@ -399,7 +398,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         ("notconfirmed_relation.csv", lambda s: s != "confirmed"),
     ):
         path = upload_dir / name
-        with path.open("w", newline="", encoding="utf-8") as fh:
+        with path.open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=header + REL_OUTPUT_COLUMNS)
             writer.writeheader()
             for er, original, pair_row in expanded:

@@ -1213,6 +1213,10 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: st
 
 def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
     timing_summary = build_processing_timing_summary(state.get("rows", []))
+    # Total = wall-clock (start→completion); avg/count = per-row work stats. Mirror
+    # summarize_upload_state so the output payload agrees with /status and the cache.
+    elapsed = _run_elapsed_seconds(state)
+    total_seconds = elapsed if elapsed is not None else timing_summary["processing_seconds_total"]
     return {
         "upload_id": state["upload_id"],
         "company_name": state.get("company_name") or "",
@@ -1225,7 +1229,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
         "processed_rows": state["processed_rows"],
         "success_rows": state["success_rows"],
         "failed_rows": state["failed_rows"],
-        "processing_seconds_total": timing_summary["processing_seconds_total"],
+        "processing_seconds_total": total_seconds,
         "processing_seconds_avg": timing_summary["processing_seconds_avg"],
         "processing_seconds_count": timing_summary["processing_seconds_count"],
         "results": [
@@ -2295,6 +2299,41 @@ def build_processing_timing_summary(rows: Any) -> dict[str, Any]:
     }
 
 
+def _run_elapsed_seconds(state: dict[str, Any]) -> Optional[float]:
+    """Wall-clock seconds from run start (created_at) to completion.
+
+    Completion = the latest terminal timestamp among the rows' status_updated_at and the
+    Gemini batch's completed_at — a stable value that does NOT drift when later
+    reconciler/finalize passes re-persist the state. While the run is still non-terminal,
+    measure up to 'now' so the UI shows live elapsed. This is the true wall-clock span,
+    NOT the sum of per-row work times (which overcounts wildly under parallel workers).
+    Returns None if created_at is unparseable (legacy states) so callers can fall back.
+    """
+    start = _parse_iso_datetime(state.get("created_at"))
+    if start is None:
+        return None
+    ends: list[Any] = []
+    for r in state.get("rows", []) or []:
+        if isinstance(r, dict):
+            d = _parse_iso_datetime(r.get("status_updated_at"))
+            if d is not None:
+                ends.append(d)
+    gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    d = _parse_iso_datetime(gb.get("completed_at"))
+    if d is not None:
+        ends.append(d)
+    terminal = state.get("status") in {"completed", "completed_with_errors"}
+    if terminal:
+        # Prefer the last row/batch terminal timestamp; fall back to the last persist
+        # (updated_at) for states that predate per-row status_updated_at.
+        end = max(ends) if ends else _parse_iso_datetime(state.get("updated_at"))
+    else:
+        end = datetime.now(timezone.utc)
+    if end is None:
+        return None
+    return round(max((end - start).total_seconds(), 0.0), 3)
+
+
 def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     rows = state.get("rows", [])
     total = len(rows)
@@ -2343,7 +2382,15 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
             outcome_counts["errored"] += 1
     state["outcome_counts"] = outcome_counts
 
-    state.update(build_processing_timing_summary(rows))
+    timing = build_processing_timing_summary(rows)
+    elapsed = _run_elapsed_seconds(state)
+    # Total = wall-clock start→completion. The per-row sum (timing[...]) overcounts
+    # under parallel workers, so only fall back to it when created_at is missing.
+    # Avg/row stays the mean per-row work time.
+    state["processing_seconds_total"] = (
+        elapsed if elapsed is not None else timing["processing_seconds_total"])
+    state["processing_seconds_avg"] = timing["processing_seconds_avg"]
+    state["processing_seconds_count"] = timing["processing_seconds_count"]
     state["updated_at"] = _now_iso()
     return state
 

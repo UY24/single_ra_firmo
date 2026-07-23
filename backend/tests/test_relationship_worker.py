@@ -73,9 +73,9 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(ctx["relationship"]["website_confidence_score"], 90)
         self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 90)
         self.assertFalse(ctx["skip_llm"])
-        # Exactly three phases fire for every valid pair.
-        self.assertEqual(search.await_count, 3)
-        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 3)
+        # Exactly two phases fire for every valid pair.
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 2)
 
     def test_not_confirmed_gates_url_to_none(self):
         search = AsyncMock(return_value=_serp(["https://modal.com/"], "No relation."))
@@ -142,10 +142,10 @@ class TestRelationshipExecutor(unittest.TestCase):
                 y_name="Modal", x_name="eastlinkcap",
                 input_url="https://eastlinkcap.com/portfolio", city="", country="")
 
-        self.assertEqual(search.await_count, 3)
+        self.assertEqual(search.await_count, 2)
         self.assertIn("https://modal.com/", captured["candidates"])
         self.assertNotIn("https://eastlinkcap.com/portfolio", captured["candidates"])
-        self.assertEqual(len(captured["evidence"]), 3)
+        self.assertEqual(len(captured["evidence"]), 2)
         self.assertEqual(captured["evidence"][0]["phase"],
                          "phase1_relationship_and_url")
         self.assertIn("2. Investor:", captured["evidence"][0]["text"])
@@ -153,7 +153,7 @@ class TestRelationshipExecutor(unittest.TestCase):
             "name": "Funding report", "url": "https://news.example/modal"}])
         self.assertEqual(resp.context["ai_overview_evidence"], captured["evidence"])
         attempts = resp.context["search_attempts"]
-        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(attempts), 2)
         self.assertEqual(attempts[0]["result"],
                          "AI overview returned; 1 candidate(s)")
         self.assertTrue(attempts[0]["ai_overview_present"])
@@ -187,7 +187,7 @@ class TestRelationshipExecutor(unittest.TestCase):
                                 city="", country="")
         llm.assert_not_called()
         self.assertEqual(resp.serpwow_cost_usd, 0.0)
-        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 3)
+        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 2)
         self.assertEqual(
             resp.context["cost_breakdown"]["serpwow_billable_request_count"], 0)
         self.assertEqual(resp.context["relationship"]["summary"],
@@ -223,7 +223,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertFalse(resp.context["skip_llm"])
         self.assertEqual(
             [item["text"] for item in resp.context["ai_overview_evidence"]],
-            ["evidence", "evidence", "evidence"],
+            ["evidence", "evidence"],
         )
         self.assertIn("https://modal.com/", resp.context["candidates"])
 
@@ -231,8 +231,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         ok = _serp(["https://modal.com/"], "text")
 
         async def flaky(query, country=None, client=None):
-            # Fail only the phase2 financial-evidence query; phase1 still succeeds.
-            if "invested in, funded, acquired, or backed" in query:
+            # Fail only the phase2 identity query; phase1 still succeeds.
+            if query.startswith('Who is'):
                 raise RuntimeError("boom")
             return ok
 
@@ -248,8 +248,8 @@ class TestRelationshipExecutor(unittest.TestCase):
         self.assertEqual(len(errored), 1)
         self.assertEqual(errored[0]["status"], "error")
         self.assertEqual(
-            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 2)
-        self.assertAlmostEqual(resp.serpwow_cost_usd, 0.0007)
+            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 1)
+        self.assertAlmostEqual(resp.serpwow_cost_usd, 0.00035)
 
 
 if __name__ == "__main__":

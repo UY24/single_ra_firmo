@@ -559,16 +559,16 @@ def build_relationship_phase_queries(
     y_name: str,
     x_domain: str,
 ) -> list[tuple[str, str]]:
-    """Three parallel AI-Overview prose questions for one X↔Y relationship pair.
+    """Two parallel AI-Overview prose questions for one X↔Y relationship pair.
 
     Sent to SerpWow `engine=google` with `include_ai_overview=true`. These are PROSE
     questions (not keyword queries) because the goal is for the AI Overview to *answer*
     the relationship and type out Y's website — the typed URL is extracted from the
     overview text (and `ai_overview_sources`) as a candidate. Precision (confirmed vs
     unclear vs not_confirmed) is left to the LLM gate. X is identified by name + domain
-    (the domain, from Input_URL, disambiguates); Y is used verbatim (OCR noise kept —
-    Google tolerates it). Three phrasings run in parallel to raise the AI-Overview hit
-    rate (the overview triggers for some wordings and not others).
+    (from Input_URL, disambiguates); Y is used verbatim (OCR noise kept). Two phrasings
+    run in parallel to raise the AI-Overview hit rate (it triggers for some wordings
+    and not others): q1 leads with the relationship, q2 leads with Y's identity.
     """
     x = str(x_name or "").strip()
     y = str(y_name or "").strip()
@@ -581,19 +581,16 @@ def build_relationship_phase_queries(
     return [
         (
             "phase1_relationship_and_url",
-            f'What is the financial relationship between {x_ident} and "{y}"? '
-            f'Type out "{y}"\'s official website as a full plain-text URL starting '
-            f"with https:// — do not give a hyperlink.",
+            f"What is the business or financial relationship, if any, between "
+            f'{x_ident} and "{y}"? Describe how they are connected. If "{y}" is a '
+            f"company, include its official company website written as a complete "
+            f"plain-text URL beginning with https:// (do not provide it as a hyperlink).",
         ),
         (
-            "phase2_financial_evidence",
-            f'Has {x_ident} invested in, funded, acquired, or backed "{y}"? '
-            f'Explain the relationship, and type out "{y}"\'s official website as a '
-            f"full plain-text https:// URL, not a hyperlink.",
-        ),
-        (
-            "phase3_website_resolver",
-            f'What is the official website of "{y}", the company associated with '
-            f'{x_ident}? Type it out as a full plain-text https:// URL, not a hyperlink.',
+            "phase2_identity_and_relationship",
+            f'Who is "{y}"? If "{y}" is a company, include its official company '
+            f"website written as a complete plain-text URL beginning with https:// "
+            f"(do not provide it as a hyperlink). Also explain its business or "
+            f"financial relationship, if any, with {x_ident}.",
         ),
     ]

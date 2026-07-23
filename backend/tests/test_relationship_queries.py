@@ -22,13 +22,12 @@ class TestXDomainHelpers(unittest.TestCase):
 
 
 class TestBuildRelationshipPhaseQueries(unittest.TestCase):
-    def test_three_prose_phases_with_full_inputs(self):
+    def test_two_prose_phases_with_full_inputs(self):
         qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "m25vc.com")
         labels = [label for label, _ in qs]
         self.assertEqual(labels, [
             "phase1_relationship_and_url",
-            "phase2_financial_evidence",
-            "phase3_website_resolver",
+            "phase2_identity_and_relationship",
         ])
         for _label, query in qs:
             # Prose AI-Overview questions: mention Y, X (name + domain), ask for a
@@ -41,15 +40,13 @@ class TestBuildRelationshipPhaseQueries(unittest.TestCase):
             self.assertIn("hyperlink", query)
 
         by = dict(qs)
-        self.assertIn("financial relationship", by["phase1_relationship_and_url"])
-        for term in ("invested", "funded", "acquired", "backed"):
-            self.assertIn(term, by["phase2_financial_evidence"])
-        self.assertIn("official website of", by["phase3_website_resolver"])
+        self.assertIn("business or financial relationship", by["phase1_relationship_and_url"])
+        self.assertIn('Who is "Sanzo"?', by["phase2_identity_and_relationship"])
 
     def test_x_identity_falls_back_to_name_without_domain(self):
-        # No parseable domain → X is identified by name alone, all 3 phases still run.
+        # No parseable domain → X is identified by name alone, both phases still run.
         qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "")
-        self.assertEqual(len(qs), 3)
+        self.assertEqual(len(qs), 2)
         for _label, query in qs:
             self.assertIn("M25 Ventures", query)
             self.assertNotIn("()", query)  # no empty "(domain)"

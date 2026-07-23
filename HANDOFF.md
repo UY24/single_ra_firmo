@@ -1,6 +1,6 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-20. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-07-23. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
@@ -58,10 +58,24 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ---
 
+## Open findings — 2026-07-23 (S3 throttling + concurrency; DISCUSSION ONLY, no code changed)
+
+Investigated during a live 1000-row relationship run. **No code was changed** — these are
+recommendations/answers for a future decision. A scratch plan sits at
+`~/.claude/plans/transient-nibbling-pearl.md` (transient).
+
+- **S3 `SlowDown` in worker logs** (`ClientError (SlowDown): Please reduce your request rate`): S3's HTTP-503 throttle. It is **already retried (5× exponential backoff) and best-effort — non-fatal**, so the run is unharmed (`_write_s3_background`, `engine.py:855`; local disk is source of truth, S3 is the resume/backstop mirror). Store is **real AWS S3** (region `ap-south-1`, `AKIA…` IAM key, **no custom `endpoint_url`** — not R2/MinIO), so AWS auto-scales the prefix to 3,500 PUT/s; the 503s are the transient cold-prefix ramp **amplified by `state.json` being re-PUT to the SAME key on every row** (`engine.py:2867`; note `output.json` is already deferred to terminal-only, comment at `engine.py:2869`). **Recommended, NOT applied:** (a) **primary/minimal** — switch boto3 `retries` `"standard"`→`"adaptive"` in `core/s3.py:42` + `engine.py:740` (AWS's own client-side rate-limiter answer to SlowDown); (b) **optional** — throttle the per-row `state.json` S3 mirror behind a new `SERPWOW_S3_STATE_FLUSH_SEC` (~5s, mirrors AI-Mode's `AI_MODE_STATUS_FLUSH_SEC`; local write stays per-row, accepted tradeoff = S3 copy lags ≤5s on cold-start resume, safe since rows are idempotent). Also flagged: the AWS **secret key lives in `.env`** — keep it gitignored, never commit it.
+- **Worker concurrency = `WORKER_CONCURRENCY` (env, default 4)** — sets BOTH the RabbitMQ channel prefetch and the consumer-loop count (`engine.py:3253` / `3856`), **identical for gsearch and relationship** (same `process_upload_job` path). So only 4 rows process at once; each relationship row fans **3** AI-Overview searches in parallel → ~`3 × WORKER_CONCURRENCY` in-flight SerpWow calls. Observed ~400 rows/hr at default 4. Raising it speeds runs **but requires a worker restart** (consumers are created at startup; won't affect an in-flight run) and is bounded by SerpWow's account rate limit (and would make the S3 SlowDown above worse). Not changed.
+- **`websites_found` = 0 during a running relationship batch is EXPECTED, not a bug**: with `RELATIONSHIP_LLM_BATCH=true` ("Batch: On" in the UI) the gate/URL-selection runs in the Gemini **batch phase after all rows finish Phase-1 scraping**, so found/confirmed populate only at the end.
+
+---
+
 ## Latest completed session — 2026-07-20 (relationship mode → AI-Overview prose search + confirmed/notconfirmed outputs, branch `relationship-ai-overview` off `aiModeBroker`)
 
-**Status: code complete, 556/556 offline, NOT live-verified, NOT pushed.** Reworked the
-relationship pipeline around SerpWow AI-Overview searches per user direction.
+**Status: COMMITTED on branch `relationship-ai-overview` (off `aiModeBroker`), tree clean,
+NOT merged/pushed. 557/557 offline, NOT live-verified.** Commits: `7722d9b` (prose-search
+rework), `e890605` (wall-clock timing), `afaeafc` (CSV UTF-8 BOM). Reworked the relationship
+pipeline around SerpWow AI-Overview searches per user direction.
 
 - **Searches are now 3 parallel PROSE AI-Overview questions** (`query_builders.build_relationship_phase_queries`, still `(x_name, y_name, x_domain)`): phase1 relationship+URL (the user's proven "what is the financial relationship between X (domain) and Y? type out Y's website…" shape), phase2 financial-evidence, phase3 website-resolver — each asks for a **typed-out plain-text https:// URL, not a hyperlink** (extracted from the AI-overview text; `ai_overview_sources[].source_url` is the structured backstop). X identified by `name (domain)`, Y verbatim (OCR noise kept). Replaces the keyword queries. Parallel now; chaining (phase1→phase2 like gsearch phase5) deferred.
 - **No unique-(X,Y) dedup** — `relationship_csv.parse_relationship_csv` now makes each CSV row its own "pair" (`source_row_indices == [idx]`); one row in → one row out. Downstream pair/fan-out machinery untouched (now trivially 1:1). CSV requires exactly `Input_URL`, `Company_Name_X`, `Company_Name_Y`.
@@ -69,6 +83,7 @@ relationship pipeline around SerpWow AI-Overview searches per user direction.
 - **Dedup-era UI/fields removed**: preview no longer returns `unique_pairs`/`duplicates`/`csv_rows` (adds `relationship: true`); `build_summary` drops `unique_pairs`/`searchable_rows`; run-detail drops the "Unique pairs" tile and blank-row "Skipped"; New Run launch gate uses `total_rows > 0` for all pipelines.
 - Files touched: `query_builders.py`, `relationship_csv.py`, `serpwow_reporting.py`, `engine.py` (`_upload_file_links`/`_reporting_result_names`/`_GSEARCH_RESULT_FILES`/preview endpoint), `static/js/{new_run,run_detail}.js`, and the relationship test suite (queries/csv/endpoint/gates/reporting/worker + 2 `.mjs` DOM contracts).
 - **"Processing time" fix (all SerpWow pipelines, not just relationship):** the run's `processing_seconds_total` was the **sum of per-row work times**, which overcounts massively under parallel workers (a 3-min run showed ~55m). Now it's **wall-clock** — `created_at` → the latest terminal timestamp (max row `status_updated_at` + `gemini_batch.completed_at`; stable, doesn't drift on later re-persists), live-elapsed to now while non-terminal (`_run_elapsed_seconds` in `engine.py`). `processing_seconds_avg` still shows the mean per-row work time. Fixed in both `summarize_upload_state` and `build_upload_output_payload`; regression test in `tests/test_timing_summary.py`.
+- **CSV mojibake fix (`Äî`/`Üí` in Excel):** all CSV writers now use `encoding="utf-8-sig"` (UTF-8 **with BOM**) instead of `"utf-8"` — `serpwow_reporting.py` (×2 writers) + `ai_mode/run_reporting.py` (×2). Root cause: a UTF-8 CSV with no BOM was read by Excel/Numbers as Mac Roman, garbling every non-ASCII char (em dash `—`→`Äî`, arrow `→`→`Üí`, `↔`, curly quotes). BOM makes the viewer auto-detect UTF-8; data unchanged, and our reader already tolerates the BOM (`utf-8-sig`). Tests that read these CSVs updated to `utf-8-sig`.
 - **Live smoke still needed** (needs SerpWow + worker): run `smallrel20.csv`; confirm the AI Overview actually triggers via SerpWow for the prose phrasing (the main risk — it fired in the user's browser but SerpWow may differ), that confirmed rows carry a typed-out URL, and that `confirmed_relation.csv`/`notconfirmed_relation.csv` + the 5 counts populate.
 
 ---

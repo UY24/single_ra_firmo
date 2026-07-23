@@ -1,5 +1,5 @@
 # backend/app/services/serpwow/modes/relationship.py
-"""relationship mode executor (SerpWow AI Overview, X↔Y financial relationship).
+"""Relationship mode executor using SerpWow AI Overview.
 
 Per unique (X, Y) pair: fire the parallel phase queries, pool candidates
 (X-domain blacklisted) + AI-overview evidence, then either call Gemini per-pair
@@ -217,8 +217,7 @@ async def execute_relationship_lookup_for_worker(
     official_website: Optional[str] = None
     gemini_cost = 0.0
     relationship: dict[str, Any] = {
-        "status": "pending", "summary": "",
-        "verified_pair": f"{x_name} ↔ {y_name}", "flags": [],
+        "status": "pending", "summary": "", "flags": [],
     }
     final_url_selection_ai: dict[str, Any] = {
         "provider": "google-gemini", "model": None, "used": False,
@@ -274,7 +273,7 @@ async def execute_relationship_lookup_for_worker(
     # batch_mode with evidence: leave verdict to the finalization batch.
 
     summary_text = (
-        f"Relationship search for pair {x_name!r} ↔ {y_name!r}: "
+        f"Relationship search for Company X {x_name!r} and Company Y {y_name!r}: "
         f"{len(queries)} phase queries, {len(deduped)} candidates, "
         f"{len(ai_overview_evidence)} AI-overview evidence blocks."
     )

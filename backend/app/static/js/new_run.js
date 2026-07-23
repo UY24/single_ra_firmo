@@ -41,7 +41,7 @@ const PIPELINES = [
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",
-    desc: "Verifies an X↔Y financial relationship and returns Y's website only when confirmed.", csvCols: _REL_COLS },
+    desc: "Verifies a financial relationship and returns Company Y's website only when confirmed.", csvCols: _REL_COLS },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
     desc: "Enrichment for rows that already have a website.", csvCols: _FIRMO_COLS },
 ];

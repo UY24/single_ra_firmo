@@ -105,9 +105,9 @@ def _phase_stats(result: dict[str, Any]) -> tuple[int, int, int, Optional[str], 
         total += 1
         if f.get("success"):
             succeeded += 1
-        if f.get("error"):
+        if f.get("error") or f.get("error_category"):
             errored += 1
-            if first_detail is None:
+            if first_detail is None and f.get("error"):
                 first_detail = str(f.get("error"))
             cat = f.get("error_category")
             if cat:

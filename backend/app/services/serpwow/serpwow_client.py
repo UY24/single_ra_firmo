@@ -48,7 +48,7 @@ def _safe_serpwow_error(exc: Exception, response: Any = None) -> str:
                     error += f" Retry after {retry_after} seconds."
                 return error
         return f"SerpWow failed (HTTP {status})."
-    return sanitize_serpwow_error_text(exc)
+    return sanitize_serpwow_error_text(exc) or type(exc).__name__
 
 def _extract_official_website_from_serpwow(data: dict[str, Any]) -> Optional[str]:
     knowledge_graph = data.get("knowledge_graph")
@@ -226,34 +226,45 @@ async def run_serpwow_search(
     }
     timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
 
-    try:
-        if client is None:
-            async with httpx.AsyncClient(timeout=timeout_sec) as owned_client:
-                return await run_serpwow_search(query, country=country, client=owned_client)
-        if search_fetch_semaphore is not None:
-            async with search_fetch_semaphore:
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout_sec) as owned_client:
+            return await run_serpwow_search(query, country=country, client=owned_client)
+
+    for attempt in range(3):
+        response = None
+        try:
+            if search_fetch_semaphore is not None:
+                async with search_fetch_semaphore:
+                    response = await client.get(SERPWOW_API_URL, params=params)
+            else:
                 response = await client.get(SERPWOW_API_URL, params=params)
-        else:
-            response = await client.get(SERPWOW_API_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        status = None
-        resp_local = locals().get("response")
-        if resp_local is not None:
-            status = getattr(resp_local, "status_code", None)
-        return {
-            "provider": "serpwow",
-            "used": False,
-            "query": query,
-            "official_website": None,
-            "candidates": [],
-            "status_code": status,
-            "search_url": None,
-            "raw_response": None,
-            "error": _safe_serpwow_error(exc, resp_local),
-            "error_category": categorize_http_error(status, f"{type(exc).__name__}: {exc}"),
-        }
+            response.raise_for_status()
+            data = response.json()
+            break
+        except Exception as exc:
+            status = getattr(response, "status_code", None)
+            retryable = (
+                isinstance(exc, httpx.TransportError)
+                or status == 429
+                or (status is not None and 500 <= status <= 599)
+            )
+            if retryable and attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return {
+                "provider": "serpwow",
+                "used": False,
+                "query": query,
+                "official_website": None,
+                "candidates": [],
+                "status_code": status,
+                "search_url": None,
+                "raw_response": None,
+                "error": _safe_serpwow_error(exc, response),
+                "error_category": categorize_http_error(
+                    status, f"{type(exc).__name__}: {exc}"
+                ),
+            }
 
     request_info = data.get("request_info", {}) if isinstance(data, dict) else {}
     serpwow_raw = data if isinstance(data, dict) else {}

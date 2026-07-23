@@ -87,7 +87,7 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
     error/gemini by the driver's chunk-failure sweep just because some OTHER row in
     the same upload went through the batch."""
 
-    async def test_skip_llm_notfound_row_survives_batch_run(self):
+    async def test_rows_outside_snapshot_follow_their_existing_state(self):
         # Row 1: skip_llm no-X short-circuit -> already completed/not_found by worker.
         skip_row = {
             "row_index": 1, "company_name": "NoXCorp", "country": "",
@@ -113,6 +113,15 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
                  "status": "completed_with_errors", "rows": [skip_row, batch_row],
                  "gemini_batch": {"status": "queued", "chunks": []}}
         persisted = {"state": state}
+        late_row = {
+            "row_index": 100, "company_name": "Late Corp", "country": "",
+            "status": "completed",
+            "error": "Pending Gemini batch post-processing decision.",
+            "result": {"official_website": None, "context": {
+                "pipeline": "relationship", "skip_llm": False,
+                "candidates": ["https://late.example/"],
+            }},
+        }
 
         async def fake_persist(uid, st):
             persisted["state"] = st
@@ -124,6 +133,8 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
             return {"name": name, "done": True, "state": {"name": "JOB_STATE_SUCCEEDED"}}
 
         def fake_collect(obj):
+            # Row 100 completes SerpWow after the batch input snapshot was built.
+            persisted["state"]["rows"].append(late_row)
             # Confirm the batched row (row-2) with an in-candidate URL.
             out = []
             for k in obj.get("_keys", []):
@@ -154,6 +165,12 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
         # The batched row was confirmed -> found.
         self.assertEqual(rows[2]["status"], "completed")
         self.assertEqual(rows[2]["result"]["official_website"], "https://modal.com/")
+        self.assertEqual(rows[100]["status"], "failed")
+        self.assertEqual(rows[100]["outcome"], o.OUTCOME_ERROR)
+        self.assertEqual(rows[100]["error_source"], o.SRC_GEMINI)
+        self.assertEqual(rows[100]["error_category"], o.CAT_INTERNAL)
+        self.assertIn("missed", rows[100]["error"])
+        self.assertIn("snapshot", rows[100]["error"])
 
 
 if __name__ == "__main__":

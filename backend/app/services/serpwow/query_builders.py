@@ -559,7 +559,7 @@ def build_relationship_phase_queries(
     y_name: str,
     x_domain: str,
 ) -> list[tuple[str, str]]:
-    """Two parallel AI-Overview prose questions for one X↔Y relationship pair.
+    """Two parallel AI-Overview prose questions for one relationship pair.
 
     Sent to SerpWow `engine=google` with `include_ai_overview=true`. These are PROSE
     questions (not keyword queries) because the goal is for the AI Overview to *answer*

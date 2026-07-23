@@ -26,7 +26,7 @@ REL_OUTPUT_COLUMNS = ["website_url", "resolved_company_y_name",
                       "relationship_status", "relationship_summary",
                       "relationship_evidence", "relationship_confidence",
                       "website_confidence", "confidence", "phases_used",
-                      "flags", "attempt_log", "verified_pair", "error_reason"]
+                      "flags", "attempt_log", "error_source", "error_reason"]
 
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
@@ -380,7 +380,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
             "phases_used": len(context.get("formatted_results") or []),
             "flags": er.flags_csv(),
             "attempt_log": er.attempt_log_csv(),
-            "verified_pair": str(rel.get("verified_pair") or ""),
+            "error_source": er.error_source or "",
             "error_reason": er.error or "",
         })
         return row
@@ -421,7 +421,6 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         result = (pair_row or {}).get("result") or {}
         ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
         d["phases_used"] = len(ctx.get("formatted_results") or [])
-        d["verified_pair"] = str(rel.get("verified_pair") or "")
         d["error_reason"] = er.error or ""
         report_rows.append(d)
     report_path = upload_dir / "report.json"
@@ -432,14 +431,15 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
     log_lines = []
     for er, _original, pair_row in expanded:
         rel = _relationship_block((pair_row or {}).get("result") or {})
+        source = f", error_source={er.error_source}" if er.error_source else ""
         if er.website_url:
-            log_lines.append(f"[{er.sno}] {er.company_name} ({rel.get('verified_pair')}) -> "
+            log_lines.append(f"[{er.sno}] {er.company_name} -> "
                              f"{er.website_url} (confidence={er.confidence}, "
-                             f"relationship={rel.get('status')})")
+                             f"relationship={rel.get('status')}{source})")
         else:
             tail = f" — {er.error}" if er.error else ""
-            log_lines.append(f"[{er.sno}] {er.company_name} ({rel.get('verified_pair')}) -> "
-                             f"not found (relationship={rel.get('status')}){tail}")
+            log_lines.append(f"[{er.sno}] {er.company_name} -> "
+                             f"not found (relationship={rel.get('status')}{source}){tail}")
     hdr = [
         f"# relationship run {summary.get('upload_id')} — status={summary.get('status')}",
         f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "

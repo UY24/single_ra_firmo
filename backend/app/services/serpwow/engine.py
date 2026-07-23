@@ -1805,7 +1805,7 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
         parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
-        "status": "pending", "summary": "", "verified_pair": "", "flags": []}
+        "status": "pending", "summary": "", "flags": []}
     context["relationship"] = update_relationship_block(
         relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
 
@@ -2069,10 +2069,9 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             # Rows that DID get a parsed dict were already fully decided (found or
             # not_found, both now status="completed") by the loop above and must not
             # be re-touched here, even though not_found rows also have no website.
-            # Rows NEVER seeded into the batch (skip_llm relationship no-X/no-evidence
-            # short-circuits, already finalized not_found/completed by the worker; or
-            # non-terminal rows) are absent from chunk_id_by_ridx -> must NOT be touched,
-            # else an unrelated row going through the batch would corrupt them to error.
+            # Rows never seeded normally stay untouched. The one exception is an exact
+            # pending sentinel: that row completed after the input snapshot and must not
+            # remain pending once this batch is terminal.
             results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
@@ -2082,7 +2081,13 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                     continue
                 ridx = int(row.get("row_index", 0) or 0)
                 if ridx not in chunk_id_by_ridx:
-                    continue  # never a batch item (skip_llm short-circuit / non-terminal)
+                    if row.get("error") == _pending_sentinel:
+                        row["status"] = "failed"
+                        row["outcome"] = _outcomes.OUTCOME_ERROR
+                        row["error_source"] = _outcomes.SRC_GEMINI
+                        row["error_category"] = _outcomes.CAT_INTERNAL
+                        row["error"] = "Gemini batch missed row after its input snapshot."
+                    continue
                 if isinstance(parsed_all.get(ridx), dict):
                     continue  # already decided (found/not_found) above
                 chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}
@@ -2463,6 +2468,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
                     "row_index": row.get("row_index"),
                     "company_name": row.get("company_name"),
                     "country": row.get("country"),
+                    "error_source": row.get("error_source"),
+                    "error_category": row.get("error_category"),
                     "error": row.get("error"),
                     "official_website": official_website or None,
                     "status_updated_at": row.get("status_updated_at"),

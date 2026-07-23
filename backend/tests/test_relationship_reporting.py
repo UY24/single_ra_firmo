@@ -26,7 +26,6 @@ def _pair_row(row_index, y, x, source_rows, official, rel_status, error=None,
                                  "evidence": [f"evidence {y} one", f"evidence {y} two"],
                                  "relationship_confidence_score": 96,
                                  "website_confidence_score": 88 if official else 0,
-                                 "verified_pair": f"{x} ↔ {y}",
                                  "flags": list(flags)},
                 "final_url_selection_ai": {
                     "model": "gemini-2.5-flash-lite",
@@ -93,7 +92,9 @@ class TestRelationshipReporting(unittest.TestCase):
             # Files split by RELATIONSHIP STATUS, not URL presence. No skipped.csv.
             self.assertNotIn("skipped.csv", paths)
             with Path(paths["confirmed_relation.csv"]).open() as fh:
-                confirmed = list(csv.DictReader(fh))
+                reader = csv.DictReader(fh)
+                confirmed_headers = reader.fieldnames
+                confirmed = list(reader)
             with Path(paths["notconfirmed_relation.csv"]).open() as fh:
                 notconfirmed = list(csv.DictReader(fh))
             self.assertEqual(len(confirmed), 2)       # both Modal duplicate rows (confirmed)
@@ -113,7 +114,12 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(row["website_confidence"], "88")
             self.assertEqual(row["phases_used"], "3")
             self.assertEqual(row["confidence"], "88")
-            self.assertEqual(row["verified_pair"], "eastlinkcap ↔ Modal")
+            self.assertEqual(
+                confirmed_headers[confirmed_headers.index("attempt_log") + 1],
+                "error_source",
+            )
+            self.assertEqual(row["error_source"], "")
+            self.assertNotIn("verified_pair", row)
             self.assertIn("attempt_log", row)
             self.assertIn("AI overview returned; 1 candidate(s)", row["attempt_log"])
             nc = notconfirmed[0]
@@ -198,6 +204,7 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(report["summary"]["relationship_breakdown"],
                              {"confirmed": 2, "not_confirmed": 1, "unclear": 0})
             self.assertEqual(report["rows"][0]["relationship_status"], "confirmed")
+            self.assertNotIn("verified_pair", json.dumps(report))
 
     def test_provider_error_reason_is_clear_and_redacted_in_viewable_files(self):
         state = _state()
@@ -229,8 +236,11 @@ class TestRelationshipReporting(unittest.TestCase):
 
         expected = "SerpWow failed (HTTP 503): Service Unavailable."
         self.assertEqual(not_found["error_reason"], expected)
+        self.assertEqual(not_found["error_source"], "serpwow")
         self.assertEqual(report["rows"][0]["error_reason"], expected)
+        self.assertEqual(report["rows"][0]["error_source"], "serpwow")
         self.assertIn(expected, run_log)
+        self.assertNotIn("↔", run_log)
         self.assertNotIn("secret-key", json.dumps(report))
         self.assertNotIn("secret-key", not_found["attempt_log"])
 

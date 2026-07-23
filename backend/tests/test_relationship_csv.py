@@ -82,6 +82,28 @@ class TestParseRelationshipCSV(unittest.TestCase):
         parsed = parse_relationship_csv(raw)
         self.assertEqual(parsed["pairs"][0]["y_name"], "Sanzo")
 
+    def test_preserves_error_marker_text_as_company_y(self):
+        raw = (
+            "Input_URL,Company_Name_X,Company_Name_Y\n"
+            "https://a.example,a,FETCH_ERROR: 403 Forbidden\n"
+            "https://b.example,b,error: 503 unavailable\n"
+        ).encode()
+        parsed = parse_relationship_csv(raw)
+        self.assertEqual(
+            [pair["y_name"] for pair in parsed["pairs"]],
+            ["FETCH_ERROR: 403 Forbidden", "error: 503 unavailable"],
+        )
+
+    def test_allows_error_word_when_it_is_not_a_marker_prefix(self):
+        raw = (
+            "Input_URL,Company_Name_X,Company_Name_Y\n"
+            "https://a.example,a,Error Coffee Company\n"
+        ).encode()
+        self.assertEqual(
+            parse_relationship_csv(raw)["pairs"][0]["y_name"],
+            "Error Coffee Company",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,7 @@ def _rel_row(row_index=1, status="completed", skip_llm=False,
                 }],
                 "search_attempts": [{"attempt": "phase1_relationship_and_url", "query": "q"}],
                 "relationship": {"status": "pending", "summary": "",
-                                 "verified_pair": "eastlinkcap ↔ Modal", "flags": []},
+                                 "flags": []},
                 "cost_breakdown": {"serpwow_request_count": 3},
             },
         },
@@ -110,6 +110,7 @@ class TestRelationshipBatchApply(unittest.TestCase):
         self.assertEqual(ctx["relationship"]["evidence"], ["Series A investment"])
         self.assertEqual(ctx["relationship"]["relationship_confidence_score"], 95)
         self.assertEqual(ctx["relationship"]["website_confidence_score"], 90)
+        self.assertNotIn("verified_pair", ctx["relationship"])
         self.assertEqual(parsed["confidence_score"], 90)
         self.assertEqual(ctx["gemini_batch_ai"]["raw"], parsed)
         self.assertIsNone(row["error"])

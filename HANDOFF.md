@@ -6,8 +6,8 @@ Last updated: 2026-07-23. Read this first if you're picking up this repo. Durabl
 
 ## Current status
 
-- **Active branch: `aiModeBroker`** (off `revampCode`; `uiuximp` was merged via PR #8) — the **AI Mode → RabbitMQ broker rework** for 500k–1M-row runs. Code complete in 3 commits (PR1 streaming/memory, PR2 broker engine, PR3 reconciler/resume/legacy-removal); **NOT live-verified, NOT pushed**.
-- Full suite: **532/532** passing.
+- **Active branch: `relationship-ai-overview`** (off `aiModeBroker`). The earlier relationship AI-Overview rework is committed locally; the 2026-07-23 relationship failure-diagnostics/retry/UI changes are **UNCOMMITTED, NOT live-verified, NOT pushed**.
+- Full suite: **564/564** passing.
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -46,8 +46,9 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Immediate next steps
 
-1. **Live-smoke `aiModeBroker`** (checklist in the session notes below), then decide merge/push (needs user approval to push).
-2. Decide whether to merge `errorTaxonomy`, and live-verify it if so.
+1. Live-smoke the current relationship changes with a small CSV, including a literal `ERROR:` or `FETCH_ERROR:` Company Y value; confirm it is accepted and processed verbatim (apart from existing outer-whitespace trimming).
+2. Commit the current relationship changes if approved, then decide merge/push (pushing requires explicit user approval).
+3. **Live-smoke `aiModeBroker`** (checklist in the older session notes below).
 
 ## Conventions (do not break)
 
@@ -70,7 +71,36 @@ recommendations/answers for a future decision. A scratch plan sits at
 
 ---
 
-## Latest completed session — 2026-07-20 (relationship mode → AI-Overview prose search + confirmed/notconfirmed outputs, branch `relationship-ai-overview` off `aiModeBroker`)
+## Latest completed session — 2026-07-23 (relationship failure diagnostics, retries, outputs, and failed-row UI)
+
+**Status: UNCOMMITTED on `relationship-ai-overview`, 564/564 offline tests passing,
+NOT live-verified, NOT pushed.** Implemented with Ponytail: existing pipeline and
+failure-analysis endpoint reused; no new dependency, endpoint, modal, or database migration.
+
+### Investigated run
+
+- Run `ac75e704-f609-4b00-ac33-4b33e066ccff` had exactly **2 failed rows** in its state: row index **63** (`Kitche`) and **67** (`CASCADE COFFEE`). Both were **SerpWow timeouts**, not Gemini failures. Their blank exception messages caused the aggregate classifier to label them `internal`; that classification bug is fixed.
+- The Gemini batch itself succeeded with no recorded Gemini chunk failures. Row 100 finished SerpWow after the Gemini input snapshot and retained `Pending Gemini batch post-processing decision.` after the batch became terminal — a real snapshot race, now covered by a regression test.
+- Values such as `FETCH_ERROR: 403...` / `ERROR: 503...` seen on other rows were the uploaded `Company_Name_Y` text, not SerpWow failures from this run. A prefix-rejection guard was briefly implemented, then **removed per user direction**: these values are valid inputs for this workflow and now proceed exactly like any other Company Y value (the parser's pre-existing outer-whitespace trim still applies).
+
+### Changes
+
+- **Bounded SerpWow retries:** `run_serpwow_search` now makes at most **3 total attempts**, with 1s/2s backoff, for `httpx.TransportError`, HTTP 429, and HTTP 5xx. Non-transient HTTP 4xx responses such as 403 return immediately. No retry library/config layer was added.
+- **Useful timeout errors:** an exception whose sanitized message is empty now falls back to its class name (for example `ReadTimeout`). `_phase_stats` counts an explicit `error_category` even when the message is blank, preserving `timeout` instead of falling back to `internal`.
+- **Terminal Gemini invariant:** after a terminal batch, a completed no-URL row absent from the input snapshot and still carrying the exact pending sentinel becomes `failed`, `outcome=error`, `error_source=gemini`, `error_category=internal`, with `Gemini batch missed row after its input snapshot.` It is therefore visible and eligible for failed-row retry instead of remaining falsely pending.
+- **Relationship output cleanup:** removed `verified_pair` and all `X ↔ Y` presentation from relationship context, CSV/report/run-log output, descriptions, and production code. `error_source` now occupies the former relationship-CSV column position; it is blank for normal business outcomes and identifies technical providers such as `serpwow`/`gemini` on failures.
+- **Failure inspection:** `build_failure_analysis` samples now include `error_source` and `error_category`. Terminal Run Detail pages with errors show a lazy `View failed rows (N)` control that reuses `GET /uploads/{id}/failure-analysis?sample_limit=100` and renders CSV row, company, source, category, and error in an accessible inline table.
+- **Company Y remains authoritative input:** there is no `ERROR:`/`FETCH_ERROR:` filtering or name correction in the CSV parser. Separately, `resolved_company_y_name` remains Gemini's evidence-based interpretation from the relationship prompt; it does not overwrite the original `Company_Name_Y` column and is blank when Gemini omits it or the LLM is skipped.
+
+### Verification / files
+
+- Full offline suite: `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` → **564/564 passing**.
+- Run Detail DOM contract passes; `git diff --check` passes; `rg -n 'verified_pair|↔' backend/app` returns no production matches.
+- Production files changed: `engine.py`, `modes/relationship.py`, `outcomes.py`, `query_builders.py`, `serpwow_client.py`, `serpwow_reporting.py`, `static/js/new_run.js`, and `static/js/run_detail.js`; related regression tests changed alongside them.
+
+---
+
+## Previous completed session — 2026-07-20 (relationship mode → AI-Overview prose search + confirmed/notconfirmed outputs, branch `relationship-ai-overview` off `aiModeBroker`)
 
 **Status: COMMITTED on branch `relationship-ai-overview` (off `aiModeBroker`), tree clean,
 NOT merged/pushed. 557/557 offline, NOT live-verified.** Commits: `7722d9b` (prose-search

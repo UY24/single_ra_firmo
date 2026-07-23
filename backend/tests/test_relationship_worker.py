@@ -65,7 +65,7 @@ class TestRelationshipExecutor(unittest.TestCase):
         ctx = resp.context
         self.assertEqual(ctx["pipeline"], "relationship")
         self.assertEqual(ctx["relationship"]["status"], "confirmed")
-        self.assertEqual(ctx["relationship"]["verified_pair"], "eastlinkcap ↔ Modal")
+        self.assertNotIn("verified_pair", ctx["relationship"])
         self.assertEqual(ctx["relationship"]["resolved_company_y_name"], "Modal Labs")
         self.assertEqual(ctx["relationship"]["evidence"],
                          ["Eastlink invested in Modal."])

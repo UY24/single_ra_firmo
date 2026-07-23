@@ -387,6 +387,64 @@ function verdictSection(rb) {
   );
 }
 
+function failedRowsSection(ref, count, companyLabel) {
+  const regionId = `failed-rows-${encodeURIComponent(ref)}`;
+  const results = el("div", {
+    id: regionId,
+    class: "failed-rows-results mt-3 hidden",
+    "aria-live": "polite",
+  });
+  let loaded = false;
+  const button = el("button", {
+    class: "btn-secondary min-h-0 px-3 py-1.5 text-xs disabled:opacity-50",
+    "aria-expanded": "false",
+    "aria-controls": regionId,
+    onclick: async () => {
+      const expanding = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanding));
+      results.classList[expanding ? "remove" : "add"]("hidden");
+      if (!expanding || loaded) return;
+      button.disabled = true;
+      results.replaceChildren(el("p", { class: "section-copy" }, "Loading failed rows…"));
+      try {
+        const data = await api(
+          `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`,
+        );
+        const rows = data.sample_failed_rows ?? [];
+        const table = el("table", { class: "data-table w-full text-xs" },
+          el("thead", {}, el("tr", { class: "data-row" },
+            ...["CSV row", companyLabel, "Error source", "Category", "Error"]
+              .map((heading) => el("th", {}, heading)))),
+          el("tbody", {}, ...rows.map((row) => el("tr", { class: "data-row" },
+            el("td", {}, row.row_index ?? "—"),
+            el("td", {}, row.company_name ?? "—"),
+            el("td", {}, row.error_source ?? "—"),
+            el("td", {}, row.error_category ?? "—"),
+            el("td", {}, row.error ?? "—"),
+          ))),
+        );
+        const total = safeCount(data.failed_rows);
+        results.replaceChildren(
+          ...(total > rows.length ? [el("p", { class: "section-copy mb-2" },
+            `Showing first ${fmtNum(rows.length)} of ${fmtNum(total)} failed rows.`)] : []),
+          rows.length
+            ? el("div", { class: "overflow-x-auto" }, table)
+            : el("p", { class: "section-copy" }, "No failed rows found."),
+        );
+        loaded = true;
+      } catch (e) {
+        results.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+      } finally {
+        button.disabled = false;
+      }
+    },
+  }, `View failed rows (${fmtNum(count)})`);
+  return el("section", { class: "detail-section failed-rows-section" },
+    sectionHeading("Failed rows"),
+    el("div", { class: "detail-section-body" }, button, results),
+  );
+}
+
 function headerCard(title, subtitle, status, phase, chips) {
   const bits = [statusBadge(status)];
   if (status === "running" && phase) {
@@ -660,6 +718,9 @@ function renderLegacyStatus(root, ref, s) {
   }
   if (g) parts.push(costSection(g));
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
+  if (runState.pollTerminal && errors > 0) {
+    parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
+  }
 
   // Stop button while the run is still doing work (rows in flight, or the
   // Gemini batch still running). Remaining rows are marked failed; retryable

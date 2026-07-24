@@ -36,6 +36,7 @@ from app.services.serpwow.query_builders import (
     build_selected_phase_queries,
 )
 from app.services.serpwow.serpwow_client import (
+    extract_ai_overview_text,
     run_serpwow_search,
 )
 from app.services.serpwow.url_utils import (
@@ -144,10 +145,13 @@ async def execute_gsearch_lookup_for_worker(
         if raw_result.get("used"):
             billable_requests += 1
         attempt_cands = raw_result.get("candidates") or []
+        phase_candidate_count = 0
         for cand in attempt_cands:
-            if cand and cand not in seen_candidates and not is_disallowed_official_url(cand):
-                seen_candidates.add(cand)
-                candidates.append(cand)
+            if cand and not is_disallowed_official_url(cand):
+                phase_candidate_count += 1
+                if cand not in seen_candidates:
+                    seen_candidates.add(cand)
+                    candidates.append(cand)
 
         formatted_results.append({
             "phase": label,
@@ -157,6 +161,11 @@ async def execute_gsearch_lookup_for_worker(
             "error_category": raw_result.get("error_category"),
             "status_code": raw_result.get("status_code"),
             "search_url": raw_result.get("search_url"),
+            # AI-overview presence + usable-candidate count per phase, so the reporting
+            # layer can flag "empty 200" phases (no overview + 0 candidates) uniformly
+            # with relationship mode. See serpwow_reporting.empty_response_breakdown.
+            "ai_overview_present": bool(extract_ai_overview_text(raw_result.get("raw_response"))),
+            "candidate_count": phase_candidate_count,
             "raw_response": raw_result.get("raw_response"),
         })
 

@@ -196,6 +196,39 @@ def _extract_official_website_candidates_from_serpwow(data: dict[str, Any]) -> l
     return unique_candidates
 
 
+def extract_ai_overview_text(raw_response: Any) -> str:
+    """Flatten a SerpWow AI-overview block to plain text (empty if none present).
+
+    Used both to build AI-overview evidence and to detect "empty 200" phases
+    (no overview text + no candidates) — see serpwow_reporting.empty_response_breakdown.
+    """
+    if not isinstance(raw_response, dict):
+        return ""
+    overview = raw_response.get("ai_overview")
+    if not isinstance(overview, dict):
+        return ""
+    contents = overview.get("ai_overview_contents")
+    if not isinstance(contents, list):
+        return ""
+    lines: list[str] = []
+
+    def _append(item: Any, prefix: str = "") -> None:
+        if not isinstance(item, dict):
+            return
+        text = item.get("text") or item.get("snippet")
+        if isinstance(text, str) and text.strip():
+            clean = " ".join(text.split())
+            lines.append(f"{prefix} {clean}" if prefix else clean)
+        nested = item.get("list")
+        if isinstance(nested, list):
+            for index, child in enumerate(nested, start=1):
+                _append(child, f"{prefix}{index}.")
+
+    for item in contents:
+        _append(item)
+    return "\n".join(lines)
+
+
 async def run_serpwow_search(
     query: str,
     country: Optional[str] = None,

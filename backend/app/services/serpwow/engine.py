@@ -5042,7 +5042,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "cost": gs["cost"],
                 "token_usage": gs["token_usage"],
                 **{k: gs[k] for k in ("blank_rows", "searchable_rows", "unique_pairs",
-                                      "relationship_breakdown") if k in gs},
+                                      "relationship_breakdown", "empty_response_breakdown") if k in gs},
                 **({"total_rows_original": gs["total_rows"]} if "unique_pairs" in gs else {}),
             }
         except Exception:

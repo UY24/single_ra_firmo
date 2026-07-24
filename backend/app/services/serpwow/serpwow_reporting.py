@@ -14,7 +14,7 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from app.models.results import AttemptLogEntry, EntityResult, Flag
 from app.services.serpwow.serpwow_client import sanitize_serpwow_error_text
@@ -191,6 +191,61 @@ def _derive_outcome(row: dict[str, Any]) -> Any:
     return None
 
 
+def _phase_is_empty(item: dict[str, Any]) -> Optional[bool]:
+    """True if a phase returned an "empty 200" (no AI overview + 0 candidates).
+
+    None when the phase errored (a transport/HTTP failure is a different problem,
+    not an empty response) or the fields are missing (older pre-feature runs).
+    """
+    if not isinstance(item, dict) or item.get("error"):
+        return None
+    if "ai_overview_present" not in item and "candidate_count" not in item:
+        return None
+    return (not item.get("ai_overview_present")) and int(item.get("candidate_count") or 0) == 0
+
+
+def empty_response_breakdown(state: dict[str, Any]) -> Optional[dict[str, int]]:
+    """Count rows whose SerpWow phases came back empty despite HTTP 200.
+
+    relationship (exactly 2 phases): both_phases / phase1_only / phase2_only.
+    gsearch (variable phase count): all_phases / some_phases.
+    Other pipelines: None (they don't run AI-overview searches).
+    """
+    pipeline = str(state.get("pipeline") or "")
+    is_rel = pipeline == "relationship"
+    if not (is_rel or pipeline == "gsearch"):
+        return None
+    out = ({"both_phases": 0, "phase1_only": 0, "phase2_only": 0} if is_rel
+           else {"all_phases": 0, "some_phases": 0})
+    for row in state.get("rows", []):
+        ctx = ((row or {}).get("result") or {}).get("context") or {}
+        phases = ctx.get("formatted_results")
+        if not isinstance(phases, list) or not phases:
+            continue
+        flags = [_phase_is_empty(p) for p in phases]
+        considered = [f for f in flags if f is not None]
+        if not considered:
+            continue
+        # relationship rows are pairs fanned out to original CSV rows.
+        weight = len((row or {}).get("source_row_indices") or []) if is_rel else 1
+        if is_rel:
+            e1 = flags[0] if len(flags) > 0 else None
+            e2 = flags[1] if len(flags) > 1 else None
+            if e1 and e2:
+                out["both_phases"] += weight
+            elif e1:
+                out["phase1_only"] += weight
+            elif e2:
+                out["phase2_only"] += weight
+        else:
+            n_empty = sum(1 for f in considered if f)
+            if n_empty == len(considered):
+                out["all_phases"] += weight
+            elif n_empty:
+                out["some_phases"] += weight
+    return out
+
+
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
@@ -284,6 +339,10 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                 breakdown[status] += n_sources
         summary["total_rows"] = int(meta.get("row_count_original") or 0)
         summary["relationship_breakdown"] = breakdown
+
+    ebd = empty_response_breakdown(state)
+    if ebd is not None:
+        summary["empty_response_breakdown"] = ebd
     return summary
 
 

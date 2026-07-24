@@ -387,6 +387,27 @@ function verdictSection(rb) {
   );
 }
 
+// Empty 200-OK SerpWow responses (no AI overview + 0 candidates). relationship
+// splits by phase (both / phase 1 only / phase 2 only); gsearch by all / some.
+// `eb` is serpwow_summary.empty_response_breakdown.
+function emptyResponsesSection(eb, isRel) {
+  const chips = isRel
+    ? [
+        chip("Both phases", fmtNum(eb.both_phases ?? 0), (eb.both_phases ?? 0) ? "danger" : "muted"),
+        chip("Phase 1 only", fmtNum(eb.phase1_only ?? 0), (eb.phase1_only ?? 0) ? "warn" : "muted"),
+        chip("Phase 2 only", fmtNum(eb.phase2_only ?? 0), (eb.phase2_only ?? 0) ? "warn" : "muted"),
+      ]
+    : [
+        chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
+        chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
+      ];
+  return el("section", { class: "detail-section" },
+    sectionHeading("Empty responses (HTTP 200)",
+      "Rows where SerpWow returned 200 but no AI overview and no candidates."),
+    el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
+  );
+}
+
 function failedRowsSection(ref, count, companyLabel) {
   const regionId = `failed-rows-${encodeURIComponent(ref)}`;
   const results = el("div", {
@@ -718,6 +739,7 @@ function renderLegacyStatus(root, ref, s) {
   }
   if (g) parts.push(costSection(g));
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
   }

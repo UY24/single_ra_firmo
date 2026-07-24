@@ -39,41 +39,16 @@ from app.services.serpwow.gemini_llm import (
 from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
 from app.services.serpwow.query_builders import build_relationship_phase_queries
 from app.services.serpwow.schemas import CrawlResponse
-from app.services.serpwow.serpwow_client import run_serpwow_search
+from app.services.serpwow.serpwow_client import (
+    extract_ai_overview_text as _overview_text,
+    run_serpwow_search,
+)
 from app.services.serpwow.url_utils import (
     dedupe_candidate_urls,
     is_disallowed_official_url,
     url_matches_domain,
     x_domain_from_input_url,
 )
-
-
-def _overview_text(raw_response: Any) -> str:
-    if not isinstance(raw_response, dict):
-        return ""
-    overview = raw_response.get("ai_overview")
-    if not isinstance(overview, dict):
-        return ""
-    contents = overview.get("ai_overview_contents")
-    if not isinstance(contents, list):
-        return ""
-    lines: list[str] = []
-
-    def _append(item: Any, prefix: str = "") -> None:
-        if not isinstance(item, dict):
-            return
-        text = item.get("text") or item.get("snippet")
-        if isinstance(text, str) and text.strip():
-            clean = " ".join(text.split())
-            lines.append(f"{prefix} {clean}" if prefix else clean)
-        nested = item.get("list")
-        if isinstance(nested, list):
-            for index, child in enumerate(nested, start=1):
-                _append(child, f"{prefix}{index}.")
-
-    for item in contents:
-        _append(item)
-    return "\n".join(lines)
 
 
 def _overview_sources(raw_response: Any) -> list[dict[str, str]]:

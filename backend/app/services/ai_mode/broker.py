@@ -43,7 +43,17 @@ def routing_key() -> str:
 
 
 def worker_concurrency() -> int:
-    return max(1, _int_env("AI_MODE_WORKER_CONCURRENCY", 20))
+    """In-flight scrape messages for AI Mode's queue.
+
+    Falls back to the shared ``WORKER_CONCURRENCY`` so a deployment that wants one
+    number only sets that one; ``AI_MODE_WORKER_CONCURRENCY`` exists for when AI Mode
+    needs to differ (its messages are batches lasting ~50s, vs a gmaps row at ~3.5s).
+    Neither of these is a provider cap — concurrent scrape.do calls are bounded
+    centrally by ``SCRAPEDO_CONCURRENCY`` (common.provider_limits), so raising these
+    cannot breach the account limit.
+    """
+    return max(1, _int_env("AI_MODE_WORKER_CONCURRENCY",
+                           _int_env("WORKER_CONCURRENCY", 20)))
 
 
 async def init_ai_mode_broker(connection) -> None:

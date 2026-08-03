@@ -9,7 +9,7 @@ Last updated: 2026-08-03. Read this first if you're picking up this repo. Durabl
 - **Active branch: `migrateserp2scrape`.** Two independent bodies of uncommitted work sit in this tree — keep them separate when committing:
   1. the **2026-08-03 gmaps → scrape.do migration** (this session, see below);
   2. the older **2026-07-23 relationship** failure-diagnostics/retry/UI changes, still **UNCOMMITTED, NOT live-verified, NOT pushed** (they predate this branch, from `relationship-ai-overview` off `aiModeBroker`).
-- Full suite: **618/618** passing (was 564 before this work added 54).
+- Full suite: **621/621** passing (was 564 before this work added 57).
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -63,7 +63,7 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Latest completed session — 2026-08-03 (gmaps: SerpWow Places → scrape.do Google Maps)
 
-**Status: UNCOMMITTED, 618/618 offline tests passing, PARTIALLY live-verified (real API
+**Status: UNCOMMITTED, 621/621 offline tests passing, PARTIALLY live-verified (real API
 calls through the real executor; NOT yet a full worker/RabbitMQ run), NOT pushed.**
 First pipeline migrated off SerpWow. Built with Ponytail: one new client file, **one new env var**
 (`SCRAPEDO_CONCURRENCY`), no new dependency, no new endpoint, no new UI component (the existing `costSection`
@@ -217,6 +217,21 @@ under a per-upload lock, so throughput was capped by state size no matter what
   enforces requests/second (suspected: 429s were seen at only 12 concurrent), a token
   bucket goes inside that one helper and no call site changes. User is confirming the
   plan's actual limits.
+- **One knob to set, not three.** `AI_MODE_WORKER_CONCURRENCY` now falls back to
+  `WORKER_CONCURRENCY` when unset, and `SCRAPEDO_CONCURRENCY` defaults to 100 — so a
+  deployment sets only `WORKER_CONCURRENCY=100` and can delete the other two from `.env`.
+  The two overrides remain for when AI Mode must differ (its messages are ~50s batches vs
+  a ~3.5s gmaps row). The provider cap deliberately does NOT track the slot count: if it
+  did, raising worker slots would silently raise the vendor limit. Verified `100 rows /
+  batch 10 = 10k calls` goes from ~28h at concurrency 5 to ~1.4h at 100, and that 100 is
+  safe — the thread pool is already sized from these env vars (a stock `to_thread` cap of
+  `min(32, cpu+4)` would otherwise have throttled it), payloads are 5-21KB so 100 in
+  flight is ~2MB, and `AI_MODE_JOB_TIMEOUT_SEC=600` has 12x headroom over ~51s calls.
+- **Known minor inefficiency introduced:** AI Mode's retry loop lives inside its
+  *synchronous* client (`time.sleep` between attempts), so the slot wrapped around
+  `to_thread(scrape_batch_sync)` is held across backoff sleeps — a slot occupied while not
+  calling. gmaps doesn't have this (only its HTTP call is wrapped). Negligible unless 429s
+  are frequent; the fix is hoisting the retry loop out of the sync client.
 - **Corrected an earlier wrong claim of mine:** raising `WORKER_CONCURRENCY` does NOT
   expose gsearch to ~500 concurrent SerpWow calls — `SEARCH_FETCH_CONCURRENCY=5` already
   gates SerpWow globally. So the two-dial model (worker slots vs per-provider caps) was

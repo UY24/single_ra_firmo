@@ -64,6 +64,30 @@ class ScrapedoGateTests(unittest.TestCase):
         self.assertIs(ai_worker.scrapedo_slot, provider_limits.scrapedo_slot)
 
 
+class OneKnobTests(unittest.TestCase):
+    """A deployment that runs one pipeline at a time should only have to set
+    WORKER_CONCURRENCY; the others exist for when they need to differ."""
+
+    def test_ai_mode_falls_back_to_the_shared_worker_knob(self) -> None:
+        from app.services.ai_mode import broker
+
+        with mock.patch.dict(os.environ, {"WORKER_CONCURRENCY": "100"}, clear=True):
+            self.assertEqual(broker.worker_concurrency(), 100)
+
+    def test_ai_mode_specific_knob_still_wins(self) -> None:
+        from app.services.ai_mode import broker
+
+        with mock.patch.dict(os.environ, {"WORKER_CONCURRENCY": "100",
+                                          "AI_MODE_WORKER_CONCURRENCY": "5"}, clear=True):
+            self.assertEqual(broker.worker_concurrency(), 5)
+
+    def test_scrapedo_cap_is_independent_of_worker_slots(self) -> None:
+        """The provider cap must NOT track the slot count — otherwise raising worker
+        slots would silently raise the vendor limit, defeating the whole point."""
+        with mock.patch.dict(os.environ, {"WORKER_CONCURRENCY": "500"}, clear=True):
+            self.assertEqual(provider_limits.scrapedo_limit(), 100)
+
+
 class AtomicWriteTests(unittest.TestCase):
     def test_write_is_atomic_and_leaves_no_temp_file(self) -> None:
         from app.services.serpwow.engine import _write_json

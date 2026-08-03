@@ -559,35 +559,38 @@ def build_relationship_phase_queries(
     y_name: str,
     x_domain: str,
 ) -> list[tuple[str, str]]:
-    """Keyword search queries for one X↔Y relationship pair.
+    """Two parallel AI-Overview prose questions for one relationship pair.
 
-    These are sent as `q=` to SerpWow's `engine=google` web search, so they MUST be
-    keyword/boolean queries (prose questions return ~no organic_results → 0 candidates).
-    Goal is to maximize candidate recall into organic_results; the downstream LLM gate
-    handles precision (it requires confirmed financial evidence and picks the website
-    from the candidate set only). `include_ai_overview=true` still fires on these, so
-    AI-overview evidence keeps flowing to the gate as a bonus.
+    Sent to SerpWow `engine=google` with `include_ai_overview=true`. These are PROSE
+    questions (not keyword queries) because the goal is for the AI Overview to *answer*
+    the relationship and type out Y's website — the typed URL is extracted from the
+    overview text (and `ai_overview_sources`) as a candidate. Precision (confirmed vs
+    unclear vs not_confirmed) is left to the LLM gate. X is identified by name + domain
+    (from Input_URL, disambiguates); Y is used verbatim (OCR noise kept). Two phrasings
+    run in parallel to raise the AI-Overview hit rate (it triggers for some wordings
+    and not others): q1 leads with the relationship, q2 leads with Y's identity.
     """
     x = str(x_name or "").strip()
     y = str(y_name or "").strip()
     xd = str(x_domain or "").strip()
-    # Both are required: Y is the search target; X is what the gate verifies the
-    # relationship against — the executor short-circuits a blank X (REL_ERROR_NO_X)
-    # before the LLM, so searching Y alone would be wasted spend.
+    # Both are required: Y is the target; X is what the gate verifies the relationship
+    # against — the executor short-circuits a blank X (REL_ERROR_NO_X) before the LLM.
     if not (x and y):
         return []
-    queries: list[tuple[str, str]] = [
-        # Direct site-finding: surfaces Y's homepage as a top organic result (recall).
-        ("phase1_official_website", f'"{y}" official website'),
-        # X-anchored financial evidence: disambiguates same-named companies and yields
-        # portfolio/news candidate URLs. Boolean OR keeps organic_results rich.
+    x_ident = f"{x} ({xd})" if xd else x
+    return [
         (
-            "phase2_financial_evidence",
-            f'"{x}" "{y}" investment OR portfolio OR funding OR '
-            f'acquisition OR investor OR backed',
+            "phase1_relationship_and_url",
+            f"What is the business or financial relationship, if any, between "
+            f'{x_ident} and "{y}"? Describe how they are connected. If "{y}" is a '
+            f"company, include its official company website written as a complete "
+            f"plain-text URL beginning with https:// (do not provide it as a hyperlink).",
+        ),
+        (
+            "phase2_identity_and_relationship",
+            f'Who is "{y}"? If "{y}" is a company, include its official company '
+            f"website written as a complete plain-text URL beginning with https:// "
+            f"(do not provide it as a hyperlink). Also explain its business or "
+            f"financial relationship, if any, with {x_ident}.",
         ),
     ]
-    if xd:
-        # Portfolio-page anchor on X's own domain: confirms Y appears on X's site.
-        queries.append(("phase3_portfolio_anchor", f'"{x}" "{y}" site:{xd}'))
-    return queries

@@ -28,11 +28,14 @@ class TestSummarizeOutcome(unittest.TestCase):
         self.assertEqual(s["failed_rows"], 0)
 
     def test_failure_analysis_by_source(self):
-        rows = [{"status": "failed", "outcome": o.OUTCOME_ERROR, "error_source": o.SRC_GEMINI,
+        rows = [{"row_index": 63, "company_name": "Kitche", "status": "failed",
+                 "outcome": o.OUTCOME_ERROR, "error_source": o.SRC_GEMINI,
                  "error_category": o.CAT_TIMEOUT, "error": "boom"}]
         fa = engine.build_failure_analysis(_state(rows))
         self.assertEqual(fa["by_source"], [{"source": "gemini", "count": 1}])
         self.assertEqual(fa["by_category"], [{"category": "timeout", "count": 1}])
+        self.assertEqual(fa["sample_failed_rows"][0]["error_source"], "gemini")
+        self.assertEqual(fa["sample_failed_rows"][0]["error_category"], "timeout")
 
 
 if __name__ == "__main__":

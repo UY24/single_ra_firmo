@@ -26,7 +26,6 @@ def _pair_row(row_index, y, x, source_rows, official, rel_status, error=None,
                                  "evidence": [f"evidence {y} one", f"evidence {y} two"],
                                  "relationship_confidence_score": 96,
                                  "website_confidence_score": 88 if official else 0,
-                                 "verified_pair": f"{x} ↔ {y}",
                                  "flags": list(flags)},
                 "final_url_selection_ai": {
                     "model": "gemini-2.5-flash-lite",
@@ -90,17 +89,17 @@ class TestRelationshipReporting(unittest.TestCase):
     def test_write_outputs_files_and_columns(self):
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), _state())
-            self.assertIn("skipped.csv", paths)
-            with Path(paths["found.csv"]).open() as fh:
-                found = list(csv.DictReader(fh))
-            with Path(paths["notFound.csv"]).open() as fh:
-                not_found = list(csv.DictReader(fh))
-            with Path(paths["skipped.csv"]).open() as fh:
-                skipped = list(csv.DictReader(fh))
-            self.assertEqual(len(found), 2)       # both Modal duplicate rows
-            self.assertEqual(len(not_found), 1)
-            self.assertEqual(len(skipped), 1)
-            row = found[0]
+            # Files split by RELATIONSHIP STATUS, not URL presence. No skipped.csv.
+            self.assertNotIn("skipped.csv", paths)
+            with Path(paths["confirmed_relation.csv"]).open() as fh:
+                reader = csv.DictReader(fh)
+                confirmed_headers = reader.fieldnames
+                confirmed = list(reader)
+            with Path(paths["notconfirmed_relation.csv"]).open() as fh:
+                notconfirmed = list(csv.DictReader(fh))
+            self.assertEqual(len(confirmed), 2)       # both Modal duplicate rows (confirmed)
+            self.assertEqual(len(notconfirmed), 1)    # GR TRDCX (not_confirmed)
+            row = confirmed[0]
             # passthrough columns preserved
             self.assertEqual(row["Box_No"], "2")
             self.assertEqual(row["OCR_Status"], "SUCCESS")
@@ -115,15 +114,23 @@ class TestRelationshipReporting(unittest.TestCase):
             self.assertEqual(row["website_confidence"], "88")
             self.assertEqual(row["phases_used"], "3")
             self.assertEqual(row["confidence"], "88")
-            self.assertEqual(row["verified_pair"], "eastlinkcap ↔ Modal")
+            self.assertEqual(
+                confirmed_headers[confirmed_headers.index("attempt_log") + 1],
+                "error_source",
+            )
+            self.assertEqual(row["error_source"], "")
+            self.assertNotIn("verified_pair", row)
             self.assertIn("attempt_log", row)
             self.assertIn("AI overview returned; 1 candidate(s)", row["attempt_log"])
-            nf = not_found[0]
-            self.assertIn("url_found_no_relationship", nf["flags"])
-            self.assertIn("error", nf)
-            self.assertEqual(skipped[0]["skip_reason"], "blank_company_name_y")
+            nc = notconfirmed[0]
+            self.assertEqual(nc["relationship_status"], "not_confirmed")
+            self.assertIn("url_found_no_relationship", nc["flags"])
+            self.assertIn("error_reason", nc)
 
-    def test_confirmed_relationship_without_url_keeps_evidence_in_not_found(self):
+    def test_confirmed_relationship_without_url_stays_in_confirmed_file(self):
+        # Split is by relationship status: a confirmed row with no URL still lands in
+        # confirmed_relation.csv (with website_url empty) — the missing URL shows up in
+        # the report's websites_not_found count, not by moving the row.
         state = _state()
         state["relationship"]["original_rows"] = [
             {"Input_URL": "https://eastlinkcap.com/p", "Company_Name_X": "eastlinkcap",
@@ -137,11 +144,14 @@ class TestRelationshipReporting(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), state)
-            with Path(paths["notFound.csv"]).open() as fh:
+            with Path(paths["confirmed_relation.csv"]).open() as fh:
                 rows = list(csv.DictReader(fh))
+            with Path(paths["notconfirmed_relation.csv"]).open() as fh:
+                self.assertEqual(list(csv.DictReader(fh)), [])
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["relationship_status"], "confirmed")
+        self.assertEqual(rows[0]["website_url"], "")
         self.assertEqual(rows[0]["resolved_company_y_name"], "Resolved Modal")
         self.assertEqual(rows[0]["relationship_confidence"], "96")
         self.assertEqual(rows[0]["website_confidence"], "0")
@@ -152,9 +162,9 @@ class TestRelationshipReporting(unittest.TestCase):
         results = serpwow_reporting.state_to_entity_results(state)
         summary = serpwow_reporting.build_summary(state, results)
         self.assertEqual(summary["total_rows"], 4)          # original CSV rows
-        self.assertEqual(summary["blank_rows"], 1)
-        self.assertEqual(summary["searchable_rows"], 3)
-        self.assertEqual(summary["unique_pairs"], 2)
+        # dedup-era keys are gone (no unique_pairs / searchable_rows / blank_rows).
+        self.assertNotIn("unique_pairs", summary)
+        self.assertNotIn("searchable_rows", summary)
         self.assertEqual(summary["websites_found"], 2)
         self.assertEqual(summary["websites_not_found"], 1)
         self.assertEqual(summary["relationship_breakdown"],
@@ -184,15 +194,17 @@ class TestRelationshipReporting(unittest.TestCase):
         self.assertEqual(summary["outcome_breakdown"],
                          {"found": 2, "not_found": 1, "errored": 2})
         self.assertEqual(summary["error_breakdown"]["by_source"], {"gemini": 2})
-        self.assertEqual(summary["searchable_rows"], 5)
-        self.assertEqual(sum(summary["outcome_breakdown"].values()), summary["searchable_rows"])
+        # Outcomes still fan out by source_row_indices (found 2 + not_found 1 + errored 2).
+        self.assertEqual(sum(summary["outcome_breakdown"].values()), 5)
 
     def test_report_json_rows_include_relationship(self):
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), _state())
             report = json.loads(Path(paths["report.json"]).read_text())
-            self.assertEqual(report["summary"]["unique_pairs"], 2)
+            self.assertEqual(report["summary"]["relationship_breakdown"],
+                             {"confirmed": 2, "not_confirmed": 1, "unclear": 0})
             self.assertEqual(report["rows"][0]["relationship_status"], "confirmed")
+            self.assertNotIn("verified_pair", json.dumps(report))
 
     def test_provider_error_reason_is_clear_and_redacted_in_viewable_files(self):
         state = _state()
@@ -217,16 +229,18 @@ class TestRelationshipReporting(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             paths = serpwow_reporting.write_outputs(Path(td), state)
-            with Path(paths["notFound.csv"]).open() as fh:
+            with Path(paths["notconfirmed_relation.csv"]).open() as fh:
                 not_found = list(csv.DictReader(fh))[0]
             report = json.loads(Path(paths["report.json"]).read_text())
             run_log = Path(paths["run.log"]).read_text()
 
         expected = "SerpWow failed (HTTP 503): Service Unavailable."
         self.assertEqual(not_found["error_reason"], expected)
-        self.assertEqual(not_found["error"], expected)
+        self.assertEqual(not_found["error_source"], "serpwow")
         self.assertEqual(report["rows"][0]["error_reason"], expected)
+        self.assertEqual(report["rows"][0]["error_source"], "serpwow")
         self.assertIn(expected, run_log)
+        self.assertNotIn("↔", run_log)
         self.assertNotIn("secret-key", json.dumps(report))
         self.assertNotIn("secret-key", not_found["attempt_log"])
 

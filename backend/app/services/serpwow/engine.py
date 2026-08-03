@@ -220,7 +220,9 @@ s3_client = None
 
 # Pipeline id constants live in constants.py; re-imported at the top of this module.
 
-_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log",
+_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv",
+                         "confirmed_relation.csv", "notconfirmed_relation.csv",
+                         "skipped.csv", "report.json", "run.log",
                          "output.json", "state.json"}
 
 
@@ -1211,6 +1213,10 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: st
 
 def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
     timing_summary = build_processing_timing_summary(state.get("rows", []))
+    # Total = wall-clock (start→completion); avg/count = per-row work stats. Mirror
+    # summarize_upload_state so the output payload agrees with /status and the cache.
+    elapsed = _run_elapsed_seconds(state)
+    total_seconds = elapsed if elapsed is not None else timing_summary["processing_seconds_total"]
     return {
         "upload_id": state["upload_id"],
         "company_name": state.get("company_name") or "",
@@ -1223,7 +1229,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
         "processed_rows": state["processed_rows"],
         "success_rows": state["success_rows"],
         "failed_rows": state["failed_rows"],
-        "processing_seconds_total": timing_summary["processing_seconds_total"],
+        "processing_seconds_total": total_seconds,
         "processing_seconds_avg": timing_summary["processing_seconds_avg"],
         "processing_seconds_count": timing_summary["processing_seconds_count"],
         "results": [
@@ -1799,7 +1805,7 @@ def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[st
         parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
 
     relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
-        "status": "pending", "summary": "", "verified_pair": "", "flags": []}
+        "status": "pending", "summary": "", "flags": []}
     context["relationship"] = update_relationship_block(
         relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
 
@@ -2063,10 +2069,9 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             # Rows that DID get a parsed dict were already fully decided (found or
             # not_found, both now status="completed") by the loop above and must not
             # be re-touched here, even though not_found rows also have no website.
-            # Rows NEVER seeded into the batch (skip_llm relationship no-X/no-evidence
-            # short-circuits, already finalized not_found/completed by the worker; or
-            # non-terminal rows) are absent from chunk_id_by_ridx -> must NOT be touched,
-            # else an unrelated row going through the batch would corrupt them to error.
+            # Rows never seeded normally stay untouched. The one exception is an exact
+            # pending sentinel: that row completed after the input snapshot and must not
+            # remain pending once this batch is terminal.
             results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
@@ -2076,7 +2081,13 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                     continue
                 ridx = int(row.get("row_index", 0) or 0)
                 if ridx not in chunk_id_by_ridx:
-                    continue  # never a batch item (skip_llm short-circuit / non-terminal)
+                    if row.get("error") == _pending_sentinel:
+                        row["status"] = "failed"
+                        row["outcome"] = _outcomes.OUTCOME_ERROR
+                        row["error_source"] = _outcomes.SRC_GEMINI
+                        row["error_category"] = _outcomes.CAT_INTERNAL
+                        row["error"] = "Gemini batch missed row after its input snapshot."
+                    continue
                 if isinstance(parsed_all.get(ridx), dict):
                     continue  # already decided (found/not_found) above
                 chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}
@@ -2293,6 +2304,41 @@ def build_processing_timing_summary(rows: Any) -> dict[str, Any]:
     }
 
 
+def _run_elapsed_seconds(state: dict[str, Any]) -> Optional[float]:
+    """Wall-clock seconds from run start (created_at) to completion.
+
+    Completion = the latest terminal timestamp among the rows' status_updated_at and the
+    Gemini batch's completed_at — a stable value that does NOT drift when later
+    reconciler/finalize passes re-persist the state. While the run is still non-terminal,
+    measure up to 'now' so the UI shows live elapsed. This is the true wall-clock span,
+    NOT the sum of per-row work times (which overcounts wildly under parallel workers).
+    Returns None if created_at is unparseable (legacy states) so callers can fall back.
+    """
+    start = _parse_iso_datetime(state.get("created_at"))
+    if start is None:
+        return None
+    ends: list[Any] = []
+    for r in state.get("rows", []) or []:
+        if isinstance(r, dict):
+            d = _parse_iso_datetime(r.get("status_updated_at"))
+            if d is not None:
+                ends.append(d)
+    gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    d = _parse_iso_datetime(gb.get("completed_at"))
+    if d is not None:
+        ends.append(d)
+    terminal = state.get("status") in {"completed", "completed_with_errors"}
+    if terminal:
+        # Prefer the last row/batch terminal timestamp; fall back to the last persist
+        # (updated_at) for states that predate per-row status_updated_at.
+        end = max(ends) if ends else _parse_iso_datetime(state.get("updated_at"))
+    else:
+        end = datetime.now(timezone.utc)
+    if end is None:
+        return None
+    return round(max((end - start).total_seconds(), 0.0), 3)
+
+
 def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     rows = state.get("rows", [])
     total = len(rows)
@@ -2341,7 +2387,15 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
             outcome_counts["errored"] += 1
     state["outcome_counts"] = outcome_counts
 
-    state.update(build_processing_timing_summary(rows))
+    timing = build_processing_timing_summary(rows)
+    elapsed = _run_elapsed_seconds(state)
+    # Total = wall-clock start→completion. The per-row sum (timing[...]) overcounts
+    # under parallel workers, so only fall back to it when created_at is missing.
+    # Avg/row stays the mean per-row work time.
+    state["processing_seconds_total"] = (
+        elapsed if elapsed is not None else timing["processing_seconds_total"])
+    state["processing_seconds_avg"] = timing["processing_seconds_avg"]
+    state["processing_seconds_count"] = timing["processing_seconds_count"]
     state["updated_at"] = _now_iso()
     return state
 
@@ -2414,6 +2468,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
                     "row_index": row.get("row_index"),
                     "company_name": row.get("company_name"),
                     "country": row.get("country"),
+                    "error_source": row.get("error_source"),
+                    "error_category": row.get("error_category"),
                     "error": row.get("error"),
                     "official_website": official_website or None,
                     "status_updated_at": row.get("status_updated_at"),
@@ -2444,10 +2500,11 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
     names = ["state.json", "output.json"]
-    if pipe in REPORTING_PIPELINES:
-        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if pipe == PIPELINE_RELATIONSHIP:
-        names += ["skipped.csv"]
+        names += ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                  "report.json", "run.log"]
+    elif pipe in REPORTING_PIPELINES:
+        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -2456,12 +2513,12 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
 
 
 def _reporting_result_names(pipeline: str) -> list[str]:
+    if pipeline == PIPELINE_RELATIONSHIP:
+        return ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                "report.json", "run.log"]
     if pipeline not in REPORTING_PIPELINES:
         return []
-    names = ["found.csv", "notFound.csv"]
-    if pipeline == PIPELINE_RELATIONSHIP:
-        names.append("skipped.csv")
-    return [*names, "report.json", "run.log"]
+    return ["found.csv", "notFound.csv", "report.json", "run.log"]
 
 
 def _list_available_reporting_files_s3_sync(
@@ -4161,8 +4218,8 @@ async def create_gsearch_upload(
 
 @app.post("/uploads/relationship/preview")
 async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Dry-run parse for the New Run preview: header mapping, blank/dedupe
-    counts, and a sample of the pairs that would actually be searched.
+    """Dry-run parse for the New Run preview: header mapping, row count, and a
+    sample of the rows that would be searched (one row in → one row out, no dedup).
     Costs nothing — no state, no queue, no Supabase."""
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
@@ -4175,25 +4232,18 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    pairs = parsed["pairs"]
+    rows = parsed["pairs"]  # one entry per CSV data row (no dedup)
     total = len(parsed["original_rows"])
-    blank = len(parsed["blank_row_indices"])
-    duplicates = total - len(pairs)
     warnings: list[str] = []
-    if duplicates > 0:
-        warnings.append(
-            f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
-        )
-    if not pairs:
+    if not rows:
         warnings.append("No searchable rows — the CSV contains no data rows.")
 
     return {
         "total_rows": total,
-        "blank_rows": blank,
-        "unique_pairs": len(pairs),
+        "relationship": True,
         "warnings": warnings,
         "columns_detected": parsed["columns_detected"],
-        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country", "csv_rows"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country"],
         "sample_rows": [
             {
                 "company_name_x": p["x_name"],
@@ -4201,9 +4251,8 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
                 "input_url": p["input_url"],
                 "city": p["city"],
                 "country": p["country"],
-                "csv_rows": len(p["source_row_indices"]),
             }
-            for p in pairs[:5]
+            for p in rows[:5]
         ],
     }
 
@@ -4993,7 +5042,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "cost": gs["cost"],
                 "token_usage": gs["token_usage"],
                 **{k: gs[k] for k in ("blank_rows", "searchable_rows", "unique_pairs",
-                                      "relationship_breakdown") if k in gs},
+                                      "relationship_breakdown", "empty_response_breakdown") if k in gs},
                 **({"total_rows_original": gs["total_rows"]} if "unique_pairs" in gs else {}),
             }
         except Exception:

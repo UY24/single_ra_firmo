@@ -40,8 +40,11 @@ class TestRelationshipGates(unittest.TestCase):
     def test_file_links_advertises_relationship_files(self):
         with patch.dict("os.environ", {"S3_BUCKET": "b"}):
             links = engine._upload_file_links("up1", "Acme", "relationship")
-        for name in ("found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"):
+        for name in ("confirmed_relation.csv", "notconfirmed_relation.csv",
+                     "report.json", "run.log"):
             self.assertIn(name, links)
+        self.assertNotIn("found.csv", links)
+        self.assertNotIn("skipped.csv", links)
 
     def test_status_summary_passthrough_keys(self):
         # the /status endpoint copies these keys from build_summary when present
@@ -51,8 +54,8 @@ class TestRelationshipGates(unittest.TestCase):
                                   "blank_rows": 0, "row_count_original": 1},
                  "rows": []}
         summ = serpwow_reporting.build_summary(state, [])
-        for key in ("blank_rows", "searchable_rows", "unique_pairs", "relationship_breakdown"):
-            self.assertIn(key, summ)
+        self.assertIn("relationship_breakdown", summ)
+        self.assertNotIn("unique_pairs", summ)
 
 
 class _FakeCompanySvc:

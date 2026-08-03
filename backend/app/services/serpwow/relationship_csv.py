@@ -2,8 +2,10 @@
 
 Input: OCR-results CSV with required Input_URL, Company_Name_X, and
 Company_Name_Y values on every row, optional city/country, and arbitrary
-passthrough columns. Rows are deduped into unique (X, Y) pairs; each pair
-remembers which original row indices it fans back out to at reporting time.
+passthrough columns. Every row is processed independently — one row in, one row
+out (no (X, Y) deduplication). Each row is still represented as a "pair" carrying
+its single source row index so the downstream engine/reporting machinery is
+unchanged (source_row_indices is always a 1-element list).
 """
 from __future__ import annotations
 
@@ -32,11 +34,6 @@ def _find_column(normalized: dict[str, str], aliases: tuple[str, ...]) -> str | 
         if alias in normalized:
             return normalized[alias]
     return None
-
-
-def _pair_key(x_name: str, y_name: str) -> tuple[str, str]:
-    collapse = lambda s: re.sub(r"\s+", " ", s.strip()).casefold()  # noqa: E731
-    return (collapse(x_name), collapse(y_name))
 
 
 def parse_relationship_csv(raw: bytes) -> dict:
@@ -71,8 +68,9 @@ def parse_relationship_csv(raw: bytes) -> dict:
     original_rows: list[dict[str, str]] = []
     blank_row_indices: list[int] = []
     pairs: list[dict] = []
-    pair_by_key: dict[tuple[str, str], dict] = {}
 
+    # One row in → one row out: no (X, Y) dedup. Each row becomes its own "pair"
+    # carrying its single source row index (source_row_indices == [idx]).
     for idx, row in enumerate(reader):
         clean = {h: (row.get(h) or "").strip() for h in header}
         original_rows.append(clean)
@@ -88,27 +86,15 @@ def parse_relationship_csv(raw: bytes) -> dict:
             raise InvalidRelationshipCSV(
                 f"CSV row {idx + 2} missing required value(s): {', '.join(missing)}"
             )
-        key = _pair_key(x_name, y_name)
-        pair = pair_by_key.get(key)
-        if pair is None:
-            pair = {
-                "pair_index": len(pairs) + 1,
-                "x_name": x_name,
-                "y_name": y_name,
-                "input_url": input_url,
-                "city": clean.get(city_col, "") if city_col else "",
-                "country": clean.get(country_col, "") if country_col else "",
-                "source_row_indices": [],
-            }
-            pair_by_key[key] = pair
-            pairs.append(pair)
-        else:
-            # First non-blank value wins for the optional context fields.
-            for col, field in ((url_col, "input_url"), (city_col, "city"),
-                               (country_col, "country")):
-                if col and not pair[field] and clean.get(col, ""):
-                    pair[field] = clean[col]
-        pair["source_row_indices"].append(idx)
+        pairs.append({
+            "pair_index": len(pairs) + 1,
+            "x_name": x_name,
+            "y_name": y_name,
+            "input_url": input_url,
+            "city": clean.get(city_col, "") if city_col else "",
+            "country": clean.get(country_col, "") if country_col else "",
+            "source_row_indices": [idx],
+        })
 
     if not original_rows:
         raise InvalidRelationshipCSV("CSV has a header but no data rows.")

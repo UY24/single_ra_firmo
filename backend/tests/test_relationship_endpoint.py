@@ -41,7 +41,7 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             patch.object(engine, "_upload_dir", MagicMock()),
         ]
 
-    def test_happy_path_groups_duplicate_pairs(self):
+    def test_happy_path_processes_every_row_no_dedup(self):
         patches = self._happy_patches()
         for p in patches:
             p.start()
@@ -49,18 +49,19 @@ class TestRelationshipUploadEndpoint(unittest.TestCase):
             resp = self._post()
             self.assertEqual(resp.status_code, 200, resp.text)
             body = resp.json()
-            self.assertEqual(body["total_rows"], 1)      # 1 unique pair
+            self.assertEqual(body["total_rows"], 2)      # no dedup: 2 rows in → 2 out
             self.assertEqual(body["blank_rows"], 0)
-            self.assertEqual(body["unique_pairs"], 1)
+            self.assertEqual(body["unique_pairs"], 2)
             # state carries the relationship block + pair-row extras
             state = engine.persist_upload_state.call_args[0][1]
             self.assertEqual(state["pipeline"], "relationship")
             self.assertEqual(state["relationship"]["blank_rows"], 0)
             self.assertEqual(state["relationship"]["row_count_original"], 2)
+            self.assertEqual(len(state["rows"]), 2)
             row = state["rows"][0]
             self.assertEqual(row["company_name"], "Modal")
             self.assertEqual(row["x_name"], "eastlinkcap")
-            self.assertEqual(row["source_row_indices"], [0, 1])
+            self.assertEqual(row["source_row_indices"], [0])
             # job carries the same extras
             job = engine.publish_job.call_args[0][0]
             self.assertEqual(job["x_name"], "eastlinkcap")
@@ -255,19 +256,19 @@ class TestRelationshipPreviewEndpoint(unittest.TestCase):
         resp = self._preview()
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
-        self.assertEqual(body["total_rows"], 2)
-        self.assertEqual(body["blank_rows"], 0)
-        self.assertEqual(body["unique_pairs"], 1)
+        self.assertEqual(body["total_rows"], 2)      # no dedup: every row counted
+        self.assertTrue(body["relationship"])
+        self.assertNotIn("unique_pairs", body)
         self.assertEqual(body["columns_detected"]["company_name_y"], "Company_Name_Y")
         self.assertEqual(body["columns_detected"]["input_url"], "Input_URL")
         self.assertIsNone(body["columns_detected"]["city"])
-        self.assertEqual(len(body["sample_rows"]), 1)
+        self.assertEqual(len(body["sample_rows"]), 2)
         sample = body["sample_rows"][0]
         self.assertEqual(sample["company_name_x"], "eastlinkcap")
         self.assertEqual(sample["company_name_y"], "Modal")
-        self.assertEqual(sample["csv_rows"], 2)
+        self.assertNotIn("csv_rows", sample)
         self.assertEqual(body["sample_columns"][0], "company_name_x")
-        self.assertEqual(len(body["warnings"]), 1)  # duplicate-pair warning
+        self.assertEqual(body["warnings"], [])       # no duplicate warning anymore
 
     def test_preview_missing_x_column_is_400(self):
         resp = self._preview(

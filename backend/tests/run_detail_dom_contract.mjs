@@ -122,6 +122,7 @@ async function renderStatus(ref, status, { ai = false } = {}) {
   timers = [];
   const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
   const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
+  const failurePath = `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`;
   let aiCalls = 0;
   globalThis.fetch = async (path, options = {}) => {
     requests.push({ path, options });
@@ -133,6 +134,17 @@ async function renderStatus(ref, status, { ai = false } = {}) {
     } else {
       if (path === aiPath) return response({ detail: "Not Found" }, 404);
       if (path === legacyPath) return response(status);
+    }
+    if (path === failurePath) {
+      return response({
+        failed_rows: 2,
+        sample_failed_rows: [
+          { row_index: 63, company_name: "Kitche", error_source: "serpwow",
+            error_category: "timeout", error: "ReadTimeout" },
+          { row_index: 67, company_name: "CASCADE COFFEE", error_source: "serpwow",
+            error_category: "timeout", error: "ReadTimeout" },
+        ],
+      });
     }
     if (String(path).includes("/result?file=")) {
       return response('name,notes\nA,"line one\nline two"\n');
@@ -249,22 +261,55 @@ async function completedGmapsHeuristic() {
   assert(!root.textContent.includes("Input tokens"), "heuristic run exposed token metrics");
 }
 
+async function failedRowsViewer() {
+  const ref = "failed rows/&";
+  const { root } = await renderStatus(ref, {
+    pipeline: "relationship", status: "completed_with_errors",
+    total_rows: 100, processed_rows: 100, failed_rows: 2,
+    serpwow_summary: {
+      confidence_mode: "llm", websites_found: 50, websites_not_found: 50,
+      outcome_breakdown: { found: 50, not_found: 48, errored: 2 },
+      error_breakdown: { by_source: { serpwow: 2 }, by_category: { timeout: 2 } },
+      relationship_breakdown: { confirmed: 50, not_confirmed: 48, unclear: 0 },
+      available_files: [], cost: {},
+    },
+  });
+  const button = byText(root, "button", "View failed rows (2)");
+  assert(button?.listeners.click, "failed-row viewer button missing");
+  assert(button.getAttribute("aria-expanded") === "false", "failed rows started expanded");
+  assert(!requests.some(({ path }) => String(path).includes("failure-analysis")),
+    "failed rows fetched before expansion");
+  await button.click();
+  await settle();
+  assert(requests.some(({ path }) => path ===
+    `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`),
+  "failure-analysis URL changed");
+  assert(button.getAttribute("aria-expanded") === "true", "failed rows did not expand");
+  const results = byClass(root, "failed-rows-results")[0];
+  assert(results?.getAttribute("aria-live") === "polite", "failed rows missing live region");
+  for (const text of ["63", "Kitche", "67", "CASCADE COFFEE", "serpwow", "timeout", "ReadTimeout"]) {
+    assert(results.textContent.includes(text), `failed rows missing ${text}`);
+  }
+  assert(byClass(results, "overflow-x-auto").length === 1,
+    "failed-row table is not horizontally scrollable");
+  assert(byClass(results, "data-table").length === 1, "failed-row data table missing");
+}
+
 async function completedRelationship() {
   const { root } = await renderStatus("relationship", {
-    pipeline: "relationship", status: "completed", total_rows: 2, processed_rows: 2,
+    pipeline: "relationship", status: "completed", total_rows: 5, processed_rows: 5,
     processing_seconds_total: 5, processing_seconds_avg: 2.5,
     serpwow_summary: {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
-      total_rows_original: 5, websites_found: 3, websites_not_found: 1, blank_rows: 1,
-      outcome_breakdown: { found: 3, not_found: 1, errored: 0 }, unique_pairs: 2,
-      available_files: ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"],
+      websites_found: 3, websites_not_found: 2,
+      outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
   });
   assertOutcomeFirst(root, "3 of 5");
-  assert(labelValue(root, "Skipped") === "1", "relationship skipped outcome missing");
-  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1", "Unique pairs"]) {
+  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1"]) {
     assert(root.textContent.includes(text), `relationship detail missing ${text}`);
   }
 }
@@ -629,6 +674,7 @@ async function accessibleModalLifecycleAndRace() {
 await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
+await failedRowsViewer();
 await completedRelationship();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();

@@ -96,6 +96,18 @@ class TestClassifyFinalizedRow(unittest.TestCase):
         self.assertEqual((info.outcome, info.error_source, info.error_category),
                          (o.OUTCOME_ERROR, o.SRC_SERPWOW, o.CAT_RATE_LIMIT))
 
+    def test_blank_error_preserves_explicit_timeout_category(self):
+        r = _result(official=None, phases=[
+            {"used": False, "error": "", "error_category": o.CAT_TIMEOUT},
+        ])
+        info = o.classify_finalized_row(
+            r, pipeline="relationship", ctx_row_error=None, skip_llm=True
+        )
+        self.assertEqual(
+            (info.outcome, info.error_source, info.error_category),
+            (o.OUTCOME_ERROR, o.SRC_SERPWOW, o.CAT_TIMEOUT),
+        )
+
     def test_relationship_sentinel_is_not_found(self):
         info = o.classify_finalized_row(_result(official=None), pipeline="relationship",
                                         ctx_row_error=REL_ERROR_NOT_CONFIRMED, skip_llm=True)

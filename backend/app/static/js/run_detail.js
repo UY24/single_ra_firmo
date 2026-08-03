@@ -387,6 +387,85 @@ function verdictSection(rb) {
   );
 }
 
+// Empty 200-OK SerpWow responses (no AI overview + 0 candidates). relationship
+// splits by phase (both / phase 1 only / phase 2 only); gsearch by all / some.
+// `eb` is serpwow_summary.empty_response_breakdown.
+function emptyResponsesSection(eb, isRel) {
+  const chips = isRel
+    ? [
+        chip("Both phases", fmtNum(eb.both_phases ?? 0), (eb.both_phases ?? 0) ? "danger" : "muted"),
+        chip("Phase 1 only", fmtNum(eb.phase1_only ?? 0), (eb.phase1_only ?? 0) ? "warn" : "muted"),
+        chip("Phase 2 only", fmtNum(eb.phase2_only ?? 0), (eb.phase2_only ?? 0) ? "warn" : "muted"),
+      ]
+    : [
+        chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
+        chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
+      ];
+  return el("section", { class: "detail-section" },
+    sectionHeading("Empty responses (HTTP 200)",
+      "Rows where SerpWow returned 200 but no AI overview and no candidates."),
+    el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
+  );
+}
+
+function failedRowsSection(ref, count, companyLabel) {
+  const regionId = `failed-rows-${encodeURIComponent(ref)}`;
+  const results = el("div", {
+    id: regionId,
+    class: "failed-rows-results mt-3 hidden",
+    "aria-live": "polite",
+  });
+  let loaded = false;
+  const button = el("button", {
+    class: "btn-secondary min-h-0 px-3 py-1.5 text-xs disabled:opacity-50",
+    "aria-expanded": "false",
+    "aria-controls": regionId,
+    onclick: async () => {
+      const expanding = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanding));
+      results.classList[expanding ? "remove" : "add"]("hidden");
+      if (!expanding || loaded) return;
+      button.disabled = true;
+      results.replaceChildren(el("p", { class: "section-copy" }, "Loading failed rows…"));
+      try {
+        const data = await api(
+          `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`,
+        );
+        const rows = data.sample_failed_rows ?? [];
+        const table = el("table", { class: "data-table w-full text-xs" },
+          el("thead", {}, el("tr", { class: "data-row" },
+            ...["CSV row", companyLabel, "Error source", "Category", "Error"]
+              .map((heading) => el("th", {}, heading)))),
+          el("tbody", {}, ...rows.map((row) => el("tr", { class: "data-row" },
+            el("td", {}, row.row_index ?? "—"),
+            el("td", {}, row.company_name ?? "—"),
+            el("td", {}, row.error_source ?? "—"),
+            el("td", {}, row.error_category ?? "—"),
+            el("td", {}, row.error ?? "—"),
+          ))),
+        );
+        const total = safeCount(data.failed_rows);
+        results.replaceChildren(
+          ...(total > rows.length ? [el("p", { class: "section-copy mb-2" },
+            `Showing first ${fmtNum(rows.length)} of ${fmtNum(total)} failed rows.`)] : []),
+          rows.length
+            ? el("div", { class: "overflow-x-auto" }, table)
+            : el("p", { class: "section-copy" }, "No failed rows found."),
+        );
+        loaded = true;
+      } catch (e) {
+        results.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+      } finally {
+        button.disabled = false;
+      }
+    },
+  }, `View failed rows (${fmtNum(count)})`);
+  return el("section", { class: "detail-section failed-rows-section" },
+    sectionHeading("Failed rows"),
+    el("div", { class: "detail-section-body" }, button, results),
+  );
+}
+
 function headerCard(title, subtitle, status, phase, chips) {
   const bits = [statusBadge(status)];
   if (status === "running" && phase) {
@@ -601,8 +680,7 @@ function renderLegacyStatus(root, ref, s) {
   }
 
   const isRel = s.pipeline === "relationship";
-  // Relationship totals use original CSV rows; state.total_rows is deduplicated queue work.
-  const total = isRel ? (g?.total_rows_original ?? s.total_rows) : s.total_rows;
+  const total = s.total_rows;
   // Canonical reporting outcomes are already exclusive and original-row-level.
   // Older reporting payloads omit the block and expose inclusive not-found counts.
   const errors = safeCount(outcome ? outcome.errored : s.failed_rows);
@@ -615,7 +693,7 @@ function renderLegacyStatus(root, ref, s) {
       label: "Total / Processed",
       value: total != null || s.processed_rows != null
         ? `${fmtNum(total)} / ${fmtNum(s.processed_rows)}` : null,
-      detail: isRel ? "Original rows / pairs processed" : "Rows",
+      detail: "Rows",
     },
     { label: "Processing time", value: s.processing_seconds_total == null ? null : fmtDuration(s.processing_seconds_total) },
     { label: "Avg / row", value: s.processing_seconds_avg == null ? null : fmtDuration(s.processing_seconds_avg) },
@@ -632,7 +710,6 @@ function renderLegacyStatus(root, ref, s) {
       tone: "muted",
     },
     { label: "Batch job", value: runState.batchStatus, tone: runState.finalizing ? "warning" : "default" },
-    { label: "Unique pairs", value: isRel && g?.unique_pairs != null ? fmtNum(g.unique_pairs) : null },
   ];
 
   const timestamp = s.updated_at ?? s.created_at;
@@ -649,7 +726,7 @@ function renderLegacyStatus(root, ref, s) {
       notFound,
       errors,
       total,
-      skipped: isRel ? g?.blank_rows ?? 0 : null,
+      skipped: null,
       failureLabel: g ? "Errors" : "Failed",
       primaryLabel: g ? "Websites found" : "Succeeded",
     }),
@@ -662,6 +739,10 @@ function renderLegacyStatus(root, ref, s) {
   }
   if (g) parts.push(costSection(g));
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
+  if (runState.pollTerminal && errors > 0) {
+    parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
+  }
 
   // Stop button while the run is still doing work (rows in flight, or the
   // Gemini batch still running). Remaining rows are marked failed; retryable
@@ -704,7 +785,7 @@ function renderLegacyStatus(root, ref, s) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
     const resultFiles = (runState.reporting && runState.batchTerminal)
       ? (s.pipeline === "relationship"
-          ? ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"]
+          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
       : [];
     const extras = [

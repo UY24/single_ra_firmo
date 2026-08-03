@@ -5,15 +5,23 @@
 # stayed green. These tests exercise the real function body.
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from app.services.serpwow import engine, serpwow_client
 
 class _FakeResponse:
-    status_code = 200
+    def __init__(self, status_code=200):
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
-        pass
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("GET", "https://api.serpwow.com"),
+                response=httpx.Response(self.status_code),
+            )
 
     def json(self) -> dict:
         return {
@@ -28,6 +36,19 @@ class _FakeResponse:
 class _FakeClient:
     async def get(self, url, params=None):
         return _FakeResponse()
+
+
+class _SequenceClient:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.calls = 0
+
+    async def get(self, url, params=None):
+        self.calls += 1
+        result = next(self.results)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class TestRunSerpwowSearchLivePath(unittest.TestCase):
@@ -64,6 +85,67 @@ class TestRunSerpwowSearchLivePath(unittest.TestCase):
         finally:
             serpwow_client.search_fetch_semaphore = original
             engine.search_fetch_semaphore = None
+
+    def test_retries_timeout_twice_then_succeeds(self) -> None:
+        client = _SequenceClient([
+            httpx.ReadTimeout("timed out"),
+            httpx.ReadTimeout("timed out"),
+            _FakeResponse(),
+        ])
+        with (
+            patch.dict("os.environ", {"SERPWOW_API_KEY": "test-key"}),
+            patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            result = asyncio.run(
+                serpwow_client.run_serpwow_search("acme", client=client)
+            )
+        self.assertTrue(result["used"])
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(sleep.await_count, 2)
+
+    def test_retries_http_503_twice_then_succeeds(self) -> None:
+        client = _SequenceClient([
+            _FakeResponse(503),
+            _FakeResponse(503),
+            _FakeResponse(),
+        ])
+        with (
+            patch.dict("os.environ", {"SERPWOW_API_KEY": "test-key"}),
+            patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            result = asyncio.run(
+                serpwow_client.run_serpwow_search("acme", client=client)
+            )
+        self.assertTrue(result["used"])
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(sleep.await_count, 2)
+
+    def test_does_not_retry_http_403(self) -> None:
+        client = _SequenceClient([_FakeResponse(403)])
+        with (
+            patch.dict("os.environ", {"SERPWOW_API_KEY": "test-key"}),
+            patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            result = asyncio.run(
+                serpwow_client.run_serpwow_search("acme", client=client)
+            )
+        self.assertFalse(result["used"])
+        self.assertEqual(result["error_category"], "auth")
+        self.assertEqual(client.calls, 1)
+        sleep.assert_not_awaited()
+
+    def test_empty_timeout_message_keeps_exception_name(self) -> None:
+        client = _SequenceClient([httpx.ReadTimeout("")] * 3)
+        with (
+            patch.dict("os.environ", {"SERPWOW_API_KEY": "test-key"}),
+            patch.object(asyncio, "sleep", new=AsyncMock()),
+        ):
+            result = asyncio.run(
+                serpwow_client.run_serpwow_search("acme", client=client)
+            )
+        self.assertIn("ReadTimeout", result["error"])
+        self.assertEqual(result["error_category"], "timeout")
+        self.assertEqual(client.calls, 3)
 
 
 if __name__ == "__main__":

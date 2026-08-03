@@ -84,6 +84,7 @@ gmaps hits SerpWow Places/Maps search and picks a best candidate via `_select_be
 - SerpWow: local `/tmp/single_ra_isi/<company>/<upload_id>/` (`state.json`, `output.json`, batch files; **gsearch also writes `found.csv`/`notFound.csv`/`report.json`/`run.log`** at terminal status). Both a legacy flat (`<upload_id>/`) and nested (`<company>/<upload_id>/`) on-disk layout must be tolerated.
 
 ## Conventions & gotchas
+- **Always use ponytail for coding.** The `ponytail` plugin/skill is the required mode for all coding in this repo (writing, refactoring, reviewing, choosing dependencies): laziest solution that actually works — YAGNI, reuse existing code, stdlib/native before new deps, shortest correct diff — without ever shortcutting understanding the problem first.
 - **Never add a `Co-Authored-By: Claude` (or any AI-attribution) trailer to commits.** Tell any committing subagent the same.
 - **Never `git push` and never query the production Supabase DB without explicit user approval.**
 - `docs/` is **gitignored** — specs/plans/handoff there are on-disk only; code under `backend/` commits normally.

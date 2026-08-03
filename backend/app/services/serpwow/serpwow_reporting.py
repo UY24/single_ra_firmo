@@ -14,7 +14,7 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from app.models.results import AttemptLogEntry, EntityResult, Flag
 from app.services.serpwow.serpwow_client import sanitize_serpwow_error_text
@@ -26,7 +26,7 @@ REL_OUTPUT_COLUMNS = ["website_url", "resolved_company_y_name",
                       "relationship_status", "relationship_summary",
                       "relationship_evidence", "relationship_confidence",
                       "website_confidence", "confidence", "phases_used",
-                      "flags", "attempt_log", "verified_pair", "error_reason"]
+                      "flags", "attempt_log", "error_source", "error_reason"]
 
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +191,61 @@ def _derive_outcome(row: dict[str, Any]) -> Any:
     return None
 
 
+def _phase_is_empty(item: dict[str, Any]) -> Optional[bool]:
+    """True if a phase returned an "empty 200" (no AI overview + 0 candidates).
+
+    None when the phase errored (a transport/HTTP failure is a different problem,
+    not an empty response) or the fields are missing (older pre-feature runs).
+    """
+    if not isinstance(item, dict) or item.get("error"):
+        return None
+    if "ai_overview_present" not in item and "candidate_count" not in item:
+        return None
+    return (not item.get("ai_overview_present")) and int(item.get("candidate_count") or 0) == 0
+
+
+def empty_response_breakdown(state: dict[str, Any]) -> Optional[dict[str, int]]:
+    """Count rows whose SerpWow phases came back empty despite HTTP 200.
+
+    relationship (exactly 2 phases): both_phases / phase1_only / phase2_only.
+    gsearch (variable phase count): all_phases / some_phases.
+    Other pipelines: None (they don't run AI-overview searches).
+    """
+    pipeline = str(state.get("pipeline") or "")
+    is_rel = pipeline == "relationship"
+    if not (is_rel or pipeline == "gsearch"):
+        return None
+    out = ({"both_phases": 0, "phase1_only": 0, "phase2_only": 0} if is_rel
+           else {"all_phases": 0, "some_phases": 0})
+    for row in state.get("rows", []):
+        ctx = ((row or {}).get("result") or {}).get("context") or {}
+        phases = ctx.get("formatted_results")
+        if not isinstance(phases, list) or not phases:
+            continue
+        flags = [_phase_is_empty(p) for p in phases]
+        considered = [f for f in flags if f is not None]
+        if not considered:
+            continue
+        # relationship rows are pairs fanned out to original CSV rows.
+        weight = len((row or {}).get("source_row_indices") or []) if is_rel else 1
+        if is_rel:
+            e1 = flags[0] if len(flags) > 0 else None
+            e2 = flags[1] if len(flags) > 1 else None
+            if e1 and e2:
+                out["both_phases"] += weight
+            elif e1:
+                out["phase1_only"] += weight
+            elif e2:
+                out["phase2_only"] += weight
+        else:
+            n_empty = sum(1 for f in considered if f)
+            if n_empty == len(considered):
+                out["all_phases"] += weight
+            elif n_empty:
+                out["some_phases"] += weight
+    return out
+
+
 def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[str, Any]:
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
@@ -283,10 +338,11 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
             if status in breakdown:
                 breakdown[status] += n_sources
         summary["total_rows"] = int(meta.get("row_count_original") or 0)
-        summary["blank_rows"] = int(meta.get("blank_rows") or 0)
-        summary["searchable_rows"] = summary["total_rows"] - summary["blank_rows"]
-        summary["unique_pairs"] = len(state.get("rows", []))
         summary["relationship_breakdown"] = breakdown
+
+    ebd = empty_response_breakdown(state)
+    if ebd is not None:
+        summary["empty_response_breakdown"] = ebd
     return summary
 
 
@@ -309,7 +365,7 @@ def write_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
     for name, rows, extra in (("found.csv", [r for r in results if r.website_url], []),
                               ("notFound.csv", [r for r in results if not r.website_url], ["error"])):
         path = upload_dir / name
-        with path.open("w", newline="", encoding="utf-8") as fh:
+        with path.open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS + extra)
             writer.writeheader()
             for r in rows:
@@ -353,7 +409,6 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
     upload_dir.mkdir(parents=True, exist_ok=True)
     meta = state.get("relationship") or {}
     header = [h for h in (meta.get("header") or []) if h]
-    original_rows = meta.get("original_rows") or []
     expanded = _relationship_expanded(state)
     results = [er for er, _o, _p in expanded]
     summary = build_summary(state, results)
@@ -384,39 +439,32 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
             "phases_used": len(context.get("formatted_results") or []),
             "flags": er.flags_csv(),
             "attempt_log": er.attempt_log_csv(),
-            "verified_pair": str(rel.get("verified_pair") or ""),
+            "error_source": er.error_source or "",
             "error_reason": er.error or "",
         })
         return row
 
-    for name, keep, extra in (
-        ("found.csv", lambda er: bool(er.website_url), []),
-        ("notFound.csv", lambda er: not er.website_url, ["error"]),
+    # Split by RELATIONSHIP STATUS (not URL presence): confirmed vs everything else
+    # (not_confirmed + unclear, plus any error/pending row → caught by the != branch,
+    # so no row is ever dropped). website_url stays in the row so you can see which
+    # confirmed rows also resolved a URL; the found/not-found URL counts live in the
+    # report.json summary (websites_found / websites_not_found).
+    def _status_of(pair_row: dict[str, Any]) -> str:
+        return str(_relationship_block((pair_row or {}).get("result") or {}).get("status") or "")
+
+    for name, keep in (
+        ("confirmed_relation.csv", lambda s: s == "confirmed"),
+        ("notconfirmed_relation.csv", lambda s: s != "confirmed"),
     ):
         path = upload_dir / name
-        with path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=header + REL_OUTPUT_COLUMNS + extra)
+        with path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=header + REL_OUTPUT_COLUMNS)
             writer.writeheader()
             for er, original, pair_row in expanded:
-                if not keep(er):
+                if not keep(_status_of(pair_row)):
                     continue
-                row = _out_row(er, original, pair_row)
-                if extra:
-                    row["error"] = er.error or ""
-                writer.writerow(row)
+                writer.writerow(_out_row(er, original, pair_row))
         paths[name] = path
-
-    skipped_path = upload_dir / "skipped.csv"
-    with skipped_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=header + ["skip_reason"])
-        writer.writeheader()
-        for idx in meta.get("blank_row_indices") or []:
-            i = int(idx)
-            original = original_rows[i] if 0 <= i < len(original_rows) else {}
-            row = {h: str(original.get(h, "") or "") for h in header}
-            row["skip_reason"] = "blank_company_name_y"
-            writer.writerow(row)
-    paths["skipped.csv"] = skipped_path
 
     report_rows = []
     for er, _original, pair_row in expanded:
@@ -432,7 +480,6 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         result = (pair_row or {}).get("result") or {}
         ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
         d["phases_used"] = len(ctx.get("formatted_results") or [])
-        d["verified_pair"] = str(rel.get("verified_pair") or "")
         d["error_reason"] = er.error or ""
         report_rows.append(d)
     report_path = upload_dir / "report.json"
@@ -443,18 +490,18 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
     log_lines = []
     for er, _original, pair_row in expanded:
         rel = _relationship_block((pair_row or {}).get("result") or {})
+        source = f", error_source={er.error_source}" if er.error_source else ""
         if er.website_url:
-            log_lines.append(f"[{er.sno}] {er.company_name} ({rel.get('verified_pair')}) -> "
+            log_lines.append(f"[{er.sno}] {er.company_name} -> "
                              f"{er.website_url} (confidence={er.confidence}, "
-                             f"relationship={rel.get('status')})")
+                             f"relationship={rel.get('status')}{source})")
         else:
             tail = f" — {er.error}" if er.error else ""
-            log_lines.append(f"[{er.sno}] {er.company_name} ({rel.get('verified_pair')}) -> "
-                             f"not found (relationship={rel.get('status')}){tail}")
+            log_lines.append(f"[{er.sno}] {er.company_name} -> "
+                             f"not found (relationship={rel.get('status')}{source}){tail}")
     hdr = [
         f"# relationship run {summary.get('upload_id')} — status={summary.get('status')}",
-        f"# original_rows={summary.get('total_rows')} blank={summary.get('blank_rows')} "
-        f"pairs={summary.get('unique_pairs')} found={summary.get('websites_found')} "
+        f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
         f"not_found={summary.get('websites_not_found')}",
         f"# relationship: {json.dumps(summary.get('relationship_breakdown'))}",
         f"# cost: llm_usd={summary['cost']['llm_usd']} serpwow_usd={summary['cost']['serpwow_usd']} "

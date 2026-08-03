@@ -241,7 +241,7 @@ async function invalidRelationshipContract() {
   const root = await renderWith(async (path) => {
     if (path === "/companies") return companiesResponse();
     if (path === "/uploads/relationship/preview") {
-      return response({ total_rows: 5, unique_pairs: 0, blank_rows: 5, warnings: [warning] });
+      return response({ total_rows: 0, relationship: true, warnings: [warning] });
     }
     throw new Error(`Unexpected fetch: ${path}`);
   });
@@ -263,7 +263,7 @@ async function pipelineInvalidationContract() {
   const root = await renderWith(async (path, opts) => {
     if (path === "/companies") return companiesResponse();
     if (path === "/uploads/relationship/preview") {
-      return response({ total_rows: 1, unique_pairs: 1, blank_rows: 0 });
+      return response({ total_rows: 1, relationship: true });
     }
     if (path === "/uploads/preview") {
       genericRequests.push({ path, opts });

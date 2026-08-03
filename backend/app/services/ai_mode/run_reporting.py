@@ -88,10 +88,12 @@ class StreamingRunReport:
         # and serve it (and the S3 mirror would upload it) as if complete.
         self._found_tmp = run_dir / "found.csv.tmp"
         self._notfound_tmp = run_dir / "notFound.csv.tmp"
-        self._found_fh = self._found_tmp.open("w", newline="", encoding="utf-8")
+        # utf-8-sig: the BOM makes Excel/Numbers auto-detect UTF-8 instead of a legacy
+        # 8-bit encoding, so em dashes / arrows / accents don't render as mojibake.
+        self._found_fh = self._found_tmp.open("w", newline="", encoding="utf-8-sig")
         self._found = csv.DictWriter(self._found_fh, fieldnames=CSV_COLUMNS)
         self._found.writeheader()
-        self._notfound_fh = self._notfound_tmp.open("w", newline="", encoding="utf-8")
+        self._notfound_fh = self._notfound_tmp.open("w", newline="", encoding="utf-8-sig")
         self._notfound = csv.DictWriter(self._notfound_fh, fieldnames=CSV_COLUMNS + ["error"])
         self._notfound.writeheader()
 

@@ -22,34 +22,36 @@ class TestXDomainHelpers(unittest.TestCase):
 
 
 class TestBuildRelationshipPhaseQueries(unittest.TestCase):
-    def test_three_phases_with_full_inputs(self):
-        qs = build_relationship_phase_queries("m25vc", "Sanzo", "m25vc.com")
+    def test_two_prose_phases_with_full_inputs(self):
+        qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "m25vc.com")
         labels = [label for label, _ in qs]
         self.assertEqual(labels, [
-            "phase1_official_website",
-            "phase2_financial_evidence",
-            "phase3_portfolio_anchor",
+            "phase1_relationship_and_url",
+            "phase2_identity_and_relationship",
         ])
         for _label, query in qs:
+            # Prose AI-Overview questions: mention Y, X (name + domain), ask for a
+            # typed-out plain-text https URL (no hyperlink).
             self.assertIn('"Sanzo"', query)
-            # Keyword queries, not prose questions — a "?" collapses organic_results.
-            self.assertNotIn("?", query)
+            self.assertIn("M25 Ventures (m25vc.com)", query)
+            self.assertIn("?", query)
+            self.assertIn("https://", query)
+            self.assertIn("plain-text", query)
+            self.assertIn("hyperlink", query)
 
         by = dict(qs)
-        self.assertIn("official website", by["phase1_official_website"])
-        self.assertIn('"Sanzo"', by["phase1_official_website"])
-        for term in ("investment", "portfolio", "acquisition", " OR "):
-            self.assertIn(term, by["phase2_financial_evidence"])
-        self.assertIn('"m25vc"', by["phase2_financial_evidence"])
-        self.assertIn("site:m25vc.com", by["phase3_portfolio_anchor"])
+        self.assertIn("business or financial relationship", by["phase1_relationship_and_url"])
+        self.assertIn('Who is "Sanzo"?', by["phase2_identity_and_relationship"])
 
-    def test_degraded_inputs(self):
-        # No x_domain (Input_URL not a parseable host) → phase3 anchor dropped,
-        # phase1 + phase2 still run.
-        no_domain = build_relationship_phase_queries("m25vc", "Sanzo", "")
-        self.assertEqual([l for l, _ in no_domain],
-                         ["phase1_official_website", "phase2_financial_evidence"])
-        # Both X and Y are required (X is what the gate verifies against).
+    def test_x_identity_falls_back_to_name_without_domain(self):
+        # No parseable domain → X is identified by name alone, both phases still run.
+        qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "")
+        self.assertEqual(len(qs), 2)
+        for _label, query in qs:
+            self.assertIn("M25 Ventures", query)
+            self.assertNotIn("()", query)  # no empty "(domain)"
+
+    def test_both_x_and_y_required(self):
         self.assertEqual(build_relationship_phase_queries("", "Sanzo", "m25vc.com"), [])
         self.assertEqual(build_relationship_phase_queries("m25vc", "", "m25vc.com"), [])
 

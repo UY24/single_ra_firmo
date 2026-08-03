@@ -1,13 +1,13 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-20. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-07-23. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
 ## Current status
 
-- **Active branch: `aiModeBroker`** (off `revampCode`; `uiuximp` was merged via PR #8) — the **AI Mode → RabbitMQ broker rework** for 500k–1M-row runs. Code complete in 3 commits (PR1 streaming/memory, PR2 broker engine, PR3 reconciler/resume/legacy-removal); **NOT live-verified, NOT pushed**.
-- Full suite: **532/532** passing.
+- **Active branch: `relationship-ai-overview`** (off `aiModeBroker`). The earlier relationship AI-Overview rework is committed locally; the 2026-07-23 relationship failure-diagnostics/retry/UI changes are **UNCOMMITTED, NOT live-verified, NOT pushed**.
+- Full suite: **564/564** passing.
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -46,18 +46,79 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Immediate next steps
 
-1. **Live-smoke `aiModeBroker`** (checklist in the session notes below), then decide merge/push (needs user approval to push).
-2. Decide whether to merge `errorTaxonomy`, and live-verify it if so.
+1. Live-smoke the current relationship changes with a small CSV, including a literal `ERROR:` or `FETCH_ERROR:` Company Y value; confirm it is accepted and processed verbatim (apart from existing outer-whitespace trimming).
+2. Commit the current relationship changes if approved, then decide merge/push (pushing requires explicit user approval).
+3. **Live-smoke `aiModeBroker`** (checklist in the older session notes below).
 
 ## Conventions (do not break)
 
+- **Always use ponytail for coding** — the `ponytail` plugin/skill (installed: `ponytail@ponytail`) is the required mode for any coding work here (writing, refactoring, reviewing, choosing deps). Laziest solution that actually works: question whether it needs to exist (YAGNI), reuse what's here, stdlib/native before new deps, shortest correct diff — but never shortcut understanding the problem first.
 - **Never** add a `Co-Authored-By: Claude` (or any AI-attribution) trailer to commits — tell any committing subagent the same.
 - **Never** `git push` or query the production Supabase DB without explicit user approval.
 - `docs/` is **gitignored** — specs/plans/handoff-history there are on-disk only; code under `backend/` commits normally.
 
 ---
 
-## Latest completed session — 2026-07-20 (remove `full` + `url_discovery` pipelines, branch `remove-full-url-discovery` off `aiModeBroker`)
+## Open findings — 2026-07-23 (S3 throttling + concurrency; DISCUSSION ONLY, no code changed)
+
+Investigated during a live 1000-row relationship run. **No code was changed** — these are
+recommendations/answers for a future decision. A scratch plan sits at
+`~/.claude/plans/transient-nibbling-pearl.md` (transient).
+
+- **S3 `SlowDown` in worker logs** (`ClientError (SlowDown): Please reduce your request rate`): S3's HTTP-503 throttle. It is **already retried (5× exponential backoff) and best-effort — non-fatal**, so the run is unharmed (`_write_s3_background`, `engine.py:855`; local disk is source of truth, S3 is the resume/backstop mirror). Store is **real AWS S3** (region `ap-south-1`, `AKIA…` IAM key, **no custom `endpoint_url`** — not R2/MinIO), so AWS auto-scales the prefix to 3,500 PUT/s; the 503s are the transient cold-prefix ramp **amplified by `state.json` being re-PUT to the SAME key on every row** (`engine.py:2867`; note `output.json` is already deferred to terminal-only, comment at `engine.py:2869`). **Recommended, NOT applied:** (a) **primary/minimal** — switch boto3 `retries` `"standard"`→`"adaptive"` in `core/s3.py:42` + `engine.py:740` (AWS's own client-side rate-limiter answer to SlowDown); (b) **optional** — throttle the per-row `state.json` S3 mirror behind a new `SERPWOW_S3_STATE_FLUSH_SEC` (~5s, mirrors AI-Mode's `AI_MODE_STATUS_FLUSH_SEC`; local write stays per-row, accepted tradeoff = S3 copy lags ≤5s on cold-start resume, safe since rows are idempotent). Also flagged: the AWS **secret key lives in `.env`** — keep it gitignored, never commit it.
+- **Worker concurrency = `WORKER_CONCURRENCY` (env, default 4)** — sets BOTH the RabbitMQ channel prefetch and the consumer-loop count (`engine.py:3253` / `3856`), **identical for gsearch and relationship** (same `process_upload_job` path). So only 4 rows process at once; each relationship row fans **3** AI-Overview searches in parallel → ~`3 × WORKER_CONCURRENCY` in-flight SerpWow calls. Observed ~400 rows/hr at default 4. Raising it speeds runs **but requires a worker restart** (consumers are created at startup; won't affect an in-flight run) and is bounded by SerpWow's account rate limit (and would make the S3 SlowDown above worse). Not changed.
+- **`websites_found` = 0 during a running relationship batch is EXPECTED, not a bug**: with `RELATIONSHIP_LLM_BATCH=true` ("Batch: On" in the UI) the gate/URL-selection runs in the Gemini **batch phase after all rows finish Phase-1 scraping**, so found/confirmed populate only at the end.
+
+---
+
+## Latest completed session — 2026-07-23 (relationship failure diagnostics, retries, outputs, and failed-row UI)
+
+**Status: UNCOMMITTED on `relationship-ai-overview`, 564/564 offline tests passing,
+NOT live-verified, NOT pushed.** Implemented with Ponytail: existing pipeline and
+failure-analysis endpoint reused; no new dependency, endpoint, modal, or database migration.
+
+### Investigated run
+
+- Run `ac75e704-f609-4b00-ac33-4b33e066ccff` had exactly **2 failed rows** in its state: row index **63** (`Kitche`) and **67** (`CASCADE COFFEE`). Both were **SerpWow timeouts**, not Gemini failures. Their blank exception messages caused the aggregate classifier to label them `internal`; that classification bug is fixed.
+- The Gemini batch itself succeeded with no recorded Gemini chunk failures. Row 100 finished SerpWow after the Gemini input snapshot and retained `Pending Gemini batch post-processing decision.` after the batch became terminal — a real snapshot race, now covered by a regression test.
+- Values such as `FETCH_ERROR: 403...` / `ERROR: 503...` seen on other rows were the uploaded `Company_Name_Y` text, not SerpWow failures from this run. A prefix-rejection guard was briefly implemented, then **removed per user direction**: these values are valid inputs for this workflow and now proceed exactly like any other Company Y value (the parser's pre-existing outer-whitespace trim still applies).
+
+### Changes
+
+- **Bounded SerpWow retries:** `run_serpwow_search` now makes at most **3 total attempts**, with 1s/2s backoff, for `httpx.TransportError`, HTTP 429, and HTTP 5xx. Non-transient HTTP 4xx responses such as 403 return immediately. No retry library/config layer was added.
+- **Useful timeout errors:** an exception whose sanitized message is empty now falls back to its class name (for example `ReadTimeout`). `_phase_stats` counts an explicit `error_category` even when the message is blank, preserving `timeout` instead of falling back to `internal`.
+- **Terminal Gemini invariant:** after a terminal batch, a completed no-URL row absent from the input snapshot and still carrying the exact pending sentinel becomes `failed`, `outcome=error`, `error_source=gemini`, `error_category=internal`, with `Gemini batch missed row after its input snapshot.` It is therefore visible and eligible for failed-row retry instead of remaining falsely pending.
+- **Relationship output cleanup:** removed `verified_pair` and all `X ↔ Y` presentation from relationship context, CSV/report/run-log output, descriptions, and production code. `error_source` now occupies the former relationship-CSV column position; it is blank for normal business outcomes and identifies technical providers such as `serpwow`/`gemini` on failures.
+- **Failure inspection:** `build_failure_analysis` samples now include `error_source` and `error_category`. Terminal Run Detail pages with errors show a lazy `View failed rows (N)` control that reuses `GET /uploads/{id}/failure-analysis?sample_limit=100` and renders CSV row, company, source, category, and error in an accessible inline table.
+- **Company Y remains authoritative input:** there is no `ERROR:`/`FETCH_ERROR:` filtering or name correction in the CSV parser. Separately, `resolved_company_y_name` remains Gemini's evidence-based interpretation from the relationship prompt; it does not overwrite the original `Company_Name_Y` column and is blank when Gemini omits it or the LLM is skipped.
+
+### Verification / files
+
+- Full offline suite: `cd backend && ../.venv/bin/python -m unittest discover -s tests -t .` → **564/564 passing**.
+- Run Detail DOM contract passes; `git diff --check` passes; `rg -n 'verified_pair|↔' backend/app` returns no production matches.
+- Production files changed: `engine.py`, `modes/relationship.py`, `outcomes.py`, `query_builders.py`, `serpwow_client.py`, `serpwow_reporting.py`, `static/js/new_run.js`, and `static/js/run_detail.js`; related regression tests changed alongside them.
+
+---
+
+## Previous completed session — 2026-07-20 (relationship mode → AI-Overview prose search + confirmed/notconfirmed outputs, branch `relationship-ai-overview` off `aiModeBroker`)
+
+**Status: COMMITTED on branch `relationship-ai-overview` (off `aiModeBroker`), tree clean,
+NOT merged/pushed. 557/557 offline, NOT live-verified.** Commits: `7722d9b` (prose-search
+rework), `e890605` (wall-clock timing), `afaeafc` (CSV UTF-8 BOM). Reworked the relationship
+pipeline around SerpWow AI-Overview searches per user direction.
+
+- **Searches are now 3 parallel PROSE AI-Overview questions** (`query_builders.build_relationship_phase_queries`, still `(x_name, y_name, x_domain)`): phase1 relationship+URL (the user's proven "what is the financial relationship between X (domain) and Y? type out Y's website…" shape), phase2 financial-evidence, phase3 website-resolver — each asks for a **typed-out plain-text https:// URL, not a hyperlink** (extracted from the AI-overview text; `ai_overview_sources[].source_url` is the structured backstop). X identified by `name (domain)`, Y verbatim (OCR noise kept). Replaces the keyword queries. Parallel now; chaining (phase1→phase2 like gsearch phase5) deferred.
+- **No unique-(X,Y) dedup** — `relationship_csv.parse_relationship_csv` now makes each CSV row its own "pair" (`source_row_indices == [idx]`); one row in → one row out. Downstream pair/fan-out machinery untouched (now trivially 1:1). CSV requires exactly `Input_URL`, `Company_Name_X`, `Company_Name_Y`.
+- **Outputs renamed + split by RELATIONSHIP STATUS** (not URL presence): `confirmed_relation.csv` (`confirmed`) and `notconfirmed_relation.csv` (everything else = `not_confirmed` + `unclear` + any error, via the `!= "confirmed"` catch-all). `found.csv`/`notFound.csv`/`skipped.csv` gone for relationship (gsearch/gmaps still use found/notFound). `report.json` summary + `/status` + run-detail page still show BOTH count sets — `confirmed`/`not_confirmed`/`unclear` **and** `websites_found`/`websites_not_found` — just no found/notFound files.
+- **Dedup-era UI/fields removed**: preview no longer returns `unique_pairs`/`duplicates`/`csv_rows` (adds `relationship: true`); `build_summary` drops `unique_pairs`/`searchable_rows`; run-detail drops the "Unique pairs" tile and blank-row "Skipped"; New Run launch gate uses `total_rows > 0` for all pipelines.
+- Files touched: `query_builders.py`, `relationship_csv.py`, `serpwow_reporting.py`, `engine.py` (`_upload_file_links`/`_reporting_result_names`/`_GSEARCH_RESULT_FILES`/preview endpoint), `static/js/{new_run,run_detail}.js`, and the relationship test suite (queries/csv/endpoint/gates/reporting/worker + 2 `.mjs` DOM contracts).
+- **"Processing time" fix (all SerpWow pipelines, not just relationship):** the run's `processing_seconds_total` was the **sum of per-row work times**, which overcounts massively under parallel workers (a 3-min run showed ~55m). Now it's **wall-clock** — `created_at` → the latest terminal timestamp (max row `status_updated_at` + `gemini_batch.completed_at`; stable, doesn't drift on later re-persists), live-elapsed to now while non-terminal (`_run_elapsed_seconds` in `engine.py`). `processing_seconds_avg` still shows the mean per-row work time. Fixed in both `summarize_upload_state` and `build_upload_output_payload`; regression test in `tests/test_timing_summary.py`.
+- **CSV mojibake fix (`Äî`/`Üí` in Excel):** all CSV writers now use `encoding="utf-8-sig"` (UTF-8 **with BOM**) instead of `"utf-8"` — `serpwow_reporting.py` (×2 writers) + `ai_mode/run_reporting.py` (×2). Root cause: a UTF-8 CSV with no BOM was read by Excel/Numbers as Mac Roman, garbling every non-ASCII char (em dash `—`→`Äî`, arrow `→`→`Üí`, `↔`, curly quotes). BOM makes the viewer auto-detect UTF-8; data unchanged, and our reader already tolerates the BOM (`utf-8-sig`). Tests that read these CSVs updated to `utf-8-sig`.
+- **Live smoke still needed** (needs SerpWow + worker): run `smallrel20.csv`; confirm the AI Overview actually triggers via SerpWow for the prose phrasing (the main risk — it fired in the user's browser but SerpWow may differ), that confirmed rows carry a typed-out URL, and that `confirmed_relation.csv`/`notconfirmed_relation.csv` + the 5 counts populate.
+
+---
+
+## Older session — 2026-07-20 (remove `full` + `url_discovery` pipelines, merged to `aiModeBroker` via PR #12)
 
 **Status: code complete, 556/556 offline, NOT live-verified, NOT pushed.** Removed the two
 legacy SerpWow pipelines completely; gsearch-all-phases supersedes them for URL discovery.

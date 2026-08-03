@@ -6,7 +6,6 @@ boto3
 pika
 aio-pika
 redis
-aiohttp
 python-dotenv
 pyyaml
 duckdb

@@ -12,7 +12,8 @@ extracted into focused sibling modules (all re-imported below for backward-compa
   serpwow_client / gemini_llm          — SerpWow HTTP + Gemini confidence/selection
   csv_input / xlsx_export / serpwow_reporting — I/O + reporting
   modes/{gsearch,gmaps,firmographics,full,common} — per-mode row executors
-  gmaps_client / codetails             — standalone SerpWow Places / codetails API scripts
+  scrapedo_maps_client                 — scrape.do Google Maps search (gmaps pipeline)
+  codetails                            — standalone SerpWow codetails API script
 
 Shared, provider-agnostic helpers live in ``app/services/common/`` (text, env).
 """
@@ -2772,15 +2773,28 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                     found = ob.get("found")
                     not_found = ob.get("not_found")
                     errored = ob.get("errored")
+                    # scrape.do-billed pipelines (gmaps) report requests + credits;
+                    # SerpWow ones keep reporting per-search USD.
+                    # Truthy, not "is not None": _build_cost emits these keys as 0 for
+                    # every SerpWow pipeline too. Checks failed/credits as well so a run
+                    # whose every call failed still reports as scrape.do.
+                    _is_scrapedo = bool(gs["cost"].get("scrapedo_requests")
+                                        or gs["cost"].get("scrapedo_credits")
+                                        or gs["cost"].get("scrapedo_failed_requests"))
                     extra = {
-                        "searches": gs["cost"]["serpwow_searches"],
-                        "search_label": "SerpWow searches",
+                        "searches": (gs["cost"]["scrapedo_requests"] if _is_scrapedo
+                                     else gs["cost"]["serpwow_searches"]),
+                        "search_label": ("Scrape.do requests" if _is_scrapedo
+                                         else "SerpWow searches"),
+                        "credits": gs["cost"]["scrapedo_credits"] if _is_scrapedo else None,
                         "tokens": tu.get("total_tokens"),
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
                         "llm_cost_usd": gs["cost"]["llm_usd"],
-                        "serpwow_cost_usd": gs["cost"]["serpwow_usd"],
+                        # None for scrape.do runs so the ping shows credits instead of
+                        # a misleading $0.00 per-search cost.
+                        "serpwow_cost_usd": None if _is_scrapedo else gs["cost"]["serpwow_usd"],
                         "found": found,
                         "not_found": not_found,
                         "errored": errored,
@@ -4193,6 +4207,13 @@ async def create_gmaps_upload(
         parsed_rows = parse_csv_rows(raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # gmaps runs on scrape.do's Google Maps API — fail fast instead of burning a whole
+    # run's rows on a missing token. Checked AFTER CSV validation so a user with a bad
+    # CSV hears about their CSV, not about our server config.
+    if not os.getenv("SCRAPEDO_TOKEN", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="SCRAPEDO_TOKEN is not configured — required for the gmaps pipeline.")
     return await _create_upload_with_rows(
         file, parsed_rows, PIPELINE_GMAPS, company_id=company_id, company_name=company_name
     )
@@ -5187,61 +5208,18 @@ async def upload_result_file(
     return Response(content=data, media_type=media, headers=headers)
 
 
-@app.get("/gmaps/discover")
-async def gmaps_discover(q: str, country: Optional[str] = None) -> dict[str, Any]:
-    started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
-    try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        import aiohttp
-        gl = gmaps_module.country_to_gl(country) if country else gmaps_module.get_gl_from_query(q)
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            cids = await gmaps_module.fetch_data_cids(session, q, gl_override=gl)
-        return {
-            "query": q,
-            "gl": gl,
-            "cids": cids,
-            "processing_seconds": round(asyncio.get_running_loop().time() - started_monotonic, 3),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/gmaps/details")
-async def gmaps_details(cid: str) -> dict[str, Any]:
-    started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
-    try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=30)
-        sem = asyncio.Semaphore(1)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            detail = await gmaps_module.fetch_place_detail(session, cid, sem)
-        response = dict(detail) if isinstance(detail, dict) else {"detail": detail}
-        response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
-        return response
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
+# The old /gmaps/discover + /gmaps/details debug routes are gone with the SerpWow
+# two-step flow: there is no data_cid discovery step to inspect any more, and
+# scrape.do's maps/search returns the website inline (see scrapedo_maps_client).
 @app.get("/gmaps/search")
 async def gmaps_search(q: str, country: Optional[str] = None) -> dict[str, Any]:
     started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
+    if not os.getenv("SCRAPEDO_TOKEN", "").strip():
+        raise HTTPException(status_code=400, detail="SCRAPEDO_TOKEN is not configured")
+
     try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        res = await gmaps_module.process_gmaps_query(q, country=country)
+        from app.services.serpwow import scrapedo_maps_client as gmaps_module
+        res = await gmaps_module.process_gmaps_query(q, gl=_country_to_gl(country))
         response = dict(res) if isinstance(res, dict) else {"result": res}
         response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
         return response

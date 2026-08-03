@@ -158,9 +158,9 @@ function uploadHistoryCard(lifecycle) {
   let timer = null;
   const tbody = el("tbody", {});
   const empty = el("p", { class: "empty-state hidden" },
-    "No SerpWow uploads found.");
+    "No pipeline uploads found.");
   const note = el("p", { class: "message message--muted", "aria-live": "polite" },
-    "Showing all SerpWow uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
+    "Showing all pipeline uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
   const errorArea = el("div", { class: "operations-feedback hidden" });
 
   function renderRows(items) {
@@ -207,7 +207,7 @@ function uploadHistoryCard(lifecycle) {
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.uploads) ? data.uploads : []);
-      note.textContent = "Showing all SerpWow uploads. Select a row to open its run detail.";
+      note.textContent = "Showing all pipeline uploads. Select a row to open its run detail.";
     } catch (e) {
       if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
@@ -230,7 +230,7 @@ function uploadHistoryCard(lifecycle) {
 
   const card = el("section", { class: "detail-section operations-section" },
     sectionHeading(
-      "SerpWow Uploads History",
+      "Pipeline Uploads History",
       "All modes in one table: progress, timing, downloads, and artifact storage paths.",
       refreshBtn,
     ),

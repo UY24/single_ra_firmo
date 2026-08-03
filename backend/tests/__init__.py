@@ -18,5 +18,8 @@ import os
 for _key in (
     "SLACK_WEBHOOK_URL", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GEMINI_API_KEY", "SERPWOW_API_KEY",
+    # AI Mode's scraper AND (since the 2026-08 migration) the gmaps pipeline's Google
+    # Maps client both read this — without it a row-path test could hit live scrape.do.
+    "SCRAPEDO_TOKEN",
 ):
     os.environ[_key] = ""

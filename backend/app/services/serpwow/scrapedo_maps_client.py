@@ -1,0 +1,250 @@
+# backend/app/services/serpwow/scrapedo_maps_client.py
+"""scrape.do Google Maps search client for the gmaps pipeline.
+
+Replaces the SerpWow places + place_details pair (the deleted ``gmaps_client.py``).
+scrape.do's ``/plugin/google/maps/search`` returns ``website``/``title``/``address``/
+``phone``/``rating``/``reviews``/``type`` inline on every ``local_results[]`` entry —
+the whole set this pipeline consumes — so the old ``1 + N`` place-details fan-out is
+gone and a row costs exactly ONE request.
+
+Verified 2026-08-03 against real CSV rows: a ``local_result`` with no ``website`` is
+still website-less in ``/plugin/google/maps/place``, so there is nothing a hydration
+call could recover. That endpoint is deliberately unused.
+
+Billing: scrape.do charges CREDITS_PER_CALL per *successful* call; failed attempts are
+free, which is why retries are cheap and ``credits`` counts HTTP-200s, not attempts.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+from typing import Any, Optional
+
+import httpx
+
+from app.services.common.env import (
+    get_float_env as _get_float_env,
+    get_int_env as _get_int_env,
+)
+from app.services.serpwow.outcomes import categorize_http_error
+
+SCRAPEDO_MAPS_SEARCH_URL = "https://api.scrape.do/plugin/google/maps/search"
+
+# scrape.do's published price for a Google Maps call. Not an env var: it's their
+# pricing, not a per-deployment setting.
+CREDITS_PER_CALL = 10
+
+# scrape.do overloads HTTP 502: it is usually transient ("request failed"), but it also
+# means "Google Maps has no listing for this query" — observed on 12/100 real rows, body
+# {"error": "no results"}. That is a business NOT-FOUND, not a failure: retrying can
+# never succeed, so match the body and return an empty result set instead.
+NO_RESULT_MARKERS = ("no results", "no result found")
+
+# Cap for any single backoff sleep, so a hostile Retry-After can't park a worker.
+MAX_BACKOFF_SECONDS = 30.0
+
+
+def _redact(value: Any) -> str:
+    """Strip the API token out of anything we put in an error message or log."""
+    return re.sub(r"([?&]token=)[^&'\"\s]+", r"\1[REDACTED]", str(value or ""))
+
+
+def _safe_error(exc: Exception, response: Any = None) -> str:
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        body = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                body = str(payload.get("error") or payload.get("message") or "").strip()
+        except Exception:
+            body = _redact(response.text)[:200]
+        if body:
+            return f"scrape.do maps search failed (HTTP {status}): {body.rstrip('.')}."
+        return f"scrape.do maps search failed (HTTP {status})."
+    return _redact(exc) or type(exc).__name__
+
+
+def _response_error_text(response: Any) -> str:
+    """The provider's own error string from a JSON body, or "" if there isn't one."""
+    try:
+        payload = response.json()
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("error") or payload.get("message") or "").strip()
+
+
+def _is_no_results(status: Optional[int], error_text: str) -> bool:
+    """A 502 whose body says "no results" — Google has no listing, so don't retry."""
+    if status != 502:
+        return False
+    low = error_text.lower()
+    return any(marker in low for marker in NO_RESULT_MARKERS)
+
+
+def _backoff_seconds(attempt: int, status: Optional[int], retry_after: Any) -> float:
+    """Exponential backoff. A 429 gets a much larger base than a 5xx: rate limits need
+    real room (a 1s/2s ramp exhausted every attempt on 27/50 rows in a live run), while
+    a transient 5xx usually clears immediately. Retry-After wins when the server sends it.
+    """
+    if retry_after:
+        try:
+            return min(float(str(retry_after).strip()), MAX_BACKOFF_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    base = 5.0 if status == 429 else 1.0
+    return min(base * (2 ** attempt), MAX_BACKOFF_SECONDS)
+
+
+def clean_url_for_report(url: str) -> str:
+    """Strip fragment/text anchors that pollute stored URLs."""
+    value = (url or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"#:~:text=.*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"%23:~:text=.*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"#.*$", "", value)
+    return value.strip()
+
+
+def extract_gmaps_website(gmaps_results: dict[str, Any]) -> Optional[str]:
+    """First non-empty ``website`` across the results.
+
+    Positional fallback for when the scorer likes none of the candidates — same role
+    the SerpWow client's version played.
+    """
+    for item in (gmaps_results or {}).get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        website = clean_url_for_report(item.get("website") or "")
+        if website:
+            return website
+    return None
+
+
+def _envelope(
+    query: str,
+    gl: str,
+    *,
+    request_count: int = 0,
+    successful_requests: int = 0,
+    results: Optional[list[Any]] = None,
+    error: Optional[str] = None,
+    error_category: Optional[str] = None,
+    no_results: bool = False,
+) -> dict[str, Any]:
+    """The envelope gmaps_scoring / run_gmaps_from_module expect.
+
+    ``results`` holds scrape.do's ``local_results[]`` VERBATIM: it is persisted as the
+    row's raw response artifact, so it must stay faithful to what the API returned.
+
+    Call accounting, so a run can report "N calls = X succeeded + Y failed":
+    ``request_count`` is every HTTP attempt, ``successful_requests`` is the HTTP 200s
+    (the only billed ones), ``failed_requests`` is the rest, and ``credits`` is derived
+    as ``CREDITS_PER_CALL × successful_requests`` — never counted by hand.
+    """
+    results = results if isinstance(results, list) else []
+    return {
+        "query": query,
+        "gl": gl,
+        "request_count": request_count,
+        "successful_requests": successful_requests,
+        "failed_requests": max(0, request_count - successful_requests),
+        "credits": CREDITS_PER_CALL * successful_requests,
+        "total_places": len(results),
+        "results": results,
+        # True when Google has no Maps listing at all (scrape.do 502 "no results").
+        # A business not-found, NOT an error — see NO_RESULT_MARKERS.
+        "no_results": no_results,
+        "error": error,
+        "error_category": error_category,
+    }
+
+
+async def process_gmaps_query(
+    q: str,
+    gl: str = "us",
+    client: Optional[httpx.AsyncClient] = None,
+) -> dict[str, Any]:
+    """One Google Maps search via scrape.do. Never raises — errors come back in the
+    envelope so the caller can map them onto the row outcome taxonomy."""
+    token = os.getenv("SCRAPEDO_TOKEN", "").strip()
+    if not token:
+        return _envelope(
+            q, gl, error="SCRAPEDO_TOKEN is not configured", error_category="auth")
+
+    if client is None:
+        timeout = _get_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0)
+        async with httpx.AsyncClient(timeout=timeout) as owned_client:
+            return await process_gmaps_query(q, gl=gl, client=owned_client)
+
+    params = {"token": token, "q": q, "hl": "en", "gl": gl}
+    # Retries AFTER the first attempt, so 2 => 3 calls per row. Shares AI Mode's
+    # SCRAPEDO_MAX_RETRIES on purpose — one scrape.do retry knob for the whole app.
+    # Failed attempts are NOT billed, so a retry costs only latency.
+    attempts = max(1, _get_int_env("SCRAPEDO_MAX_RETRIES", 2) + 1)
+    request_count = 0
+
+    for attempt in range(attempts):
+        response = None
+        try:
+            request_count += 1
+            response = await client.get(SCRAPEDO_MAPS_SEARCH_URL, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            status = getattr(response, "status_code", None)
+            body_error = _response_error_text(response) if response is not None else ""
+
+            # "502 no results" means Google has no listing — terminal, and a not-found
+            # rather than a failure. Report zero results with no error so the row
+            # classifies as not_found instead of burning 3 more doomed attempts.
+            if _is_no_results(status, body_error):
+                return _envelope(q, gl, request_count=request_count,
+                                 results=[], no_results=True)
+
+            # Everything else 5xx/429/transport is genuinely transient per scrape.do's docs.
+            retryable = (
+                isinstance(exc, httpx.TransportError)
+                or status == 429
+                or (status is not None and 500 <= status <= 599)
+            )
+            if retryable and attempt < attempts - 1:
+                retry_after = (response.headers.get("Retry-After")
+                               if response is not None else None)
+                await asyncio.sleep(_backoff_seconds(attempt, status, retry_after))
+                continue
+            return _envelope(
+                q, gl,
+                request_count=request_count,
+                error=_safe_error(exc, response),
+                error_category=categorize_http_error(
+                    status, f"{type(exc).__name__}: {exc}"),
+            )
+
+        # HTTP 200 == a billed call, even if the body then reports a problem.
+        if isinstance(payload, dict) and payload.get("error"):
+            message = _redact(payload["error"])
+            return _envelope(
+                q, gl,
+                request_count=request_count,
+                successful_requests=1,
+                error=f"scrape.do maps search failed: {message}",
+                error_category=categorize_http_error(None, message),
+            )
+
+        local_results = payload.get("local_results") if isinstance(payload, dict) else None
+        # Zero results is a legitimate not-found, not an error.
+        return _envelope(
+            q, gl,
+            request_count=request_count,
+            successful_requests=1,
+            results=local_results if isinstance(local_results, list) else [],
+        )
+
+    # Unreachable: the loop either returns or exhausts into the error path above.
+    return _envelope(q, gl, request_count=request_count,
+                     error="scrape.do maps search failed", error_category="internal")

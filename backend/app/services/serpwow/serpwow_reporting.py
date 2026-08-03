@@ -158,8 +158,18 @@ def state_to_entity_results(state: dict[str, Any]) -> list[EntityResult]:
     return [row_to_entity_result(r, i + 1) for i, r in enumerate(state.get("rows", []))]
 
 
-def _build_cost(llm_usd: float, serpwow_searches: int,
-                billable_searches: int) -> dict[str, Any]:
+def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
+                scrapedo_requests: int = 0, scrapedo_credits: int = 0,
+                scrapedo_successful_requests: int = 0,
+                scrapedo_failed_requests: int = 0) -> dict[str, Any]:
+    """SerpWow is per-search USD; scrape.do is credits (10 per successful call) with no
+    USD figure. Both key sets are always present so a run whose pipeline has migrated
+    and a pre-migration run of the same pipeline each render from their own fields.
+
+    scrape.do call accounting reconciles as
+    ``scrapedo_requests == scrapedo_successful_requests + scrapedo_failed_requests``,
+    with credits charged only on the successful ones.
+    """
     try:
         rate = float(os.getenv("SERPWOW_USD_PER_SEARCH", "") or 0.0)
     except (TypeError, ValueError):
@@ -170,8 +180,26 @@ def _build_cost(llm_usd: float, serpwow_searches: int,
         "serpwow_searches": serpwow_searches,
         "serpwow_billable_searches": billable_searches,
         "serpwow_usd": round(serpwow_usd, 6),
+        "scrapedo_requests": scrapedo_requests,
+        "scrapedo_successful_requests": scrapedo_successful_requests,
+        "scrapedo_failed_requests": scrapedo_failed_requests,
+        "scrapedo_credits": scrapedo_credits,
         "total_usd": round(llm_usd + serpwow_usd, 6),
     }
+
+
+def _cost_log_line(summary: dict[str, Any]) -> str:
+    """The run.log ``# cost:`` header. Credits appear only for scrape.do-billed runs,
+    so a SerpWow run's line is unchanged."""
+    cost = summary.get("cost") or {}
+    line = (f"# cost: llm_usd={cost.get('llm_usd')} serpwow_usd={cost.get('serpwow_usd')} "
+            f"total_usd={cost.get('total_usd')} serpwow_searches={cost.get('serpwow_searches')}")
+    if cost.get("scrapedo_requests") or cost.get("scrapedo_credits"):
+        line += (f" scrapedo_requests={cost.get('scrapedo_requests')}"
+                 f" (ok={cost.get('scrapedo_successful_requests')}"
+                 f" failed={cost.get('scrapedo_failed_requests')})"
+                 f" scrapedo_credits={cost.get('scrapedo_credits')}")
+    return line
 
 
 def _derive_outcome(row: dict[str, Any]) -> Any:
@@ -250,6 +278,10 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     found = sum(1 for r in results if r.website_url)
     serpwow_searches = 0
     billable_searches = 0
+    scrapedo_requests = 0
+    scrapedo_credits = 0
+    scrapedo_ok = 0
+    scrapedo_failed = 0
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
@@ -258,17 +290,29 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         result = row.get("result") or {}
         ctx = result.get("context") or {}
         cb = ctx.get("cost_breakdown") or {}
-        request_count = int(cb.get("serpwow_request_count") or 0)
-        serpwow_searches += request_count
-        if "serpwow_billable_request_count" in cb:
-            billable_searches += int(cb.get("serpwow_billable_request_count") or 0)
+        # A row is billed by exactly ONE provider. scrape.do rows (gmaps) carry no
+        # SerpWow keys at all, so they must skip SerpWow accounting entirely —
+        # otherwise the billable-count fallback below would infer 1 billable search
+        # from their formatted_results entry and price them at SERPWOW_USD_PER_SEARCH.
+        # A pre-migration gmaps run has no scrapedo_* keys and still lands in the
+        # SerpWow branch, which is what keeps its old cost card rendering.
+        if "scrapedo_requests" in cb or "scrapedo_credits" in cb:
+            scrapedo_requests += int(cb.get("scrapedo_requests") or 0)
+            scrapedo_credits += int(cb.get("scrapedo_credits") or 0)
+            scrapedo_ok += int(cb.get("scrapedo_successful_requests") or 0)
+            scrapedo_failed += int(cb.get("scrapedo_failed_requests") or 0)
         else:
-            formatted = ctx.get("formatted_results")
-            billable_searches += (
-                sum(1 for item in formatted
-                    if isinstance(item, dict) and item.get("success"))
-                if isinstance(formatted, list) and formatted else request_count
-            )
+            request_count = int(cb.get("serpwow_request_count") or 0)
+            serpwow_searches += request_count
+            if "serpwow_billable_request_count" in cb:
+                billable_searches += int(cb.get("serpwow_billable_request_count") or 0)
+            else:
+                formatted = ctx.get("formatted_results")
+                billable_searches += (
+                    sum(1 for item in formatted
+                        if isinstance(item, dict) and item.get("success"))
+                    if isinstance(formatted, list) and formatted else request_count
+                )
         llm_usd += float(result.get("gemini_cost_usd") or 0.0)
         for key in ("final_url_selection_ai", "gemini_batch_ai"):
             obj = ctx.get(key)
@@ -301,7 +345,9 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
-        "cost": _build_cost(llm_usd, serpwow_searches, billable_searches),
+        "cost": _build_cost(llm_usd, serpwow_searches, billable_searches,
+                            scrapedo_requests, scrapedo_credits,
+                            scrapedo_ok, scrapedo_failed),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
     # Outcome/error breakdown is original-row-level. Relationship state rows are
@@ -394,8 +440,7 @@ def write_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:
         f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
         f"not_found={summary.get('websites_not_found')} batch={summary.get('is_batch')} "
         f"model={summary.get('model')}",
-        f"# cost: llm_usd={summary['cost']['llm_usd']} serpwow_usd={summary['cost']['serpwow_usd']} "
-        f"total_usd={summary['cost']['total_usd']} serpwow_searches={summary['cost']['serpwow_searches']}",
+        _cost_log_line(summary),
         "",
     ]
     log_path = upload_dir / "run.log"
@@ -504,8 +549,7 @@ def _write_relationship_outputs(upload_dir: Path, state: dict[str, Any]) -> dict
         f"# rows={summary.get('total_rows')} found={summary.get('websites_found')} "
         f"not_found={summary.get('websites_not_found')}",
         f"# relationship: {json.dumps(summary.get('relationship_breakdown'))}",
-        f"# cost: llm_usd={summary['cost']['llm_usd']} serpwow_usd={summary['cost']['serpwow_usd']} "
-        f"total_usd={summary['cost']['total_usd']} serpwow_searches={summary['cost']['serpwow_searches']}",
+        _cost_log_line(summary),
         "",
     ]
     log_path = upload_dir / "run.log"

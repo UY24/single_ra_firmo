@@ -1,13 +1,15 @@
 # HANDOFF — `website_url_finder`
 
-Last updated: 2026-07-23. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
+Last updated: 2026-08-03. Read this first if you're picking up this repo. Durable architecture (module map, S3 layout, pipeline internals) lives in `CLAUDE.md`; older dated sessions are archived in `docs/HISTORY.md`.
 
 ---
 
 ## Current status
 
-- **Active branch: `relationship-ai-overview`** (off `aiModeBroker`). The earlier relationship AI-Overview rework is committed locally; the 2026-07-23 relationship failure-diagnostics/retry/UI changes are **UNCOMMITTED, NOT live-verified, NOT pushed**.
-- Full suite: **564/564** passing.
+- **Active branch: `migrateserp2scrape`.** Two independent bodies of uncommitted work sit in this tree — keep them separate when committing:
+  1. the **2026-08-03 gmaps → scrape.do migration** (this session, see below);
+  2. the older **2026-07-23 relationship** failure-diagnostics/retry/UI changes, still **UNCOMMITTED, NOT live-verified, NOT pushed** (they predate this branch, from `relationship-ai-overview` off `aiModeBroker`).
+- Full suite: **606/606** passing (was 564 before the gmaps migration added 42).
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -56,6 +58,164 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 - **Never** add a `Co-Authored-By: Claude` (or any AI-attribution) trailer to commits — tell any committing subagent the same.
 - **Never** `git push` or query the production Supabase DB without explicit user approval.
 - `docs/` is **gitignored** — specs/plans/handoff-history there are on-disk only; code under `backend/` commits normally.
+
+---
+
+## Latest completed session — 2026-08-03 (gmaps: SerpWow Places → scrape.do Google Maps)
+
+**Status: UNCOMMITTED, 606/606 offline tests passing, PARTIALLY live-verified (real API
+calls through the real executor; NOT yet a full worker/RabbitMQ run), NOT pushed.**
+First pipeline migrated off SerpWow. Built with Ponytail: one new client file, **no new env
+var**, no new dependency, no new endpoint, no new UI component (the existing `costSection`
+turned out to be already parameterized), and one dependency plus two debug routes *deleted*.
+
+### What changed and why
+
+SerpWow used **two** calls per gmaps row: `search_type=places` to harvest `data_cid`s, then
+one `place_details` per CID (`1+N`, up to 21 requests) — only because `fetch_data_cids`
+threw away everything but the CID. scrape.do's `/plugin/google/maps/search` returns
+`website`/`title`/`address`/`phone`/`rating`/`reviews`/`type` **inline per `local_results[]`
+entry**, which is the entire set this pipeline reads. So gmaps is now **one request per row**.
+
+- **NEW `serpwow/scrapedo_maps_client.py`** — `process_gmaps_query(q, gl, client=None)`
+  returning the same envelope the scorer/reporting already expect, plus the call/credit
+  accounting. **No gmaps-specific env keys**: it shares
+  `SCRAPEDO_TOKEN`/`SCRAPEDO_TIMEOUT_SECONDS`/`SCRAPEDO_MAX_RETRIES` with AI Mode, and reuses
+  `outcomes.categorize_http_error` plus the retry shape from
+  `serpwow_client.run_serpwow_search` (429/5xx/transport only — see the retry pass below for
+  the final backoff policy). Errors are **returned, not raised**. The token is redacted from
+  all error text. `results` is `local_results` **verbatim** (it's persisted as the row artifact).
+- **`/plugin/google/maps/place` is deliberately unused.** Empirically verified before coding
+  against real CSV rows: a `local_result` with no `website` has no `website` in `/maps/place`
+  either (checked `AMIGO CORPORATION`, `data_cid=15915247393667579758`), so a hydration pass
+  would recover nothing. Sample rows: a Turkish SME returned 1 result **with** website; a
+  Bangladeshi row returned 17 results, 11 with websites (the website-less ones were other
+  companies entirely, which `_score_gmaps_candidates` skips by design).
+- **Credits, not USD, and zero SerpWow residue.** 10 credits per **successful** call (failed
+  attempts are free, so retries are cheap). A gmaps row's `cost_breakdown` is exactly
+  `{scrapedo_requests, scrapedo_successful_requests, scrapedo_failed_requests,
+  scrapedo_credits, gemini_cost_usd, total_cost_usd}` — no `serpwow_*`
+  or `massive_proxy_*` keys — and `CrawlResponse.serpwow_cost_usd`/`massive_proxy_cost_usd`
+  are now `Optional[float] = None`, so gmaps leaves them unset instead of reporting a
+  meaningless `$0.00` (their XLSX columns come out blank for gmaps; the other three pipelines
+  still pass real floats). `gemini_cost_usd`/`total_cost_usd` **stay** because
+  `GMAPS_CONFIDENCE_MODE=llm` is a genuine USD cost.
+  `build_summary` **routes on the presence of `scrapedo_*` keys** and skips SerpWow
+  accounting for those rows. That routing is load-bearing: a gmaps row carries a
+  `formatted_results` entry for its one call, so without it the billable-count fallback
+  infers 1 billable search and prices every row at `SERPWOW_USD_PER_SEARCH` — regression test
+  `test_formatted_results_cannot_infer_billable_serpwow_searches`. It doubles as the
+  back-compat path, since a pre-migration gmaps run has no `scrapedo_*` keys, takes the
+  SerpWow branch, and keeps its old cost card (`run_detail.js` likewise branches on the
+  data, not the pipeline key). Slack shows "N requests · N credits".
+
+### Retry / 502 / call-accounting pass (same session, after a 100-row live run)
+
+A 100-row live run came back `completed_with_errors` with **12 rows failing HTTP 502**.
+Reading its `state.json` showed retries were already firing (`scrapedo_requests` was 3 on
+exactly those 12 rows) and credits were already 200-only (880 = 88 × 10). The real finding
+was in the 502 **body**: `{"error": "no results"}`.
+
+- **`502 "no results"` is Google having no Maps listing — a business not-found, not a
+  failure.** It is now matched (`NO_RESULT_MARKERS`), returns `results=[]`,
+  `no_results=True`, **no error and no retry**, and the row classifies `not_found` with
+  `row_error = "No Google Maps listing exists for this company."`. Replaying those exact
+  12 queries confirms it: 1 attempt instead of 3, 0 credits, no error. Previously they
+  were `outcome=error`, which inflated the error count, put them under "View failed
+  rows", and made them eligible for a "Rerun failed" that could never succeed.
+- **Retries stay on the shared `SCRAPEDO_MAX_RETRIES`** (currently `2` → 3 calls/row).
+  A gmaps-specific `GMAPS_MAX_RETRIES` was built and then **removed per user direction**:
+  one scrape.do retry knob for the whole app beats a second env var. Consequence to know:
+  gmaps and AI Mode now share a retry policy, so raising it moves both, and gmaps gets
+  2 retries rather than the 3 originally discussed. Accepted tradeoff.
+- **429 backs off much harder than 5xx.** A second run showed **27/50 rows failing on
+  HTTP 429** with all attempts exhausted — a 1s/2s ramp is useless against a rate limit.
+  Now 1/2/4s for 5xx vs **5/10/20s** for 429, `Retry-After` honored when sent, everything
+  capped at `MAX_BACKOFF_SECONDS` (30s) so a hostile header can't park a worker.
+  If 429s persist, the next lever is `WORKER_CONCURRENCY` vs the scrape.do plan's
+  concurrency cap — not more retries.
+- **Explicit call accounting.** The envelope and `cost_breakdown` now carry
+  `scrapedo_requests` (every attempt), `scrapedo_successful_requests` (HTTP 200s, the only
+  billed ones) and `scrapedo_failed_requests`, with `credits` **derived** as
+  `CREDITS_PER_CALL × successful_requests` rather than incremented by hand. A run
+  reconciles as **requests == succeeded + failed** (enforced by a test that sweeps
+  success/500/429/no-results). `report.json`, the `run.log` cost line
+  (`scrapedo_requests=136 (ok=88 failed=48) scrapedo_credits=880`), the Slack ping and the
+  run-detail card ("880 credits · 48 failed") all surface the split.
+- Guarded a subtlety while wiring the UI/Slack switch: `_build_cost` emits the
+  `scrapedo_*` keys as **0 for every SerpWow pipeline too**, so the "is this a scrape.do
+  run?" test must be **truthy**, not `is not None` — otherwise gsearch would have
+  rendered as Scrape.do. Checked against requests/credits/failed so an all-failed run
+  still shows the right card.
+
+- **Two more pre-existing bugs fixed on the way** (found by tracing, not reported):
+  1. **A provider failure was silently a business "not found".** `process_gmaps_query` returned
+     `{"error": …}` on a missing key / HTTP failure and `run_gmaps_from_module` dropped it, so
+     `classify_finalized_row` (which reads `context["formatted_results"]`, a key gmaps never
+     set) fell through to `not_found`. A rate-limited or mis-keyed run reported "no website
+     found" on every row, was invisible in the error breakdown, and could not be retried
+     because nothing was marked `failed`. Now the error propagates and the executor writes a
+     one-entry `formatted_results` tagged `error_source: scrapedo`; `_phase_stats` returns the
+     phase's declared source so attribution isn't hardcoded to SerpWow. Genuine zero-result
+     rows stay `not_found`.
+  2. **`SCRAPEDO_TOKEN` was missing from `tests/__init__.py`'s hermeticity guard** — a real
+     hole (AI Mode already read it) that a gmaps row-path test could have used to hit live
+     scrape.do from a developer `.env`. Added.
+- **Result ordering restored:** `position` order survives, where the old `set()` of CIDs
+  randomized it and fed `_score_gmaps_candidates`'s `-0.01*idx` tiebreaker noise.
+- **Deleted:** `serpwow/gmaps_client.py`, the `GET /gmaps/discover` + `GET /gmaps/details`
+  debug routes (no `data_cid` step exists any more), and **`aiohttp` from `requirements.txt`**
+  — that file plus `/gmaps/discover` were its only importers. `/gmaps/search` repointed at the
+  new client with a `SCRAPEDO_TOKEN` guard. `POST /uploads/gmaps` now 400s on a missing token
+  (checked **after** CSV validation, so a bad CSV still reports the CSV problem).
+- **UI copy de-SerpWowed** (the pipeline card said "Fast SerpWow Maps discovery"): New Run's
+  gmaps card now reads "Fast Scrape.do Maps discovery…", and Operations' table — which lists
+  **every** non-AI-Mode pipeline, so a provider name was simply wrong — went from "SerpWow
+  Uploads History"/"Showing all SerpWow uploads" to provider-neutral "Pipeline Uploads
+  History"/"Showing all pipeline uploads" (4 strings). **Two `"SerpWow"` strings in
+  `run_detail.js` were deliberately KEPT** after verifying they're still correct:
+  `providerLabel = "SerpWow"` is only a default (gmaps/AI Mode override it with
+  "Scrape.do"), and "Rows where SerpWow returned 200…" sits in `emptyResponsesSection`,
+  which is unreachable for gmaps because `empty_response_breakdown()` returns `None` for
+  anything but gsearch/relationship. Renaming either would have made the UI wrong for the
+  three pipelines still on SerpWow.
+
+- **Files:** `scrapedo_maps_client.py` (new), `modes/common.py`, `modes/gmaps.py`,
+  `outcomes.py`, `serpwow_reporting.py`, `schemas.py`, `engine.py`, `core/notify.py`,
+  `static/js/{run_detail,new_run,operations}.js`, `requirements.txt`, `.env.example`,
+  `CLAUDE.md`; tests `test_scrapedo_maps_client.py` (new, 22), `test_gmaps_llm.py`,
+  `test_gsearch_cost.py`, `test_timing_summary.py`, `tests/__init__.py`.
+- **Verification done:** 606/606 offline tests, all 6 `.mjs` DOM contracts, `node --check` on
+  every JS module. Plus **live single-row runs through the real executor** (not just mocks):
+  a Turkish SME resolved `https://abcsacmetal.com.tr/` with `industry` populated from
+  `types`, 1 request / 10 credits, `serpwow_cost_usd=None`; and the 12 previously-502 rows
+  replayed as `no_results=True`, 1 attempt, 0 credits, no error.
+
+### Still to do
+
+1. **Full-stack live smoke** — the only thing not yet exercised (needs RabbitMQ + worker, and
+   writes to production S3/Supabase/Slack, so it needs explicit approval). Run
+   `samples/smalltest.csv` through gmaps and confirm: `run.log` shows
+   `scrapedo_requests=<rows> (ok=… failed=…) scrapedo_credits=10×ok` with **one request per
+   successful row, NOT `1+N`**; the found-rate is **comparable to a SerpWow gmaps run on the
+   same CSV** (the acceptance gate — a materially worse rate would mean
+   `local_results[].website` is sparser than the probe rows suggested); the previously-502
+   rows now land in `notFound.csv` as `not_found` with "No Google Maps listing exists for this
+   company." and the run reaches `completed` rather than `completed_with_errors`; the
+   run-detail card shows "Scrape.do — N credits · N failed" with no `$`; an older gmaps run
+   still renders its SerpWow cost card; and a deliberately bad token yields
+   `error_source=scrapedo` / `error_category=auth` rows under "View failed rows" with 0 credits.
+2. **Watch the 429s at scale.** The 50-row run lost 27 rows to rate limiting. The backoff is
+   now 5/10/20s, but if it persists the lever is `WORKER_CONCURRENCY` (default 4) against the
+   scrape.do plan's concurrency cap — **not** more retries.
+3. Decide whether gsearch / relationship / firmographics follow (they still call
+   `api.serpwow.com` via `run_serpwow_search` / `codetails.fetch_serpwow`). Naming decision
+   taken: rename `serpwow_*` → `scrapedo_*` per pipeline as it migrates, package rename
+   (`app/services/serpwow/`, `serpwow_reporting.py`, the `serpwow_summary` `/status` field,
+   the `serpwow_response/` S3 prefix) **last**, once nothing is on SerpWow.
+4. The pre-existing 2026-07-23 relationship work in this tree is still uncommitted and
+   unverified — see the session below. This gmaps work is independent of it, so a commit
+   should separate the two.
 
 ---
 

@@ -37,7 +37,7 @@ const PIPELINES = [
   { key: "ai_deep", label: "AI Mode 2 - Deep Search", endpoint: "/uploads/ai-mode", ai: true,
     desc: "Small batches, deeper investigation, better for hard targets.", csvCols: _AI_COLS },
   { key: "gmaps", label: "Google Maps", endpoint: "/uploads/gmaps",
-    desc: "Fast SerpWow Maps discovery for local business signals.", csvCols: _SW_COLS },
+    desc: "Fast Scrape.do Maps discovery for local business signals.", csvCols: _SW_COLS },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",

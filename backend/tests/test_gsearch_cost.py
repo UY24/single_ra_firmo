@@ -61,5 +61,97 @@ class TestGsearchCost(unittest.TestCase):
         self.assertAlmostEqual(summary["cost"]["serpwow_usd"], 0.00035)
 
 
+def _gmaps_state(rows: list[dict]) -> dict:
+    return {
+        "upload_id": "u1", "company_name": "Co", "pipeline": "gmaps", "status": "completed",
+        "rows": [{
+            "company_name": "Co", "country": "US", "status": "completed",
+            "result": {"official_website": "https://co.com", "gemini_cost_usd": 0.0,
+                       "context": {"cost_breakdown": cb}},
+        } for cb in rows],
+    }
+
+
+class TestScrapedoCredits(unittest.TestCase):
+    """gmaps bills scrape.do credits (10 per successful call), not per-search USD."""
+
+    # A real gmaps row: scrapedo_* only, no serpwow_* keys whatsoever.
+    SCRAPEDO_ROW = {"scrapedo_requests": 1, "scrapedo_successful_requests": 1,
+                    "scrapedo_failed_requests": 0, "scrapedo_credits": 10}
+
+    def test_run_reconciles_calls_into_succeeded_plus_failed(self):
+        # Mirrors the observed 100-row run: 88 rows succeeded first try, 12 rows burned
+        # 4 attempts each and failed. 88 billed calls = 880 credits; 48 failed = free.
+        ok = dict(self.SCRAPEDO_ROW)
+        bad = {"scrapedo_requests": 4, "scrapedo_successful_requests": 0,
+               "scrapedo_failed_requests": 4, "scrapedo_credits": 0}
+        state = _gmaps_state([ok] * 88 + [bad] * 12)
+        summary = serpwow_reporting.build_summary(
+            state, serpwow_reporting.state_to_entity_results(state))
+        cost = summary["cost"]
+        self.assertEqual(cost["scrapedo_successful_requests"], 88)
+        self.assertEqual(cost["scrapedo_failed_requests"], 48)
+        self.assertEqual(cost["scrapedo_requests"], 136)
+        self.assertEqual(cost["scrapedo_requests"],
+                         cost["scrapedo_successful_requests"] + cost["scrapedo_failed_requests"])
+        self.assertEqual(cost["scrapedo_credits"], 880)
+        self.assertEqual(cost["scrapedo_credits"], 10 * cost["scrapedo_successful_requests"])
+
+    def test_credits_are_summed_across_rows(self):
+        state = _gmaps_state([self.SCRAPEDO_ROW] * 3)
+        with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
+            summary = serpwow_reporting.build_summary(
+                state, serpwow_reporting.state_to_entity_results(state))
+        cost = summary["cost"]
+        self.assertEqual(cost["scrapedo_requests"], 3)
+        self.assertEqual(cost["scrapedo_credits"], 30)
+        # The SerpWow rate must not price a scrape.do run.
+        self.assertEqual(cost["serpwow_searches"], 0)
+        self.assertEqual(cost["serpwow_usd"], 0.0)
+        self.assertEqual(cost["total_usd"], 0.0)
+
+    def test_formatted_results_cannot_infer_billable_serpwow_searches(self):
+        # Regression: gmaps rows carry a formatted_results entry for their single
+        # scrape.do call. Without the scrapedo_* routing in build_summary, the
+        # billable-count fallback would read success=True from it and bill the row at
+        # SERPWOW_USD_PER_SEARCH.
+        state = _gmaps_state([self.SCRAPEDO_ROW] * 2)
+        for row in state["rows"]:
+            row["result"]["context"]["formatted_results"] = [
+                {"phase": "gmaps", "success": True, "error": None}]
+        with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
+            summary = serpwow_reporting.build_summary(
+                state, serpwow_reporting.state_to_entity_results(state))
+        self.assertEqual(summary["cost"]["serpwow_billable_searches"], 0)
+        self.assertEqual(summary["cost"]["serpwow_usd"], 0.0)
+        self.assertEqual(summary["cost"]["scrapedo_credits"], 20)
+
+    def test_pre_migration_gmaps_run_still_reports_serpwow_searches(self):
+        # Back-compat: a run recorded before the migration has no scrapedo_* keys.
+        state = _gmaps_state([{"serpwow_request_count": 4}])
+        with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
+            summary = serpwow_reporting.build_summary(
+                state, serpwow_reporting.state_to_entity_results(state))
+        cost = summary["cost"]
+        self.assertEqual(cost["serpwow_searches"], 4)
+        self.assertAlmostEqual(cost["serpwow_usd"], 0.0014)
+        self.assertEqual(cost["scrapedo_credits"], 0)
+
+    def test_run_log_shows_credits_only_for_scrapedo_runs(self):
+        scrapedo = serpwow_reporting._cost_log_line(
+            {"cost": {"llm_usd": 0.0, "serpwow_usd": 0.0, "total_usd": 0.0,
+                      "serpwow_searches": 0, "scrapedo_requests": 3,
+                      "scrapedo_credits": 30}})
+        self.assertIn("scrapedo_requests=3", scrapedo)
+        self.assertIn("scrapedo_credits=30", scrapedo)
+
+        serpwow = serpwow_reporting._cost_log_line(
+            {"cost": {"llm_usd": 0.0, "serpwow_usd": 0.0035, "total_usd": 0.0035,
+                      "serpwow_searches": 10, "scrapedo_requests": 0,
+                      "scrapedo_credits": 0}})
+        self.assertIn("serpwow_searches=10", serpwow)
+        self.assertNotIn("scrapedo", serpwow)
+
+
 if __name__ == "__main__":
     unittest.main()

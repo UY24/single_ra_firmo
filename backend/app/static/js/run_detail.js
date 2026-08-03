@@ -331,8 +331,11 @@ function chip(label, value, tone = "muted") {
   );
 }
 
-// Cost breakdown card: LLM (LLM pipelines only) · SerpWow (+searches) · Total.
-// `g` is serpwow_summary; reads g.cost {llm_usd, serpwow_usd, serpwow_searches, total_usd}.
+// Cost breakdown card: LLM (LLM pipelines only) · provider · Total. The provider cell is
+// parameterized: SerpWow searches + USD by default (gsearch/relationship/firmographics),
+// or Scrape.do credits for pipelines billed that way (gmaps, AI Mode) — see the call sites.
+// `g` is serpwow_summary; reads g.cost {llm_usd, serpwow_usd, serpwow_searches,
+// scrapedo_credits, total_usd}.
 function costItem(label, value, sub, extraClass = "") {
   return el("div", { class: `cost-item ${extraClass}`.trim() },
     el("span", { class: "cost-label" }, label),
@@ -345,6 +348,7 @@ function costSection(g, {
   providerLabel = "SerpWow",
   providerCostKey = "serpwow_usd",
   searchKey = "serpwow_searches",
+  searchUnit = "searches",
   failedSearchCount = null,
   llmCostKey = "llm_usd",
   totalCostKey = "total_usd",
@@ -356,7 +360,7 @@ function costSection(g, {
       ? Math.max(0, Number(cost[searchKey]) - Number(cost.serpwow_billable_searches))
       : 0);
   const searchSub = cost[searchKey] == null ? null
-    : `${fmtNum(cost[searchKey])} searches`
+    : `${fmtNum(cost[searchKey])} ${searchUnit}`
       + (failed ? ` · ${fmtNum(failed)} failed` : "");
   const items = [];
   if (isLlm && llmCostKey) items.push(costItem("LLM", fmtUsd(cost[llmCostKey])));
@@ -513,7 +517,7 @@ function progressSection(done, total, running) {
 // disabled. `baseUrl(name)` builds the per-file result URL (download appends
 // "&download=true"). `extras` (optional) are download-only rows {name, href} for
 // files served by a different endpoint (e.g. the full output.json/xlsx). Used by
-// both AI Mode and the SerpWow gsearch/gmaps detail view.
+// both AI Mode and the gsearch/gmaps detail view.
 function filesSection(allFiles, baseUrl, available, extras) {
   const files = Array.isArray(available) ? available : allFiles;
   const rows = allFiles.map((name) => {
@@ -737,7 +741,24 @@ function renderLegacyStatus(root, ref, s) {
     parts.push(el("div", { class: "callout callout-red" },
       el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  if (g) parts.push(costSection(g));
+  // Branch on the DATA, not the pipeline key: a gmaps run predating the scrape.do
+  // migration still carries serpwow_searches/serpwow_usd and keeps its old cost card.
+  if (g) {
+    // Truthy, not != null: the cost block carries these keys as 0 for SerpWow pipelines
+    // too. Checking failed/credits as well keeps an all-failed run on the Scrape.do card.
+    const isScrapedo = !!(g.cost?.scrapedo_requests || g.cost?.scrapedo_credits
+                          || g.cost?.scrapedo_failed_requests);
+    parts.push(isScrapedo
+      ? costSection(g, {
+          providerLabel: "Scrape.do",
+          providerCostKey: null,
+          searchKey: "scrapedo_credits",
+          searchUnit: "credits",
+          failedSearchCount: g.cost.scrapedo_failed_requests ?? 0,
+          totalCostKey: null,
+        })
+      : costSection(g));
+  }
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
   if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
   if (runState.pollTerminal && errors > 0) {

@@ -29,6 +29,7 @@ from typing import Any, Optional
 from dataclasses import asdict
 
 from app.models.entities import Entity, parse_entities_csv
+from app.services.common.provider_limits import scrapedo_slot
 from app.services.ai_mode import broker, run_store
 from app.services.ai_mode import ai_mode_service as svc
 from app.services.ai_mode.ai_mode_service import (
@@ -389,10 +390,14 @@ async def process_scrape_job(payload: dict[str, Any]) -> None:
         f"scrape batch {request_index} started started_at={started_at} "
         f"entities={len(group)}",
     )
-    rec = await asyncio.to_thread(
-        svc.scrape_batch_sync, run_dir, mode, settings, scrapedo_client,
-        request_index, group,
-    )
+    # Account-wide scrape.do gate, shared with the gmaps pipeline (both run in this
+    # worker process against the same account, so two separate caps could sum past it).
+    # Held across the to_thread call because that IS the HTTP request.
+    async with scrapedo_slot():
+        rec = await asyncio.to_thread(
+            svc.scrape_batch_sync, run_dir, mode, settings, scrapedo_client,
+            request_index, group,
+        )
     finished_at = utc_now_iso()
     status_word = "success" if rec["ok"] else "error"
     if rec.get("reused"):

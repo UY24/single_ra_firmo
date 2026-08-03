@@ -150,6 +150,7 @@ async def run_gmaps_from_module(
                 "official_website": None,
                 **counts,
                 "no_results": False,
+                "billed_empty": False,
                 "raw_response": gmaps_result,
                 "error": str(provider_error),
                 "error_category": (gmaps_result or {}).get("error_category"),
@@ -173,6 +174,8 @@ async def run_gmaps_from_module(
             **counts,
             # Google has no Maps listing for this company: a not-found, not a failure.
             "no_results": bool((gmaps_result or {}).get("no_results")),
+            # Billed (HTTP 200) but zero results — credits spent for nothing.
+            "billed_empty": bool((gmaps_result or {}).get("billed_empty")),
             "raw_response": gmaps_result,
             "error": None,
             "error_category": None,
@@ -188,6 +191,7 @@ async def run_gmaps_from_module(
             "failed_requests": 0,
             "credits": 0,
             "no_results": False,
+            "billed_empty": False,
             "raw_response": None,
             "error": str(exc),
             "error_category": "internal",

@@ -79,6 +79,20 @@ class TestScrapedoCredits(unittest.TestCase):
     SCRAPEDO_ROW = {"scrapedo_requests": 1, "scrapedo_successful_requests": 1,
                     "scrapedo_failed_requests": 0, "scrapedo_credits": 10}
 
+    def test_billed_empty_rows_are_summed_for_the_refund_claim(self):
+        ok = dict(self.SCRAPEDO_ROW)
+        empty = {"scrapedo_requests": 1, "scrapedo_successful_requests": 1,
+                 "scrapedo_failed_requests": 0, "scrapedo_credits": 10,
+                 "scrapedo_billed_empty": 1}
+        state = _gmaps_state([ok] * 90 + [empty] * 10)
+        summary = serpwow_reporting.build_summary(
+            state, serpwow_reporting.state_to_entity_results(state))
+        cost = summary["cost"]
+        self.assertEqual(cost["scrapedo_billed_empty"], 10)
+        # 100 billed calls, 10 of which bought nothing => 100 credits wasted.
+        self.assertEqual(cost["scrapedo_credits"], 1000)
+        self.assertEqual(cost["scrapedo_billed_empty"] * 10, 100)
+
     def test_run_reconciles_calls_into_succeeded_plus_failed(self):
         # Mirrors the observed 100-row run: 88 rows succeeded first try, 12 rows burned
         # 4 attempts each and failed. 88 billed calls = 880 credits; 48 failed = free.

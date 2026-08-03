@@ -9,7 +9,7 @@ Last updated: 2026-08-03. Read this first if you're picking up this repo. Durabl
 - **Active branch: `migrateserp2scrape`.** Two independent bodies of uncommitted work sit in this tree — keep them separate when committing:
   1. the **2026-08-03 gmaps → scrape.do migration** (this session, see below);
   2. the older **2026-07-23 relationship** failure-diagnostics/retry/UI changes, still **UNCOMMITTED, NOT live-verified, NOT pushed** (they predate this branch, from `relationship-ai-overview` off `aiModeBroker`).
-- Full suite: **606/606** passing (was 564 before the gmaps migration added 42).
+- Full suite: **618/618** passing (was 564 before this work added 54).
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -63,10 +63,10 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Latest completed session — 2026-08-03 (gmaps: SerpWow Places → scrape.do Google Maps)
 
-**Status: UNCOMMITTED, 606/606 offline tests passing, PARTIALLY live-verified (real API
+**Status: UNCOMMITTED, 618/618 offline tests passing, PARTIALLY live-verified (real API
 calls through the real executor; NOT yet a full worker/RabbitMQ run), NOT pushed.**
-First pipeline migrated off SerpWow. Built with Ponytail: one new client file, **no new env
-var**, no new dependency, no new endpoint, no new UI component (the existing `costSection`
+First pipeline migrated off SerpWow. Built with Ponytail: one new client file, **one new env var**
+(`SCRAPEDO_CONCURRENCY`), no new dependency, no new endpoint, no new UI component (the existing `costSection`
 turned out to be already parameterized), and one dependency plus two debug routes *deleted*.
 
 ### What changed and why
@@ -191,6 +191,45 @@ was in the 502 **body**: `{"error": "no results"}`.
   `types`, 1 request / 10 credits, `serpwow_cost_usd=None`; and the 12 previously-502 rows
   replayed as `no_results=True`, 1 attempt, 0 credits, no error.
 
+### Throughput / concurrency pass (same session)
+
+Investigated "can we use scrape.do's 100 concurrent calls". **The provider was never the
+bottleneck — `state.json` was.** `update_row_state` rewrites the WHOLE state file per row
+under a per-upload lock, so throughput was capped by state size no matter what
+`WORKER_CONCURRENCY` was set to. Measured ceiling: **41 rows/s at 100 rows, 4.3 at 1k,
+0.4 at 10k** — raising concurrency to 100 would have left ~96 sockets idle behind the lock.
+
+- **Dropped the duplicated provider payload from persisted state** (the fix). gmaps'
+  `context.gmaps.raw_response` was **36.6 of every 39.2 KB**, and gsearch inlined one per
+  phase (up to 5/row). Both are already persisted as the row's `serpwow_response/`
+  artifact and nothing reads them back from state; the in-process consumers (scoring, the
+  Gemini selector) use the live object. Row: **39.2 KB → 2.2 KB (94% smaller)**. Ceiling at
+  1k rows: **4.3 → ~76 rows/s**, comfortably above the ~28 rows/s that 100 concurrency
+  needs. **Good to roughly 2.7k rows**; past that the per-upload lock binds again.
+- **`_write_json` is now atomic** (temp + `os.replace`) and runs via `asyncio.to_thread`.
+  It was a bare `path.write_text`, so a crash mid-write truncated `state.json` and lost
+  **the whole run's** progress, not one row's — and at 1k rows it blocked the event loop
+  for 115 ms per row while other rows' HTTP waited.
+- **`common/provider_limits.scrapedo_slot()`** — ONE scrape.do concurrency gate
+  (`SCRAPEDO_CONCURRENCY`, default 100) shared by **gmaps and AI Mode**, since the cap is
+  per *account* and both run in the same worker process. Mirrors the pre-existing
+  `search_fetch_semaphore` for SerpWow. It's a concurrency cap only — if scrape.do also
+  enforces requests/second (suspected: 429s were seen at only 12 concurrent), a token
+  bucket goes inside that one helper and no call site changes. User is confirming the
+  plan's actual limits.
+- **Corrected an earlier wrong claim of mine:** raising `WORKER_CONCURRENCY` does NOT
+  expose gsearch to ~500 concurrent SerpWow calls — `SEARCH_FETCH_CONCURRENCY=5` already
+  gates SerpWow globally. So the two-dial model (worker slots vs per-provider caps) was
+  already half-built; only the scrape.do half was missing.
+- **`scrapedo_billed_empty`** — counts HTTP **200s that returned zero results**, i.e.
+  credits spent for no data (the scrape.do refund claim). Deliberately distinct from the
+  free 502 "no results". Flows row → `cost_breakdown` → `report.json` → `run.log`.
+  **Measured on the 100-row run: 0 refundable rows** (66 found, 22 billed-with-results-but-
+  no-website, 12 free 502s) — so gmaps is not leaking money. The `scrapedo_empty_requests/`
+  folder in the repo root is **AI Mode**, not gmaps: that's where the real empty-response
+  spend is, and it's untouched by this work.
+- **Deleted the dead `redis` dependency** (imported nowhere), alongside `aiohttp` earlier.
+
 ### Still to do
 
 1. **Full-stack live smoke** — the only thing not yet exercised (needs RabbitMQ + worker, and
@@ -208,12 +247,25 @@ was in the 502 **body**: `{"error": "no results"}`.
 2. **Watch the 429s at scale.** The 50-row run lost 27 rows to rate limiting. The backoff is
    now 5/10/20s, but if it persists the lever is `WORKER_CONCURRENCY` (default 4) against the
    scrape.do plan's concurrency cap — **not** more retries.
-3. Decide whether gsearch / relationship / firmographics follow (they still call
+3. **Raise `WORKER_CONCURRENCY` (currently 12) toward 100 and restart the worker** —
+   consumers are built at startup, so it won't affect an in-flight run. Safe now that
+   both providers are semaphore-gated. Then measure a 1k run.
+4. **500k target needs the state store replaced.** Agreed direction (user decision):
+   gmaps becomes its own small runner reusing AI Mode's *primitives* — `s3_sync`,
+   `StreamingRunReport`, the broker/own-queue pattern, `status.json` O(1) counters,
+   file-presence-as-state — but NOT AI Mode's `ModeConfig`/LLM-cleanup flow, which
+   assumes a prompt-driven pipeline gmaps doesn't have. Design notes: message carries a
+   BATCH of ~20 rows (500k rows → 25k messages, not 500k) but files are **per row**,
+   since Maps search is one company per query — that's the one real divergence from AI
+   Mode's 1:1 batch:file model. Also needs a cap on `report.json`'s per-row array
+   (AI Mode caps entities at 50k; SerpWow's is unbounded) and sharded row directories
+   (500k files in one dir/S3 prefix is a slow LIST).
+5. Decide whether gsearch / relationship / firmographics follow (they still call
    `api.serpwow.com` via `run_serpwow_search` / `codetails.fetch_serpwow`). Naming decision
    taken: rename `serpwow_*` → `scrapedo_*` per pipeline as it migrates, package rename
    (`app/services/serpwow/`, `serpwow_reporting.py`, the `serpwow_summary` `/status` field,
    the `serpwow_response/` S3 prefix) **last**, once nothing is on SerpWow.
-4. The pre-existing 2026-07-23 relationship work in this tree is still uncommitted and
+6. The pre-existing 2026-07-23 relationship work in this tree is still uncommitted and
    unverified — see the session below. This gmaps work is independent of it, so a commit
    should separate the two.
 

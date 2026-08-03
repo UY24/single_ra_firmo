@@ -5,7 +5,6 @@ jinja2
 boto3
 pika
 aio-pika
-redis
 python-dotenv
 pyyaml
 duckdb

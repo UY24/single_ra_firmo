@@ -27,6 +27,7 @@ from app.services.common.env import (
     get_float_env as _get_float_env,
     get_int_env as _get_int_env,
 )
+from app.services.common.provider_limits import scrapedo_slot
 from app.services.serpwow.outcomes import categorize_http_error
 
 SCRAPEDO_MAPS_SEARCH_URL = "https://api.scrape.do/plugin/google/maps/search"
@@ -135,6 +136,7 @@ def _envelope(
     error: Optional[str] = None,
     error_category: Optional[str] = None,
     no_results: bool = False,
+    billed_empty: bool = False,
 ) -> dict[str, Any]:
     """The envelope gmaps_scoring / run_gmaps_from_module expect.
 
@@ -157,8 +159,11 @@ def _envelope(
         "total_places": len(results),
         "results": results,
         # True when Google has no Maps listing at all (scrape.do 502 "no results").
-        # A business not-found, NOT an error — see NO_RESULT_MARKERS.
+        # A business not-found, NOT an error — see NO_RESULT_MARKERS. Costs nothing.
         "no_results": no_results,
+        # True when a BILLED (HTTP 200) call came back with zero results — credits
+        # spent for no data, i.e. the refund-claim case. `no_results` is the free one.
+        "billed_empty": billed_empty,
         "error": error,
         "error_category": error_category,
     }
@@ -192,7 +197,10 @@ async def process_gmaps_query(
         response = None
         try:
             request_count += 1
-            response = await client.get(SCRAPEDO_MAPS_SEARCH_URL, params=params)
+            # Account-wide scrape.do gate, shared with AI Mode. Wraps only the HTTP
+            # call so a slot is never held across backoff sleeps.
+            async with scrapedo_slot():
+                response = await client.get(SCRAPEDO_MAPS_SEARCH_URL, params=params)
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
@@ -237,12 +245,17 @@ async def process_gmaps_query(
             )
 
         local_results = payload.get("local_results") if isinstance(payload, dict) else None
-        # Zero results is a legitimate not-found, not an error.
+        results = local_results if isinstance(local_results, list) else []
+        # Zero results is a legitimate not-found, not an error — but a 200 IS billed, so
+        # an empty one is money spent for nothing and worth counting separately (it is
+        # the case to raise with scrape.do for a credit refund). Distinct from the 502
+        # "no results" path above, which costs nothing.
         return _envelope(
             q, gl,
             request_count=request_count,
             successful_requests=1,
-            results=local_results if isinstance(local_results, list) else [],
+            results=results,
+            billed_empty=not results,
         )
 
     # Unreachable: the loop either returns or exhausts into the error path above.

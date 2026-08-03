@@ -70,12 +70,24 @@ class SuccessTests(unittest.TestCase):
         self.assertEqual(env["credits"], client.CREDITS_PER_CALL)
         self.assertEqual(env["credits"], 10)
 
-    def test_zero_results_is_not_an_error(self) -> None:
+    def test_zero_results_is_not_an_error_but_is_flagged_as_billed_empty(self) -> None:
         env = _run(lambda request: httpx.Response(200, json={"local_results": []}))
         self.assertEqual(env["results"], [])
         self.assertIsNone(env["error"])
-        # Still a billed call.
+        # Still a billed call — and that's exactly why it's worth flagging: 10 credits
+        # spent for no data is the case to claim back from scrape.do.
         self.assertEqual(env["credits"], 10)
+        self.assertTrue(env["billed_empty"])
+
+    def test_a_result_bearing_response_is_not_billed_empty(self) -> None:
+        self.assertFalse(_run(lambda r: httpx.Response(200, json=PAYLOAD))["billed_empty"])
+
+    def test_free_502_no_results_is_not_billed_empty(self) -> None:
+        # Zero credits spent, so there is nothing to claim back.
+        env = _run(lambda r: httpx.Response(502, json={"error": "no results"}))
+        self.assertTrue(env["no_results"])
+        self.assertFalse(env["billed_empty"])
+        self.assertEqual(env["credits"], 0)
 
     def test_scorer_skips_the_website_less_entry(self) -> None:
         env = _run(lambda request: httpx.Response(200, json=PAYLOAD))

@@ -168,6 +168,35 @@ class TestGmapsProviderErrorIsAnError(unittest.TestCase):
         self.assertEqual(cb["scrapedo_credits"], 0)
         self.assertEqual(cb["scrapedo_failed_requests"], 1)
 
+    def test_raw_payload_is_not_duplicated_into_persisted_state(self):
+        """state.json is rewritten IN FULL on every row update, so inlining each row's
+        provider payload made it the dominant cost of a run (0.85MB at 100 rows, and
+        quadratic from there). The payload already lives in serpwow_response/."""
+        ctx = _run().context
+        self.assertNotIn("raw_response", ctx["gmaps"])
+        # The useful fields survive.
+        for key in ("query", "official_website", "credits", "request_count"):
+            self.assertIn(key, ctx["gmaps"])
+
+    def test_billed_empty_is_counted_separately_from_free_no_results(self):
+        """HTTP 200 with zero results IS billed -> credits spent for no data, which is
+        the scrape.do refund case. A 502 "no results" is free and must not count."""
+        empty = dict(_gmaps_ctx(website=None))
+        empty.update(billed_empty=True, credits=10, successful_requests=1,
+                     failed_requests=0, raw_response={"results": []})
+        self.assertEqual(_run(ctx=empty).context["cost_breakdown"]["scrapedo_billed_empty"], 1)
+
+        free = dict(_gmaps_ctx(website=None))
+        free.update(no_results=True, billed_empty=False, credits=0,
+                    successful_requests=0, failed_requests=1,
+                    raw_response={"results": []})
+        cb = _run(ctx=free).context["cost_breakdown"]
+        self.assertEqual(cb["scrapedo_billed_empty"], 0)
+        self.assertEqual(cb["scrapedo_credits"], 0)
+
+    def test_normal_row_reports_no_billed_empty(self):
+        self.assertEqual(_run().context["cost_breakdown"]["scrapedo_billed_empty"], 0)
+
     def test_call_accounting_reconciles(self):
         cb = _run().context["cost_breakdown"]
         self.assertEqual(

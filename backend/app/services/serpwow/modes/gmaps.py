@@ -90,6 +90,9 @@ async def execute_gmaps_lookup(
     gmaps_requests_failed = int(gmaps_context.get("failed_requests", 0) or 0)
     gmaps_credits_used = int(gmaps_context.get("credits", 0) or 0)
     gmaps_no_results = bool(gmaps_context.get("no_results"))
+    # Billed (HTTP 200) but zero results: credits spent for no data. Tracked separately
+    # from no_results (which is free) because it's the scrape.do refund-claim case.
+    gmaps_billed_empty = bool(gmaps_context.get("billed_empty"))
     if gmaps_no_results:
         summary = "No Google Maps listing exists for this company."
 
@@ -150,7 +153,14 @@ async def execute_gmaps_lookup(
         "used_proxy": False,
         "blocked": False,
         "error": gmaps_context.get("error"),
-        "gmaps": gmaps_context,
+        # WITHOUT raw_response: that payload is already persisted verbatim as this
+        # row's serpwow_response/ artifact (+ S3 mirror), and nothing reads it back
+        # from state. Keeping it made each row ~39KB instead of ~2.6KB, and since
+        # update_row_state rewrites the WHOLE state file per row, that duplication
+        # was the dominant cost of a run (0.85MB state.json at only 100 rows).
+        # The in-process consumers (scoring above, the Gemini selector) use the live
+        # object, not this copy.
+        "gmaps": {k: v for k, v in gmaps_context.items() if k != "raw_response"},
         # One "phase" for the single maps call. This is the structure the row-outcome
         # taxonomy reads (outcomes._phase_stats), so a scrape.do failure classifies as
         # outcome=error/source=scrapedo instead of silently becoming a business
@@ -167,6 +177,7 @@ async def execute_gmaps_lookup(
             "error_source": _outcomes.SRC_SCRAPEDO,
             "candidate_count": len(candidates),
             "no_results": gmaps_no_results,
+            "billed_empty": gmaps_billed_empty,
         }],
         # No serpwow_* keys: gmaps left SerpWow in 2026-08 and scrape.do bills credits,
         # not per-search USD. build_summary routes on the scrapedo_* keys and skips
@@ -178,6 +189,7 @@ async def execute_gmaps_lookup(
             "scrapedo_requests": gmaps_requests_used,
             "scrapedo_successful_requests": gmaps_requests_ok,
             "scrapedo_failed_requests": gmaps_requests_failed,
+            "scrapedo_billed_empty": 1 if gmaps_billed_empty else 0,
             "scrapedo_credits": gmaps_credits_used,
             "gemini_cost_usd": gemini_cost_usd,
             "total_cost_usd": gemini_cost_usd,

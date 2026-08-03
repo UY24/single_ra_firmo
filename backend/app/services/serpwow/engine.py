@@ -500,7 +500,19 @@ def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: 
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+    """Write JSON ATOMICALLY (temp file + os.replace).
+
+    A plain write_text leaves a truncated file if the process dies mid-write, and for
+    state.json that loses the WHOLE run's progress, not one row. os.replace is atomic
+    within a filesystem, so a reader sees either the old file or the new one.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _company_slug(value: str) -> str:
@@ -837,9 +849,11 @@ def _list_local_state_files_sync(limit: int) -> list[Path]:
 
 
 async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any]) -> None:
-    # 1. Always write to the local filesystem first for immediate local consistency
+    # 1. Always write to the local filesystem first for immediate local consistency.
+    #    Off the event loop: this is the hot path (once per row per update) and a large
+    #    state.json blocks every other in-flight row's HTTP while it serializes.
     local_path = _state_file(upload_id) if name == "state" else _output_file(upload_id)
-    _write_json(local_path, data)
+    await asyncio.to_thread(_write_json, local_path, data)
 
     # 2. If S3 is enabled, schedule S3 write in the background
     use_s3 = bool(os.getenv("S3_BUCKET"))

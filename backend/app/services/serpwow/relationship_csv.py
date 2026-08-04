@@ -66,7 +66,6 @@ def parse_relationship_csv(raw: bytes) -> dict:
     country_col = _find_column(normalized, _COUNTRY_ALIASES)
 
     original_rows: list[dict[str, str]] = []
-    blank_row_indices: list[int] = []
     pairs: list[dict] = []
 
     # One row in → one row out: no (X, Y) dedup. Each row becomes its own "pair"
@@ -102,7 +101,9 @@ def parse_relationship_csv(raw: bytes) -> dict:
     return {
         "header": header,
         "original_rows": original_rows,
-        "blank_row_indices": blank_row_indices,
+        # NOTE there is no "blank rows" list and no empty-pairs case: a blank required
+        # value raises above, and a header-only CSV raises too, so `pairs` is non-empty
+        # whenever this returns. Callers need no guard for it.
         "pairs": pairs,
         # Which actual CSV headers matched each logical field (None when the
         # optional column is absent) — surfaced by the upload-preview endpoint.

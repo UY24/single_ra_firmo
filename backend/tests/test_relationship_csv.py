@@ -19,7 +19,6 @@ class TestParseRelationshipCSV(unittest.TestCase):
         parsed = parse_relationship_csv(CSV_OK)
         self.assertEqual(parsed["header"][0], "Input_URL")
         self.assertEqual(len(parsed["original_rows"]), 4)
-        self.assertEqual(parsed["blank_row_indices"], [])
         # No (X, Y) dedup: 4 rows in → 4 pairs out, each with its own single index.
         self.assertEqual(len(parsed["pairs"]), 4)
         for i, p in enumerate(parsed["pairs"]):

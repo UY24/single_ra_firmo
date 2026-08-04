@@ -12,7 +12,7 @@ Last updated: 2026-08-04. Read this first if you're picking up this repo. Durabl
   `3a3ed0c`) — the "uncommitted, two bodies of work" note that used to live here is stale.
   NOT pushed. See the 2026-08-04 session below for the follow-on: `relationship` itself
   has since migrated off SerpWow onto scrape.do Google AI Mode.
-- Full suite: **700/700** passing, plus 6/6 `.mjs` DOM contracts.
+- Full suite: **701/701** passing, plus 6/6 `.mjs` DOM contracts.
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -49,7 +49,7 @@ docker compose up -d rabbitmq                        # broker + mgmt UI on 15672
 python worker.py                                     # from repo root; ONE process only
 
 # Tests (offline, unittest — NOT pytest; -t . is mandatory)
-cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 700 tests
+cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 701 tests
 
 # UI contract tests are SEPARATE and not part of the unittest run — run them too after
 # touching any static/js file, or JS regressions ship silently.
@@ -82,7 +82,7 @@ now, because the 500k plan builds gmaps on AI Mode's primitives.
 
 ## Latest completed session — 2026-08-04 (relationship: SerpWow → scrape.do Google AI Mode migration)
 
-**Status: 700/700 offline tests + 6/6 `.mjs` DOM contracts passing on `relationship-scrapedo`.
+**Status: 701/701 offline tests + 6/6 `.mjs` DOM contracts passing on `relationship-scrapedo`.
 NOT yet live-verified with a real run — see the checklist below before trusting this at
 scale.**
 

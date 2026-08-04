@@ -2,7 +2,9 @@
 """Search-query construction for SerpWow modes (primary/fallback + phase queries)."""
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 from app.services.serpwow.geo import _country_to_gl
@@ -554,43 +556,42 @@ def build_selected_phase_queries(
     return attempt_queries
 
 
-def build_relationship_phase_queries(
+_RELATIONSHIP_PROMPT_CACHE: Optional[str] = None
+
+
+def load_relationship_prompt() -> str:
+    """The single AI Mode search prompt, read once per process.
+
+    Lives in app/prompts/ so it can be tuned without a code change;
+    RELATIONSHIP_SEARCH_PROMPT_FILE points at an alternative for A/B runs.
+    """
+    global _RELATIONSHIP_PROMPT_CACHE
+    if _RELATIONSHIP_PROMPT_CACHE is None:
+        name = os.getenv("RELATIONSHIP_SEARCH_PROMPT_FILE",
+                         "").strip() or "relationship_search.txt"
+        path = Path(__file__).resolve().parents[2] / "prompts" / name
+        _RELATIONSHIP_PROMPT_CACHE = path.read_text(encoding="utf-8").strip()
+    return _RELATIONSHIP_PROMPT_CACHE
+
+
+def build_relationship_search_query(
     x_name: str,
     y_name: str,
     x_domain: str,
-) -> list[tuple[str, str]]:
-    """Two parallel AI-Overview prose questions for one relationship pair.
+    input_url: str,
+    city: str,
+    country: str,
+) -> str:
+    """Fill the prompt for ONE row. Replaces the three phase queries.
 
-    Sent to SerpWow `engine=google` with `include_ai_overview=true`. These are PROSE
-    questions (not keyword queries) because the goal is for the AI Overview to *answer*
-    the relationship and type out Y's website — the typed URL is extracted from the
-    overview text (and `ai_overview_sources`) as a candidate. Precision (confirmed vs
-    unclear vs not_confirmed) is left to the LLM gate. X is identified by name + domain
-    (from Input_URL, disambiguates); Y is used verbatim (OCR noise kept). Two phrasings
-    run in parallel to raise the AI-Overview hit rate (it triggers for some wordings
-    and not others): q1 leads with the relationship, q2 leads with Y's identity.
+    Company Y is passed VERBATIM including OCR noise — that noise is meaningful input
+    the model is explicitly asked to resolve, not something to clean up.
     """
-    x = str(x_name or "").strip()
-    y = str(y_name or "").strip()
-    xd = str(x_domain or "").strip()
-    # Both are required: Y is the target; X is what the gate verifies the relationship
-    # against — the executor short-circuits a blank X (REL_ERROR_NO_X) before the LLM.
-    if not (x and y):
-        return []
-    x_ident = f"{x} ({xd})" if xd else x
-    return [
-        (
-            "phase1_relationship_and_url",
-            f"What is the business or financial relationship, if any, between "
-            f'{x_ident} and "{y}"? Describe how they are connected. If "{y}" is a '
-            f"company, include its official company website written as a complete "
-            f"plain-text URL beginning with https:// (do not provide it as a hyperlink).",
-        ),
-        (
-            "phase2_identity_and_relationship",
-            f'Who is "{y}"? If "{y}" is a company, include its official company '
-            f"website written as a complete plain-text URL beginning with https:// "
-            f"(do not provide it as a hyperlink). Also explain its business or "
-            f"financial relationship, if any, with {x_ident}.",
-        ),
-    ]
+    return load_relationship_prompt().format(
+        x_name=(x_name or "").strip(),
+        y_name=(y_name or "").strip(),
+        x_domain=(x_domain or "").strip() or "an unknown domain",
+        input_url=(input_url or "").strip() or "not provided",
+        city=(city or "").strip() or "an unspecified city",
+        country=(country or "").strip() or "an unspecified country",
+    )

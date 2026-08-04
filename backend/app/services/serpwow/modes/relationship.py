@@ -37,7 +37,6 @@ from app.services.serpwow.gemini_llm import (
     update_relationship_block,
 )
 from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
-from app.services.serpwow.query_builders import build_relationship_phase_queries
 from app.services.serpwow.schemas import CrawlResponse
 from app.services.serpwow.serpwow_client import (
     extract_ai_overview_text as _overview_text,
@@ -78,6 +77,41 @@ def _extract_https_urls(text: str) -> list[str]:
     return urls
 
 
+def _build_relationship_phase_queries(
+    x_name: str,
+    y_name: str,
+    x_domain: str,
+) -> list[tuple[str, str]]:
+    """Two parallel AI-Overview prose questions for one relationship pair.
+
+    # rewritten in the scrape.do migration — inlined here (moved out of
+    # query_builders.py) only to keep this module importable until Task 3
+    # replaces this whole file with the AI Mode evidence adapter.
+    """
+    x = str(x_name or "").strip()
+    y = str(y_name or "").strip()
+    xd = str(x_domain or "").strip()
+    if not (x and y):
+        return []
+    x_ident = f"{x} ({xd})" if xd else x
+    return [
+        (
+            "phase1_relationship_and_url",
+            f"What is the business or financial relationship, if any, between "
+            f'{x_ident} and "{y}"? Describe how they are connected. If "{y}" is a '
+            f"company, include its official company website written as a complete "
+            f"plain-text URL beginning with https:// (do not provide it as a hyperlink).",
+        ),
+        (
+            "phase2_identity_and_relationship",
+            f'Who is "{y}"? If "{y}" is a company, include its official company '
+            f"website written as a complete plain-text URL beginning with https:// "
+            f"(do not provide it as a hyperlink). Also explain its business or "
+            f"financial relationship, if any, with {x_ident}.",
+        ),
+    ]
+
+
 async def execute_relationship_lookup_for_worker(
     y_name: str,
     x_name: str,
@@ -88,7 +122,7 @@ async def execute_relationship_lookup_for_worker(
     debug_row_index: Optional[int] = None,
 ) -> tuple[CrawlResponse, str]:
     x_domain = x_domain_from_input_url(input_url)
-    queries = build_relationship_phase_queries(
+    queries = _build_relationship_phase_queries(
         x_name=x_name, y_name=y_name, x_domain=x_domain)
 
     timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)

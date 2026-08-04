@@ -1,6 +1,6 @@
 // backend/app/static/js/new_run.js - full-width "start a new run" workflow.
 import { api, el, fmtNum } from "./api.js";
-import { errorCard, head, cell } from "./ui.js";
+import { errorCard, head, cell, runHref } from "./ui.js";
 
 const _AI_COLS = [
   { name: "company_name", req: true,  hint: "company, name, entity_name, entity, organization" },
@@ -397,7 +397,7 @@ export async function render(root) {
         el("p", { class: "text-sm font-semibold text-emerald-600" },
           `Run started (${info.run_id ?? info.upload_id ?? "ok"}). Redirecting...`));
       const target = state.pipeline.ai
-        ? `#/runs/${encodeURIComponent(info.run_id)}`
+        ? runHref(info.run_id, "ai")
         : "#/runs";
       setTimeout(() => { window.location.hash = target; }, 700);
     } catch (e) {

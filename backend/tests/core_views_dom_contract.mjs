@@ -166,7 +166,7 @@ async function dashboardContract() {
   assert(summary.getAttribute("href") === "#/runs?company_id=co%20id%2F%26", "company summary href is not encoded");
   assert(byClass(summary, "company-outcome-rate")[0]?.textContent.startsWith("—"), "zero outcomes must render an em dash rate");
   assert(!byTag(root, "button").some((button) => hasDescendant(button, "dl")), "a button must not wrap company metrics");
-  const runLink = linkByHref(root, "#/runs/run%20id%2F1%3F");
+  const runLink = linkByHref(root, "#/runs/run%20id%2F1%3F?engine=serpwow");
   assert(runLink, "dashboard run link is not a real encoded anchor");
   assert(runLink.getAttribute("aria-label")?.includes("Zero Co"), "dashboard run link needs a helpful aria-label");
 }
@@ -223,7 +223,7 @@ async function runsContract() {
   assert(pipelineSelect.value === "gmaps", "pipeline filter did not hydrate from query");
   assert(statusSelect.value === "completed", "status filter did not hydrate from query");
   assert(linkByHref(root, "#/runs")?.textContent === "Clear", "Clear anchor missing");
-  const runLink = linkByHref(root, "#/runs/run%20%2F2%3F");
+  const runLink = linkByHref(root, "#/runs/run%20%2F2%3F?engine=serpwow");
   assert(runLink, "runs table link is not a real encoded anchor");
   assert(runLink.getAttribute("aria-label")?.includes("Acme"), "runs table link needs a helpful aria-label");
 

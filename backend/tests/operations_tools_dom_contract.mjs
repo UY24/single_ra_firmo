@@ -174,7 +174,7 @@ async function terminalAndActionContract() {
     "completed_with_errors batch should enable JSON download");
   assert(!linkByHref(root, "/uploads/gmaps-running/output?download=true"),
     "gmaps running batch must not enable downloads");
-  assert(linkByHref(root, "#/runs/up%20id%2F1%3F"),
+  assert(linkByHref(root, "#/runs/up%20id%2F1%3F?engine=serpwow"),
     `batch upload ID needs a real run link: ${byTag(root, "a").map((link) => link.getAttribute("href")).join(",")}`);
   assert(byText(root, "span", "Batch Cancelled"), "cancelled label missing");
   const partialLabel = byText(root, "span", "Batch Completed With Errors");

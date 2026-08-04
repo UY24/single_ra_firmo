@@ -88,6 +88,89 @@ class OneKnobTests(unittest.TestCase):
             self.assertEqual(provider_limits.scrapedo_limit(), 100)
 
 
+class StateMirrorThrottleTests(unittest.TestCase):
+    """state.json is re-PUT to the SAME S3 key on every row update and grows with the
+    run — a 100-row run uploaded ~84MB of near-identical copies, saturating uplink and
+    hot-spotting one key (the documented SlowDown cause)."""
+
+    def _write(self, upload_id, status, interval="5", tmp=None):
+        """Run write_upload_artifact; return True if an S3 mirror was scheduled."""
+        from app.services.serpwow import engine
+
+        scheduled = []
+        state = {"company_name": "Acme", "pipeline": "gmaps", "status": status}
+        with mock.patch.object(engine, "_state_file",
+                               return_value=Path(tmp) / f"{upload_id}.json"), \
+             mock.patch.object(engine, "_find_upload_dir", return_value=Path(tmp)), \
+             mock.patch.object(engine, "_write_json"), \
+             mock.patch.object(engine, "_write_json_to_s3_sync"), \
+             mock.patch.object(engine.asyncio, "create_task",
+                               side_effect=lambda coro: (scheduled.append(1),
+                                                         coro.close())[0]), \
+             mock.patch.dict(os.environ, {"S3_BUCKET": "b",
+                                          "SERPWOW_S3_STATE_FLUSH_SEC": interval}):
+            asyncio.run(engine.write_upload_artifact(upload_id, "state", state))
+        return bool(scheduled)
+
+    def setUp(self) -> None:
+        from app.services.serpwow import engine
+        engine._last_state_s3_flush.clear()
+
+    def test_rapid_mid_run_updates_are_coalesced(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            first = self._write("u-throttle", "processing", tmp=d)
+            second = self._write("u-throttle", "processing", tmp=d)
+            third = self._write("u-throttle", "processing", tmp=d)
+        self.assertTrue(first, "the first update must mirror")
+        self.assertFalse(second, "a second update within the interval must be skipped")
+        self.assertFalse(third)
+
+    def test_terminal_state_always_mirrors(self) -> None:
+        """Non-negotiable: whatever we skip mid-run, the FINAL state must reach S3 or a
+        cold-start resume would read a stale run."""
+        with tempfile.TemporaryDirectory() as d:
+            self._write("u-term", "processing", tmp=d)          # consumes the window
+            self.assertTrue(self._write("u-term", "completed", tmp=d))
+            self.assertTrue(self._write("u-term", "completed_with_errors", tmp=d))
+            self.assertTrue(self._write("u-term", "failed", tmp=d))
+
+    def test_terminal_clears_the_tracking_entry(self) -> None:
+        from app.services.serpwow import engine
+
+        with tempfile.TemporaryDirectory() as d:
+            self._write("u-clean", "processing", tmp=d)
+            self.assertIn("u-clean", engine._last_state_s3_flush)
+            self._write("u-clean", "completed", tmp=d)
+        self.assertNotIn("u-clean", engine._last_state_s3_flush,
+                         "must not leak an entry per run forever")
+
+    def test_zero_interval_disables_throttling(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._write("u-off", "processing", interval="0", tmp=d))
+            self.assertTrue(self._write("u-off", "processing", interval="0", tmp=d))
+
+    def test_local_disk_is_always_written_even_when_s3_is_skipped(self) -> None:
+        """The throttle must only affect the S3 copy — local disk stays the source of
+        truth and every row's result must survive a crash."""
+        from app.services.serpwow import engine
+
+        with tempfile.TemporaryDirectory() as d:
+            writes = []
+            state = {"company_name": "Acme", "pipeline": "gmaps", "status": "processing"}
+            with mock.patch.object(engine, "_state_file", return_value=Path(d) / "s.json"), \
+                 mock.patch.object(engine, "_find_upload_dir", return_value=Path(d)), \
+                 mock.patch.object(engine, "_write_json",
+                                   side_effect=lambda *a, **k: writes.append(1)), \
+                 mock.patch.object(engine, "_write_json_to_s3_sync"), \
+                 mock.patch.object(engine.asyncio, "create_task",
+                                   side_effect=lambda c: c.close()), \
+                 mock.patch.dict(os.environ, {"S3_BUCKET": "b",
+                                              "SERPWOW_S3_STATE_FLUSH_SEC": "9999"}):
+                for _ in range(3):
+                    asyncio.run(engine.write_upload_artifact("u-local", "state", state))
+            self.assertEqual(len(writes), 3, "every update must hit local disk")
+
+
 class AtomicWriteTests(unittest.TestCase):
     def test_write_is_atomic_and_leaves_no_temp_file(self) -> None:
         from app.services.serpwow.engine import _write_json

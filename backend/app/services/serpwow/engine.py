@@ -23,6 +23,7 @@ import io
 import json
 import os
 import re
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -750,7 +751,9 @@ def get_s3_client():
             config=BotoConfig(
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
-                retries={"max_attempts": max(1, s3_retries), "mode": "standard"},
+                # "adaptive" adds AWS's client-side rate limiter, which is their documented answer to
+                # S3 SlowDown (HTTP 503): it backs off proactively instead of just retrying harder.
+                retries={"max_attempts": max(1, s3_retries), "mode": "adaptive"},
                 max_pool_connections=100,
             ),
         )
@@ -848,6 +851,15 @@ def _list_local_state_files_sync(limit: int) -> list[Path]:
     return state_files[:limit]
 
 
+_TERMINAL_STATUSES = frozenset({"completed", "completed_with_errors", "failed"})
+# upload_id -> monotonic time of the last state.json S3 mirror (see write_upload_artifact).
+_last_state_s3_flush: dict[str, float] = {}
+
+
+def _is_terminal_state_status(data: dict[str, Any]) -> bool:
+    return str(data.get("status") or "") in _TERMINAL_STATUSES
+
+
 async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any]) -> None:
     # 1. Always write to the local filesystem first for immediate local consistency.
     #    Off the event loop: this is the hot path (once per row per update) and a large
@@ -866,6 +878,22 @@ async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any])
             else _output_s3_key(upload_id, company_name, pipeline)
         )
         _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
+
+        # state.json is re-PUT to the SAME key on every row update, and it grows with the
+        # run — a 100-row run uploaded ~84MB of near-identical copies (2 per row x 420KB),
+        # which saturates uplink and hot-spots one S3 key (the documented SlowDown cause).
+        # Throttle it: local disk stays the source of truth and is written every time, the
+        # S3 copy lags at most SERPWOW_S3_STATE_FLUSH_SEC. Terminal snapshots ALWAYS
+        # mirror, so the final state is never missing from S3 — and rows are idempotent,
+        # so a cold-start resume from a slightly stale mirror only re-does safe work.
+        if name == "state" and not _is_terminal_state_status(data):
+            interval = _get_float_env("SERPWOW_S3_STATE_FLUSH_SEC", 5.0)
+            now = time.monotonic()
+            if (now - _last_state_s3_flush.get(upload_id, 0.0)) < interval:
+                return
+            _last_state_s3_flush[upload_id] = now
+        elif name == "state":
+            _last_state_s3_flush.pop(upload_id, None)   # terminal: stop tracking
 
         async def _write_s3_background():
             max_retries = 5
@@ -3988,6 +4016,13 @@ async def shutdown_event() -> None:
     if gemini_batch_tasks:
         await asyncio.gather(*gemini_batch_tasks.values(), return_exceptions=True)
         gemini_batch_tasks.clear()
+    # Release the gmaps pipeline's pooled scrape.do connections.
+    try:
+        from app.services.serpwow import scrapedo_maps_client
+
+        await scrapedo_maps_client.close_shared_client()
+    except Exception:
+        pass
     await close_rabbitmq()
 
 

@@ -96,6 +96,18 @@ async def execute_gmaps_lookup(
     if gmaps_no_results:
         summary = "No Google Maps listing exists for this company."
 
+    # Split this row's FAILED attempts by what the row ultimately became, so a 502 that
+    # recovered on retry never shows up as an error. The three buckets are mutually
+    # exclusive and sum to gmaps_requests_failed:
+    #   recovered  -> the row succeeded in the end; those attempts were transient
+    #   error      -> the row failed after every retry: the only real errors
+    #   (remainder) -> attempts on a row that ended "no Google listing" (free, expected)
+    gmaps_recovered_requests = gmaps_requests_failed if gmaps_requests_ok else 0
+    gmaps_error_requests = (
+        gmaps_requests_failed
+        if (not gmaps_requests_ok and not gmaps_no_results) else 0
+    )
+
     # Confidence: heuristic by default; LLM when GMAPS_CONFIDENCE_MODE=llm. The LLM
     # path reuses gsearch's selector + context keys so serpwow_reporting/build_summary
     # surface confidence/model/tokens/cost with no reporting changes.
@@ -189,6 +201,9 @@ async def execute_gmaps_lookup(
             "scrapedo_requests": gmaps_requests_used,
             "scrapedo_successful_requests": gmaps_requests_ok,
             "scrapedo_failed_requests": gmaps_requests_failed,
+            "scrapedo_recovered_requests": gmaps_recovered_requests,
+            "scrapedo_error_requests": gmaps_error_requests,
+            "scrapedo_no_results": 1 if gmaps_no_results else 0,
             "scrapedo_billed_empty": 1 if gmaps_billed_empty else 0,
             "scrapedo_credits": gmaps_credits_used,
             "gemini_cost_usd": gemini_cost_usd,

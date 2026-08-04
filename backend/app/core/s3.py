@@ -38,8 +38,10 @@ def get_s3_client():
             config=BotoConfig(
                 connect_timeout=_get_int_env("S3_CONNECT_TIMEOUT_SEC", 15),
                 read_timeout=_get_int_env("S3_READ_TIMEOUT_SEC", 90),
+                # "adaptive" adds AWS's client-side rate limiter, which is their documented answer to
+                # S3 SlowDown (HTTP 503): it backs off proactively instead of just retrying harder.
                 retries={"max_attempts": max(1, _get_int_env("S3_MAX_RETRIES", 3)),
-                         "mode": "standard"},
+                         "mode": "adaptive"},
                 max_pool_connections=100,
             ),
         )

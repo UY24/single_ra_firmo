@@ -27,7 +27,7 @@ from app.services.common.env import (
     get_float_env as _get_float_env,
     get_int_env as _get_int_env,
 )
-from app.services.common.provider_limits import scrapedo_slot
+from app.services.common.provider_limits import scrapedo_limit, scrapedo_slot
 from app.services.serpwow.outcomes import categorize_http_error
 
 SCRAPEDO_MAPS_SEARCH_URL = "https://api.scrape.do/plugin/google/maps/search"
@@ -44,6 +44,49 @@ NO_RESULT_MARKERS = ("no results", "no result found")
 
 # Cap for any single backoff sleep, so a hostile Retry-After can't park a worker.
 MAX_BACKOFF_SECONDS = 30.0
+
+
+# One AsyncClient reused across rows. A fresh client per row costs ~330ms of DNS/TCP/TLS
+# setup on every call (measured) and forfeits keep-alive entirely — at 500k rows that is
+# ~46 hours of pure connection overhead. Keepalive is sized to the concurrency cap so
+# every in-flight slot can hold a warm connection instead of re-handshaking.
+_shared_client: Optional[httpx.AsyncClient] = None
+_shared_client_loop: Any = None
+
+
+async def _get_shared_client() -> httpx.AsyncClient:
+    global _shared_client, _shared_client_loop
+    loop = asyncio.get_running_loop()
+    # Rebuild if closed, or if we somehow moved loops (tests, restarted worker): an
+    # AsyncClient is bound to the loop whose connections it holds.
+    if (_shared_client is None or _shared_client.is_closed
+            or _shared_client_loop is not loop):
+        if _shared_client is not None and not _shared_client.is_closed:
+            try:
+                await _shared_client.aclose()
+            except Exception:
+                pass
+        pool = max(1, scrapedo_limit())
+        _shared_client = httpx.AsyncClient(
+            timeout=_get_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0),
+            limits=httpx.Limits(max_connections=pool,
+                                max_keepalive_connections=pool,
+                                keepalive_expiry=60.0),
+        )
+        _shared_client_loop = loop
+    return _shared_client
+
+
+async def close_shared_client() -> None:
+    """Release the pooled connections (called from the app/worker shutdown hook)."""
+    global _shared_client, _shared_client_loop
+    if _shared_client is not None and not _shared_client.is_closed:
+        try:
+            await _shared_client.aclose()
+        except Exception:
+            pass
+    _shared_client = None
+    _shared_client_loop = None
 
 
 def _redact(value: Any) -> str:
@@ -181,10 +224,11 @@ async def process_gmaps_query(
         return _envelope(
             q, gl, error="SCRAPEDO_TOKEN is not configured", error_category="auth")
 
+    # Reuse the pooled client (keep-alive) unless a caller injects one — tests pass a
+    # MockTransport-backed client. Deliberately NOT an `async with`: the shared client
+    # must outlive this call.
     if client is None:
-        timeout = _get_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0)
-        async with httpx.AsyncClient(timeout=timeout) as owned_client:
-            return await process_gmaps_query(q, gl=gl, client=owned_client)
+        client = await _get_shared_client()
 
     params = {"token": token, "q": q, "hl": "en", "gl": gl}
     # Retries AFTER the first attempt, so 2 => 3 calls per row. Shares AI Mode's
@@ -207,14 +251,11 @@ async def process_gmaps_query(
             status = getattr(response, "status_code", None)
             body_error = _response_error_text(response) if response is not None else ""
 
-            # "502 no results" means Google has no listing — terminal, and a not-found
-            # rather than a failure. Report zero results with no error so the row
-            # classifies as not_found instead of burning 3 more doomed attempts.
-            if _is_no_results(status, body_error):
-                return _envelope(q, gl, request_count=request_count,
-                                 results=[], no_results=True)
-
-            # Everything else 5xx/429/transport is genuinely transient per scrape.do's docs.
+            # 5xx (incl. 502) / 429 / transport are all retried — scrape.do documents them
+            # as transient, and a failed attempt costs no credits, so the only price is
+            # latency. A 502 "no results" IS retried too: the same status is overloaded
+            # for "transiently broken" and "Google has no listing", and we can't tell
+            # which until the retries are spent.
             retryable = (
                 isinstance(exc, httpx.TransportError)
                 or status == 429
@@ -225,6 +266,13 @@ async def process_gmaps_query(
                                if response is not None else None)
                 await asyncio.sleep(_backoff_seconds(attempt, status, retry_after))
                 continue
+
+            # Attempts exhausted. If it is STILL 502 "no results", treat it as a business
+            # not-found (unbilled, no error) rather than a technical failure — retrying
+            # proved it wasn't transient.
+            if _is_no_results(status, body_error):
+                return _envelope(q, gl, request_count=request_count,
+                                 results=[], no_results=True)
             return _envelope(
                 q, gl,
                 request_count=request_count,

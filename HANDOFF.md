@@ -9,7 +9,7 @@ Last updated: 2026-08-03. Read this first if you're picking up this repo. Durabl
 - **Active branch: `migrateserp2scrape`.** Two independent bodies of uncommitted work sit in this tree — keep them separate when committing:
   1. the **2026-08-03 gmaps → scrape.do migration** (this session, see below);
   2. the older **2026-07-23 relationship** failure-diagnostics/retry/UI changes, still **UNCOMMITTED, NOT live-verified, NOT pushed** (they predate this branch, from `relationship-ai-overview` off `aiModeBroker`).
-- Full suite: **621/621** passing (was 564 before this work added 57).
+- Full suite: **633/633** passing (was 564 before this work added 69).
   ```bash
   cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
   ```
@@ -63,7 +63,7 @@ cd backend && ../.venv/bin/python -m unittest discover -s tests -t .
 
 ## Latest completed session — 2026-08-03 (gmaps: SerpWow Places → scrape.do Google Maps)
 
-**Status: UNCOMMITTED, 621/621 offline tests passing, PARTIALLY live-verified (real API
+**Status: UNCOMMITTED, 633/633 offline tests passing, PARTIALLY live-verified (real API
 calls through the real executor; NOT yet a full worker/RabbitMQ run), NOT pushed.**
 First pipeline migrated off SerpWow. Built with Ponytail: one new client file, **one new env var**
 (`SCRAPEDO_CONCURRENCY`), no new dependency, no new endpoint, no new UI component (the existing `costSection`
@@ -244,6 +244,76 @@ under a per-upload lock, so throughput was capped by state size no matter what
   folder in the repo root is **AI Mode**, not gmaps: that's where the real empty-response
   spend is, and it's untouched by this work.
 - **Deleted the dead `redis` dependency** (imported nowhere), alongside `aiohttp` earlier.
+
+### Live-run findings + latency pass (2026-08-04)
+
+Ran 100 gmaps rows at `WORKER_CONCURRENCY=100`: **134s wall, 28.6s median per row**, when
+100 concurrent rows at 3.5s each should be ~4s. Diagnosed from the run's own state.json.
+
+- **scrape.do is the ceiling, and it QUEUES instead of 429ing.** Every row: exactly
+  **1 attempt, zero errors, zero 429s** — so not retries, not our backoff, not rate-limit
+  rejection. But a single call inflated **3.5s → 28.6s** under load, peak in-flight was
+  **60 not 100**, and the delivered rate was **~0.88 calls/s**. Client concurrency above
+  the provider's real capacity becomes latency, not throughput. **Consequence: the 500k
+  estimate is ~158 hours (6.6 days) at the observed rate, NOT the ~4.9h I projected from
+  isolated latency.** Open question for scrape.do: what the Maps endpoint's actual
+  throughput is on this plan — "100 concurrent" plainly isn't 100 served at once.
+  **Do not raise concurrency further**: rows already hit 43s against
+  `SCRAPEDO_TIMEOUT_SECONDS=90`, so more queueing turns slow rows into failed ones.
+  Cheap next experiment: same 100 rows at `WORKER_CONCURRENCY=25`. If wall time is
+  unchanged, 25 is strictly better (same throughput, 4x lower latency, no timeout risk).
+- **Shared pooled `httpx.AsyncClient`** (was one per row): measured **636ms → 233ms** per
+  call, i.e. ~400ms of DNS/TCP/TLS setup per row and ~55 hours across 500k. Keepalive
+  sized to `SCRAPEDO_CONCURRENCY`; closed in `shutdown_event`. Tests assert the pooling
+  holds — every other test injects its own client, so this path had **no coverage** and
+  the first version shipped with a `NameError` that the suite couldn't catch.
+- **`state.json` S3 mirror throttled** to `SERPWOW_S3_STATE_FLUSH_SEC` (5s). It was re-PUT
+  to the same key twice per row: ~**84MB of near-identical uploads per 100-row run**,
+  which is what made my own S3 benchmark time out on uplink. Local disk still written
+  every time; **terminal snapshots always mirror**. boto3 retries now `adaptive` in both
+  clients (AWS's documented answer to SlowDown). Both were already recommended in the
+  2026-07-23 notes below.
+- **`/uploads/ai-mode/...` 404 on every page load** (user-reported) was a deliberate probe:
+  a run id alone doesn't say which engine owns it. Views that know the pipeline now pass
+  `?engine=ai|serpwow` (`ui.runHref`/`engineOf`), so the right endpoint is tried first.
+  The probe **stays as a fallback** — bookmarked/typed URLs carry no hint and a stale hint
+  must still resolve. `render()` was restructured into an ordered candidate list.
+- Measured and **ruled out** as causes: S3 PUT latency (317ms, ~1% of a row), boto3
+  connection pool (already 100), the publish loop (no per-row persist), the per-upload
+  state lock (~5ms at this size).
+
+### 502 retry + error-classification (2026-08-04, per user direction)
+
+- **All 502s are retried now** (3 retries, exponential backoff). Earlier a 502 whose body
+  said `"no results"` was treated as terminal, because replaying 4 such queries returned
+  no-results every time. User's call to retry anyway: 502 can be genuinely transient and
+  failed attempts are unbilled, so the only cost is latency. **Accepted trade: the ~12%
+  of rows with no listing now burn 4 attempts + 7s of backoff each, so runs get ~30%
+  slower.** If a run still reports the same `rows_no_listing` count as before, the retries
+  bought nothing and reverting is worth considering.
+- **A row that recovers after a 502 is NOT an error.** Each row's failed attempts are
+  bucketed by the row's final state: `scrapedo_recovered_requests` (row succeeded — never
+  an error), `scrapedo_error_requests` (row failed after every retry — the only real
+  errors), remainder = attempts on a no-listing row. The UI's failed badge and the
+  `run.log` `errors=` figure both use `scrapedo_error_requests` only.
+  `run.log`: `scrapedo_requests=120 (ok=95 recovered=5 no_listing=12 errors=8) scrapedo_credits=950`.
+
+### Live tuning result: LOWER concurrency is faster
+
+| `WORKER_CONCURRENCY` | wall (100 rows) | per row | throughput |
+|---|---|---|---|
+| 100 | 134s | 28.6s | 0.75 rows/s |
+| **25** | **70.5s** | **10.8s** | **1.42 rows/s** |
+
+Over-subscribing scrape.do inflated per-call latency 2.6x and made the run 1.9x **slower**.
+Confirms the queueing diagnosis. **Keep 25**; test 10 to find the knee. At 1.42 rows/s
+that is ~5.1k rows/hour, so 500k ≈ 98 hours.
+
+Also clarified for deployment: **one worker PROCESS is not one concurrent request.** The
+worker is async — a single process held 60 scrape.do calls in flight. The one-worker rule
+exists because two processes would race on `state.json` (the lock is in-process only), not
+because of throughput. One EC2 running API + worker with high `WORKER_CONCURRENCY` is the
+correct shape.
 
 ### Still to do
 

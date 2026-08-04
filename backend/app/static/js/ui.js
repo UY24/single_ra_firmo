@@ -19,6 +19,22 @@ export function pipelineLabel(pipeline) {
   return PIPELINE_LABELS[key] ?? (key || "Run");
 }
 
+// AI Mode runs and SerpWow-engine runs are served by DIFFERENT status endpoints, and a
+// run id alone doesn't say which. Views that already know the pipeline pass the answer
+// along as ?engine=, so run-detail can skip a probe request on every page load.
+export const AI_MODE_PIPELINES = new Set(["ai_bulk", "ai_deep"]);
+
+export function engineOf(pipeline) {
+  if (pipeline == null || pipeline === "") return null;
+  return AI_MODE_PIPELINES.has(String(pipeline)) ? "ai" : "serpwow";
+}
+
+/** Link to a run. `engine` is an optional hint ("ai" | "serpwow"); omit when unknown. */
+export function runHref(runRef, engine = null) {
+  const base = `#/runs/${encodeURIComponent(runRef)}`;
+  return engine ? `${base}?engine=${engine}` : base;
+}
+
 export function copyText(text) {
   if (!text || text === "-" || text === "—") return;
   navigator.clipboard.writeText(text).catch(() => {});

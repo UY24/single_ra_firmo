@@ -79,6 +79,48 @@ class TestScrapedoCredits(unittest.TestCase):
     SCRAPEDO_ROW = {"scrapedo_requests": 1, "scrapedo_successful_requests": 1,
                     "scrapedo_failed_requests": 0, "scrapedo_credits": 10}
 
+    def test_no_results_is_reported_apart_from_real_errors(self):
+        """Reproduces the observed 100-row run: 88 billed + 12 "no listing" 502s.
+        Those 12 must NOT read as failures — they're unbilled, unretried, and expected."""
+        ok = dict(self.SCRAPEDO_ROW)
+        no_listing = {"scrapedo_requests": 1, "scrapedo_successful_requests": 0,
+                      "scrapedo_failed_requests": 1, "scrapedo_credits": 0,
+                      "scrapedo_no_results": 1, "scrapedo_error_requests": 0}
+        state = _gmaps_state([ok] * 88 + [no_listing] * 12)
+        summary = serpwow_reporting.build_summary(
+            state, serpwow_reporting.state_to_entity_results(state))
+        cost = summary["cost"]
+        self.assertEqual(cost["scrapedo_requests"], 100)       # not 200
+        self.assertEqual(cost["scrapedo_successful_requests"], 88)
+        self.assertEqual(cost["scrapedo_no_results"], 12)
+        self.assertEqual(cost["scrapedo_credits"], 880)        # 10 x 88 only
+        # Real errors = failed minus no-results => zero on a clean run.
+        self.assertEqual(cost["scrapedo_failed_requests"] - cost["scrapedo_no_results"], 0)
+        line = serpwow_reporting._cost_log_line(summary)
+        self.assertIn("ok=88", line)
+        self.assertIn("no_listing=12", line)
+        self.assertIn("errors=0", line)
+        self.assertIn("rows_no_listing=12", line)
+
+    def test_a_row_that_recovered_after_502_is_not_an_error(self):
+        """User requirement: a 502 that succeeded on retry must NOT show as an error.
+        Only a row that failed after every retry counts."""
+        recovered = {"scrapedo_requests": 3, "scrapedo_successful_requests": 1,
+                     "scrapedo_failed_requests": 2, "scrapedo_credits": 10,
+                     "scrapedo_recovered_requests": 2, "scrapedo_error_requests": 0}
+        dead = {"scrapedo_requests": 4, "scrapedo_successful_requests": 0,
+                "scrapedo_failed_requests": 4, "scrapedo_credits": 0,
+                "scrapedo_recovered_requests": 0, "scrapedo_error_requests": 4}
+        state = _gmaps_state([recovered] * 5 + [dead] * 2)
+        cost = serpwow_reporting.build_summary(
+            state, serpwow_reporting.state_to_entity_results(state))["cost"]
+        self.assertEqual(cost["scrapedo_recovered_requests"], 10)  # 5 rows x 2 retries
+        self.assertEqual(cost["scrapedo_error_requests"], 8)       # only the 2 dead rows
+        self.assertEqual(cost["scrapedo_credits"], 50)             # 5 rows billed once each
+        line = serpwow_reporting._cost_log_line({"cost": cost})
+        self.assertIn("recovered=10", line)
+        self.assertIn("errors=8", line)
+
     def test_billed_empty_rows_are_summed_for_the_refund_claim(self):
         ok = dict(self.SCRAPEDO_ROW)
         empty = {"scrapedo_requests": 1, "scrapedo_successful_requests": 1,

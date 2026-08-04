@@ -162,7 +162,10 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
                 scrapedo_requests: int = 0, scrapedo_credits: int = 0,
                 scrapedo_successful_requests: int = 0,
                 scrapedo_failed_requests: int = 0,
-                scrapedo_billed_empty: int = 0) -> dict[str, Any]:
+                scrapedo_billed_empty: int = 0,
+                scrapedo_no_results: int = 0,
+                scrapedo_recovered_requests: int = 0,
+                scrapedo_error_requests: int = 0) -> dict[str, Any]:
     """SerpWow is per-search USD; scrape.do is credits (10 per successful call) with no
     USD figure. Both key sets are always present so a run whose pipeline has migrated
     and a pre-migration run of the same pipeline each render from their own fields.
@@ -186,6 +189,14 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
         "scrapedo_failed_requests": scrapedo_failed_requests,
         # Billed HTTP 200s that returned zero results: credits spent for no data, i.e.
         # the refund claim to raise with scrape.do. Not the same as a free 502.
+        # Non-200s that are NOT errors: Google simply has no Maps listing. Unbilled,
+        # not retried, and reported apart from real failures so a clean run does not
+        # look like it had 12 failures.
+        "scrapedo_no_results": scrapedo_no_results,
+        # Failed attempts split by what the ROW became: a 502 that recovered on retry
+        # is not an error, only a row that failed after every retry is.
+        "scrapedo_recovered_requests": scrapedo_recovered_requests,
+        "scrapedo_error_requests": scrapedo_error_requests,
         "scrapedo_billed_empty": scrapedo_billed_empty,
         "scrapedo_credits": scrapedo_credits,
         "total_usd": round(llm_usd + serpwow_usd, 6),
@@ -199,10 +210,17 @@ def _cost_log_line(summary: dict[str, Any]) -> str:
     line = (f"# cost: llm_usd={cost.get('llm_usd')} serpwow_usd={cost.get('serpwow_usd')} "
             f"total_usd={cost.get('total_usd')} serpwow_searches={cost.get('serpwow_searches')}")
     if cost.get("scrapedo_requests") or cost.get("scrapedo_credits"):
+        failed = int(cost.get("scrapedo_failed_requests") or 0)
+        recovered = int(cost.get("scrapedo_recovered_requests") or 0)
+        errors = int(cost.get("scrapedo_error_requests") or 0)
+        # Whatever is left failed on a row that ended "no Google listing" — expected.
+        no_listing_calls = max(0, failed - recovered - errors)
         line += (f" scrapedo_requests={cost.get('scrapedo_requests')}"
                  f" (ok={cost.get('scrapedo_successful_requests')}"
-                 f" failed={cost.get('scrapedo_failed_requests')})"
-                 f" scrapedo_credits={cost.get('scrapedo_credits')}")
+                 f" recovered={recovered} no_listing={no_listing_calls}"
+                 f" errors={errors})"
+                 f" scrapedo_credits={cost.get('scrapedo_credits')}"
+                 f" rows_no_listing={cost.get('scrapedo_no_results')}")
         if cost.get("scrapedo_billed_empty"):
             line += f" scrapedo_billed_empty={cost.get('scrapedo_billed_empty')}"
 
@@ -290,6 +308,9 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     scrapedo_ok = 0
     scrapedo_failed = 0
     scrapedo_billed_empty = 0
+    scrapedo_no_results = 0
+    scrapedo_recovered = 0
+    scrapedo_errors = 0
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
@@ -310,6 +331,9 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
             scrapedo_ok += int(cb.get("scrapedo_successful_requests") or 0)
             scrapedo_failed += int(cb.get("scrapedo_failed_requests") or 0)
             scrapedo_billed_empty += int(cb.get("scrapedo_billed_empty") or 0)
+            scrapedo_no_results += int(cb.get("scrapedo_no_results") or 0)
+            scrapedo_recovered += int(cb.get("scrapedo_recovered_requests") or 0)
+            scrapedo_errors += int(cb.get("scrapedo_error_requests") or 0)
         else:
             request_count = int(cb.get("serpwow_request_count") or 0)
             serpwow_searches += request_count
@@ -356,7 +380,8 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                         "total_tokens": prompt_tokens + completion_tokens},
         "cost": _build_cost(llm_usd, serpwow_searches, billable_searches,
                             scrapedo_requests, scrapedo_credits,
-                            scrapedo_ok, scrapedo_failed, scrapedo_billed_empty),
+                            scrapedo_ok, scrapedo_failed, scrapedo_billed_empty,
+                            scrapedo_no_results, scrapedo_recovered, scrapedo_errors),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
     # Outcome/error breakdown is original-row-level. Relationship state rows are

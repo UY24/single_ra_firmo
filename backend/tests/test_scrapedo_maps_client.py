@@ -84,7 +84,8 @@ class SuccessTests(unittest.TestCase):
 
     def test_free_502_no_results_is_not_billed_empty(self) -> None:
         # Zero credits spent, so there is nothing to claim back.
-        env = _run(lambda r: httpx.Response(502, json={"error": "no results"}))
+        with mock.patch.object(client.asyncio, "sleep", new=_no_sleep):
+            env = _run(lambda r: httpx.Response(502, json={"error": "no results"}))
         self.assertTrue(env["no_results"])
         self.assertFalse(env["billed_empty"])
         self.assertEqual(env["credits"], 0)
@@ -97,6 +98,71 @@ class SuccessTests(unittest.TestCase):
     def test_extract_gmaps_website_fallback_strips_fragment(self) -> None:
         env = _run(lambda request: httpx.Response(200, json=PAYLOAD))
         self.assertEqual(client.extract_gmaps_website(env), "https://abcsacmetal.com.tr/")
+
+
+class SharedClientTests(unittest.TestCase):
+    """A fresh AsyncClient per row cost ~400ms of DNS/TCP/TLS setup per call (measured
+    636ms -> 233ms after pooling), i.e. ~55 hours across 500k rows. These assert the
+    pooling actually holds, since every other test injects its own client and would
+    never exercise this path."""
+
+    def setUp(self) -> None:
+        asyncio.run(client.close_shared_client())
+
+    tearDown = setUp
+
+    def test_same_client_is_reused_across_calls(self) -> None:
+        async def go():
+            a = await client._get_shared_client()
+            b = await client._get_shared_client()
+            return a, b
+
+        a, b = asyncio.run(go())
+        self.assertIs(a, b)
+
+    def test_close_releases_it_and_a_later_call_rebuilds(self) -> None:
+        async def go():
+            a = await client._get_shared_client()
+            await client.close_shared_client()
+            self.assertIsNone(client._shared_client)
+            b = await client._get_shared_client()
+            return a, b
+
+        a, b = asyncio.run(go())
+        self.assertIsNot(a, b)
+        self.assertTrue(a.is_closed)
+
+    def test_pool_is_sized_to_the_concurrency_cap(self) -> None:
+        """Keepalive must cover every in-flight slot, or slots above the default 20
+        would re-handshake and the fix would only half-work."""
+        async def go():
+            with mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "100"}, clear=False):
+                from app.services.common import provider_limits
+                provider_limits.reset_scrapedo_limit()
+                return await client._get_shared_client()
+
+        c = asyncio.run(go())
+        self.assertEqual(c._transport._pool._max_connections, 100)
+        self.assertEqual(c._transport._pool._max_keepalive_connections, 100)
+
+    def test_a_call_does_not_close_the_shared_client(self) -> None:
+        """The old code wrapped the client in `async with`, which would close the
+        pooled client after the first row and defeat reuse entirely."""
+        pooled = None
+
+        async def go():
+            nonlocal pooled
+            pooled = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json=PAYLOAD)))
+            with mock.patch.object(client, "_get_shared_client",
+                                   new=mock.AsyncMock(return_value=pooled)), \
+                 mock.patch.dict(os.environ, TOKEN_ENV, clear=False):
+                return await client.process_gmaps_query("q", gl="us")
+
+        env = asyncio.run(go())
+        self.assertEqual(env["credits"], 10)
+        self.assertFalse(pooled.is_closed, "the pooled client must survive the call")
+        asyncio.run(pooled.aclose())
 
 
 class CallAccountingTests(unittest.TestCase):
@@ -140,7 +206,9 @@ class NoResultsTests(unittest.TestCase):
     listing. That is a business not-found, not a transient failure — 12/100 rows of a
     real run hit it and were wrongly reported as errors."""
 
-    def test_no_results_is_not_retried(self) -> None:
+    def test_no_results_is_retried_before_being_believed(self) -> None:
+        """502 is overloaded by scrape.do: transient failure AND "no listing". We can't
+        tell which, and a failed attempt is unbilled, so spend the retries first."""
         calls = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -149,21 +217,48 @@ class NoResultsTests(unittest.TestCase):
 
         with mock.patch.object(client.asyncio, "sleep", new=_no_sleep):
             env = _run(handler, SCRAPEDO_MAX_RETRIES="3")
-        self.assertEqual(len(calls), 1, "no results must not burn retries")
-        self.assertEqual(env["request_count"], 1)
+        self.assertEqual(len(calls), 4, "1 attempt + 3 retries")
+        self.assertEqual(env["request_count"], 4)
+        # Still unbilled and still a not-found, not an error.
+        self.assertTrue(env["no_results"])
+        self.assertEqual(env["credits"], 0)
+        self.assertIsNone(env["error"])
+
+    def test_a_transient_502_that_recovers_is_billed_once(self) -> None:
+        """The reason retrying 502 "no results" is worth it: sometimes it IS transient."""
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 3:
+                return httpx.Response(502, json={"error": "no results"})
+            return httpx.Response(200, json=PAYLOAD)
+
+        with mock.patch.object(client.asyncio, "sleep", new=_no_sleep):
+            env = _run(handler, SCRAPEDO_MAX_RETRIES="3")
+        self.assertEqual(env["results"], PAYLOAD["local_results"])
+        self.assertFalse(env["no_results"])
+        self.assertEqual(env["credits"], 10)
+        self.assertEqual(env["failed_requests"], 2)
 
     def test_no_results_is_not_an_error(self) -> None:
-        env = _run(lambda request: httpx.Response(502, json={"error": "no results"}))
+        with mock.patch.object(client.asyncio, "sleep", new=_no_sleep):
+            env = _run(lambda request: httpx.Response(502, json={"error": "no results"}))
         self.assertIsNone(env["error"])
         self.assertIsNone(env["error_category"])
         self.assertTrue(env["no_results"])
         self.assertEqual(env["results"], [])
 
     def test_no_results_is_not_billed(self) -> None:
-        env = _run(lambda request: httpx.Response(502, json={"error": "no results"}))
+        # Retried now (502 is overloaded), so every attempt shows as a failed call —
+        # but none of them is billed, which is the point.
+        with mock.patch.object(client.asyncio, "sleep", new=_no_sleep):
+            env = _run(lambda request: httpx.Response(502, json={"error": "no results"}),
+                       SCRAPEDO_MAX_RETRIES="2")
         self.assertEqual(env["credits"], 0)
         self.assertEqual(env["successful_requests"], 0)
-        self.assertEqual(env["failed_requests"], 1)
+        self.assertEqual(env["failed_requests"], 3)
+        self.assertEqual(env["request_count"], 3)
 
     def test_transient_502_is_still_retried(self) -> None:
         calls = []

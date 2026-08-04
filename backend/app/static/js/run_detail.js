@@ -754,7 +754,10 @@ function renderLegacyStatus(root, ref, s) {
           providerCostKey: null,
           searchKey: "scrapedo_credits",
           searchUnit: "credits",
-          failedSearchCount: g.cost.scrapedo_failed_requests ?? 0,
+          // Real errors ONLY — attempts on rows that failed after every retry. A 502
+          // that recovered on retry, or one meaning "Google has no listing", is not a
+          // failure, and counting either here would make a clean run look broken.
+          failedSearchCount: g.cost.scrapedo_error_requests ?? 0,
           totalCostKey: null,
         })
       : costSection(g));
@@ -823,38 +826,49 @@ export async function render(root, params) {
   root.replaceChildren(loadingCard());
   let stop = null;
 
-  const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
+  // A run id alone doesn't say which engine owns it, so each candidate endpoint is
+  // probed with a raw fetch (a 404 must route to the other one rather than be swallowed
+  // by the poller's retry). Views that know the pipeline pass ?engine= so the right one
+  // is tried FIRST and the wasted 404 disappears — but the hint is only an ordering,
+  // never a requirement: bookmarked or hand-typed URLs carry no hint, and a stale one
+  // still resolves via the second candidate.
+  const candidates = [
+    {
+      engine: "ai",
+      path: `/uploads/ai-mode/${encodeURIComponent(ref)}/status`,
+      start: (p) => pollStatus(p, (s) => renderAiStatus(root, ref, s)),
+    },
+    {
+      engine: "serpwow",
+      path: `/uploads/${encodeURIComponent(ref)}/status`,
+      start: (p) => pollStatus(p, (s) => renderLegacyStatus(root, ref, s), 2000,
+                               (s) => deriveLegacyRunState(s).pollTerminal),
+    },
+  ];
+  if (params.query?.engine === "serpwow") candidates.reverse();
 
-  // Probe with a raw fetch so a 404 (not an AI-mode run) can route to the
-  // legacy SerpWow fallback instead of being swallowed by the poller's retry.
-  let probe;
-  try {
-    probe = await fetch(aiPath);
-  } catch (e) {
-    root.replaceChildren(errorCard(e.message));
-    return () => {};
-  }
-
-  if (probe.ok) {
-    stop = pollStatus(aiPath, (s) => renderAiStatus(root, ref, s));
-  } else if (probe.status === 404) {
-    const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
+  let failure = null;
+  for (const candidate of candidates) {
+    let probe;
     try {
-      await api(legacyPath); // 404 here too → unknown run
-      stop = pollStatus(
-        legacyPath,
-        (s) => renderLegacyStatus(root, ref, s),
-        2000,
-        (s) => deriveLegacyRunState(s).pollTerminal,
-      );
+      probe = await fetch(candidate.path);
     } catch (e) {
-      root.replaceChildren(errorCard(
-        /not found/i.test(e.message) ? `Run "${ref}" was not found.` : e.message));
+      failure = e.message;
+      break;
     }
-  } else {
-    let detail = probe.statusText;
-    try { detail = (await probe.json()).detail ?? detail; } catch {}
-    root.replaceChildren(errorCard(detail));
+    if (probe.ok) {
+      stop = candidate.start(candidate.path);
+      break;
+    }
+    if (probe.status !== 404) {
+      failure = probe.statusText;
+      try { failure = (await probe.json()).detail ?? failure; } catch {}
+      break;
+    }
+    // 404 → not this engine; fall through to the next candidate.
+  }
+  if (!stop) {
+    root.replaceChildren(errorCard(failure ?? `Run "${ref}" was not found.`));
   }
 
   // The router invokes this before the next view renders — stops the poller.

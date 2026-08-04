@@ -17,6 +17,7 @@ import {
   copyCell,
   pageIntro,
   sectionHeading,
+  runHref,
 } from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
@@ -174,7 +175,7 @@ function uploadHistoryCard(lifecycle) {
       },
         cell(uploadId ? el("a", {
           class: "table-link font-mono text-xs",
-          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          href: runHref(uploadId, "serpwow"),
           title: uploadId,
           "aria-label": `Open run ${uploadId}`,
         }, shortId(uploadId)) : "-"),
@@ -350,7 +351,7 @@ function batchManagerCard(lifecycle) {
       return el("tr", { class: "data-row" },
         cell(uploadId ? el("a", {
           class: "table-link font-mono text-xs",
-          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          href: runHref(uploadId, "serpwow"),
           title: uploadId,
           "aria-label": `Open run ${uploadId}`,
         }, shortId(uploadId)) : "-"),

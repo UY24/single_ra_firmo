@@ -211,9 +211,16 @@ def _write_outputs(prefix: str, counters: store.Counters,
             + "\n")
 
     run_status = "completed_with_errors" if outcomes["errored"] else "completed"
+    # A stop can land mid-verdict or mid-reporting (run_scrape_phase's own check only
+    # catches a stop between phases 1 and 2) — surface that as a distinct status rather
+    # than mislabeling a deliberately-halted run "completed_with_errors". Every row up to
+    # the stop is still written out normally; only the label changes.
+    if store.stop_requested(prefix):
+        run_status = "stopped"
 
     summary = {
         "pipeline": "relationship",
+        "status": run_status,
         "total_rows": total_rows,
         "websites_found": found,
         "websites_not_found": total_rows - found,
@@ -263,6 +270,10 @@ def _write_outputs(prefix: str, counters: store.Counters,
     shutil.copyfileobj(log_tmp, final_tmp)
     store.put_fileobj(f"{prefix}/run.log", final_tmp, content_type="text/plain")
 
-    counters.set_phase("completed")
+    # phase (scan-eligibility) only ever lands on "completed" or "stopped" — never
+    # "completed_with_errors", which is a report/log label, not a phase value. Both
+    # "completed" and "stopped" are terminal in relationship_runner._TERMINAL_PHASES,
+    # so a redrive never re-touches a finished-or-stopped run either way.
+    counters.set_phase("stopped" if run_status == "stopped" else "completed")
     counters.flush(force=True)
     return summary

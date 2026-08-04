@@ -369,5 +369,249 @@ class VerdictPhaseTests(unittest.TestCase):
         self.assertEqual(submitted["keys"], [])
 
 
+class DriveTests(unittest.TestCase):
+    def test_drive_run_executes_all_three_phases_in_order(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        order = []
+
+        async def phase(name):
+            order.append(name)
+
+        with _patched(fake), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: phase("scrape")), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: phase("verdict")), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: order.append("outputs") or {}), \
+                mock.patch.object(runner, "_notify_terminal"):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+            asyncio.run(runner.drive_run("run1"))
+
+        self.assertEqual(order, ["scrape", "verdict", "outputs"])
+
+    def test_drive_run_on_an_unknown_id_is_a_noop_not_a_crash(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            asyncio.run(runner.drive_run("nope"))   # must not raise
+
+    def test_drive_run_notifies_after_a_completed_run(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        notified = []
+        with _patched(fake), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: {"status": "completed"}), \
+                mock.patch.object(runner, "_notify_terminal",
+                                  lambda rid, ptr, summary: notified.append(
+                                      (rid, summary))):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+            asyncio.run(runner.drive_run("run1"))
+        self.assertEqual(notified, [("run1", {"status": "completed"})])
+
+    def test_a_stop_between_phase_1_and_2_never_reaches_outputs_or_notify(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+            store.request_stop(PREFIX)
+        called = []
+        with _patched(fake), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: called.append("outputs") or {}), \
+                mock.patch.object(runner, "_notify_terminal",
+                                  lambda *a: called.append("notify")):
+            asyncio.run(runner.drive_run("run1"))
+        self.assertEqual(called, [])
+        with _patched(fake):
+            self.assertEqual(store.read_status(PREFIX)["phase"], "stopped")
+
+    def test_a_phase_exception_marks_the_run_failed_not_crashing_the_caller(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+
+        async def boom(p, c):
+            raise RuntimeError("scrape.do is on fire")
+
+        with _patched(fake), mock.patch.object(runner, "run_scrape_phase", boom):
+            asyncio.run(runner.drive_run("run1"))   # must not raise
+
+        with _patched(fake):
+            self.assertEqual(store.read_status(PREFIX)["phase"], "failed")
+
+
+class NotifyTerminalTests(unittest.TestCase):
+    """_notify_terminal must attempt both channels and never raise, even if either
+    dependency (Supabase, Slack) is unavailable or throws."""
+
+    def test_never_raises_when_both_notifiers_blow_up(self) -> None:
+        summary = {"status": "completed", "cost": {}, "outcome_breakdown": {},
+                   "websites_found": 1, "websites_not_found": 0, "total_rows": 1}
+        pointer = {"run_db_id": "db-1", "company_name": "Acme"}
+        with mock.patch("app.services.serpwow.engine._update_supabase_run",
+                        side_effect=RuntimeError("supabase down")), \
+                mock.patch("app.core.notify.notify_run_complete",
+                          side_effect=RuntimeError("slack down")):
+            runner._notify_terminal("run1", pointer, summary)   # must not raise
+
+    def test_both_channels_are_attempted_with_a_run_db_id(self) -> None:
+        summary = {"status": "completed_with_errors",
+                   "cost": {"scrapedo_requests": 5, "scrapedo_credits": 50},
+                   "outcome_breakdown": {"errored": 1}, "websites_found": 2,
+                   "websites_not_found": 1, "total_rows": 3}
+        pointer = {"run_db_id": "db-1", "company_name": "Acme"}
+        with mock.patch("app.services.serpwow.engine._update_supabase_run") as sb, \
+                mock.patch("app.core.notify.notify_run_complete") as slack:
+            runner._notify_terminal("run1", pointer, summary)
+
+        sb.assert_called_once()
+        self.assertEqual(sb.call_args.args[0]["status"], "completed_with_errors")
+        slack.assert_called_once()
+        self.assertEqual(slack.call_args.kwargs["status"], "completed_with_errors")
+
+    def test_no_supabase_call_without_a_run_db_id(self) -> None:
+        """No run_db_id in the pointer (Supabase was never configured for this run) —
+        Supabase must be skipped, not called with a falsy id."""
+        summary = {"status": "completed", "cost": {}, "outcome_breakdown": {},
+                   "websites_found": 0, "websites_not_found": 0, "total_rows": 0}
+        pointer = {"company_name": "Acme"}
+        with mock.patch("app.services.serpwow.engine._update_supabase_run") as sb, \
+                mock.patch("app.core.notify.notify_run_complete") as slack:
+            runner._notify_terminal("run1", pointer, summary)
+        sb.assert_not_called()
+        slack.assert_called_once()
+
+
+class RedriveTests(unittest.TestCase):
+    def _pointer(self, fake, status):
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+            store.put_object(store.status_key(PREFIX), status)
+
+    def test_a_stale_nonterminal_run_is_redriven(self) -> None:
+        fake = FakeS3()
+        self._pointer(fake, {"phase": "scraping",
+                             "updated_at": "2000-01-01T00:00:00Z"})
+        driven = []
+        with _patched(fake), mock.patch.object(
+                runner, "drive_run",
+                lambda rid: driven.append(rid) or asyncio.sleep(0)):
+            n = asyncio.run(runner.redrive_stale_runs())
+        self.assertEqual(driven, ["run1"])
+        self.assertEqual(n, 1)
+
+    def test_a_fresh_run_is_left_alone(self) -> None:
+        import time
+        fake = FakeS3()
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._pointer(fake, {"phase": "scraping", "updated_at": fresh})
+        driven = []
+        with _patched(fake), mock.patch.object(
+                runner, "drive_run",
+                lambda rid: driven.append(rid) or asyncio.sleep(0)):
+            asyncio.run(runner.redrive_stale_runs())
+        self.assertEqual(driven, [])
+
+    def test_a_completed_run_is_never_redriven(self) -> None:
+        fake = FakeS3()
+        self._pointer(fake, {"phase": "completed",
+                             "updated_at": "2000-01-01T00:00:00Z"})
+        driven = []
+        with _patched(fake), mock.patch.object(
+                runner, "drive_run",
+                lambda rid: driven.append(rid) or asyncio.sleep(0)):
+            asyncio.run(runner.redrive_stale_runs())
+        self.assertEqual(driven, [])
+
+    def test_a_stopped_run_is_never_redriven(self) -> None:
+        """stopped is terminal too — an operator's explicit stop must not be
+        auto-resumed by the scan."""
+        fake = FakeS3()
+        self._pointer(fake, {"phase": "stopped",
+                             "updated_at": "2000-01-01T00:00:00Z"})
+        driven = []
+        with _patched(fake), mock.patch.object(
+                runner, "drive_run",
+                lambda rid: driven.append(rid) or asyncio.sleep(0)):
+            asyncio.run(runner.redrive_stale_runs())
+        self.assertEqual(driven, [])
+
+
+class ConsumeRelationshipRunsTests(unittest.TestCase):
+    """The queue consumer acks on receipt (before driving the run) — see
+    redrive_stale_runs for why. Prove the ack-then-drive ordering with a fake channel."""
+
+    def test_message_is_acked_before_the_run_is_driven(self) -> None:
+        import json as _json
+
+        events = []
+
+        class FakeMessage:
+            def __init__(self, body: bytes):
+                self.body = body
+
+            async def ack(self):
+                events.append("ack")
+
+        class FakeQueue:
+            def __init__(self):
+                self._handler = None
+
+            async def consume(self, handler):
+                self._handler = handler
+
+        class FakeChannel:
+            def __init__(self):
+                self.queue = FakeQueue()
+                self.declared = None
+
+            async def declare_queue(self, name, durable=True):
+                self.declared = (name, durable)
+                return self.queue
+
+        async def fake_drive(run_id):
+            events.append(("drive", run_id))
+
+        channel = FakeChannel()
+        with mock.patch.object(runner, "drive_run", fake_drive):
+            asyncio.run(runner.consume_relationship_runs(channel))
+            message = FakeMessage(_json.dumps({"run_id": "run1"}).encode("utf-8"))
+            asyncio.run(channel.queue._handler(message))
+
+        self.assertEqual(events, ["ack", ("drive", "run1")])
+        self.assertEqual(channel.declared, (runner.RELATIONSHIP_QUEUE, True))
+
+    def test_an_undecodable_message_is_dropped_not_raised(self) -> None:
+        class FakeMessage:
+            def __init__(self, body: bytes):
+                self.body = body
+
+            async def ack(self):
+                pass
+
+        class FakeQueue:
+            async def consume(self, handler):
+                self._handler = handler
+
+        class FakeChannel:
+            async def declare_queue(self, name, durable=True):
+                self.queue = FakeQueue()
+                return self.queue
+
+        channel = FakeChannel()
+        asyncio.run(runner.consume_relationship_runs(channel))
+        message = FakeMessage(b"not json")
+        asyncio.run(channel.queue._handler(message))   # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

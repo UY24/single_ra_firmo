@@ -10,6 +10,8 @@ scrape.do calls, so the broker is a durable start signal, not a work distributor
 from __future__ import annotations
 
 import asyncio
+import calendar
+import json
 import logging
 import os
 import time
@@ -19,10 +21,15 @@ from app.services.common.env import get_int_env as _get_int_env
 from app.services.serpwow import relationship_store as store
 from app.services.serpwow.modes.relationship import build_evidence, row_fields
 from app.services.serpwow.query_builders import build_relationship_search_query
+from app.services.serpwow.relationship_outputs import write_outputs
 from app.services.serpwow.scrapedo_ai_client import search_ai_mode
 from app.services.serpwow.url_utils import x_domain_from_input_url
 
 _LOGGER = logging.getLogger(__name__)
+
+RELATIONSHIP_QUEUE = "relationship_runs"
+RELATIONSHIP_ROUTING_KEY = "relationship.run"
+_TERMINAL_PHASES = {"completed", "failed", "stopped"}
 
 # Bounds stop-marker latency deterministically. With independently varying scrape
 # latencies, asyncio.wait(FIRST_COMPLETED) returns roughly one task at a time, so
@@ -277,3 +284,153 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
     if inflight:
         await asyncio.gather(*inflight, return_exceptions=True)
     counters.flush(force=True)
+
+
+async def drive_run(run_id: str) -> None:
+    """Run (or resume) one relationship run end to end. Idempotent and never raises.
+
+    Every phase skips work that already has an object, so calling this on a run that is
+    partly or fully done costs no scrape.do credits and no Gemini tokens.
+    """
+    pointer = await asyncio.to_thread(store.read_run_pointer, run_id)
+    if not pointer:
+        _LOGGER.warning("relationship run %s: no pointer object, nothing to drive", run_id)
+        return
+    prefix = str(pointer.get("prefix") or "")
+    status = await asyncio.to_thread(store.read_status, prefix) or {}
+    counters = store.Counters(prefix, rows_total=int(status.get("rows_total") or 0))
+    for field in counters.values:
+        counters.values[field] = int(status.get(field) or 0)
+
+    try:
+        await run_scrape_phase(prefix, counters)
+        if await asyncio.to_thread(store.stop_requested, prefix):
+            counters.set_phase("stopped")
+            counters.flush(force=True)
+            return
+        await run_verdict_phase(prefix, counters)
+        summary = await asyncio.to_thread(write_outputs, prefix, counters)
+        await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
+    except Exception as exc:
+        _LOGGER.exception("relationship run %s failed: %s", run_id, exc)
+        counters.set_phase("failed")
+        counters.flush(force=True)
+
+
+def _notify_terminal(run_id: str, pointer: dict[str, Any], summary: dict[str, Any]) -> None:
+    """Best-effort Slack + Supabase at terminal status. Never raises — bookkeeping must
+    not fail a run that already produced its outputs."""
+    cost = summary.get("cost") or {}
+    outcomes = summary.get("outcome_breakdown") or {}
+    # write_outputs threads a distinct "stopped" status through when a stop was
+    # requested mid-verdict/reporting (the scrape-phase stop is caught earlier, in
+    # drive_run, before this ever runs); fall back to the 2-way derivation for older
+    # summaries that predate that field.
+    status = summary.get("status") or (
+        "completed_with_errors" if outcomes.get("errored") else "completed")
+
+    # Supabase: a relationship run has no state dict, so run_db_id rides in the pointer.
+    # _update_supabase_run reads a state-shaped dict; the shared REPORTING_PIPELINES
+    # branch there rebuilds stats from state["rows"], which this pipeline doesn't keep,
+    # so pass the already-computed numbers and accept that branch is a no-op for us.
+    try:
+        from app.services.serpwow.engine import _update_supabase_run
+
+        if pointer.get("run_db_id"):
+            _update_supabase_run({
+                "run_db_id": pointer["run_db_id"],
+                "pipeline": "relationship",
+                "status": status,
+                "rows": [],
+                "websites_found": summary.get("websites_found"),
+                "websites_not_found": summary.get("websites_not_found"),
+                "success_count": summary.get("websites_found"),
+                "failed_count": outcomes.get("errored"),
+                "cost": cost,
+            })
+    except Exception:
+        pass
+
+    try:
+        from app.core.notify import notify_run_complete
+
+        notify_run_complete(
+            pipeline="relationship",
+            company=pointer.get("company_name"),
+            run_ref=run_id,
+            status=status,
+            found=summary.get("websites_found"),
+            not_found=summary.get("websites_not_found"),
+            errored=outcomes.get("errored"),
+            total_rows=summary.get("total_rows"),
+            searches=cost.get("scrapedo_requests"),
+            search_label="Scrape.do searches",
+            credits=cost.get("scrapedo_credits"),
+        )
+    except Exception:
+        pass
+
+
+def _stale_seconds() -> int:
+    return max(60, _get_int_env("RELATIONSHIP_STALE_SEC", 900))
+
+
+def _age_seconds(updated_at: str) -> float:
+    try:
+        parsed = time.strptime(str(updated_at), "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return float("inf")
+    return max(0.0, time.time() - calendar.timegm(parsed))
+
+
+async def redrive_stale_runs() -> int:
+    """Re-drive runs that stopped making progress. Returns how many were re-driven.
+
+    This is the ONLY self-healing machinery this pipeline needs, and it replaces
+    ack-after-persist: a per-run message held for hours would hit RabbitMQ's 30-minute
+    consumer_timeout and have its channel torn down, so the consumer acks on receipt
+    instead. This scan also covers what a redelivery never could — the worker being down
+    when the run was published, or the instance being replaced.
+
+    Safe to run at any time: a re-drive skips every row that already has an object.
+    """
+    driven = 0
+    for pointer in await asyncio.to_thread(store.list_run_pointers):
+        prefix = str(pointer.get("prefix") or "")
+        run_id = str(pointer.get("run_id") or "")
+        if not prefix or not run_id:
+            continue
+        status = await asyncio.to_thread(store.read_status, prefix) or {}
+        if str(status.get("phase") or "") in _TERMINAL_PHASES:
+            continue
+        if _age_seconds(status.get("updated_at")) < _stale_seconds():
+            continue
+        _LOGGER.info("relationship %s: stale, re-driving", run_id)
+        await drive_run(run_id)
+        driven += 1
+    return driven
+
+
+async def consume_relationship_runs(channel) -> None:
+    """Declare the run queue and start consuming.
+
+    Own queue and channel, NOT the shared SerpWow queue: a run message occupies its
+    consumer for the whole run, so on the shared queue it would permanently eat one of
+    WORKER_CONCURRENCY's slots.
+    """
+    queue = await channel.declare_queue(RELATIONSHIP_QUEUE, durable=True)
+
+    async def on_message(message) -> None:
+        # Ack FIRST — see redrive_stale_runs for why this pipeline inverts the repo's
+        # usual ack-after-persist rule.
+        await message.ack()
+        try:
+            body = json.loads(message.body.decode("utf-8"))
+        except Exception:
+            _LOGGER.warning("relationship: undecodable run message, dropped")
+            return
+        run_id = str(body.get("run_id") or "")
+        if run_id:
+            await drive_run(run_id)
+
+    await queue.consume(on_message)

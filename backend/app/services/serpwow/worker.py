@@ -1,7 +1,39 @@
 import asyncio
+import logging
+import os
 import signal
 
 from app.services.serpwow import engine as app
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _start_relationship_worker() -> None:
+    """Own channel + queue for relationship runs, plus the stale-run re-drive scan.
+
+    Best-effort: a relationship-side failure here must not take the SerpWow (or
+    AI Mode) consumers down, mirroring how ai_mode's consumers are started.
+    """
+    from app.services.serpwow.relationship_runner import (
+        consume_relationship_runs,
+        redrive_stale_runs,
+    )
+
+    # Own channel: aio_pika QoS is per-channel, and a run message is held for hours.
+    relationship_channel = await app.rabbitmq_connection.channel()
+    await relationship_channel.set_qos(prefetch_count=1)
+    await consume_relationship_runs(relationship_channel)
+
+    async def _relationship_redrive_loop() -> None:
+        while True:
+            try:
+                await redrive_stale_runs()
+            except Exception:
+                _LOGGER.exception("relationship re-drive scan failed")
+            await asyncio.sleep(
+                max(60, int(os.getenv("RELATIONSHIP_REDRIVE_SCAN_SEC", "300"))))
+
+    asyncio.create_task(_relationship_redrive_loop())
 
 
 async def main() -> None:
@@ -18,6 +50,10 @@ async def main() -> None:
     try:
         await app.start_worker_consumers()
         print("Worker started. Consuming RabbitMQ jobs...")
+        try:
+            await _start_relationship_worker()
+        except Exception as exc:
+            print(f"[relationship-worker] consumer failed to start: {exc}")
         stop_wait_task = asyncio.create_task(stop_event.wait())
         consumer_tasks = list(app.rabbitmq_consumer_tasks)
         wait_targets: list[asyncio.Task] = [stop_wait_task, *consumer_tasks]

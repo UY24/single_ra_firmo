@@ -258,6 +258,25 @@ class CostAccountingTests(unittest.TestCase):
         self.assertEqual(eb["by_source"], {"scrapedo": 2, "internal": 1})
         self.assertEqual(eb["by_category"], {"internal": 2, "http_5xx": 1})
 
+    def test_a_stopped_run_gets_a_distinct_status_not_completed_with_errors(self) -> None:
+        """A stop can land mid-verdict/reporting (run_scrape_phase's own stop check only
+        covers the gap between phases 1 and 2). write_outputs must still write every row
+        that made it through, but label the run "stopped" — not "completed" or
+        "completed_with_errors" — and the phase must stay one the redrive scan treats
+        as terminal (never a re-spend)."""
+        fake = FakeS3()
+        _seed_cost_rows(fake)
+        with _patched(fake):
+            store.request_stop(COST_PREFIX)
+            counters = store.Counters(COST_PREFIX, rows_total=4)
+            summary = outputs.write_outputs(COST_PREFIX, counters)
+            status = store.read_status(COST_PREFIX)
+
+        self.assertEqual(summary["status"], "stopped")
+        self.assertEqual(status["phase"], "stopped")
+        from app.services.serpwow import relationship_runner as runner
+        self.assertIn("stopped", runner._TERMINAL_PHASES)
+
     def test_run_log_status_is_completed_when_nothing_errored(self) -> None:
         fake = FakeS3()
         with _patched(fake):

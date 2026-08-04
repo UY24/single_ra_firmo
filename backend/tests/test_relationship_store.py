@@ -21,6 +21,13 @@ class FakeS3:
             raise RuntimeError("S3 is down")
         self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode()
 
+    def upload_fileobj(self, Fileobj, Bucket, Key, ExtraArgs=None):
+        self.put_calls += 1
+        if Key in self.fail_keys:
+            raise RuntimeError("S3 is down")
+        Fileobj.seek(0)
+        self.objects[Key] = Fileobj.read()
+
     def get_object(self, Bucket, Key):
         if Key not in self.objects:
             raise self.NoSuchKey(Key)

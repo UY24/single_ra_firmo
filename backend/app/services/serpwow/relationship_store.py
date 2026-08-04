@@ -86,8 +86,19 @@ def put_object(key: str, payload: dict[str, Any]) -> None:
 
 
 def put_bytes(key: str, data: bytes, content_type: str = "text/csv") -> None:
-    """Write raw bytes (input.csv, the output CSVs, run.log). RAISES on failure."""
+    """Write raw bytes (input.csv, report.json — anything small enough to hold in
+    memory whole). RAISES on failure. See put_fileobj for anything that scales with
+    row count (the output CSVs, run.log)."""
     _client().put_object(Bucket=_bucket(), Key=key, Body=data, ContentType=content_type)
+
+
+def put_fileobj(key: str, fileobj: Any, content_type: str = "text/csv") -> None:
+    """Upload a file-like object via boto3's managed transfer (multipart handled
+    internally). Lets a caller assemble one output artifact in a spooled temp file
+    instead of an in-memory buffer, so a 500k-row CSV/log costs O(chunk) memory, not
+    O(file). Same strict contract as put_bytes: RAISES on failure."""
+    fileobj.seek(0)
+    _client().upload_fileobj(fileobj, _bucket(), key, ExtraArgs={"ContentType": content_type})
 
 
 def get_object(key: str) -> Optional[dict[str, Any]]:
@@ -203,15 +214,27 @@ def iter_input_rows(prefix: str) -> Iterator[dict[str, str]]:
     text = io.TextIOWrapper(body, encoding="utf-8-sig", newline="")
     for idx, row in enumerate(csv.DictReader(text)):
         clean = {k: (v or "").strip() for k, v in row.items() if k is not None}
+        if "row_index" in clean:
+            # A real input column literally named row_index would otherwise be
+            # silently clobbered by the injected index below with no trace of the
+            # original value — preserve it under a distinct key first.
+            clean["row_index__input"] = clean["row_index"]
         clean["row_index"] = idx
         yield clean
 
 
 def read_input_header(prefix: str) -> list[str]:
-    body = get_bytes(input_key(prefix)) or b""
-    text = body.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    return next(reader, [])
+    """Just the header row. Streams the object body (same pattern as
+    iter_input_rows) rather than reading the whole file with get_bytes: a 500k-row
+    CSV can be well over 100MB and this only needs the first line. Blank cells (a
+    trailing comma in the source CSV) are filtered, matching the old writer."""
+    body = _client().get_object(Bucket=_bucket(), Key=input_key(prefix))["Body"]
+    try:
+        text = io.TextIOWrapper(body, encoding="utf-8-sig", newline="")
+        row = next(csv.reader(text), [])
+    finally:
+        body.close()
+    return [h for h in row if h]
 
 
 # ---------------------------------------------------------------- stop marker

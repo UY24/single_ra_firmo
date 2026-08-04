@@ -1,8 +1,8 @@
 import asyncio
 import logging
-import os
 import signal
 
+from app.services.common.env import get_int_env
 from app.services.serpwow import engine as app
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,8 +25,10 @@ async def _start_relationship_worker() -> None:
                 await redrive_stale_runs()
             except Exception:
                 _LOGGER.exception("relationship re-drive scan failed")
-            await asyncio.sleep(
-                max(60, int(os.getenv("RELATIONSHIP_REDRIVE_SCAN_SEC", "300"))))
+            # get_int_env, not int(os.getenv(...)): this sits OUTSIDE the try above, so a
+            # junk value here would raise and kill the whole worker process (this task is
+            # registered for main()'s failure detection). get_int_env falls back instead.
+            await asyncio.sleep(max(60, get_int_env("RELATIONSHIP_REDRIVE_SCAN_SEC", 300)))
 
     # Started BEFORE the channel/consumer setup below, and on purpose: this loop is what
     # recovers a run published while the worker (or its RabbitMQ connection) was down or

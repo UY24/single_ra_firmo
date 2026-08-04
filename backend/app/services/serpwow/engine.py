@@ -137,8 +137,6 @@ from app.services.serpwow.constants import (
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
     REPORTING_PIPELINES,
-    REL_ERROR_CONFIRMED_URL_INVALID,
-    REL_ERROR_NOT_CONFIRMED,
 )
 from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
@@ -291,6 +289,9 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
 
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
     gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
+
+    relationship is absent: it owns its own Gemini Batch driver in
+    relationship_runner and never routes through this shared row-batch engine.
     """
     pipe = str(pipeline or "")
     if pipe == PIPELINE_GSEARCH:
@@ -298,8 +299,6 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     if pipe == PIPELINE_GMAPS:
         mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
         return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
-    if pipe == PIPELINE_RELATIONSHIP:
-        return _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
     return False
 
 
@@ -312,7 +311,7 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     pipeline is intentionally left unchanged.
     """
     pipe = str(state.get("pipeline") or "")
-    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}:
+    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         return False
     if not _batch_postprocess_enabled_for(pipe):
         return False
@@ -1299,21 +1298,6 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        from app.services.serpwow.gemini_llm import build_relationship_prompt
-        return build_relationship_prompt(
-            x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
-            y_name=str(row.get("company_name") or ""),
-            input_url=str(row.get("input_url") or ""),
-            city=str(row.get("city") or ""),
-            country=str(row.get("country") or ""),
-            candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_evidence=list(_ctx_probe.get("ai_overview_evidence") or []),
-            search_attempts=list(_ctx_probe.get("search_attempts") or []),
-            x_domain=str(_ctx_probe.get("x_domain") or ""),
-        )
     input_obj = {
         "company_name": row.get("company_name"),
         "country": row.get("country"),
@@ -1769,10 +1753,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
     a batch-decided no-website row is a business not_found (outcome=not_found), not
     an error. Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        return _apply_relationship_batch_parsed_to_row(row, parsed, row_usage, batch_model)
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
     row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
@@ -1816,65 +1796,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
         return "completed"
     row["status"] = "completed"
     row["error"] = _outcomes.BATCH_NOT_FOUND
-    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
-    row["error_source"] = None
-    row["error_category"] = None
-    return "completed"
-
-
-def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
-                                            row_usage: dict[str, Any], batch_model: str) -> str:
-    """Relationship variant of _apply_batch_parsed_to_row: the LLM's
-    relationship_status GATES the URL (spec §4). Always returns 'completed' now:
-    a not-confirmed / confirmed-but-invalid gate is a business not_found
-    (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import (
-        apply_relationship_gate,
-        update_relationship_block,
-    )
-
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    context = result.get("context") if isinstance(result.get("context"), dict) else {}
-    row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
-    updated_gemini = round(_as_float(result.get("gemini_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    updated_total = round(_as_float(result.get("total_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-
-    candidates = [c for c in (context.get("candidates") or []) if isinstance(c, str)]
-    x_domain = str(context.get("x_domain") or "")
-    gated_url, status, gate_flags = apply_relationship_gate(
-        parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
-
-    relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
-        "status": "pending", "summary": "", "flags": []}
-    context["relationship"] = update_relationship_block(
-        relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
-
-    result["official_website"] = gated_url
-    result["gemini_cost_usd"] = updated_gemini
-    result["total_cost_usd"] = updated_total
-    cb = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
-    cb["gemini_batch_cost_usd"] = round(_as_float(cb.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    cb["gemini_cost_usd"] = updated_gemini
-    cb["total_cost_usd"] = updated_total
-    context["cost_breakdown"] = cb
-    context["gemini_batch_ai"] = {"provider": "google-gemini-batch", "model": batch_model,
-                                  "used": True, "usage": row_usage,
-                                  "cost_usd": row_batch_cost_usd,
-                                  "raw": parsed, "error": None}
-    context["success"] = bool(gated_url)
-    result["context"] = context
-    row["result"] = result
-
-    if gated_url:
-        row["status"] = "completed"
-        row["error"] = None
-        row["outcome"] = _outcomes.OUTCOME_FOUND
-        row["error_source"] = None
-        row["error_category"] = None
-        return "completed"
-    row["status"] = "completed"
-    row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
-                    else REL_ERROR_CONFIRMED_URL_INVALID)
     row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
     row["error_source"] = None
     row["error_category"] = None
@@ -2692,10 +2613,6 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             ob = summ.get("outcome_breakdown") or {}
             success_count = ob.get("found", summ["websites_found"])
             failed_count = ob.get("errored", 0)
-            if state.get("relationship"):
-                # Relationship canonical outcomes are already fanned to original
-                # searchable rows; only the original total needs an explicit field.
-                extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -3387,6 +3304,35 @@ async def publish_job(job: dict[str, Any]) -> None:
     )
 
 
+async def publish_relationship_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole relationship run.
+
+    Goes to the shared named exchange under RELATIONSHIP_ROUTING_KEY — the same
+    exchange consume_relationship_runs binds its queue to, and the one AI Mode and
+    SerpWow already use, so every binding is visible in one place in the management UI.
+
+    Failure is tolerated: the worker's stale-run scan picks the run up within
+    RELATIONSHIP_REDRIVE_SCAN_SEC, so a broker hiccup delays a run, never loses it.
+    """
+    from app.services.serpwow.relationship_runner import RELATIONSHIP_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[relationship] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    await asyncio.wait_for(
+        rabbitmq_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                content_type="application/json",
+            ),
+            routing_key=RELATIONSHIP_ROUTING_KEY,
+        ),
+        timeout=5.0,
+    )
+
+
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
     """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
     legacy binary: found->completed, everything-else->failed (no not_found remap)."""
@@ -3482,10 +3428,10 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 debug_row_index=row_index,
                 phase=phase_value,
             )
-        elif pipeline == PIPELINE_RELATIONSHIP:
-            raise ValueError(
-                "relationship rows are not driven per-row any more — see relationship_runner")
         else:
+            # relationship is deliberately absent: it is run-driven (one message per
+            # RUN, see relationship_runner), never row-driven, so a relationship job
+            # arriving here is a bug this correctly rejects.
             raise ValueError(f"unknown pipeline {pipeline!r}")
 
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
@@ -3803,7 +3749,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
             # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
             # only in batch mode, where a stuck row blocks the finalization batch from
             # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
-            if not (_rec_pipe in {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}
+            # relationship is not here: it has no per-row messages to re-publish and
+            # runs its own stale-run scan (relationship_runner.redrive_stale_runs).
+            if not (_rec_pipe == PIPELINE_GSEARCH
                     or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
@@ -4323,19 +4271,16 @@ async def create_relationship_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    import uuid
+
+    from app.services.serpwow import relationship_store as rel_store
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
         parse_relationship_csv,
     )
 
-    # The relationship gate REQUIRES the LLM (no heuristic mode) and SerpWow —
-    # fail fast at upload time like AI Mode does, instead of failing every row.
-    for env_key in ("GEMINI_API_KEY", "SERPWOW_API_KEY"):
-        if not os.getenv(env_key, "").strip():
-            raise HTTPException(status_code=400,
-                                detail=f"{env_key} is not configured — required for the relationship pipeline.")
-
     raw = await file.read()
+    # CSV first: a bad CSV must report the CSV problem, not a config problem.
     try:
         parsed = parse_relationship_csv(raw)
     except InvalidRelationshipCSV as exc:
@@ -4344,36 +4289,38 @@ async def create_relationship_upload(
         raise HTTPException(status_code=400,
                             detail="No searchable rows — every Company_Name_Y is blank.")
 
-    parsed_rows = [
-        {
-            "row_index": p["pair_index"],
-            "company_name": p["y_name"],
-            "country": p["country"],
-            "firm_id": "", "industry": "", "full_address": "", "official_website": "",
-            "x_name": p["x_name"],
-            "input_url": p["input_url"],
-            "city": p["city"],
-            "source_row_indices": p["source_row_indices"],
-        }
-        for p in parsed["pairs"]
-    ]
-    response = await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_RELATIONSHIP,
-        company_id=company_id, company_name=company_name,
-        run_total_rows=len(parsed["original_rows"]),
-        extra_state={
-            "relationship": {
-                "header": parsed["header"],
-                "original_rows": parsed["original_rows"],
-                "blank_row_indices": parsed["blank_row_indices"],
-                "blank_rows": len(parsed["blank_row_indices"]),
-                "row_count_original": len(parsed["original_rows"]),
-            }
-        },
-    )
-    response["blank_rows"] = len(parsed["blank_row_indices"])
-    response["unique_pairs"] = len(parsed["pairs"])
-    return response
+    # SERPWOW_API_KEY is deliberately NOT checked: relationship left SerpWow in 2026-08.
+    for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
+        if not os.getenv(env_key, "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_key} is not configured — required for the relationship pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = rel_store.run_prefix(company_name or company_id, run_id)
+    total = len(parsed["original_rows"])
+
+    # Best-effort Supabase run row; create_run never raises (returns None untracked).
+    # get_company_service() itself is None when Supabase is unconfigured.
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_RELATIONSHIP,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(rel_store.put_bytes, rel_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: phase 3 has no state dict to read it from.
+    await asyncio.to_thread(rel_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id)
+    # The API writes status.json exactly once, before publishing. From the first scrape
+    # on, the worker is the only writer.
+    counters = rel_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_relationship_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_RELATIONSHIP,
+            "total_rows": total, "company_id": company_id}
 
 
 @app.post("/uploads/{upload_id}/retry-failed-rows")
@@ -4381,6 +4328,27 @@ async def retry_failed_rows(
     upload_id: str,
     limit: int = Query(0, ge=0, le=5000),
 ) -> dict[str, Any]:
+    from app.services.serpwow import relationship_store as rel_store
+
+    # Rerun failed (relationship): drop the error markers so a re-drive rescrapes
+    # exactly those rows. Checked before the broker guard on purpose — the re-drive
+    # scan starts the run even if the publish below is skipped.
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        prefix = pointer["prefix"]
+        removed = 0
+        for key in await asyncio.to_thread(
+                lambda: [k for k in rel_store.iter_keys(f"{prefix}/raw/")
+                         if k.endswith(".error.json")]):
+            await asyncio.to_thread(rel_store.delete_object, key)
+            removed += 1
+        await asyncio.to_thread(rel_store.clear_stop, prefix)
+        await publish_relationship_run(upload_id)
+        return {"upload_id": upload_id, "retried_rows": removed,
+                # operations.js reads enqueued_rows for its status line.
+                "enqueued_rows": removed,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     if rabbitmq_exchange is None:
         detail = "RabbitMQ not connected. Try again shortly."
         if rabbitmq_last_error:
@@ -4531,6 +4499,20 @@ async def stop_upload(upload_id: str) -> dict[str, Any]:
     RabbitMQ messages are then dropped by the worker's idempotency guard) and
     best-effort cancel a pending/running Gemini batch. The upload terminalizes
     on this persist, so outputs/Supabase/Slack fire with whatever was done."""
+    from app.services.serpwow import relationship_store as rel_store
+
+    # Relationship runs have no rows and no engine-side Gemini batch to cancel — the
+    # stop is an S3 marker the runner polls between rows.
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        await asyncio.to_thread(rel_store.request_stop, pointer["prefix"])
+        # run_detail.js reports stopped_rows/batch_cancelled in its confirmation
+        # message; neither is knowable here (rows are not tracked individually), so
+        # send honest zeros rather than leave the UI rendering "undefined".
+        return {"upload_id": upload_id, "stop_requested": True,
+                "stopped_rows": 0, "batch_cancelled": False,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     _pending_sentinel = "Pending Gemini batch post-processing decision."
     async with get_upload_lock(upload_id):
         try:
@@ -5051,8 +5033,66 @@ async def batch_job_delete_by_name(
     }
 
 
+async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a relationship run from status.json counters.
+
+    Same JSON shape as the state-driven pipelines, so run_detail.js is unchanged.
+    Returns None when this id is not a relationship run.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    phase = str(counters.get("phase") or "queued")
+    status = {"queued": "queued", "scraping": "processing", "cleaning": "processing",
+              "reporting": "processing", "completed": "completed",
+              "stopped": "completed", "failed": "failed"}.get(phase, "processing")
+    total = int(counters.get("rows_total") or 0)
+    scraped = int(counters.get("rows_scraped") or 0)
+    failed = int(counters.get("rows_failed") or 0)
+
+    report = await asyncio.to_thread(
+        rel_store.get_object, f"{prefix}/report.json") or {}
+    summary = report.get("summary") or {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "llm",
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0, "scrapedo_billed_empty":
+                     int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+    return {
+        "upload_id": run_id,
+        "pipeline": PIPELINE_RELATIONSHIP,
+        "company_name": pointer.get("company_name"),
+        "status": status,
+        "total_rows": total,
+        "processed_rows": scraped + failed,
+        "failed_rows": failed,
+        "phase": phase,
+        "updated_at": counters.get("updated_at"),
+        "serpwow_summary": summary,
+        "files": ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                  "report.json", "run.log"],
+    }
+
+
 @app.get("/uploads/{upload_id}/status")
 async def upload_status(upload_id: str) -> dict[str, Any]:
+    # relationship runs have no state.json — they are counter-driven. Check the pointer
+    # first; the response shape is identical so the UI needs no change.
+    relationship_status = await _relationship_status(upload_id)
+    if relationship_status is not None:
+        return relationship_status
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:
@@ -5217,6 +5257,21 @@ async def upload_result_file(
     file: str = Query(...),
     download: bool = Query(False),
 ) -> Response:
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        allowed = {"confirmed_relation.csv", "notconfirmed_relation.csv",
+                   "report.json", "run.log", "input.csv", "status.json"}
+        if file not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unknown file {file!r}")
+        data = await asyncio.to_thread(
+            rel_store.get_bytes, f"{pointer['prefix']}/{file}")
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"{file} not available yet")
+        media = "application/json" if file.endswith(".json") else "text/plain"
+        return Response(content=data, media_type=media)
+
     if file not in _GSEARCH_RESULT_FILES:
         raise HTTPException(status_code=400, detail="file not allowed")
     upload_dir = _find_upload_dir(upload_id)

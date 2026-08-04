@@ -6,6 +6,13 @@ rows live in input.csv on S3, and parallelism comes from the bounded task window
 (topped up to RELATIONSHIP_CONCURRENCY and refilled as tasks finish), not from the
 message count. A single async process in this repo has already held 60 concurrent
 scrape.do calls, so the broker is a durable start signal, not a work distributor.
+
+ponytail: the _driving single-flight guard below is IN-PROCESS ONLY (a module-level
+set). It is correct today because the repo runs exactly one worker process. A second
+worker process would let two drivers race the same run and double-submit an in-flight
+Gemini shard — real re-spend. Upgrade path: a distributed lease, e.g. an S3
+conditional-put (IfNoneMatch) lock object under the run prefix, renewed by the driver
+and expired on crash.
 """
 from __future__ import annotations
 
@@ -464,10 +471,12 @@ async def consume_relationship_runs(channel) -> None:
     consumer for the whole run, so on the shared queue it would permanently eat one of
     WORKER_CONCURRENCY's slots. Bound to the SAME direct exchange AI Mode uses
     (RABBITMQ_EXCHANGE, default "singleRA_search" — see ai_mode/broker.py) under
-    RELATIONSHIP_ROUTING_KEY: Task 9's publisher MUST publish there (exchange.publish(...,
-    routing_key=RELATIONSHIP_ROUTING_KEY)), not to the default exchange by queue name —
-    the latter silently drops every message, since a queue bound to a named exchange no
-    longer also listens on the default exchange under its own name.
+    RELATIONSHIP_ROUTING_KEY, which is where engine.publish_relationship_run publishes.
+
+    (Publishing to the default exchange by queue name would also reach this queue —
+    every AMQP queue keeps its implicit default-exchange binding — but the named
+    exchange is what AI Mode and SerpWow use, and it makes the binding visible in the
+    management UI instead of implicit.)
     """
     exchange = await channel.declare_exchange(
         os.getenv("RABBITMQ_EXCHANGE", "singleRA_search"),

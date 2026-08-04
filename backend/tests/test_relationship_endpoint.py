@@ -1,173 +1,206 @@
-import asyncio
+"""Relationship upload/status endpoints after the scrape.do migration."""
 import io
+import os
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from app.services.serpwow import engine
+from app.services.serpwow import relationship_store as store
+from app.services.serpwow.engine import app
+from tests.test_relationship_store import FakeS3, _patched
 
-CSV = (
+GOOD_CSV = (b"Input_URL,Company_Name_X,Company_Name_Y\n"
+            b"https://acme.com/p,Acme,Sanzo\n")
+ENV = {"GEMINI_API_KEY": "k", "SCRAPEDO_TOKEN": "t", "S3_BUCKET": "b"}
+
+
+class UploadValidationTests(unittest.TestCase):
+    def test_missing_scrapedo_token_is_a_400(self) -> None:
+        with mock.patch.dict(os.environ, {**ENV, "SCRAPEDO_TOKEN": ""}, clear=False):
+            client = TestClient(app)
+            r = client.post("/uploads/relationship",
+                            files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                            data={"company_id": "c1", "company_name": "Acme"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("SCRAPEDO_TOKEN", r.json()["detail"])
+
+    def test_serpwow_api_key_is_no_longer_required(self) -> None:
+        """The relationship pipeline no longer calls SerpWow at all."""
+        fake = FakeS3()
+        with mock.patch.dict(os.environ, {**ENV, "SERPWOW_API_KEY": ""}, clear=False), \
+                _patched(fake), \
+                mock.patch("app.services.serpwow.engine.publish_relationship_run",
+                           new=mock.AsyncMock()):
+            client = TestClient(app)
+            r = client.post("/uploads/relationship",
+                            files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                            data={"company_id": "c1", "company_name": "Acme"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_a_bad_csv_reports_the_csv_problem_not_the_token(self) -> None:
+        with mock.patch.dict(os.environ, {**ENV, "SCRAPEDO_TOKEN": ""}, clear=False):
+            client = TestClient(app)
+            r = client.post("/uploads/relationship",
+                            files={"file": ("in.csv", b"nope\n1\n", "text/csv")},
+                            data={"company_id": "c1", "company_name": "Acme"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Company_Name_Y", r.json()["detail"])
+
+
+class UploadSideEffectTests(unittest.TestCase):
+    def test_upload_writes_input_csv_pointer_and_status_then_publishes(self) -> None:
+        fake = FakeS3()
+        published = mock.AsyncMock()
+        with mock.patch.dict(os.environ, ENV, clear=False), _patched(fake), \
+                mock.patch("app.services.serpwow.engine.publish_relationship_run",
+                           new=published):
+            client = TestClient(app)
+            r = client.post("/uploads/relationship",
+                            files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                            data={"company_id": "c1", "company_name": "Acme"})
+
+        run_id = r.json()["upload_id"]
+        with _patched(fake):
+            pointer = store.read_run_pointer(run_id)
+            status = store.read_status(pointer["prefix"])
+            self.assertEqual(store.get_bytes(store.input_key(pointer["prefix"])),
+                             GOOD_CSV)
+        self.assertEqual(status["rows_total"], 1)
+        self.assertEqual(status["phase"], "queued")
+        published.assert_awaited_once()
+
+    def test_supabase_run_db_id_rides_in_the_pointer(self) -> None:
+        """Phase 3 has no state dict — the pointer is where it finds the runs row."""
+        fake = FakeS3()
+        svc = mock.MagicMock()
+        svc.create_run.return_value = "run-db-7"
+        with mock.patch.dict(os.environ, ENV, clear=False), _patched(fake), \
+                mock.patch("app.services.companies.get_company_service",
+                           return_value=svc), \
+                mock.patch("app.services.serpwow.engine.publish_relationship_run",
+                           new=mock.AsyncMock()):
+            r = TestClient(app).post(
+                "/uploads/relationship",
+                files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                data={"company_id": "c1", "company_name": "Acme"})
+            with _patched(fake):
+                pointer = store.read_run_pointer(r.json()["upload_id"])
+        self.assertEqual(pointer["run_db_id"], "run-db-7")
+        self.assertEqual(svc.create_run.call_args.kwargs["pipeline"], "relationship")
+        self.assertEqual(svc.create_run.call_args.kwargs["total_rows"], 1)
+
+    def test_no_state_json_object_is_ever_written(self) -> None:
+        """state.json is what this migration removed; its return would be a regression."""
+        fake = FakeS3()
+        with mock.patch.dict(os.environ, ENV, clear=False), _patched(fake), \
+                mock.patch("app.services.serpwow.engine.publish_relationship_run",
+                           new=mock.AsyncMock()):
+            TestClient(app).post(
+                "/uploads/relationship",
+                files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                data={"company_id": "c1", "company_name": "Acme"})
+        self.assertFalse(any(k.endswith("/state.json") for k in fake.objects))
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_is_served_from_counters_not_from_rows(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run1", "acme/relationship/run1", "Acme")
+            store.put_object(store.status_key("acme/relationship/run1"), {
+                "rows_total": 500000, "rows_scraped": 1234, "rows_failed": 2,
+                "rows_billed_empty": 5, "credits": 12340, "requests": 1240,
+                "phase": "scraping", "updated_at": "2026-08-04T00:00:00Z"})
+
+            r = TestClient(app).get("/uploads/run1/status")
+
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(body["pipeline"], "relationship")
+        self.assertEqual(body["total_rows"], 500000)
+        self.assertEqual(body["status"], "processing")
+        self.assertEqual(body["serpwow_summary"]["cost"]["scrapedo_credits"], 12340)
+
+    def test_an_unknown_run_id_still_404s(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            r = TestClient(app).get("/uploads/nope/status")
+        self.assertEqual(r.status_code, 404)
+
+
+class FileStopAndRerunTests(unittest.TestCase):
+    """The /result, /stop and /retry-failed-rows relationship branches, all keyed
+    off the run pointer so non-relationship ids keep their old behaviour."""
+
+    PREFIX = "acme/relationship/run2"
+
+    def _seeded(self) -> FakeS3:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run2", self.PREFIX, "Acme")
+        return fake
+
+    def test_result_serves_an_output_object_from_s3(self) -> None:
+        fake = self._seeded()
+        with _patched(fake):
+            store.put_bytes(f"{self.PREFIX}/confirmed_relation.csv", b"a,b\n1,2\n")
+            r = TestClient(app).get(
+                "/uploads/run2/result", params={"file": "confirmed_relation.csv"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content, b"a,b\n1,2\n")
+
+    def test_result_404s_before_the_file_exists_and_400s_off_the_allowlist(self) -> None:
+        fake = self._seeded()
+        with _patched(fake):
+            client = TestClient(app)
+            missing = client.get("/uploads/run2/result", params={"file": "run.log"})
+            bad = client.get("/uploads/run2/result", params={"file": "state.json"})
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(bad.status_code, 400)
+
+    def test_stop_writes_the_stop_marker(self) -> None:
+        fake = self._seeded()
+        with _patched(fake):
+            r = TestClient(app).post("/uploads/run2/stop")
+            self.assertTrue(store.stop_requested(self.PREFIX))
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["stop_requested"])
+
+    def test_rerun_failed_drops_error_markers_clears_stop_and_republishes(self) -> None:
+        fake = self._seeded()
+        published = mock.AsyncMock()
+        with _patched(fake):
+            store.put_object(store.error_key(self.PREFIX, 3), {"error": "boom"})
+            store.put_object(store.raw_key(self.PREFIX, 4), {"ok": True})
+            store.request_stop(self.PREFIX)
+        with _patched(fake), mock.patch(
+                "app.services.serpwow.engine.publish_relationship_run", new=published):
+            r = TestClient(app).post("/uploads/run2/retry-failed-rows")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["retried_rows"], 1)
+        self.assertNotIn(store.error_key(self.PREFIX, 3), fake.objects)
+        # A successful row is never re-scraped, and the stop marker is lifted.
+        self.assertIn(store.raw_key(self.PREFIX, 4), fake.objects)
+        self.assertNotIn(store.stop_key(self.PREFIX), fake.objects)
+        published.assert_awaited_once_with("run2")
+
+
+PREVIEW_CSV = (
     "Input_URL,Company_Name_X,Box_No,Image_URL,Company_Name_Y,OCR_Status\n"
     "https://www.eastlinkcap.com/p,eastlinkcap,2.0,img2,Modal,SUCCESS\n"
     "https://www.eastlinkcap.com/p,eastlinkcap,3.0,img3,Modal,SUCCESS\n"
 ).encode()
 
-FAKE_ENV = {"GEMINI_API_KEY": "k", "SERPWOW_API_KEY": "k",
-            "RELATIONSHIP_LLM_BATCH": "false", "S3_BUCKET": ""}
-
-
-class TestRelationshipUploadEndpoint(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(engine.app)
-
-    def _post(self, data=None, csv_bytes=CSV):
-        return self.client.post(
-            "/uploads/relationship",
-            files={"file": ("rel.csv", io.BytesIO(csv_bytes), "text/csv")},
-            data=data or {"company_id": "c1", "company_name": "Acme"},
-        )
-
-    def _happy_patches(self):
-        svc = MagicMock()
-        svc.get_company.return_value = {"id": "c1", "name": "Acme"}
-        svc.create_run.return_value = "run-db-1"
-        return [
-            patch.dict("os.environ", FAKE_ENV),
-            patch("app.services.companies.get_company_service", return_value=svc),
-            patch.object(engine, "rabbitmq_exchange", MagicMock()),
-            patch.object(engine, "publish_job", AsyncMock()),
-            patch.object(engine, "persist_upload_state", AsyncMock()),
-            patch.object(engine, "_upload_dir", MagicMock()),
-        ]
-
-    def test_happy_path_processes_every_row_no_dedup(self):
-        patches = self._happy_patches()
-        for p in patches:
-            p.start()
-        try:
-            resp = self._post()
-            self.assertEqual(resp.status_code, 200, resp.text)
-            body = resp.json()
-            self.assertEqual(body["total_rows"], 2)      # no dedup: 2 rows in → 2 out
-            self.assertEqual(body["blank_rows"], 0)
-            self.assertEqual(body["unique_pairs"], 2)
-            # state carries the relationship block + pair-row extras
-            state = engine.persist_upload_state.call_args[0][1]
-            self.assertEqual(state["pipeline"], "relationship")
-            self.assertEqual(state["relationship"]["blank_rows"], 0)
-            self.assertEqual(state["relationship"]["row_count_original"], 2)
-            self.assertEqual(len(state["rows"]), 2)
-            row = state["rows"][0]
-            self.assertEqual(row["company_name"], "Modal")
-            self.assertEqual(row["x_name"], "eastlinkcap")
-            self.assertEqual(row["source_row_indices"], [0])
-            # job carries the same extras
-            job = engine.publish_job.call_args[0][0]
-            self.assertEqual(job["x_name"], "eastlinkcap")
-            self.assertEqual(job["input_url"], "https://www.eastlinkcap.com/p")
-            self.assertEqual(job["pipeline"], "relationship")
-            self.assertNotIn("source_row_indices", job)
-        finally:
-            for p in patches:
-                p.stop()
-
-    def test_missing_y_column_is_400(self):
-        patches = self._happy_patches()
-        for p in patches:
-            p.start()
-        try:
-            resp = self._post(csv_bytes=b"Company_Name_X,Other\na,b\n")
-            self.assertEqual(resp.status_code, 400)
-            self.assertIn("Company_Name_Y", resp.json()["detail"])
-        finally:
-            for p in patches:
-                p.stop()
-
-    def test_missing_gemini_key_is_400(self):
-        patches = self._happy_patches()
-        for p in patches:
-            p.start()
-        try:
-            with patch.dict("os.environ", {"GEMINI_API_KEY": ""}):
-                resp = self._post()
-            self.assertEqual(resp.status_code, 400)
-            self.assertIn("GEMINI_API_KEY", resp.json()["detail"])
-        finally:
-            for p in patches:
-                p.stop()
-
-    def test_blank_required_value_is_400(self):
-        patches = self._happy_patches()
-        for p in patches:
-            p.start()
-        try:
-            resp = self._post(csv_bytes=(
-                b"Input_URL,Company_Name_X,Company_Name_Y\n"
-                b"https://m25vc.com/p,m25vc,\n"
-            ))
-            self.assertEqual(resp.status_code, 400)
-            self.assertIn("Company_Name_Y", resp.json()["detail"])
-        finally:
-            for p in patches:
-                p.stop()
-
-
-class TestRetryFailedRowsCarriesPairFields(unittest.TestCase):
-    """Regression: a retried relationship row must carry x_name/input_url/city
-    (dropped previously) so it doesn't hit the not-has_x short-circuit again,
-    but must NOT carry source_row_indices (fan-out bookkeeping, not a job field)."""
-
-    def setUp(self):
-        self.client = TestClient(engine.app)
-
-    def _state(self):
-        return {
-            "upload_id": "u-retry-1",
-            "company_name": "Acme",
-            "pipeline": "relationship",
-            "phase": "all",
-            "rows": [
-                {
-                    "row_index": 1,
-                    "company_name": "Modal",
-                    "country": "",
-                    "status": "failed",
-                    "error": "no_company_x",
-                    "x_name": "eastlinkcap",
-                    "input_url": "https://www.eastlinkcap.com/p",
-                    "city": "Boston",
-                    "source_row_indices": [1, 2],
-                }
-            ],
-        }
-
-    def test_retry_republishes_pair_fields_without_source_row_indices(self):
-        state = self._state()
-        with patch.object(engine, "rabbitmq_exchange", MagicMock()), \
-             patch.object(engine, "get_upload_state", AsyncMock(return_value=state)), \
-             patch.object(engine, "read_upload_artifact", AsyncMock(return_value=state)), \
-             patch.object(engine, "persist_upload_state", AsyncMock()), \
-             patch.object(engine, "publish_job", AsyncMock()) as pub:
-            resp = self.client.post("/uploads/u-retry-1/retry-failed-rows")
-        self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(pub.await_count, 1)
-        job = pub.call_args[0][0]
-        self.assertEqual(job["x_name"], "eastlinkcap")
-        self.assertEqual(job["input_url"], "https://www.eastlinkcap.com/p")
-        self.assertEqual(job["city"], "Boston")
-        self.assertNotIn("source_row_indices", job)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestRelationshipPreviewEndpoint(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(engine.app)
+    """The dry-run preview is unchanged by the scrape.do migration — it never
+    touched SerpWow, state.json or the queue."""
 
-    def _preview(self, csv_bytes=CSV):
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def _preview(self, csv_bytes=PREVIEW_CSV):
         return self.client.post(
             "/uploads/relationship/preview",
             files={"file": ("rel.csv", io.BytesIO(csv_bytes), "text/csv")},
@@ -202,3 +235,7 @@ class TestRelationshipPreviewEndpoint(unittest.TestCase):
             b"Input_URL,Company_Name_X,Company_Name_Y\nhttps://m25vc.com/p,m25vc,\n")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Company_Name_Y", resp.json()["detail"])
+
+
+if __name__ == "__main__":
+    unittest.main()

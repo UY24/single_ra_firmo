@@ -314,6 +314,72 @@ async function completedRelationship() {
   }
 }
 
+// The two payloads below are byte-for-byte what engine._relationship_status builds
+// after the scrape.do migration: no gemini_batch, no rows[], no file_links, no
+// success_rows — a relationship run has no state.json to derive them from. This case
+// is the proof that the counter-driven response still drives the unchanged UI.
+async function counterDrivenRelationshipTerminal() {
+  const { root } = await renderStatus("rel-counter", {
+    upload_id: "rel-counter", pipeline: "relationship", company_name: "Acme",
+    status: "completed", total_rows: 5, processed_rows: 5, failed_rows: 0,
+    phase: "completed", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      pipeline: "relationship", status: "completed", total_rows: 5,
+      websites_found: 3, websites_not_found: 2,
+      relationship_breakdown: { confirmed: 3, not_confirmed: 2, unclear: 0 },
+      outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} },
+      empty_response_breakdown: { empty: 1 },
+      confidence_mode: "llm",
+      cost: {
+        scrapedo_requests: 5, scrapedo_successful_requests: 5,
+        scrapedo_failed_requests: 0, scrapedo_error_requests: 0,
+        scrapedo_billed_empty: 1, scrapedo_credits: 50,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+  });
+  assertOutcomeFirst(root, "3 of 5");
+  assert(root.textContent.includes("Relationship verdict"), "verdict section missing");
+  assert(root.textContent.includes("Scrape.do"), "scrape.do cost card missing");
+  assert(root.textContent.includes("50"), "scrape.do credits missing");
+  assert(!byText(root, "button", "Stop run"), "terminal run still offered Stop");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "counter-driven terminal run rendered no Files card");
+  for (const name of ["confirmed_relation.csv", "notconfirmed_relation.csv",
+    "report.json", "run.log"]) {
+    assert(files.textContent.includes(name), `Files card missing ${name}`);
+  }
+  assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
+  assert(!byTag(files, "button").some((button) => button.disabled),
+    "terminal relationship files rendered disabled");
+}
+
+async function counterDrivenRelationshipRunning() {
+  const { root } = await renderStatus("rel-running", {
+    upload_id: "rel-running", pipeline: "relationship", company_name: "Acme",
+    status: "processing", total_rows: 500000, processed_rows: 1236, failed_rows: 2,
+    phase: "scraping", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      total_rows: 500000, websites_found: 0, websites_not_found: 498764,
+      confidence_mode: "llm",
+      outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
+      empty_response_breakdown: { empty: 5 },
+      cost: {
+        scrapedo_requests: 1240, scrapedo_credits: 12340,
+        scrapedo_error_requests: 0, scrapedo_billed_empty: 5,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+  });
+  // A missing gemini_batch must not make a running run look "finalizing" or terminal.
+  assert(byText(root, "button", "Stop run"), "running relationship run offered no Stop");
+  assert(!byClass(root, "files-section").length, "running run exposed files that do not exist yet");
+  assertOutcomeFirst(root, "0 of 500,000");
+}
+
 async function finalizingBatch() {
   const base = {
     pipeline: "gsearch", status: "completed", total_rows: 4, processed_rows: 4,
@@ -676,6 +742,8 @@ await completedGsearchLlm();
 await completedGmapsHeuristic();
 await failedRowsViewer();
 await completedRelationship();
+await counterDrivenRelationshipTerminal();
+await counterDrivenRelationshipRunning();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
 await nonReportingPipelineIgnoresBatchState();

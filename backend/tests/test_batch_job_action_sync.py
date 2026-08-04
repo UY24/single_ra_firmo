@@ -126,7 +126,9 @@ class TestBatchJobActionLocalSync(unittest.TestCase):
         persist.assert_not_awaited()
 
     def test_cancel_requested_remains_pending_for_reporting_pipelines(self):
-        for pipeline in ("gsearch", "gmaps", "relationship"):
+        # relationship is absent: it never routes through the shared row-batch engine
+        # (its own Gemini Batch driver lives in relationship_runner).
+        for pipeline in ("gsearch", "gmaps"):
             with self.subTest(pipeline=pipeline), \
                  patch.object(engine, "_batch_postprocess_enabled_for", return_value=True):
                 state = {"pipeline": pipeline, "gemini_batch": {"status": "cancel_requested"}}

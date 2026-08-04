@@ -19,20 +19,6 @@ class TestRelationshipGates(unittest.TestCase):
             {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP},
         )
 
-    def test_batch_gate_follows_env(self):
-        with patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            self.assertFalse(engine._batch_postprocess_enabled_for("relationship"))
-        with patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}):
-            self.assertTrue(engine._batch_postprocess_enabled_for("relationship"))
-
-    def test_batch_pending_defers_relationship(self):
-        state = {"pipeline": "relationship",
-                 "gemini_batch": {"status": "running"}}
-        with patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}):
-            self.assertTrue(engine._batch_postprocess_pending(state))
-        with patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            self.assertFalse(engine._batch_postprocess_pending(state))
-
     def test_result_file_allowlist_has_skipped_csv(self):
         self.assertIn("skipped.csv", engine._GSEARCH_RESULT_FILES)
 

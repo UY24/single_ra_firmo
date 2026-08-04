@@ -141,7 +141,7 @@ function previewTables(preview) {
   // Relationship preview: surface the search plan up front.
   if (preview.relationship) {
     parts.push(el("p", { class: "section-copy" },
-      "Each row is searched across 3 AI-Overview phases (relationship + website)."));
+      "Each row is verified with one Google AI Mode search (relationship + website)."));
   }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));

@@ -180,5 +180,17 @@ class PointerTests(unittest.TestCase):
             self.assertIsNone(store.read_run_pointer("nope"))
 
 
+class HermeticityTests(unittest.TestCase):
+    """The relationship pipeline's AI Mode client and S3 store read these credentials
+    directly (see scrapedo_ai_client.py / relationship_store.py) — tests/__init__.py
+    must blank them for the whole process or a row-path test could hit live services."""
+
+    def test_cloud_credentials_are_blanked_for_the_test_process(self) -> None:
+        for key in ("SCRAPEDO_TOKEN", "S3_BUCKET", "GEMINI_API_KEY",
+                    "AWS_SECRET_ACCESS_KEY"):
+            self.assertEqual(os.environ.get(key, ""), "",
+                             f"{key} leaked into the test process")
+
+
 if __name__ == "__main__":
     unittest.main()

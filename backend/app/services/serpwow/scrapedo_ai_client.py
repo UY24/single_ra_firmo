@@ -120,7 +120,10 @@ async def search_ai_mode(
             return _envelope(
                 query, gl,
                 request_count=request_count,
-                error=_safe_error(exc, response),
+                # label: this string is persisted per row and shown in "View failed rows"
+                # — without it every transport error/429/5xx on this pipeline reads as a
+                # Google MAPS failure (the shared helper's default).
+                error=_safe_error(exc, response, label="ai-mode"),
                 error_category=categorize_http_error(
                     status, f"{type(exc).__name__}: {exc}"),
             )

@@ -362,6 +362,19 @@ class FailureTests(unittest.TestCase):
         # HTTP 200 means scrape.do charged for it.
         self.assertEqual(env["credits"], 10)
 
+    def test_token_in_a_JSON_error_body_is_redacted(self) -> None:
+        """_safe_error's JSON-body branch was the one path that skipped _redact (the
+        non-JSON fallback always had it), so a provider error that echoes the request URL
+        persisted the API token into a durable per-row S3 error object."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": f"bad token for {request.url}"})
+
+        env = _run(handler, SCRAPEDO_MAX_RETRIES="0")
+        self.assertNotIn("test-token", env["error"])
+        self.assertIn("[REDACTED]", env["error"])
+        # gmaps keeps the default endpoint label — nothing about this pipeline changed.
+        self.assertIn("scrape.do maps search failed", env["error"])
+
     def test_token_is_redacted_from_error_text(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError(f"failed connecting to {request.url}")

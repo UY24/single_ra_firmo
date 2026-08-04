@@ -130,6 +130,23 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("test-token", env["error"])
         self.assertIn("REDACTED", env["error"])
 
+    def test_errors_name_the_ai_mode_endpoint_not_google_maps(self) -> None:
+        """This string is persisted per row and shown in "View failed rows". Reusing the
+        gmaps helper's hardcoded text reported every transport error, 429 and 5xx on this
+        pipeline as a Google MAPS failure."""
+        env = _run(lambda request: httpx.Response(500, json={"error": "upstream boom"}),
+                   SCRAPEDO_MAX_RETRIES="0")
+        self.assertIn("ai-mode", env["error"])
+        self.assertNotIn("maps", env["error"])
+
+    def test_a_json_error_body_is_redacted_too(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": f"bad token for {request.url}"})
+
+        env = _run(handler, SCRAPEDO_MAX_RETRIES="0")
+        self.assertNotIn("test-token", env["error"])
+        self.assertIn("[REDACTED]", env["error"])
+
     def test_missing_token_errors_without_calling_out(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise AssertionError("must not make a request without a token")

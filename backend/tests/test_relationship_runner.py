@@ -364,7 +364,11 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
                                 clear=False), \
                 mock.patch("time.sleep", lambda _s: None):
             out = runner._run_gemini_batch(PREFIX, [("0", {})])
-        self.assertEqual(out, {"0": {}})
+        self.assertEqual(out["0"]["parsed"], {})
+        # usage + model are kept now, not discarded — the UI's token/model tiles read them.
+        self.assertIn("usage", out["0"])
+        self.assertEqual(out["0"]["model"], os.getenv("GEMINI_BATCH_MODEL",
+                                                      "gemini-2.5-flash-lite"))
 
 
 class VerdictPhaseTests(unittest.TestCase):
@@ -384,10 +388,13 @@ class VerdictPhaseTests(unittest.TestCase):
         self._seed_raw(fake)
 
         def fake_batch(prefix_arg, items, counters=None):
-            return {key: {"relationship_status": "confirmed",
-                          "official_website": "https://y.com",
-                          "relationship_confidence_score": 90,
-                          "website_confidence_score": 90} for key, _body in items}
+            return {key: {"parsed": {"relationship_status": "confirmed",
+                                     "official_website": "https://y.com",
+                                     "relationship_confidence_score": 90,
+                                     "website_confidence_score": 90},
+                          "usage": {"promptTokenCount": 11,
+                                    "candidatesTokenCount": 7},
+                          "model": "gemini-2.5-flash-lite"} for key, _body in items}
 
         with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch):
             counters = store.Counters(PREFIX, rows_total=3)

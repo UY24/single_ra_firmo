@@ -35,6 +35,7 @@ from app.services.serpwow import relationship_store as store
 from app.services.serpwow.modes.relationship import build_evidence, row_fields
 from app.services.serpwow.query_builders import build_relationship_search_query
 from app.services.serpwow.relationship_outputs import write_outputs
+from app.services.serpwow.row_logging import _log_row_stage
 from app.services.serpwow.scrapedo_ai_client import search_ai_mode
 from app.services.serpwow.url_utils import x_domain_from_input_url
 
@@ -144,6 +145,21 @@ async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters
             counters.bump(rows_billed_empty=1)
     counters.flush()
 
+    # Per-row trace via the repo's existing helper, which PRINTS. _LOGGER alone was the
+    # reason `python worker.py` sat silent through a whole relationship run while gmaps and
+    # AI Mode filled the terminal: nothing configures a logging handler in the worker.
+    _log_row_stage(
+        "relationship.scrape",
+        (f"y={fields['y_name']!r} refs={len(envelope.get('references') or [])} "
+         f"blocks={len(envelope.get('text_blocks') or [])} "
+         f"attempts={envelope.get('request_count')} credits={envelope.get('credits')}"
+         + (f" billed_empty=1" if envelope.get("billed_empty") else "")
+         + (f" error={envelope['error']}" if envelope.get("error") else "")),
+        upload_id=prefix.rsplit("/", 1)[-1],
+        row_index=idx,
+        level="WARN" if envelope.get("error") else "INFO",
+    )
+
 
 async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
     """Scrape every row that has no object yet, `SCRAPEDO_CONCURRENCY` at a time."""
@@ -151,6 +167,9 @@ async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
     counters.flush(force=True)
 
     done = await asyncio.to_thread(store.list_done_rows, prefix)
+    _log_row_stage("relationship.phase",
+                   f"scrape phase: {len(done)} row(s) already done, concurrency="
+                   f"{_concurrency()}", upload_id=prefix.rsplit("/", 1)[-1])
     _LOGGER.info("relationship %s: resuming with %d row(s) already done", prefix, len(done))
 
     stopped = False
@@ -286,7 +305,12 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
         key = str(record.get("key") or "")
         parsed = gb.parse_json_from_text(record.get("text") or "")
         if key:
-            out[key] = parsed or {}
+            # Keep `usage` and `model`, not just the verdict. collect_results already
+            # hands back per-request usageMetadata and we were throwing it away, which is
+            # why the run-detail Model chip and the Input/Output-token and LLM-cost tiles
+            # went blank for this pipeline — the UI reads them, nothing fed them.
+            out[key] = {"parsed": parsed or {}, "usage": record.get("usage"),
+                        "model": model}
     return out
 
 
@@ -327,6 +351,10 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
     """
     counters.set_phase("cleaning")
     counters.flush(force=True)
+    _log_row_stage("relationship.phase",
+                   "LLM phase: submitting Gemini Batch verdict shards "
+                   f"(shard_size={_shard_size()} max_inflight={_max_inflight()})",
+                   upload_id=prefix.rsplit("/", 1)[-1])
 
     scraped = await asyncio.to_thread(store.list_done_rows, prefix)
     already = await asyncio.to_thread(store.list_cleaned_rows, prefix)
@@ -341,12 +369,16 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
         results = await asyncio.to_thread(_run_gemini_batch, prefix, items, counters)
         for key, _body in items:
             candidates, x_domain = item_meta.get(key, ([], ""))
+            result = results.get(key) or {}
             await asyncio.to_thread(
                 store.put_object, store.cleaned_key(prefix, int(key)),
-                {"row_index": int(key), "parsed": results.get(key),
+                {"row_index": int(key), "parsed": result.get("parsed"),
                  # Stored so phase 3 reads cleaned/ alone: re-deriving the candidate set
                  # would mean fetching every raw object a second time.
-                 "candidates": candidates, "x_domain": x_domain, "error": None})
+                 "candidates": candidates, "x_domain": x_domain, "error": None,
+                 # Per-row LLM usage + model, so write_outputs can report token counts,
+                 # the model name and the Gemini cost the UI already has tiles for.
+                 "usage": result.get("usage"), "model": result.get("model")})
             counters.bump(rows_cleaned=1)
         counters.flush()
 
@@ -429,7 +461,10 @@ async def drive_run(run_id: str) -> None:
             return
         prefix = str(pointer.get("prefix") or "")
         status = await asyncio.to_thread(store.read_status, prefix) or {}
-        counters = store.Counters(prefix, rows_total=int(status.get("rows_total") or 0))
+        # created_at is carried forward, never re-stamped: it is what makes total wall
+        # clock survive a worker restart mid-run.
+        counters = store.Counters(prefix, rows_total=int(status.get("rows_total") or 0),
+                                  created_at=status.get("created_at"))
         for field in counters.values:
             counters.values[field] = int(status.get(field) or 0)
 
@@ -439,7 +474,9 @@ async def drive_run(run_id: str) -> None:
         await asyncio.to_thread(_update_supabase, pointer, status="running")
 
         try:
+            _phase = time.monotonic()
             await run_scrape_phase(prefix, counters)
+            counters.bump(scrape_seconds=int(time.monotonic() - _phase))
             # A stop does NOT discard the run. Skip only the (money-spending) verdict
             # phase: write_outputs already handles rows with no cleaned/ object fine
             # (parsed=None -> "unclear"), and it is what produces confirmed_relation.csv,
@@ -448,7 +485,9 @@ async def drive_run(run_id: str) -> None:
             # left Supabase on "queued" forever, and showed a completed run with an
             # empty Files card.
             if not await asyncio.to_thread(store.stop_requested, prefix):
+                _phase = time.monotonic()
                 await run_verdict_phase(prefix, counters)
+                counters.bump(llm_seconds=int(time.monotonic() - _phase))
             summary = await asyncio.to_thread(write_outputs, prefix, counters)
             await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
         except Exception as exc:

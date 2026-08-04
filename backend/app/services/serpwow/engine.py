@@ -4331,6 +4331,8 @@ async def create_relationship_upload(
                             company_name or company_id, run_db_id)
     # The API writes status.json exactly once, before publishing. From the first scrape
     # on, the worker is the only writer.
+    # created_at is stamped ONCE here and carried by every later drive, so total wall
+    # clock survives a worker restart mid-run.
     counters = rel_store.Counters(prefix, rows_total=total, phase="queued")
     await asyncio.to_thread(counters.flush, True)
 
@@ -5078,6 +5080,23 @@ def _relationship_available_files(prefix: str) -> list[str]:
             if next(rel_store.iter_keys(f"{prefix}/{name}"), None) is not None]
 
 
+def _relationship_elapsed(counters: dict[str, Any]) -> Optional[int]:
+    """Wall clock from a relationship run's created_at to now, for mid-run display.
+
+    report.json only exists once the run is terminal, so without this the Processing-time
+    tile stayed blank for the whole run.
+    """
+    import calendar
+    import time as _time
+
+    try:
+        started = calendar.timegm(
+            _time.strptime(str(counters.get("created_at")), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(_time.time() - started))
+
+
 async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     """Build the /status response for a relationship run from status.json counters.
 
@@ -5106,6 +5125,14 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
         # there is no per-row LLM path. Must match relationship_outputs' summary so the
         # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
         "is_batch": True,
+        # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
+        # these are honest zeros rather than absent keys — the tiles render 0, not blank,
+        # and fill in for real once report.json exists.
+        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _relationship_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
+                          "cleaning": int(counters.get("llm_seconds") or 0)},
         "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
         "empty_response_breakdown": {
             "empty": int(counters.get("rows_billed_empty") or 0)},
@@ -5140,6 +5167,11 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     return {
         "upload_id": run_id,
         "pipeline": PIPELINE_RELATIONSHIP,
+        # Mid-run the report doesn't exist yet, so serve timings from the counters. The UI
+        # reads processing_seconds_total/avg at the top level, not inside the summary.
+        "created_at": counters.get("created_at"),
+        "processing_seconds_total": summary.get("processing_seconds_total"),
+        "processing_seconds_avg": summary.get("processing_seconds_avg"),
         "company_name": pointer.get("company_name"),
         "status": status,
         "total_rows": total,

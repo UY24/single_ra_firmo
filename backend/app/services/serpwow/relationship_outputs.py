@@ -25,6 +25,7 @@ import tempfile
 from typing import Any
 
 from app.services.serpwow import relationship_store as store
+from app.services.serpwow.cost import calculate_gemini_cost_usd
 from app.services.serpwow.modes.relationship import build_row_result, row_fields
 
 EXTRA_COLUMNS = [
@@ -122,6 +123,12 @@ def _write_outputs(prefix: str, counters: store.Counters,
         stack.callback(text.close)
         return tmp, text
 
+    # Timings come off the counters, which carry created_at from upload and the two
+    # per-phase totals the runner accumulates.
+    elapsed_total = counters.elapsed_seconds()
+    scrape_seconds = int(counters.values.get("scrape_seconds") or 0)
+    llm_seconds = int(counters.values.get("llm_seconds") or 0)
+
     header = store.read_input_header(prefix)
     passthrough = _passthrough_fieldnames(header)
     fieldnames = [out_name for out_name, _src in passthrough] + EXTRA_COLUMNS
@@ -145,6 +152,9 @@ def _write_outputs(prefix: str, counters: store.Counters,
     by_category: dict[str, int] = {}
     requests = successes = credits = billed_empty = error_requests = 0
     total_rows = found = 0
+    prompt_tokens = completion_tokens = 0
+    llm_usd = 0.0
+    model: str | None = None
 
     for original in store.iter_input_rows(prefix):
         total_rows += 1
@@ -177,6 +187,16 @@ def _write_outputs(prefix: str, counters: store.Counters,
 
         cleaned = store.get_object(store.cleaned_key(prefix, idx)) or {}
         parsed = cleaned.get("parsed")
+        # LLM accounting, aggregated per row so nothing scales with run size. The UI has
+        # had Model / Input tokens / Output tokens / LLM-cost tiles all along; they were
+        # blank only because this summary never fed them.
+        usage = cleaned.get("usage")
+        if isinstance(usage, dict):
+            prompt_tokens += int(usage.get("promptTokenCount") or 0)
+            completion_tokens += int(usage.get("candidatesTokenCount") or 0)
+            llm_usd += calculate_gemini_cost_usd(usage)
+        if model is None and cleaned.get("model"):
+            model = str(cleaned["model"])
         result = build_row_result(
             fields, envelope, parsed if isinstance(parsed, dict) else None,
             cleaned.get("candidates") or [], str(cleaned.get("x_domain") or ""))
@@ -240,6 +260,17 @@ def _write_outputs(prefix: str, counters: store.Counters,
         # always the Gemini Batch verdict pass. Leaving it unset made run_detail.js read
         # undefined and render "Batch: Off", which was simply wrong.
         "is_batch": True,
+        # The run-detail Model chip and the Input/Output-token tiles read exactly these.
+        "model": model,
+        "token_usage": {"prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens},
+        # Wall-clock, from status.json's created_at to now. Phase splits are reported
+        # separately below so "how long did scrape.do take vs the LLM" is answerable.
+        "processing_seconds_total": elapsed_total,
+        "processing_seconds_avg": (round(elapsed_total / total_rows, 3)
+                                   if elapsed_total and total_rows else None),
+        "phase_seconds": {"scraping": scrape_seconds, "cleaning": llm_seconds},
         "cost": {
             # scrape.do bills CREDITS, never dollars. No serpwow_* key appears here —
             # its absence is what routes this run down the scrape.do branch in the UI.
@@ -249,8 +280,9 @@ def _write_outputs(prefix: str, counters: store.Counters,
             "scrapedo_error_requests": error_requests,
             "scrapedo_billed_empty": billed_empty,
             "scrapedo_credits": credits,
-            "llm_usd": 0.0,
-            "total_usd": 0.0,
+            "llm_usd": round(llm_usd, 6),
+            # scrape.do is credits-only, so the USD total is the Gemini spend alone.
+            "total_usd": round(llm_usd, 6),
         },
     }
 

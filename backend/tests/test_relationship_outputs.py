@@ -51,6 +51,54 @@ def _read_csv(fake, name, prefix=PREFIX):
     return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
 
 
+class LlmReportingTests(unittest.TestCase):
+    """The run-detail Model chip and the Input/Output-token + LLM-cost tiles read these.
+    They went blank because the summary stopped feeding them, not because the UI lost
+    them — collect_results returns usage per request and the runner was discarding it."""
+
+    def test_model_tokens_and_gemini_cost_are_reported(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            # Two rows carry usage; the third has none (e.g. an error row).
+            for idx in (0, 1):
+                c = store.get_object(store.cleaned_key(PREFIX, idx)) or {}
+                c.update({"usage": {"promptTokenCount": 100,
+                                    "candidatesTokenCount": 40},
+                          "model": "gemini-2.5-flash-lite"})
+                store.put_object(store.cleaned_key(PREFIX, idx), c)
+            summary = outputs.write_outputs(PREFIX, store.Counters(PREFIX, rows_total=3))
+
+        self.assertEqual(summary["model"], "gemini-2.5-flash-lite")
+        self.assertEqual(summary["token_usage"]["prompt_tokens"], 200)
+        self.assertEqual(summary["token_usage"]["completion_tokens"], 80)
+        self.assertEqual(summary["token_usage"]["total_tokens"], 280)
+        # scrape.do is credits-only, so USD is the Gemini spend alone.
+        self.assertEqual(summary["cost"]["llm_usd"], summary["cost"]["total_usd"])
+        self.assertGreater(summary["cost"]["llm_usd"], 0.0)
+
+    def test_batch_mode_is_always_on_for_this_pipeline(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            summary = outputs.write_outputs(PREFIX, store.Counters(PREFIX, rows_total=3))
+        self.assertTrue(summary["is_batch"])
+
+    def test_timings_are_reported_per_phase_and_in_total(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            counters = store.Counters(PREFIX, rows_total=3,
+                                      created_at="2026-08-04T00:00:00Z")
+            counters.bump(scrape_seconds=42, llm_seconds=300)
+            summary = outputs.write_outputs(PREFIX, counters)
+
+        self.assertEqual(summary["phase_seconds"], {"scraping": 42, "cleaning": 300})
+        # created_at is long past, so total wall clock is a real positive number.
+        self.assertGreater(summary["processing_seconds_total"], 0)
+        self.assertGreater(summary["processing_seconds_avg"], 0)
+
+
 class OutputTests(unittest.TestCase):
     def test_split_is_by_relationship_status_not_url_presence(self) -> None:
         fake = FakeS3()

@@ -15,6 +15,7 @@ ONLY copy, a swallowed PUT failure silently loses a row's work.
 """
 from __future__ import annotations
 
+import calendar
 import csv
 import io
 import json
@@ -253,6 +254,10 @@ def stop_requested(prefix: str) -> bool:
 
 # ---------------------------------------------------------------- counters
 
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def read_status(prefix: str) -> Optional[dict[str, Any]]:
     return get_object(status_key(prefix))
 
@@ -271,14 +276,22 @@ class Counters:
     # task_errors: row/shard tasks that raised (see relationship_runner._drain). Not a
     # row count — one verdict-shard error can strand thousands of rows — but it is the
     # only durable trace that something failed outside the per-row error markers.
+    # scrape_seconds / llm_seconds are cumulative per-phase wall clock, so the run can
+    # answer "how long did scrape.do take vs the LLM" without a second store. Integers
+    # like every other field, so status.json stays ~2KB at any run size.
     _FIELDS = ("rows_total", "rows_scraped", "rows_failed", "rows_billed_empty",
-               "rows_cleaned", "requests", "credits", "task_errors")
+               "rows_cleaned", "requests", "credits", "task_errors",
+               "scrape_seconds", "llm_seconds")
 
-    def __init__(self, prefix: str, rows_total: int = 0, phase: str = "queued") -> None:
+    def __init__(self, prefix: str, rows_total: int = 0, phase: str = "queued",
+                 created_at: str | None = None) -> None:
         self.prefix = prefix
         self.values: dict[str, int] = {f: 0 for f in self._FIELDS}
         self.values["rows_total"] = int(rows_total)
         self.phase = phase
+        # Set once, at upload, and carried forward by every later drive — it is what makes
+        # total wall clock reportable. updated_at alone cannot give it.
+        self.created_at = created_at or _utc_now()
         self._last_flush = 0.0
 
     def bump(self, **deltas: int) -> None:
@@ -291,7 +304,20 @@ class Counters:
 
     def snapshot(self) -> dict[str, Any]:
         return {**self.values, "phase": self.phase,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                "created_at": self.created_at, "updated_at": _utc_now()}
+
+    def elapsed_seconds(self) -> Optional[int]:
+        """Wall clock from created_at to now, or None if created_at is unparseable.
+
+        Survives a worker restart because created_at lives in status.json, not memory —
+        which is the whole reason total run time is reportable at all here.
+        """
+        try:
+            started = calendar.timegm(
+                time.strptime(str(self.created_at), "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            return None
+        return max(0, int(time.time() - started))
 
     def flush(self, force: bool = False) -> None:
         interval = max(0.0, get_float_env("RELATIONSHIP_STATUS_FLUSH_SEC", 2.0))

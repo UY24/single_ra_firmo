@@ -38,6 +38,17 @@ class UploadValidationTests(unittest.TestCase):
                             data={"company_id": "c1", "company_name": "Acme"})
         self.assertEqual(r.status_code, 200)
 
+    def test_missing_s3_bucket_is_a_400_not_an_opaque_500(self) -> None:
+        """This pipeline is S3-only — an unset bucket must fail like any other env key,
+        not blow up inside the first put_bytes."""
+        with mock.patch.dict(os.environ, {**ENV, "S3_BUCKET": ""}, clear=False):
+            client = TestClient(app)
+            r = client.post("/uploads/relationship",
+                            files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                            data={"company_id": "c1", "company_name": "Acme"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("S3_BUCKET", r.json()["detail"])
+
     def test_a_bad_csv_reports_the_csv_problem_not_the_token(self) -> None:
         with mock.patch.dict(os.environ, {**ENV, "SCRAPEDO_TOKEN": ""}, clear=False):
             client = TestClient(app)
@@ -126,6 +137,134 @@ class StatusTests(unittest.TestCase):
         fake = FakeS3()
         with _patched(fake):
             r = TestClient(app).get("/uploads/nope/status")
+        self.assertEqual(r.status_code, 404)
+
+    def test_terminal_status_comes_from_the_report_not_the_phase(self) -> None:
+        """phase only ever reaches "completed"; write_outputs computes
+        completed_with_errors and _notify_terminal sends THAT to Supabase, so the
+        detail page must agree with the Runs list."""
+        fake = FakeS3()
+        prefix = "acme/relationship/run3"
+        with _patched(fake):
+            store.write_run_pointer("run3", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "rows_scraped": 4, "rows_failed": 1,
+                              "phase": "completed"})
+            store.put_bytes(f"{prefix}/report.json", b'{"summary": {'
+                            b'"status": "completed_with_errors", "total_rows": 5,'
+                            b'"outcome_breakdown": {"found": 3, "not_found": 1,'
+                            b'"errored": 1}}}')
+            r = TestClient(app).get("/uploads/run3/status")
+        self.assertEqual(r.json()["status"], "completed_with_errors")
+
+    def test_a_stopped_run_reads_as_terminal_for_the_poller(self) -> None:
+        """run_detail.js has no rule for "stopped": passing it through would poll
+        forever and never show the Files card."""
+        fake = FakeS3()
+        prefix = "acme/relationship/run4"
+        with _patched(fake):
+            store.write_run_pointer("run4", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "phase": "stopped"})
+            store.put_bytes(f"{prefix}/report.json",
+                            b'{"summary": {"status": "stopped", "total_rows": 5}}')
+            r = TestClient(app).get("/uploads/run4/status")
+        self.assertEqual(r.json()["status"], "completed")
+
+    def test_available_files_lists_only_files_that_exist(self) -> None:
+        """A run that failed mid-scrape is terminal, so the UI renders the Files card —
+        it must not offer four enabled links to objects that were never written."""
+        fake = FakeS3()
+        prefix = "acme/relationship/run5"
+        with _patched(fake):
+            store.write_run_pointer("run5", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "rows_failed": 5, "phase": "failed"})
+            failed = TestClient(app).get("/uploads/run5/status").json()
+
+            store.put_bytes(f"{prefix}/confirmed_relation.csv", b"a\n")
+            store.put_bytes(f"{prefix}/run.log", b"x\n")
+            partial = TestClient(app).get("/uploads/run5/status").json()
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["serpwow_summary"]["available_files"], [])
+        self.assertEqual(partial["serpwow_summary"]["available_files"],
+                         ["confirmed_relation.csv", "run.log"])
+
+    def test_a_running_run_does_not_pay_for_the_file_probe(self) -> None:
+        fake = FakeS3()
+        prefix = "acme/relationship/run6"
+        with _patched(fake):
+            store.write_run_pointer("run6", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "phase": "scraping"})
+            body = TestClient(app).get("/uploads/run6/status").json()
+        self.assertEqual(body["status"], "processing")
+        self.assertEqual(body["serpwow_summary"]["available_files"], [])
+
+
+class FailureAnalysisTests(unittest.TestCase):
+    """GET /uploads/{id}/failure-analysis — the endpoint behind the "View failed rows"
+    control run_detail.js offers whenever outcome_breakdown.errored > 0."""
+
+    PREFIX = "acme/relationship/run7"
+
+    def test_failed_rows_come_from_the_error_objects(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run7", self.PREFIX, "Acme")
+            store.put_object(store.status_key(self.PREFIX), {"rows_total": 4})
+            for idx, category in ((2, "timeout"), (1, "http_502")):
+                store.put_object(store.error_key(self.PREFIX, idx), {
+                    "row_index": idx, "error": f"boom {idx}",
+                    "error_category": category,
+                    "fields": {"y_name": f"Y{idx}", "country": "us"}})
+            store.put_object(store.raw_key(self.PREFIX, 3), {"row_index": 3})
+            r = TestClient(app).get("/uploads/run7/failure-analysis",
+                                    params={"sample_limit": 100})
+
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(body["failed_rows"], 2)          # the raw object is not counted
+        self.assertEqual(body["total_rows"], 4)
+        self.assertEqual(body["failed_rate_pct"], 50.0)
+        # Sorted by row_index, and shaped exactly as the JS table reads it.
+        self.assertEqual([row["row_index"] for row in body["sample_failed_rows"]], [1, 2])
+        first = body["sample_failed_rows"][0]
+        self.assertEqual(first["company_name"], "Y1")
+        self.assertEqual(first["error_source"], "scrapedo")
+        self.assertEqual(first["error_category"], "http_502")
+        self.assertEqual(first["error"], "boom 1")
+        self.assertEqual(body["by_category"],
+                         [{"category": "http_502", "count": 1},
+                          {"category": "timeout", "count": 1}])
+
+    def test_sample_limit_caps_the_gets_but_not_the_count(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run7", self.PREFIX, "Acme")
+            for idx in range(5):
+                store.put_object(store.error_key(self.PREFIX, idx),
+                                 {"row_index": idx, "error": "boom"})
+            r = TestClient(app).get("/uploads/run7/failure-analysis",
+                                    params={"sample_limit": 2})
+        body = r.json()
+        self.assertEqual(body["failed_rows"], 5)
+        self.assertEqual(len(body["sample_failed_rows"]), 2)
+
+    def test_a_clean_run_reports_zero_rather_than_404ing(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run7", self.PREFIX, "Acme")
+            r = TestClient(app).get("/uploads/run7/failure-analysis")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["failed_rows"], 0)
+        self.assertEqual(r.json()["sample_failed_rows"], [])
+
+    def test_a_non_relationship_id_still_404s(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            r = TestClient(app).get("/uploads/nope/failure-analysis")
         self.assertEqual(r.status_code, 404)
 
 

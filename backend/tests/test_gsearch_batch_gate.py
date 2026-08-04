@@ -59,6 +59,16 @@ class TestBatchItemSeeding(unittest.TestCase):
         self.assertEqual([key for key, _ in items], ["row-1"])
         self.assertEqual(by_key, {"row-1": 1})
 
+    def test_the_no_candidates_skip_is_gsearch_only(self):
+        """The guard is `pipeline == gsearch AND not candidates` — a defence for legacy
+        gsearch rows written before skip_llm existed. Widening it to every pipeline would
+        silently drop candidate-less gmaps rows from the batch, so pin gmaps here."""
+        row = _gsearch_row()
+        row["result"]["context"]["pipeline"] = "gmaps"
+        items, by_key = legacy_app._build_batch_items_for_state({"rows": [row]})
+        self.assertEqual([key for key, _ in items], ["row-1"])
+        self.assertEqual(by_key, {"row-1": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

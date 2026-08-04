@@ -812,7 +812,10 @@ function renderLegacyStatus(root, ref, s) {
           ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
       : [];
-    const extras = [
+    // Relationship runs are counter-driven: there is no state.json to build output.json
+    // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two
+    // relationship CSVs above — don't advertise two links that cannot work.
+    const extras = s.pipeline === "relationship" ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
     ];

@@ -331,6 +331,8 @@ async function counterDrivenRelationshipTerminal() {
       error_breakdown: { by_source: {}, by_category: {} },
       empty_response_breakdown: { empty: 1 },
       confidence_mode: "llm",
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
+        "report.json", "run.log"],
       cost: {
         scrapedo_requests: 5, scrapedo_successful_requests: 5,
         scrapedo_failed_requests: 0, scrapedo_error_requests: 0,
@@ -354,6 +356,42 @@ async function counterDrivenRelationshipTerminal() {
   assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
   assert(!byTag(files, "button").some((button) => button.disabled),
     "terminal relationship files rendered disabled");
+  // A relationship run has no state.json, so /output (json and xlsx) 404s — the Files
+  // card must not offer them. gsearch keeps them (see failedReportingRunShowsFiles).
+  assert(!files.textContent.includes("output.json")
+    && !files.textContent.includes("output.xlsx"),
+  "relationship Files card advertised the state-driven output endpoints");
+}
+
+async function counterDrivenRelationshipFailedMidScrape() {
+  // Terminal (so filesReady is true) but write_outputs never ran: available_files is
+  // empty and every file link must render disabled rather than as an enabled 404.
+  const { root } = await renderStatus("rel-failed", {
+    upload_id: "rel-failed", pipeline: "relationship", company_name: "Acme",
+    status: "failed", total_rows: 5, processed_rows: 2, failed_rows: 2,
+    phase: "failed", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      total_rows: 5, websites_found: 0, websites_not_found: 3,
+      confidence_mode: "llm", available_files: [],
+      outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
+      empty_response_breakdown: { empty: 0 },
+      cost: {
+        scrapedo_requests: 2, scrapedo_credits: 20,
+        scrapedo_error_requests: 0, scrapedo_billed_empty: 0,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+  });
+  const files = byClass(root, "files-section")[0];
+  assert(files, "failed relationship run hid the Files surface");
+  const buttons = byTag(files, "button");
+  assert(buttons.length === 4, `expected 4 file buttons, got ${buttons.length}`);
+  assert(buttons.every((button) => button.disabled),
+    "failed mid-scrape run offered enabled links to files it never wrote");
+  // The failed-rows viewer is offered, so its endpoint must answer (see
+  // FailureAnalysisTests in test_relationship_endpoint.py).
+  assert(byText(root, "button", "View failed rows (2)"), "failed-row viewer missing");
 }
 
 async function counterDrivenRelationshipRunning() {
@@ -363,7 +401,7 @@ async function counterDrivenRelationshipRunning() {
     phase: "scraping", updated_at: "2026-08-04T00:00:00Z",
     serpwow_summary: {
       total_rows: 500000, websites_found: 0, websites_not_found: 498764,
-      confidence_mode: "llm",
+      confidence_mode: "llm", available_files: [],
       outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
       empty_response_breakdown: { empty: 5 },
       cost: {
@@ -744,6 +782,7 @@ await failedRowsViewer();
 await completedRelationship();
 await counterDrivenRelationshipTerminal();
 await counterDrivenRelationshipRunning();
+await counterDrivenRelationshipFailedMidScrape();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
 await nonReportingPipelineIgnoresBatchState();

@@ -4273,6 +4273,7 @@ async def create_relationship_upload(
 ) -> dict[str, Any]:
     import uuid
 
+    from app.core import s3 as core_s3
     from app.services.serpwow import relationship_store as rel_store
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
@@ -4295,6 +4296,13 @@ async def create_relationship_upload(
             raise HTTPException(
                 status_code=400,
                 detail=f"{env_key} is not configured — required for the relationship pipeline.")
+    # S3 is not optional here the way it is for the state-driven pipelines: this run has
+    # no local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the relationship pipeline.")
 
     run_id = uuid.uuid4().hex
     prefix = rel_store.run_prefix(company_name or company_id, run_id)
@@ -5033,6 +5041,35 @@ async def batch_job_delete_by_name(
     }
 
 
+_RELATIONSHIP_FILES = ("confirmed_relation.csv", "notconfirmed_relation.csv",
+                       "report.json", "run.log")
+
+# Keyed by BOTH status.json phases and report.json summary statuses (the two vocabularies
+# do not collide). "stopped" maps to "completed" deliberately: run_detail.js's terminal
+# set has no rule for it, so passing it through would poll forever and never render the
+# Files card — and a stopped run IS terminal, with its outputs written.
+_RELATIONSHIP_RUN_STATUS = {
+    "queued": "queued", "scraping": "processing", "cleaning": "processing",
+    "reporting": "processing", "completed": "completed",
+    "completed_with_errors": "completed_with_errors",
+    "stopped": "completed", "failed": "failed",
+}
+# Mirrors run_detail.js's ROW_TERMINAL_STATUSES.
+_RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
+
+
+def _relationship_available_files(prefix: str) -> list[str]:
+    """Which of the run's four output files actually exist.
+
+    One scoped LIST per name (each returns 0 or 1 keys) rather than a single LIST of the
+    run prefix: at 500k rows that prefix holds a million raw/ and cleaned/ objects.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    return [name for name in _RELATIONSHIP_FILES
+            if next(rel_store.iter_keys(f"{prefix}/{name}"), None) is not None]
+
+
 async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     """Build the /status response for a relationship run from status.json counters.
 
@@ -5047,9 +5084,6 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     prefix = str(pointer.get("prefix") or "")
     counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
     phase = str(counters.get("phase") or "queued")
-    status = {"queued": "queued", "scraping": "processing", "cleaning": "processing",
-              "reporting": "processing", "completed": "completed",
-              "stopped": "completed", "failed": "failed"}.get(phase, "processing")
     total = int(counters.get("rows_total") or 0)
     scraped = int(counters.get("rows_scraped") or 0)
     failed = int(counters.get("rows_failed") or 0)
@@ -5069,6 +5103,19 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
                      int(counters.get("rows_billed_empty") or 0),
                  "llm_usd": 0.0, "total_usd": 0.0},
     }
+    # Prefer the status write_outputs computed: it is what _notify_terminal sent to
+    # Supabase, so taking it here is what stops the detail page and the Runs list
+    # disagreeing (phase only ever reaches "completed", never "completed_with_errors").
+    status = _RELATIONSHIP_RUN_STATUS.get(
+        str(summary.get("status") or "") or phase, "processing")
+
+    # Only advertise files that exist. A run that failed mid-scrape is terminal — so the
+    # UI renders the Files card — but wrote none of the four; gsearch guards exactly this
+    # case with available_files, and without it every link is an enabled 404.
+    available: list[str] = []
+    if status in _RELATIONSHIP_TERMINAL_STATUSES:
+        available = await asyncio.to_thread(_relationship_available_files, prefix)
+
     return {
         "upload_id": run_id,
         "pipeline": PIPELINE_RELATIONSHIP,
@@ -5079,9 +5126,8 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
         "failed_rows": failed,
         "phase": phase,
         "updated_at": counters.get("updated_at"),
-        "serpwow_summary": summary,
-        "files": ["confirmed_relation.csv", "notconfirmed_relation.csv",
-                  "report.json", "run.log"],
+        "serpwow_summary": {**summary, "available_files": available},
+        "files": list(_RELATIONSHIP_FILES),
     }
 
 
@@ -5183,11 +5229,88 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     }
 
 
+async def _relationship_failure_analysis(
+    run_id: str, sample_limit: int,
+) -> Optional[dict[str, Any]]:
+    """build_failure_analysis's shape, sourced from raw/*.error.json instead of rows[].
+
+    The "View failed rows" control run_detail.js offers whenever outcome_breakdown.errored
+    is non-zero calls this; without a branch here a relationship run answered 404 and the
+    page showed a red error under its own button.
+
+    ``failed_rows`` is exact (one LIST of raw/, the same scan list_done_rows does). The
+    aggregate buckets are computed over the SAMPLE only — the alternative is GETting up to
+    500k error objects to answer a debug panel that reads neither.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    limit = max(1, int(sample_limit))
+
+    def _collect() -> tuple[int, list[dict[str, Any]]]:
+        keys = [k for k in rel_store.iter_keys(f"{prefix}/raw/")
+                if k.endswith(".error.json")]
+        rows: list[dict[str, Any]] = []
+        for key in sorted(keys)[:limit]:
+            envelope = rel_store.get_object(key) or {}
+            fields = envelope.get("fields") or {}
+            rows.append({
+                "row_index": envelope.get("row_index"),
+                "company_name": fields.get("y_name"),
+                "country": fields.get("country"),
+                # Only scrape.do can produce an error object — the verdict and reporting
+                # phases never write one (see relationship_runner._scrape_one).
+                "error_source": "scrapedo",
+                "error_category": envelope.get("error_category"),
+                "error": envelope.get("error"),
+                "official_website": None,
+                "status_updated_at": None,
+            })
+        rows.sort(key=lambda row: (row["row_index"] is None, row["row_index"]))
+        return len(keys), rows
+
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    failed_count, sample = await asyncio.to_thread(_collect)
+    total_rows = int(counters.get("rows_total") or 0)
+
+    def _buckets(field: str, name: str) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for row in sample:
+            value = str(row.get(field) or "").strip()
+            if value:
+                counts[value] = counts.get(value, 0) + 1
+        return [{name: k, "count": v} for k, v in
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]]
+
+    return {
+        "upload_id": run_id,
+        "status": str(counters.get("phase") or ""),
+        "gemini_batch": None,
+        "total_rows": total_rows,
+        "failed_rows": failed_count,
+        "failed_rate_pct": (round((failed_count / total_rows) * 100, 2)
+                            if total_rows else 0.0),
+        "failed_missing_official_website": failed_count,
+        "error_buckets": _buckets("error", "reason"),
+        "search_attempt_error_buckets": [],
+        "by_source": _buckets("error_source", "source"),
+        "by_category": _buckets("error_category", "category"),
+        "sample_failed_rows": sample,
+    }
+
+
 @app.get("/uploads/{upload_id}/failure-analysis")
 async def upload_failure_analysis(
     upload_id: str,
     sample_limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
+    relationship_analysis = await _relationship_failure_analysis(upload_id, sample_limit)
+    if relationship_analysis is not None:
+        return relationship_analysis
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:

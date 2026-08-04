@@ -299,5 +299,75 @@ class StopCheckFrequencyTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class VerdictPhaseTests(unittest.TestCase):
+    def _seed_raw(self, fake, n=3):
+        _seed(fake)
+        with _patched(fake):
+            for idx in range(n):
+                store.put_object(store.raw_key(PREFIX, idx), {
+                    **OK_ENVELOPE, "row_index": idx, "x_domain": "acme.com",
+                    "fields": {"row_index": idx, "x_name": "Acme", "y_name": f"Y{idx}",
+                               "input_url": "https://acme.com/p", "city": "",
+                               "country": "US"},
+                })
+
+    def test_a_verdict_object_is_written_per_row_with_its_candidate_set(self) -> None:
+        fake = FakeS3()
+        self._seed_raw(fake)
+
+        def fake_batch(prefix_arg, items):
+            return {key: {"relationship_status": "confirmed",
+                          "official_website": "https://y.com",
+                          "relationship_confidence_score": 90,
+                          "website_confidence_score": 90} for key, _body in items}
+
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch):
+            counters = store.Counters(PREFIX, rows_total=3)
+            asyncio.run(runner.run_verdict_phase(PREFIX, counters))
+
+        with _patched(fake):
+            cleaned = store.get_object(store.cleaned_key(PREFIX, 0))
+        self.assertEqual(cleaned["parsed"]["relationship_status"], "confirmed")
+        # Stored so phase 3 reads cleaned/ only, not cleaned/ + raw/.
+        self.assertIn("https://y.com", cleaned["candidates"])
+        self.assertEqual(cleaned["x_domain"], "acme.com")
+
+    def test_rows_that_already_have_a_verdict_are_not_resubmitted(self) -> None:
+        fake = FakeS3()
+        self._seed_raw(fake)
+        with _patched(fake):
+            store.put_object(store.cleaned_key(PREFIX, 0),
+                             {"row_index": 0, "parsed": {}, "candidates": []})
+        submitted = {}
+
+        def fake_batch(prefix_arg, items):
+            submitted["keys"] = [k for k, _b in items]
+            return {k: {} for k, _b in items}
+
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch):
+            asyncio.run(runner.run_verdict_phase(
+                PREFIX, store.Counters(PREFIX, rows_total=3)))
+
+        self.assertNotIn("0", submitted["keys"])
+        self.assertEqual(sorted(submitted["keys"]), ["1", "2"])
+
+    def test_error_rows_are_skipped_entirely(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.put_object(store.error_key(PREFIX, 0), ERR_ENVELOPE)
+        submitted = {}
+
+        def fake_batch(prefix_arg, items):
+            submitted["keys"] = [k for k, _b in items]
+            return {}
+
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch):
+            asyncio.run(runner.run_verdict_phase(
+                PREFIX, store.Counters(PREFIX, rows_total=1)))
+
+        self.assertEqual(submitted["keys"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

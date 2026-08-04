@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -147,3 +148,132 @@ def _next_or_exhausted(it):
     """One pull off a (possibly blocking) iterator, run inside asyncio.to_thread by the
     caller so the blocking read stays off the event loop."""
     return next(it, _EXHAUSTED)
+
+
+def _shard_size() -> int:
+    return max(1, _get_int_env("GEMINI_BATCH_SHARD_SIZE", 5000))
+
+
+def _max_inflight() -> int:
+    """Concurrent Gemini batch jobs.
+
+    At 500k rows and the default 5, this is 100 shards in 20 SEQUENTIAL waves, and the
+    Batch API targets turnaround within 24h per job — so this knob, not the scraping,
+    is the likely wall-clock bottleneck. Raise it to your project's concurrent-batch
+    quota before a 500k run.
+    """
+    return max(1, _get_int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
+
+
+def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]]) -> dict[str, dict]:
+    """Submit one shard and block until it is terminal; returns {key: parsed_json}.
+
+    Seam for tests — patched in test_relationship_runner. Sync on purpose: callers wrap
+    it in asyncio.to_thread.
+    """
+    import time as _time
+
+    from app.services.ai_mode import gemini_batch as gb
+
+    if not items:
+        return {}
+    model = os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite")
+    created = gb.create_batch(model, items, display_name=f"relationship-{prefix}")
+    name = gb.batch_name_from_create(created)
+    while True:
+        obj = gb.get_batch(name)
+        if gb.is_terminal(gb.state_name(obj), bool(obj.get("done"))):
+            break
+        _time.sleep(_get_int_env("GEMINI_BATCH_POLL_SEC", 30))
+    out: dict[str, dict] = {}
+    for record in gb.collect_results(obj):
+        key = str(record.get("key") or "")
+        parsed = gb.parse_json_from_text(record.get("text") or "")
+        if key:
+            out[key] = parsed or {}
+    return out
+
+
+def _build_batch_item(envelope: dict[str, Any]) -> tuple[str, dict, list[str], str]:
+    """(key, request_body, candidates, x_domain) for one scraped row.
+
+    The prompt itself is UNCHANGED — build_relationship_prompt keeps its rules; only the
+    evidence handed to it now comes from AI Mode.
+    """
+    from app.services.ai_mode import gemini_batch as gb
+    from app.services.serpwow.gemini_llm import build_relationship_prompt
+
+    fields = envelope.get("fields") or {}
+    x_domain = str(envelope.get("x_domain") or "")
+    evidence = build_evidence(envelope, x_domain)
+    prompt = build_relationship_prompt(
+        x_name=fields.get("x_name") or "",
+        y_name=fields.get("y_name") or "",
+        input_url=fields.get("input_url") or "",
+        city=fields.get("city") or "",
+        country=fields.get("country") or "",
+        candidates=evidence["candidates"],
+        ai_overview_evidence=evidence["ai_overview_evidence"],
+        search_attempts=evidence["search_attempts"],
+        x_domain=x_domain,
+    )
+    key = str(int(envelope.get("row_index")))
+    body = gb.messages_to_gemini_request([{"role": "user", "content": prompt}])
+    return key, body, evidence["candidates"], x_domain
+
+
+async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
+    """Turn every scraped row into a verdict via the Gemini Batch API.
+
+    Raw objects are GET'd just-in-time to build each request body, so no run-wide list
+    of payloads exists. Rows that already have a cleaned object are skipped, which makes
+    a re-drive redo only the LLM work that is actually missing.
+    """
+    counters.set_phase("cleaning")
+    counters.flush(force=True)
+
+    scraped = await asyncio.to_thread(store.list_done_rows, prefix)
+    already = await asyncio.to_thread(store.list_cleaned_rows, prefix)
+    pending = sorted(scraped - already)
+
+    shard: list[tuple[str, dict]] = []
+    meta: dict[str, tuple[list[str], str]] = {}
+    inflight: set[asyncio.Task] = set()
+
+    async def submit(items: list[tuple[str, dict]],
+                     item_meta: dict[str, tuple[list[str], str]]) -> None:
+        results = await asyncio.to_thread(_run_gemini_batch, prefix, items)
+        for key, _body in items:
+            candidates, x_domain = item_meta.get(key, ([], ""))
+            await asyncio.to_thread(
+                store.put_object, store.cleaned_key(prefix, int(key)),
+                {"row_index": int(key), "parsed": results.get(key),
+                 # Stored so phase 3 reads cleaned/ alone: re-deriving the candidate set
+                 # would mean fetching every raw object a second time.
+                 "candidates": candidates, "x_domain": x_domain, "error": None})
+            counters.bump(rows_cleaned=1)
+        counters.flush()
+
+    for idx in pending:
+        envelope = await asyncio.to_thread(store.get_object, store.raw_key(prefix, idx))
+        if not envelope:
+            continue  # error marker or truncated object: no verdict to seek
+        key, body, candidates, x_domain = _build_batch_item(envelope)
+        shard.append((key, body))
+        meta[key] = (candidates, x_domain)
+        if len(shard) >= _shard_size():
+            while len(inflight) >= _max_inflight():
+                _finished, inflight = await asyncio.wait(
+                    inflight, return_when=asyncio.FIRST_COMPLETED)
+            inflight.add(asyncio.create_task(submit(shard, meta)))
+            shard, meta = [], {}
+
+    # Always flush the tail shard, even if empty: _run_gemini_batch's own "if not
+    # items: return {}" guard makes an empty flush a no-op (no batch job created, no
+    # spend) — but it's what lets a run with zero net-pending rows (e.g. every
+    # remaining row was an error marker) still resolve deterministically through the
+    # same seam the tests patch, instead of a special empty-run path.
+    inflight.add(asyncio.create_task(submit(shard, meta)))
+    if inflight:
+        await asyncio.gather(*inflight, return_exceptions=True)
+    counters.flush(force=True)

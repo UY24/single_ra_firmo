@@ -1,0 +1,177 @@
+"""S3-only run store: object presence is the state, and writes must be strict."""
+import io
+import os
+import unittest
+from unittest import mock
+
+from app.services.serpwow import relationship_store as store
+
+
+class FakeS3:
+    """Minimal in-memory stand-in for the boto3 S3 client surface we use."""
+
+    def __init__(self, fail_keys=()):
+        self.objects: dict[str, bytes] = {}
+        self.fail_keys = set(fail_keys)
+        self.put_calls = 0
+
+    def put_object(self, Bucket, Key, Body, ContentType="application/json"):
+        self.put_calls += 1
+        if Key in self.fail_keys:
+            raise RuntimeError("S3 is down")
+        self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode()
+
+    def get_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise self.NoSuchKey(Key)
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def delete_object(self, Bucket, Key):
+        self.objects.pop(Key, None)
+
+    def get_paginator(self, _name):
+        objects = self.objects
+
+        class _P:
+            def paginate(self, Bucket, Prefix):
+                keys = sorted(k for k in objects if k.startswith(Prefix))
+                for i in range(0, max(1, len(keys)), 2):  # force multi-page
+                    yield {"Contents": [{"Key": k} for k in keys[i:i + 2]]}
+
+        return _P()
+
+    class NoSuchKey(Exception):
+        pass
+
+
+def _patched(fake):
+    return mock.patch.multiple(
+        store,
+        _client=mock.Mock(return_value=fake),
+        _bucket=mock.Mock(return_value="test-bucket"),
+    )
+
+
+class KeyLayoutTests(unittest.TestCase):
+    def test_rows_are_sharded_by_thousands(self) -> None:
+        p = "acme/relationship/run1"
+        self.assertEqual(store.raw_key(p, 0), f"{p}/raw/0/row_000000.json")
+        self.assertEqual(store.raw_key(p, 999), f"{p}/raw/0/row_000999.json")
+        self.assertEqual(store.raw_key(p, 1000), f"{p}/raw/1/row_001000.json")
+        self.assertEqual(store.raw_key(p, 499999), f"{p}/raw/499/row_499999.json")
+
+    def test_error_and_cleaned_keys_share_the_shard_scheme(self) -> None:
+        p = "acme/relationship/run1"
+        self.assertEqual(store.error_key(p, 5), f"{p}/raw/0/row_000005.error.json")
+        self.assertEqual(store.cleaned_key(p, 5), f"{p}/cleaned/0/row_000005.json")
+
+    def test_run_prefix_uses_the_shared_company_slug(self) -> None:
+        self.assertEqual(store.run_prefix("ISI Market Test", "abc"),
+                         "isi-market-test/relationship/abc")
+
+
+class StrictWriteTests(unittest.TestCase):
+    def test_put_object_round_trips(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.put_object("k", {"a": 1})
+            self.assertEqual(store.get_object("k"), {"a": 1})
+
+    def test_put_object_RAISES_on_failure(self) -> None:
+        """The whole point of not using mirror_file_to_s3: with S3 as the only copy,
+        a swallowed PUT failure silently loses the row's work."""
+        fake = FakeS3(fail_keys={"k"})
+        with _patched(fake):
+            with self.assertRaises(RuntimeError):
+                store.put_object("k", {"a": 1})
+
+    def test_get_object_returns_none_for_a_missing_key(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            self.assertIsNone(store.get_object("nope"))
+
+
+class ResumeTests(unittest.TestCase):
+    def test_list_done_rows_finds_raw_and_error_objects_across_pages(self) -> None:
+        fake = FakeS3()
+        p = "acme/relationship/run1"
+        with _patched(fake):
+            store.put_object(store.raw_key(p, 0), {})
+            store.put_object(store.raw_key(p, 1500), {})
+            store.put_object(store.error_key(p, 7), {})
+            done = store.list_done_rows(p)
+        self.assertEqual(done, {0, 1500, 7})
+
+    def test_list_done_rows_is_empty_for_a_fresh_run(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            self.assertEqual(store.list_done_rows("acme/relationship/new"), set())
+
+
+class CountersTests(unittest.TestCase):
+    def test_flush_is_throttled_but_force_always_writes(self) -> None:
+        fake = FakeS3()
+        with _patched(fake), mock.patch.dict(
+                os.environ, {"RELATIONSHIP_STATUS_FLUSH_SEC": "999"}, clear=False):
+            c = store.Counters("acme/relationship/run1", rows_total=10)
+            c.flush(force=True)
+            first = fake.put_calls
+            c.bump(rows_scraped=1)
+            c.flush()                      # throttled — no write
+            self.assertEqual(fake.put_calls, first)
+            c.flush(force=True)            # terminal snapshot always writes
+            self.assertEqual(fake.put_calls, first + 1)
+
+    def test_status_json_holds_counters_only_never_rows(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            c = store.Counters("acme/relationship/run1", rows_total=500000)
+            c.bump(rows_scraped=3, credits=30, requests=3)
+            c.set_phase("scraping")
+            c.flush(force=True)
+            status = store.read_status("acme/relationship/run1")
+        self.assertEqual(status["rows_total"], 500000)
+        self.assertEqual(status["rows_scraped"], 3)
+        self.assertEqual(status["credits"], 30)
+        self.assertEqual(status["phase"], "scraping")
+        self.assertNotIn("rows", status)
+        # ~2KB regardless of run size is the whole point.
+        self.assertLess(len(str(status)), 2048)
+
+
+class StopMarkerTests(unittest.TestCase):
+    def test_stop_marker_round_trips(self) -> None:
+        fake = FakeS3()
+        p = "acme/relationship/run1"
+        with _patched(fake):
+            self.assertFalse(store.stop_requested(p))
+            store.request_stop(p)
+            self.assertTrue(store.stop_requested(p))
+
+
+class PointerTests(unittest.TestCase):
+    def test_pointer_resolves_a_run_id_to_its_prefix(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run1", "acme/relationship/run1", "Acme")
+            ptr = store.read_run_pointer("run1")
+        self.assertEqual(ptr["prefix"], "acme/relationship/run1")
+        self.assertEqual(ptr["company_name"], "Acme")
+
+    def test_pointer_carries_the_supabase_run_db_id(self) -> None:
+        """A relationship run has no state dict, so the pointer is where phase 3 finds
+        the Supabase row to update."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run1", "acme/relationship/run1", "Acme",
+                                    run_db_id="db-42")
+            self.assertEqual(store.read_run_pointer("run1")["run_db_id"], "db-42")
+
+    def test_missing_pointer_is_none_not_an_error(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            self.assertIsNone(store.read_run_pointer("nope"))
+
+
+if __name__ == "__main__":
+    unittest.main()

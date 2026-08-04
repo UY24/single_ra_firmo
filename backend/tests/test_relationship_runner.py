@@ -239,5 +239,65 @@ class StreamingTests(unittest.TestCase):
         self.assertGreaterEqual(heartbeat["ticks"], 5)
 
 
+class StopCheckFrequencyTests(unittest.TestCase):
+    def test_stop_check_frequency_is_time_bounded_not_row_bounded(self) -> None:
+        """Finding 2: with independently varying scrape latencies, asyncio.wait
+        (FIRST_COMPLETED) wakes the dispatch loop roughly once per completion, so a
+        once-per-outer-iteration check was effectively once-per-row in steady state
+        (reviewer measured 218 checks over 300 rows at limit=100, i.e. 73%). The check
+        must be time-gated so its frequency is bounded by construction, not by how
+        completions happen to interleave. Sleeps are deliberately varied (not the
+        uniform stub other tests use) — a uniform stub synchronises completions and
+        is exactly what made the old, non-time-gated bound look tighter than it is."""
+        rows = 60
+        csv_bytes = b"Input_URL,Company_Name_X,Company_Name_Y,country\n" + b"".join(
+            f"https://acme.com/p,Acme,Y{i},US\n".encode() for i in range(rows))
+        fake = FakeS3()
+        with _patched(fake):
+            store.put_bytes(store.input_key(PREFIX), csv_bytes)
+
+        delays = [0.001, 0.006, 0.002, 0.008, 0.003, 0.005]
+        call_count = {"n": 0}
+
+        async def fake_search(query, gl="us", client=None):
+            i = call_count["n"]
+            call_count["n"] += 1
+            await asyncio.sleep(delays[i % len(delays)])
+            return OK_ENVELOPE
+
+        real_stop_requested = store.stop_requested
+        stop_calls = {"n": 0}
+
+        def counting_stop(prefix):
+            stop_calls["n"] += 1
+            return real_stop_requested(prefix)
+
+        with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
+                mock.patch.object(store, "stop_requested", counting_stop), \
+                mock.patch.object(runner, "_STOP_CHECK_INTERVAL_SEC", 0.02), \
+                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "20"},
+                                clear=False):
+            counters = store.Counters(PREFIX, rows_total=rows)
+            asyncio.run(runner.run_scrape_phase(PREFIX, counters))
+
+        # A time-gated check over this run's short wall-clock duration should fire a
+        # handful of times, nowhere near once per row.
+        self.assertLess(stop_calls["n"], rows // 2)
+
+    def test_stop_marker_set_before_the_first_check_interval_still_halts_immediately(
+            self) -> None:
+        """The throttle must never skip the very first check: a stop marker set before
+        the phase starts has to halt it with zero scrape calls, exactly like the
+        untimed version did."""
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.request_stop(PREFIX)
+        # A long interval would still be fine here — the FIRST check is unconditional —
+        # but use the production default to prove that, not a test-friendly override.
+        calls, _ = _drive(fake, [OK_ENVELOPE] * 3)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

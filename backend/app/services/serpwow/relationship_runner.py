@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from app.services.common.env import get_int_env as _get_int_env
@@ -21,6 +22,13 @@ from app.services.serpwow.scrapedo_ai_client import search_ai_mode
 from app.services.serpwow.url_utils import x_domain_from_input_url
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bounds stop-marker latency deterministically. With independently varying scrape
+# latencies, asyncio.wait(FIRST_COMPLETED) returns roughly one task at a time, so
+# checking "once per outer-loop iteration" is effectively once per row in steady state
+# (measured: 218 checks over 300 rows at limit=100, i.e. 73%) — a wall-clock gate is the
+# only bound that holds regardless of how completions happen to interleave.
+_STOP_CHECK_INTERVAL_SEC = 1.0
 
 
 def _concurrency() -> int:
@@ -90,14 +98,21 @@ async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
     limit = _concurrency()
     tasks: set[asyncio.Task] = set()
     exhausted = False
+    # -inf forces the very first pass to check, so a stop marker set before the phase
+    # starts still halts it immediately (see test_stop_marker_halts_the_phase_early).
+    last_stop_check = float("-inf")
 
     while not exhausted or tasks:
-        # Checked once per refill of the task window, not once per row: at 500k rows a
-        # per-row S3 GET here would serialize ~500k round-trips into the dispatch loop
-        # that gates how fast new work starts.
-        if not exhausted and await asyncio.to_thread(store.stop_requested, prefix):
-            stopped = True
-            exhausted = True
+        # Time-gated, not once-per-row and not once-per-refill: at 500k rows a per-row
+        # (or per-completion) S3 GET here would serialize hundreds of thousands of
+        # round-trips into the dispatch loop that gates how fast new work starts. A
+        # wall-clock bound holds regardless of how task completions interleave.
+        now = time.monotonic()
+        if not exhausted and now - last_stop_check >= _STOP_CHECK_INTERVAL_SEC:
+            last_stop_check = now
+            if await asyncio.to_thread(store.stop_requested, prefix):
+                stopped = True
+                exhausted = True
 
         while not exhausted and len(tasks) < limit:
             # next() on a generator runs the generator BODY, including the blocking S3

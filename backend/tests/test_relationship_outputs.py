@@ -51,6 +51,35 @@ def _read_csv(fake, name, prefix=PREFIX):
     return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
 
 
+class AttemptLogTests(unittest.TestCase):
+    def test_the_csv_carries_an_attempt_log_with_the_candidate_set(self) -> None:
+        """One AI Mode call replaced three phase queries, but "one attempt" is not
+        "nothing worth recording": without this you cannot tell a verdict reached on 12
+        references from one reached on an empty response."""
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            outputs.write_outputs(PREFIX, store.Counters(PREFIX, rows_total=3))
+        row = _read_csv(fake, "confirmed_relation.csv")[0]
+        log = row["attempt_log"]
+        self.assertIn("google/search/ai-mode", log)
+        self.assertIn("ai_mode_references:", log)
+        self.assertIn("candidates_after_filtering:", log)
+        # The candidate set the gate was allowed to choose from.
+        self.assertIn("candidate: https://drinksanzo.com", log)
+        # Newline-joined so each fact is its own line inside one quoted cell.
+        self.assertIn("\n", log)
+
+    def test_an_errored_row_records_the_error_in_its_attempt_log(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            outputs.write_outputs(PREFIX, store.Counters(PREFIX, rows_total=3))
+        dead = next(r for r in _read_csv(fake, "notconfirmed_relation.csv")
+                    if r["Company_Name_Y"] == "Dead")
+        self.assertIn("529", dead["attempt_log"])
+
+
 class LlmReportingTests(unittest.TestCase):
     """The run-detail Model chip and the Input/Output-token + LLM-cost tiles read these.
     They went blank because the summary stopped feeding them, not because the UI lost

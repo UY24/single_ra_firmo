@@ -31,7 +31,8 @@ from app.services.serpwow.modes.relationship import build_row_result, row_fields
 EXTRA_COLUMNS = [
     "website_url", "resolved_company_y_name", "relationship_status",
     "relationship_summary", "relationship_evidence", "relationship_confidence",
-    "website_confidence", "confidence", "flags", "error_source", "error_reason",
+    "website_confidence", "confidence", "flags", "attempt_log",
+    "error_source", "error_reason",
 ]
 
 # Column names this module writes itself, plus the "row_index" bookkeeping key every
@@ -92,6 +93,9 @@ def _out_row(original: dict[str, str], passthrough: list[tuple[str, str]],
         "website_confidence": int(rel.get("website_confidence_score") or 0),
         "confidence": int(parsed.get("confidence_score") or 0),
         "flags": _flags_csv(rel),
+        # The row's audit trail: how many text blocks/references came back, how many
+        # candidates survived filtering, and the candidate set the gate could pick from.
+        "attempt_log": result.get("attempt_log", ""),
         "error_source": result["error_source"],
         "error_reason": result["row_error"],
     })

@@ -214,4 +214,42 @@ def build_row_result(
         "row_error": row_error or "",
         "error_source": "scrapedo" if envelope.get("error") else "",
         "candidates": candidates,
+        "attempt_log": build_attempt_log(envelope, candidates),
     }
+
+
+def build_attempt_log(envelope: dict[str, Any], candidates: list[str]) -> str:
+    """The row's audit trail, one line per fact, for the output CSVs' attempt_log cell.
+
+    One AI Mode call replaced three SerpWow phase queries, so there is a single attempt
+    rather than a per-phase list — but "one attempt" is not "nothing worth recording":
+    without this there is no way to tell a verdict reached on 12 references from one
+    reached on an empty response, which is exactly what you need when judging the prompt.
+
+    Newline-joined, matching EntityResult.attempt_log_csv: each line renders on its own
+    row INSIDE one quoted CSV cell.
+    """
+    blocks = envelope.get("text_blocks") or []
+    refs = envelope.get("references") or []
+    lines = [
+        f"provider: scrape.do google/search/ai-mode",
+        f"attempts: {envelope.get('request_count') or 0} "
+        f"(billed 200s: {envelope.get('successful_requests') or 0}, "
+        f"credits: {envelope.get('credits') or 0})",
+        f"ai_mode_text_blocks: {len(blocks)}",
+        f"ai_mode_references: {len(refs)}",
+        f"candidates_after_filtering: {len(candidates)}",
+    ]
+    if envelope.get("billed_empty"):
+        lines.append("billed_empty: HTTP 200 with no text and no references")
+    if envelope.get("error"):
+        lines.append(f"error: {envelope['error']}")
+    # The candidate set the gate was allowed to pick from — the single most useful thing
+    # when a confirmed row came back with no URL.
+    lines.extend(f"candidate: {url}" for url in candidates[:10])
+    if len(candidates) > 10:
+        lines.append(f"... and {len(candidates) - 10} more candidate(s)")
+    query = str(envelope.get("query") or "")
+    if query:
+        lines.append(f"query: {query[:300]}")
+    return "\n".join(lines)

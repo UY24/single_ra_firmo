@@ -682,6 +682,27 @@ function renderLegacyStatus(root, ref, s) {
       if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
   }
+  // Which provider is actually working right now. `phase` is served by the
+  // counter-driven status endpoint; without this the run looked identical whether
+  // scrape.do was mid-flight, Gemini was chewing a batch, or nothing was running at all.
+  const PHASE_LABELS = {
+    queued: ["Queued", "muted"],
+    scraping: ["Scraping (scrape.do)", "info"],
+    cleaning: ["LLM (Gemini batch)", "info"],
+    reporting: ["Writing outputs", "info"],
+    completed: ["Done", "good"],
+    stopped: ["Stopped", "warning"],
+    failed: ["Failed", "danger"],
+  };
+  if (s.phase && PHASE_LABELS[s.phase]) {
+    const [label, tone] = PHASE_LABELS[s.phase];
+    chips.push(chip("Phase", label, tone));
+  }
+  const phaseSecs = g?.phase_seconds;
+  if (phaseSecs && (phaseSecs.scraping || phaseSecs.cleaning)) {
+    chips.push(chip("scrape.do", fmtDuration(phaseSecs.scraping ?? 0), "muted"));
+    chips.push(chip("LLM", fmtDuration(phaseSecs.cleaning ?? 0), "muted"));
+  }
 
   const isRel = s.pipeline === "relationship";
   const total = s.total_rows;

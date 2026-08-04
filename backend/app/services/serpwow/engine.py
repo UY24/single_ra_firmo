@@ -152,9 +152,6 @@ from app.services.serpwow.modes.common import (
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
-from app.services.serpwow.modes.relationship import (
-    execute_relationship_lookup_for_worker,
-)
 from app.services.serpwow.modes.gmaps import execute_gmaps_lookup
 from app.services.serpwow.modes.firmographics import execute_firmographic_extraction
 
@@ -3486,15 +3483,8 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 phase=phase_value,
             )
         elif pipeline == PIPELINE_RELATIONSHIP:
-            crawl_response, serpwow_raw_json = await execute_relationship_lookup_for_worker(
-                y_name=company_name,
-                x_name=str(job.get("x_name") or ""),
-                input_url=str(job.get("input_url") or ""),
-                city=str(job.get("city") or ""),
-                country=country,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-            )
+            raise ValueError(
+                "relationship rows are not driven per-row any more — see relationship_runner")
         else:
             raise ValueError(f"unknown pipeline {pipeline!r}")
 

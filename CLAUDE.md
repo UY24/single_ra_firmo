@@ -94,8 +94,11 @@ Writes go through `relationship_store.put_object`, which **raises** — unlike
 `s3_sync.mirror_file_to_s3`, because with S3 as the only copy a swallowed PUT loses work.
 
 **One RabbitMQ message per RUN** (`relationship_runs`, own queue and channel), body
-`{"run_id": …}`; concurrency comes from a semaphore inside the consumer
-(`RELATIONSHIP_CONCURRENCY`, default 100), not from the message count. The consumer
+`{"run_id": …}`; concurrency comes from a bounded task window inside the consumer, sized
+from **`SCRAPEDO_CONCURRENCY`** (the per-account vendor cap it shares with gmaps and AI
+Mode) — this pipeline has no concurrency knob of its own, because a second setting could
+only disagree with the semaphore every call already passes through. `WORKER_CONCURRENCY`
+is irrelevant here: it sets RabbitMQ prefetch, and there is one message per run. The consumer
 **acks on receipt** — the repo's only inversion of ack-after-persist — because RabbitMQ's
 30-minute `consumer_timeout` would tear down a multi-hour run. Durability comes from
 `redrive_stale_runs` instead, which also covers a worker that was down at publish time or

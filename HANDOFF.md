@@ -131,11 +131,13 @@ instead of 3.
 
 ### Two numbers that are NOT proven yet
 
-- **`RELATIONSHIP_CONCURRENCY=100`** — this is a target, not a measurement. The gmaps
+- **`SCRAPEDO_CONCURRENCY=100`** — this is a target, not a measurement. The gmaps
   session (above) measured scrape.do's **Google Maps** endpoint running 100 concurrent
   **1.9x SLOWER** than 25, because scrape.do queues rather than 429ing (it does not reject
   overload, it just gets in line). Whether the **AI Mode** endpoint behaves the same way is
-  unverified — re-measure on a live run before trusting 100 for this pipeline.
+  unverified — re-measure on a live run before trusting 100 for this pipeline. Note this is
+  the shared per-account vendor cap: relationship deliberately has no concurrency knob of
+  its own, so tuning this moves gmaps and AI Mode too.
 - **The Gemini Batch wave count at 500k rows.** At the shared defaults
   (`GEMINI_BATCH_SHARD_SIZE=5000`, `GEMINI_BATCH_MAX_INFLIGHT=5`), 500k rows is 100 shards
   run 5 at a time = **20 sequential waves**, and Google's Batch API targets turnaround
@@ -154,7 +156,7 @@ instead of 3.
    change** is needed for a prompt change.
 4. Record: wall-clock time, per-row latency, `scrapedo_billed_empty`,
    `scrapedo_error_requests`, and credits spent.
-5. Re-run the same CSV at `RELATIONSHIP_CONCURRENCY=25` and compare against the 100 run —
+5. Re-run the same CSV at `SCRAPEDO_CONCURRENCY=25` and compare against the 100 run —
    this is the test that will prove or disprove the concurrency number above.
 6. `kill -9` the worker mid-scrape, restart it, and confirm the run resumes and completes
    with zero lost or double-billed rows (proving the S3-only resume story).

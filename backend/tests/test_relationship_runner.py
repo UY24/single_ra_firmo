@@ -43,7 +43,7 @@ def _drive(fake, envelopes):
         return envelopes[len(calls) - 1] if len(calls) <= len(envelopes) else OK_ENVELOPE
 
     with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
-            mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"}, clear=False):
+            mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "2"}, clear=False):
         counters = store.Counters(PREFIX, rows_total=3)
         asyncio.run(runner.run_scrape_phase(PREFIX, counters))
     return calls, counters
@@ -158,14 +158,14 @@ class StreamingTests(unittest.TestCase):
         with _patched(fake), \
                 mock.patch.object(store, "iter_input_rows", counting_iter), \
                 mock.patch.object(runner, "search_ai_mode", fake_search), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"},
+                mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "2"},
                                 clear=False):
             counters = store.Counters(PREFIX, rows_total=3)
             asyncio.run(runner.run_scrape_phase(PREFIX, counters))
 
         # Never more rows pulled from the CSV than the concurrency window (2) allows.
         # (rows_total is also 3 here, so asserting against 3 would pass either way —
-        # the real claim is bounded by RELATIONSHIP_CONCURRENCY, not by row count.)
+        # the real claim is bounded by SCRAPEDO_CONCURRENCY, not by row count.)
         # This bound is timing-sensitive: it counts CSV pulls, not in-flight tasks, so a
         # slower stub could legitimately observe limit + 1 if a row is pulled just before
         # a completing task frees its slot. See the invariant test below for the bound
@@ -189,7 +189,7 @@ class StreamingTests(unittest.TestCase):
             return OK_ENVELOPE
 
         with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"},
+                mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "2"},
                                 clear=False):
             counters = store.Counters(PREFIX, rows_total=3)
             asyncio.run(runner.run_scrape_phase(PREFIX, counters))
@@ -229,7 +229,7 @@ class StreamingTests(unittest.TestCase):
 
         with _patched(fake), mock.patch.object(store, "iter_input_rows", slow_iter), \
                 mock.patch.object(runner, "search_ai_mode", fake_search), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"},
+                mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "2"},
                                 clear=False):
             asyncio.run(drive())
 
@@ -275,7 +275,7 @@ class StopCheckFrequencyTests(unittest.TestCase):
         with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
                 mock.patch.object(store, "stop_requested", counting_stop), \
                 mock.patch.object(runner, "_STOP_CHECK_INTERVAL_SEC", 0.02), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "20"},
+                mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "20"},
                                 clear=False):
             counters = store.Counters(PREFIX, rows_total=rows)
             asyncio.run(runner.run_scrape_phase(PREFIX, counters))

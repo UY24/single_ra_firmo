@@ -3,9 +3,11 @@
 
 ONE RabbitMQ message carries a whole run. The message body is just {"run_id": ...}; the
 rows live in input.csv on S3, and parallelism comes from the bounded task window in here
-(topped up to RELATIONSHIP_CONCURRENCY and refilled as tasks finish), not from the
-message count. A single async process in this repo has already held 60 concurrent
-scrape.do calls, so the broker is a durable start signal, not a work distributor.
+(topped up to the scrape.do account cap `SCRAPEDO_CONCURRENCY` and refilled as tasks
+finish), not from the message count. A single async process in this repo has already held
+60 concurrent scrape.do calls, so the broker is a durable start signal, not a work
+distributor. Note `WORKER_CONCURRENCY` is irrelevant here: it sets RabbitMQ prefetch, and
+this pipeline has exactly one message per run.
 
 ponytail: the _driving single-flight guard below is IN-PROCESS ONLY (a module-level
 set). It is correct today because the repo runs exactly one worker process. A second
@@ -28,6 +30,7 @@ from typing import Any
 import aio_pika
 
 from app.services.common.env import get_int_env as _get_int_env
+from app.services.common.provider_limits import scrapedo_limit
 from app.services.serpwow import relationship_store as store
 from app.services.serpwow.modes.relationship import build_evidence, row_fields
 from app.services.serpwow.query_builders import build_relationship_search_query
@@ -57,13 +60,24 @@ _STOP_CHECK_INTERVAL_SEC = 1.0
 
 
 def _concurrency() -> int:
-    """In-flight AI Mode calls for this pipeline.
+    """Size of the live-task window = in-flight AI Mode calls for this pipeline.
 
-    Defaults to 100 per the spec. NOT proven: on scrape.do's Maps endpoint this repo
-    measured 100 running 1.9x SLOWER than 25, because scrape.do queues rather than
-    429ing. Re-measure on a 100-row run before trusting this number.
+    DERIVED from the vendor cap (`SCRAPEDO_CONCURRENCY`, default 100) rather than owning
+    its own knob. A separate setting could only ever disagree with the real limit: every
+    call already passes through `scrapedo_slot()`, so a window wider than the semaphore
+    just parks tasks on it, and a narrower one silently throttles below what was
+    configured. The window still has to exist — without it a 500k-row run would create
+    500k tasks, all blocked on the same semaphore.
+
+    Note this derives a *worker* bound FROM the *vendor* cap, which is the safe direction.
+    The reverse (a vendor cap tracking `WORKER_CONCURRENCY`) is explicitly rejected in
+    provider_limits: it would let raising worker slots silently raise the vendor limit.
+
+    NOT proven at 100: on scrape.do's Maps endpoint this repo measured 100 running 1.9x
+    SLOWER than 25, because scrape.do queues rather than 429ing. Re-measure on a 100-row
+    run before trusting it.
     """
-    return max(1, _get_int_env("RELATIONSHIP_CONCURRENCY", 100))
+    return max(1, scrapedo_limit())
 
 
 async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters) -> None:
@@ -105,7 +119,7 @@ async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters
 
 
 async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
-    """Scrape every row that has no object yet, `RELATIONSHIP_CONCURRENCY` at a time."""
+    """Scrape every row that has no object yet, `SCRAPEDO_CONCURRENCY` at a time."""
     counters.set_phase("scraping")
     counters.flush(force=True)
 

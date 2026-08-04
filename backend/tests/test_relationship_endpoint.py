@@ -198,8 +198,50 @@ class StatusTests(unittest.TestCase):
             store.write_run_pointer("run6", prefix, "Acme")
             store.put_object(store.status_key(prefix),
                              {"rows_total": 5, "phase": "scraping"})
-            body = TestClient(app).get("/uploads/run6/status").json()
+            # Count the LISTs: an empty available_files proves nothing on its own when
+            # the fixture has no output files to find.
+            with mock.patch.object(fake, "get_paginator",
+                                   wraps=fake.get_paginator) as paginator:
+                body = TestClient(app).get("/uploads/run6/status").json()
         self.assertEqual(body["status"], "processing")
+        self.assertEqual(body["serpwow_summary"]["available_files"], [])
+        self.assertEqual(paginator.call_count, 0)
+
+    def test_a_terminal_run_pays_one_scoped_list_per_file(self) -> None:
+        """The counterpart: the probe really is one LIST per name, never a LIST of the
+        run prefix (which holds ~1M raw/ and cleaned/ objects at 500k rows)."""
+        fake = FakeS3()
+        prefix = "acme/relationship/run6b"
+        with _patched(fake):
+            store.write_run_pointer("run6b", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "phase": "completed"})
+            with mock.patch.object(fake, "get_paginator",
+                                   wraps=fake.get_paginator) as paginator:
+                TestClient(app).get("/uploads/run6b/status")
+        self.assertEqual(paginator.call_count, 4)
+
+    def test_a_re_driven_run_reports_the_live_phase_not_the_stale_report(self) -> None:
+        """report.json OUTLIVES its run: retry_failed_rows deletes the error markers,
+        not the outputs. Trusting it while the re-drive is back at phase "scraping"
+        would report the PREVIOUS run's terminal status for the whole re-run — the page
+        would stop polling, hide progress, offer no Stop, and advertise stale files."""
+        fake = FakeS3()
+        prefix = "acme/relationship/run8"
+        with _patched(fake):
+            store.write_run_pointer("run8", prefix, "Acme")
+            store.put_object(store.status_key(prefix),
+                             {"rows_total": 5, "rows_scraped": 1, "phase": "scraping"})
+            store.put_bytes(f"{prefix}/report.json",
+                            b'{"summary": {"status": "completed_with_errors",'
+                            b'"total_rows": 5}}')
+            # The previous run's outputs are still sitting there too.
+            store.put_bytes(f"{prefix}/confirmed_relation.csv", b"a\n")
+            store.put_bytes(f"{prefix}/run.log", b"x\n")
+            body = TestClient(app).get("/uploads/run8/status").json()
+
+        self.assertEqual(body["status"], "processing")
+        self.assertEqual(body["phase"], "scraping")
         self.assertEqual(body["serpwow_summary"]["available_files"], [])
 
 
@@ -251,6 +293,22 @@ class FailureAnalysisTests(unittest.TestCase):
         body = r.json()
         self.assertEqual(body["failed_rows"], 5)
         self.assertEqual(len(body["sample_failed_rows"]), 2)
+
+    def test_the_sample_is_the_first_n_rows_not_a_lexicographic_slice(self) -> None:
+        """Shard directories are numeric but unpadded, so raw/10/ sorts before raw/2/.
+        Plain sorted() would sample rows 0, 10000, 10001... instead of the first two."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run9", self.PREFIX, "Acme")
+            for idx in (0, 2000, 10000, 10001):   # shards 0, 2, 10, 10
+                store.put_object(store.error_key(self.PREFIX, idx),
+                                 {"row_index": idx, "error": "boom"})
+            r = TestClient(app).get("/uploads/run9/failure-analysis",
+                                    params={"sample_limit": 2})
+        body = r.json()
+        self.assertEqual(body["failed_rows"], 4)
+        self.assertEqual([row["row_index"] for row in body["sample_failed_rows"]],
+                         [0, 2000])
 
     def test_a_clean_run_reports_zero_rather_than_404ing(self) -> None:
         fake = FakeS3()

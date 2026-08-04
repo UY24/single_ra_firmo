@@ -5103,15 +5103,24 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
                      int(counters.get("rows_billed_empty") or 0),
                  "llm_usd": 0.0, "total_usd": 0.0},
     }
-    # Prefer the status write_outputs computed: it is what _notify_terminal sent to
+    # Prefer the status write_outputs computed — it is what _notify_terminal sent to
     # Supabase, so taking it here is what stops the detail page and the Runs list
     # disagreeing (phase only ever reaches "completed", never "completed_with_errors").
-    status = _RELATIONSHIP_RUN_STATUS.get(
-        str(summary.get("status") or "") or phase, "processing")
+    #
+    # But ONLY when phase == "completed", because report.json OUTLIVES its run:
+    # retry_failed_rows deletes the error markers, not the outputs, so a re-driven run
+    # sits at phase "scraping" with the PREVIOUS run's terminal report.json still in
+    # place. write_outputs rewrites report.json immediately before setting the phase to
+    # "completed", so that phase — and only that one — proves the report is this drive's.
+    # ("stopped" needs no special case: write_outputs makes summary["status"] "stopped"
+    # exactly when it sets that phase, and both map to "completed" below.)
+    reported = str(summary.get("status") or "") if phase == "completed" else ""
+    status = _RELATIONSHIP_RUN_STATUS.get(reported or phase, "processing")
 
     # Only advertise files that exist. A run that failed mid-scrape is terminal — so the
     # UI renders the Files card — but wrote none of the four; gsearch guards exactly this
-    # case with available_files, and without it every link is an enabled 404.
+    # case with available_files, and without it every link is an enabled 404. Gated on the
+    # derived status, so a re-driven run (non-terminal again) advertises nothing either.
     available: list[str] = []
     if status in _RELATIONSHIP_TERMINAL_STATUSES:
         available = await asyncio.to_thread(_relationship_available_files, prefix)
@@ -5250,11 +5259,18 @@ async def _relationship_failure_analysis(
     prefix = str(pointer.get("prefix") or "")
     limit = max(1, int(sample_limit))
 
+    def _by_row_index(key: str) -> tuple[int, int, str]:
+        # NOT plain sorted(): shard directories are numeric but unpadded, so raw/10/
+        # sorts before raw/2/ and the "first N" sample becomes a lexicographic slice
+        # once a run exceeds ten shards.
+        idx = rel_store._idx_from_key(key)
+        return (1, 0, key) if idx is None else (0, idx, "")
+
     def _collect() -> tuple[int, list[dict[str, Any]]]:
         keys = [k for k in rel_store.iter_keys(f"{prefix}/raw/")
                 if k.endswith(".error.json")]
         rows: list[dict[str, Any]] = []
-        for key in sorted(keys)[:limit]:
+        for key in sorted(keys, key=_by_row_index)[:limit]:
             envelope = rel_store.get_object(key) or {}
             fields = envelope.get("fields") or {}
             rows.append({

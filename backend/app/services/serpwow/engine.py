@@ -5102,6 +5102,10 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
         "total_rows": total, "websites_found": 0,
         "websites_not_found": max(0, total - scraped),
         "confidence_mode": "llm",
+        # Always true for this pipeline — phase 2 is always the Gemini Batch verdict pass,
+        # there is no per-row LLM path. Must match relationship_outputs' summary so the
+        # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
+        "is_batch": True,
         "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
         "empty_response_breakdown": {
             "empty": int(counters.get("rows_billed_empty") or 0)},

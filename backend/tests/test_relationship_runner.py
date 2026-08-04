@@ -5,6 +5,7 @@ import time
 import unittest
 from unittest import mock
 
+from app.services import ai_mode as ai_mode_pkg
 from app.services.serpwow import relationship_runner as runner
 from app.services.serpwow import relationship_store as store
 from tests.test_relationship_store import FakeS3, _patched
@@ -323,6 +324,47 @@ class StopCheckFrequencyTests(unittest.TestCase):
         # but use the production default to prove that, not a test-friendly override.
         calls, _ = _drive(fake, [OK_ENVELOPE] * 3)
         self.assertEqual(calls, [])
+
+
+class GeminiBatchTimeoutTests(unittest.TestCase):
+    """A shard that never terminalises used to park the polling thread FOREVER: the run
+    sat in phase="cleaning" while the heartbeat kept it looking healthy, so
+    redrive_stale_runs never rescued it either. Now the wait is bounded."""
+
+    def _never_terminal(self):
+        gb = mock.Mock()
+        gb.create_batch.return_value = {"name": "batches/stuck"}
+        gb.batch_name_from_create.return_value = "batches/stuck"
+        gb.get_batch.return_value = {"done": False}
+        gb.state_name.return_value = "JOB_STATE_RUNNING"
+        gb.is_terminal.return_value = False
+        return gb
+
+    def test_a_batch_that_never_finishes_raises_instead_of_hanging(self) -> None:
+        gb = self._never_terminal()
+        slept = []
+        with mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
+                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "60",
+                                             "GEMINI_BATCH_POLL_SEC": "30"}, clear=False), \
+                mock.patch("time.sleep", slept.append), \
+                mock.patch("time.monotonic", side_effect=[0.0, 10.0, 70.0, 70.0]):
+            with self.assertRaises(TimeoutError):
+                runner._run_gemini_batch(PREFIX, [("0", {})])
+        # It polled and waited rather than bailing on the first pass.
+        self.assertTrue(slept)
+
+    def test_it_does_not_raise_while_still_inside_the_deadline(self) -> None:
+        gb = self._never_terminal()
+        # Terminal on the second poll, so a healthy slow batch is unaffected.
+        gb.is_terminal.side_effect = [False, True]
+        gb.collect_results.return_value = [{"key": "0", "text": "{}"}]
+        gb.parse_json_from_text.return_value = {}
+        with mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
+                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "99999"},
+                                clear=False), \
+                mock.patch("time.sleep", lambda _s: None):
+            out = runner._run_gemini_batch(PREFIX, [("0", {})])
+        self.assertEqual(out, {"0": {}})
 
 
 class VerdictPhaseTests(unittest.TestCase):

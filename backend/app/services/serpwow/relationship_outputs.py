@@ -236,6 +236,10 @@ def _write_outputs(prefix: str, counters: store.Counters,
                             "task_errors": task_errors},
         "empty_response_breakdown": {"empty": billed_empty},
         "confidence_mode": "llm",
+        # Hardcoded, not derived: this pipeline has no per-row LLM path at all — phase 2 is
+        # always the Gemini Batch verdict pass. Leaving it unset made run_detail.js read
+        # undefined and render "Batch: Off", which was simply wrong.
+        "is_batch": True,
         "cost": {
             # scrape.do bills CREDITS, never dollars. No serpwow_* key appears here —
             # its absence is what routes this run down the scrape.do branch in the UI.

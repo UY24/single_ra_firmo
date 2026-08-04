@@ -262,10 +262,22 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
     model = os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite")
     created = gb.create_batch(model, items, display_name=f"relationship-{prefix}")
     name = gb.batch_name_from_create(created)
+    # Bounded, unlike the `while True` this replaced. A shard that never reaches a terminal
+    # state used to park this thread forever: the run sat in phase="cleaning" with the
+    # heartbeat keeping it looking healthy, so redrive_stale_runs never rescued it either.
+    # AI Mode already bounds its equivalent wait (AI_MODE_BATCH_TIMEOUT_SEC); 48h is
+    # Gemini's own hard job expiry, so past it the job cannot still succeed.
+    deadline = _time.monotonic() + _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 172800)
     while True:
         obj = gb.get_batch(name)
         if gb.is_terminal(gb.state_name(obj), bool(obj.get("done"))):
             break
+        if _time.monotonic() >= deadline:
+            # Raise rather than return {}: _drain counts it, the run reports
+            # completed_with_errors, and the rows stay without a cleaned/ object so the
+            # next drive redoes exactly them.
+            raise TimeoutError(
+                f"Gemini batch {name} did not finish within GEMINI_BATCH_TIMEOUT_SEC")
         if counters is not None:
             counters.flush(force=True)
         _time.sleep(_get_int_env("GEMINI_BATCH_POLL_SEC", 30))

@@ -161,6 +161,33 @@ class StatusTests(unittest.TestCase):
             r = TestClient(app).get("/uploads/nope/status")
         self.assertEqual(r.status_code, 404)
 
+    def test_batch_mode_reads_On_while_a_run_is_still_in_progress(self) -> None:
+        """The UI's Batch chip is `serpwow_summary.is_batch`. This pipeline has no per-row
+        LLM path — phase 2 is ALWAYS the Gemini Batch verdict pass — so an absent key made
+        run_detail.js read undefined and render "Batch: Off", which was just wrong."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run1", "acme/relationship/run1", "Acme")
+            store.put_object(store.status_key("acme/relationship/run1"), {
+                "rows_total": 10, "rows_scraped": 10, "phase": "cleaning",
+                "updated_at": "2026-08-04T00:00:00Z"})
+            r = TestClient(app).get("/uploads/run1/status")
+        self.assertTrue(r.json()["serpwow_summary"]["is_batch"])
+
+    def test_batch_mode_still_reads_On_from_a_terminal_report(self) -> None:
+        """Same value from the other source, so the chip cannot flip when a run finishes."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_run_pointer("run1", "acme/relationship/run1", "Acme")
+            store.put_object(store.status_key("acme/relationship/run1"),
+                             {"rows_total": 10, "phase": "completed",
+                              "updated_at": "2026-08-04T00:00:00Z"})
+            store.put_object("acme/relationship/run1/report.json",
+                             {"summary": {"status": "completed", "is_batch": True,
+                                          "total_rows": 10}})
+            r = TestClient(app).get("/uploads/run1/status")
+        self.assertTrue(r.json()["serpwow_summary"]["is_batch"])
+
     def test_terminal_status_comes_from_the_report_not_the_phase(self) -> None:
         """phase only ever reaches "completed"; write_outputs computes
         completed_with_errors and _notify_terminal sends THAT to Supabase, so the

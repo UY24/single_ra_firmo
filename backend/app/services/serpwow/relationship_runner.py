@@ -2,8 +2,9 @@
 """Relationship run orchestration: scrape -> verdict -> outputs.
 
 ONE RabbitMQ message carries a whole run. The message body is just {"run_id": ...}; the
-rows live in input.csv on S3, and parallelism comes from the semaphore in here, not from
-the message count. A single async process in this repo has already held 60 concurrent
+rows live in input.csv on S3, and parallelism comes from the bounded task window in here
+(topped up to RELATIONSHIP_CONCURRENCY and refilled as tasks finish), not from the
+message count. A single async process in this repo has already held 60 concurrent
 scrape.do calls, so the broker is a durable start signal, not a work distributor.
 """
 from __future__ import annotations
@@ -85,25 +86,39 @@ async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
             return
         await _scrape_one(prefix, row, counters)
 
-    tasks: set[asyncio.Task] = set()
-    rows = await asyncio.to_thread(_iter_pending, prefix, done)
+    it = _iter_pending(prefix, done)
     limit = _concurrency()
+    tasks: set[asyncio.Task] = set()
+    exhausted = False
 
-    for row in rows:
-        if await asyncio.to_thread(store.stop_requested, prefix):
+    while not exhausted or tasks:
+        # Checked once per refill of the task window, not once per row: at 500k rows a
+        # per-row S3 GET here would serialize ~500k round-trips into the dispatch loop
+        # that gates how fast new work starts.
+        if not exhausted and await asyncio.to_thread(store.stop_requested, prefix):
             stopped = True
-            break
-        # Bound the number of live tasks so the CSV is consumed lazily: at 500k rows a
-        # list of row dicts would be hundreds of MB.
-        while len(tasks) >= limit:
-            _done_tasks, tasks = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED)
-        task = asyncio.create_task(guarded(row))
-        tasks.add(task)
+            exhausted = True
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        while not exhausted and len(tasks) < limit:
+            # next() on a generator runs the generator BODY, including the blocking S3
+            # CSV read — wrapping the to_thread call around the *call* that builds the
+            # generator (as an earlier version of this did) only builds the generator
+            # object and does no I/O, so the read would happen back on the event loop
+            # the first time this loop iterates it. Wrapping next() itself keeps every
+            # blocking read off the event loop while still pulling one row at a time.
+            row = await asyncio.to_thread(_next_or_exhausted, it)
+            if row is _EXHAUSTED:
+                exhausted = True
+                break
+            tasks.add(asyncio.create_task(guarded(row)))
+
+        if tasks:
+            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
     counters.flush(force=True)
+
+
+_EXHAUSTED = object()
 
 
 def _iter_pending(prefix: str, done: set[int]):
@@ -111,3 +126,9 @@ def _iter_pending(prefix: str, done: set[int]):
     for row in store.iter_input_rows(prefix):
         if int(row["row_index"]) not in done:
             yield row
+
+
+def _next_or_exhausted(it):
+    """One pull off a (possibly blocking) iterator, run inside asyncio.to_thread by the
+    caller so the blocking read stays off the event loop."""
+    return next(it, _EXHAUSTED)

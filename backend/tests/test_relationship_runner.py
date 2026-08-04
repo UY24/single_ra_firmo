@@ -1,6 +1,7 @@
 """Phase 1: resume-by-object-presence, concurrency, and credit accounting."""
 import asyncio
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -165,7 +166,77 @@ class StreamingTests(unittest.TestCase):
         # Never more rows pulled from the CSV than the concurrency window (2) allows.
         # (rows_total is also 3 here, so asserting against 3 would pass either way —
         # the real claim is bounded by RELATIONSHIP_CONCURRENCY, not by row count.)
+        # This bound is timing-sensitive: it counts CSV pulls, not in-flight tasks, so a
+        # slower stub could legitimately observe limit + 1 if a row is pulled just before
+        # a completing task frees its slot. See the invariant test below for the bound
+        # that holds regardless of stub timing.
         self.assertLessEqual(live["max"], 2)
+
+    def test_live_tasks_never_exceed_the_concurrency_limit(self) -> None:
+        """The hard invariant, asserted directly: count concurrent search_ai_mode calls
+        (a tight proxy for len(tasks)) instead of CSV pulls, so the bound holds
+        regardless of stub timing. A slower stub (sleep(0.01), as the reviewer used to
+        reproduce the pull-ahead edge case) makes sure a real breach would show up."""
+        fake = FakeS3()
+        _seed(fake)
+        live = {"max": 0, "now": 0}
+
+        async def fake_search(query, gl="us", client=None):
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+            await asyncio.sleep(0.01)
+            live["now"] -= 1
+            return OK_ENVELOPE
+
+        with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
+                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"},
+                                clear=False):
+            counters = store.Counters(PREFIX, rows_total=3)
+            asyncio.run(runner.run_scrape_phase(PREFIX, counters))
+
+        self.assertLessEqual(live["max"], 2)
+
+    def test_the_blocking_csv_read_does_not_freeze_the_event_loop(self) -> None:
+        """Finding 1 regression: `asyncio.to_thread(_iter_pending, prefix, done)` only
+        constructs the generator object (near-instant, no I/O) — the blocking S3 read
+        happens wherever next() is actually called. If that next() runs on the event
+        loop, a slow row read stalls every in-flight scrape.do call. Prove the loop
+        stays responsive during a slow read via a background heartbeat."""
+        fake = FakeS3()
+        _seed(fake)
+        real_iter = store.iter_input_rows
+
+        def slow_iter(prefix):
+            for row in real_iter(prefix):
+                time.sleep(0.05)  # simulate a blocking network read
+                yield row
+
+        heartbeat = {"ticks": 0}
+
+        async def ticker():
+            while True:
+                heartbeat["ticks"] += 1
+                await asyncio.sleep(0.01)
+
+        async def fake_search(query, gl="us", client=None):
+            return OK_ENVELOPE
+
+        async def drive():
+            tick_task = asyncio.create_task(ticker())
+            counters = store.Counters(PREFIX, rows_total=3)
+            await runner.run_scrape_phase(PREFIX, counters)
+            tick_task.cancel()
+
+        with _patched(fake), mock.patch.object(store, "iter_input_rows", slow_iter), \
+                mock.patch.object(runner, "search_ai_mode", fake_search), \
+                mock.patch.dict(os.environ, {"RELATIONSHIP_CONCURRENCY": "2"},
+                                clear=False):
+            asyncio.run(drive())
+
+        # 3 rows * 0.05s blocking read = 0.15s total; a frozen event loop would tick
+        # near zero times during that window. A responsive one ticks roughly every
+        # 0.01s, so 5+ ticks is a solid margin.
+        self.assertGreaterEqual(heartbeat["ticks"], 5)
 
 
 if __name__ == "__main__":

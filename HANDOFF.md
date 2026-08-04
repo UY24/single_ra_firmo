@@ -129,6 +129,50 @@ relationship-scoped — it's the single scrape.do retry knob shared by gmaps and
 scraper too (see `.env.example` / `CLAUDE.md`), so all three now get 4 total calls per row
 instead of 3.
 
+### Final whole-branch review — triaged follow-ups
+
+A whole-branch review (24 commits) closed five merge blockers, which are **fixed**: task
+exceptions were being swallowed in both phases, `Stop` during the scrape phase discarded
+the whole run, the verdict phase had no stop check so a stop still bought every remaining
+Gemini shard, `publish_relationship_run` was unguarded so a broker timeout 500'd an upload
+whose run already existed in S3, and the scrape.do error body wasn't token-redacted. Also
+fixed: zero-evidence rows were being sent to Gemini and their paid verdict discarded, and
+Supabase never said `running` so a healthy multi-day run read `queued` for its whole life.
+
+**These survive, deliberately. Three are gates on 500k, not on merge:**
+
+- **MUST FIX before 500k — `retry-failed-rows` cannot complete at that scale.** It LISTs all
+  of `raw/` (~1000 pages) and then issues one **serial** `to_thread` DELETE per dead row
+  inside a single HTTP request; 50k dead rows is 20+ minutes and a client timeout. It also
+  silently ignores its `limit` param, and `relationship_store.delete_object` swallows
+  failures — so a row can be counted in `retried_rows` and never actually rescraped. Fix is
+  `delete_objects` in 1000-key batches plus honouring `limit`.
+- **MUST FIX before 500k — `phase="failed"` is terminal for the re-drive scan.** Any
+  transient error over a multi-day run (an S3 stream drop, a `SlowDown` past boto3's
+  retries) parks the run permanently; recovery means hand-typing the run id into the
+  Operations page. Fix: an attempts counter in `status.json`, AI Mode's `requeue_attempts`
+  pattern, and let the scan pick `failed` up N times — a re-drive is already free.
+- **MUST FIX before 500k — `GEMINI_BATCH_MAX_INFLIGHT` is silently capped.** Each shard
+  holds a thread for its entire multi-hour poll, so raising it above the default
+  `ThreadPoolExecutor`'s `min(32, cpu+4)` (**6 on a 2-vCPU box**) does nothing and the extra
+  shards are never created. A sized executor is the prerequisite for the tuning advice.
+  The same executor is shared by the CSV `next()`, the stop-marker check and every S3 PUT —
+  but for the *scrape* phase that is ~0.08 thread-seconds/s at measured rates, a non-issue.
+- **Also before 500k:** `parse_relationship_csv` builds two full dict copies of every row in
+  the **API** process for both preview and upload (>1GB twice for a 500k CSV) — the front
+  door is the only non-streaming point left; and `/uploads/{id}/result` reads a whole
+  several-hundred-MB CSV into memory instead of streaming the boto3 body.
+- **Accepted, with rulings:** `task_errors` is a per-run high-water mark, so once a run
+  records one task error every later clean re-drive still reads `completed_with_errors`
+  (sticky in the safe direction). The verdict-phase stop check needs a shard boundary, so on
+  a run smaller than `GEMINI_BATCH_SHARD_SIZE` — **including the 100-row test below** — a
+  stop mid-verdict still buys the single tail shard. A stopped run runs the full reporting
+  pass, which at 500k is a multi-hour `reporting` window with a stale `updated_at`; harmless
+  only because the single-flight guard is in-process and there is exactly **one** worker.
+  Spend is recomputed from surviving objects, so after a Rerun-failed `report.json`
+  *under*-reports credits while `status.json` over-reports — don't treat either as total
+  spend. A transient S3 blip makes a live run's `/status` read 404 for one poll.
+
 ### Two numbers that are NOT proven yet
 
 - **`SCRAPEDO_CONCURRENCY=100`** — this is a target, not a measurement. The gmaps

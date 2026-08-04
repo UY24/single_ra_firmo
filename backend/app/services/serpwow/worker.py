@@ -19,11 +19,6 @@ async def _start_relationship_worker() -> None:
         redrive_stale_runs,
     )
 
-    # Own channel: aio_pika QoS is per-channel, and a run message is held for hours.
-    relationship_channel = await app.rabbitmq_connection.channel()
-    await relationship_channel.set_qos(prefetch_count=1)
-    await consume_relationship_runs(relationship_channel)
-
     async def _relationship_redrive_loop() -> None:
         while True:
             try:
@@ -33,7 +28,19 @@ async def _start_relationship_worker() -> None:
             await asyncio.sleep(
                 max(60, int(os.getenv("RELATIONSHIP_REDRIVE_SCAN_SEC", "300"))))
 
-    asyncio.create_task(_relationship_redrive_loop())
+    # Started BEFORE the channel/consumer setup below, and on purpose: this loop is what
+    # recovers a run published while the worker (or its RabbitMQ connection) was down or
+    # being replaced, so it must not be skipped just because the connection/channel isn't
+    # ready *this* time — that would defeat the exact case the scan exists for. Registered
+    # in the shared consumer-task list so it's cancelled on shutdown and watched by
+    # main()'s failure detection, same as every other consumer task.
+    redrive_task = asyncio.create_task(_relationship_redrive_loop())
+    app.rabbitmq_consumer_tasks.append(redrive_task)
+
+    # Own channel: aio_pika QoS is per-channel, and a run message is held for hours.
+    relationship_channel = await app.rabbitmq_connection.channel()
+    await relationship_channel.set_qos(prefetch_count=1)
+    await consume_relationship_runs(relationship_channel)
 
 
 async def main() -> None:

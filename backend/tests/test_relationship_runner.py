@@ -315,7 +315,7 @@ class VerdictPhaseTests(unittest.TestCase):
         fake = FakeS3()
         self._seed_raw(fake)
 
-        def fake_batch(prefix_arg, items):
+        def fake_batch(prefix_arg, items, counters=None):
             return {key: {"relationship_status": "confirmed",
                           "official_website": "https://y.com",
                           "relationship_confidence_score": 90,
@@ -340,7 +340,7 @@ class VerdictPhaseTests(unittest.TestCase):
                              {"row_index": 0, "parsed": {}, "candidates": []})
         submitted = {}
 
-        def fake_batch(prefix_arg, items):
+        def fake_batch(prefix_arg, items, counters=None):
             submitted["keys"] = [k for k, _b in items]
             return {k: {} for k, _b in items}
 
@@ -358,7 +358,7 @@ class VerdictPhaseTests(unittest.TestCase):
             store.put_object(store.error_key(PREFIX, 0), ERR_ENVELOPE)
         submitted = {}
 
-        def fake_batch(prefix_arg, items):
+        def fake_batch(prefix_arg, items, counters=None):
             submitted["keys"] = [k for k, _b in items]
             return {}
 
@@ -451,14 +451,19 @@ class DriveTests(unittest.TestCase):
 
 class NotifyTerminalTests(unittest.TestCase):
     """_notify_terminal must attempt both channels and never raise, even if either
-    dependency (Supabase, Slack) is unavailable or throws."""
+    dependency (Supabase, Slack) is unavailable or throws. Supabase goes through
+    get_company_service().update_run(...) directly — NOT engine._update_supabase_run,
+    whose rows-shaped REPORTING_PIPELINES branch would zero out every stat this pipeline
+    doesn't keep in state["rows"] (found/not_found/cost/success/failed/file_links)."""
 
     def test_never_raises_when_both_notifiers_blow_up(self) -> None:
         summary = {"status": "completed", "cost": {}, "outcome_breakdown": {},
                    "websites_found": 1, "websites_not_found": 0, "total_rows": 1}
         pointer = {"run_db_id": "db-1", "company_name": "Acme"}
-        with mock.patch("app.services.serpwow.engine._update_supabase_run",
-                        side_effect=RuntimeError("supabase down")), \
+        fake_svc = mock.Mock()
+        fake_svc.update_run.side_effect = RuntimeError("supabase down")
+        with mock.patch("app.services.companies.get_company_service",
+                        return_value=fake_svc), \
                 mock.patch("app.core.notify.notify_run_complete",
                           side_effect=RuntimeError("slack down")):
             runner._notify_terminal("run1", pointer, summary)   # must not raise
@@ -469,12 +474,24 @@ class NotifyTerminalTests(unittest.TestCase):
                    "outcome_breakdown": {"errored": 1}, "websites_found": 2,
                    "websites_not_found": 1, "total_rows": 3}
         pointer = {"run_db_id": "db-1", "company_name": "Acme"}
-        with mock.patch("app.services.serpwow.engine._update_supabase_run") as sb, \
+        fake_svc = mock.Mock()
+        with mock.patch("app.services.companies.get_company_service",
+                        return_value=fake_svc), \
                 mock.patch("app.core.notify.notify_run_complete") as slack:
             runner._notify_terminal("run1", pointer, summary)
 
-        sb.assert_called_once()
-        self.assertEqual(sb.call_args.args[0]["status"], "completed_with_errors")
+        fake_svc.update_run.assert_called_once()
+        args, kwargs = fake_svc.update_run.call_args
+        self.assertEqual(args[0], "db-1")
+        self.assertEqual(kwargs["status"], "completed_with_errors")
+        # The real numbers write_outputs computed, NOT zeros rebuilt from an empty rows
+        # list — this is the exact thing the shared engine._update_supabase_run helper
+        # would have gotten wrong for this pipeline.
+        self.assertEqual(kwargs["websites_found"], 2)
+        self.assertEqual(kwargs["websites_not_found"], 1)
+        self.assertEqual(kwargs["failed_count"], 1)
+        self.assertEqual(kwargs["total_rows"], 3)
+        self.assertEqual(kwargs["cost"]["scrapedo_credits"], 50)
         slack.assert_called_once()
         self.assertEqual(slack.call_args.kwargs["status"], "completed_with_errors")
 
@@ -484,10 +501,22 @@ class NotifyTerminalTests(unittest.TestCase):
         summary = {"status": "completed", "cost": {}, "outcome_breakdown": {},
                    "websites_found": 0, "websites_not_found": 0, "total_rows": 0}
         pointer = {"company_name": "Acme"}
-        with mock.patch("app.services.serpwow.engine._update_supabase_run") as sb, \
+        with mock.patch("app.services.companies.get_company_service") as get_svc, \
                 mock.patch("app.core.notify.notify_run_complete") as slack:
             runner._notify_terminal("run1", pointer, summary)
-        sb.assert_not_called()
+        get_svc.assert_not_called()
+        slack.assert_called_once()
+
+    def test_no_crash_when_supabase_is_unconfigured(self) -> None:
+        """get_company_service() returning None (Supabase env unset) must be a no-op,
+        not an AttributeError on None.update_run(...)."""
+        summary = {"status": "completed", "cost": {}, "outcome_breakdown": {},
+                   "websites_found": 1, "websites_not_found": 0, "total_rows": 1}
+        pointer = {"run_db_id": "db-1", "company_name": "Acme"}
+        with mock.patch("app.services.companies.get_company_service",
+                        return_value=None), \
+                mock.patch("app.core.notify.notify_run_complete") as slack:
+            runner._notify_terminal("run1", pointer, summary)   # must not raise
         slack.assert_called_once()
 
 
@@ -546,9 +575,43 @@ class RedriveTests(unittest.TestCase):
         self.assertEqual(driven, [])
 
 
+class _FakeExchange:
+    pass
+
+
+class _FakeQueue:
+    def __init__(self):
+        self._handler = None
+        self.bound = None
+
+    async def bind(self, exchange, routing_key):
+        self.bound = (exchange, routing_key)
+
+    async def consume(self, handler):
+        self._handler = handler
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.queue = _FakeQueue()
+        self.exchange = _FakeExchange()
+        self.declared_exchange = None
+        self.declared_queue = None
+
+    async def declare_exchange(self, name, kind, durable=True):
+        self.declared_exchange = (name, kind, durable)
+        return self.exchange
+
+    async def declare_queue(self, name, durable=True):
+        self.declared_queue = (name, durable)
+        return self.queue
+
+
 class ConsumeRelationshipRunsTests(unittest.TestCase):
     """The queue consumer acks on receipt (before driving the run) — see
-    redrive_stale_runs for why. Prove the ack-then-drive ordering with a fake channel."""
+    redrive_stale_runs for why. Prove the ack-then-drive ordering with a fake channel.
+    It must also bind to the shared exchange (M3) rather than only declare the queue —
+    otherwise Task 9's publisher has nothing to deliver to."""
 
     def test_message_is_acked_before_the_run_is_driven(self) -> None:
         import json as _json
@@ -562,33 +625,19 @@ class ConsumeRelationshipRunsTests(unittest.TestCase):
             async def ack(self):
                 events.append("ack")
 
-        class FakeQueue:
-            def __init__(self):
-                self._handler = None
-
-            async def consume(self, handler):
-                self._handler = handler
-
-        class FakeChannel:
-            def __init__(self):
-                self.queue = FakeQueue()
-                self.declared = None
-
-            async def declare_queue(self, name, durable=True):
-                self.declared = (name, durable)
-                return self.queue
-
         async def fake_drive(run_id):
             events.append(("drive", run_id))
 
-        channel = FakeChannel()
+        channel = _FakeChannel()
         with mock.patch.object(runner, "drive_run", fake_drive):
             asyncio.run(runner.consume_relationship_runs(channel))
             message = FakeMessage(_json.dumps({"run_id": "run1"}).encode("utf-8"))
             asyncio.run(channel.queue._handler(message))
 
         self.assertEqual(events, ["ack", ("drive", "run1")])
-        self.assertEqual(channel.declared, (runner.RELATIONSHIP_QUEUE, True))
+        self.assertEqual(channel.declared_queue, (runner.RELATIONSHIP_QUEUE, True))
+        self.assertEqual(
+            channel.queue.bound, (channel.exchange, runner.RELATIONSHIP_ROUTING_KEY))
 
     def test_an_undecodable_message_is_dropped_not_raised(self) -> None:
         class FakeMessage:
@@ -598,19 +647,150 @@ class ConsumeRelationshipRunsTests(unittest.TestCase):
             async def ack(self):
                 pass
 
-        class FakeQueue:
-            async def consume(self, handler):
-                self._handler = handler
-
-        class FakeChannel:
-            async def declare_queue(self, name, durable=True):
-                self.queue = FakeQueue()
-                return self.queue
-
-        channel = FakeChannel()
+        channel = _FakeChannel()
         asyncio.run(runner.consume_relationship_runs(channel))
         message = FakeMessage(b"not json")
         asyncio.run(channel.queue._handler(message))   # must not raise
+
+    def test_a_non_dict_json_message_is_dropped_not_raised(self) -> None:
+        """M1: valid JSON that isn't an object (e.g. a bare list) must not crash the
+        consumer with AttributeError from calling .get() on a list."""
+        class FakeMessage:
+            def __init__(self, body: bytes):
+                self.body = body
+
+            async def ack(self):
+                pass
+
+        channel = _FakeChannel()
+        asyncio.run(runner.consume_relationship_runs(channel))
+        message = FakeMessage(b"[1, 2, 3]")
+        asyncio.run(channel.queue._handler(message))   # must not raise
+
+
+class GeminiBatchHeartbeatTests(unittest.TestCase):
+    """I2(a): _run_gemini_batch must flush counters on every poll iteration, so a run
+    legitimately waiting on a single (possibly hours-long) Gemini batch never goes stale
+    under RELATIONSHIP_STALE_SEC and gets a second, re-spending drive_run started on it."""
+
+    def test_a_polling_batch_flushes_counters_before_it_resolves(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        polls = [
+            {"name": "batches/1", "done": False, "state": {"name": "JOB_STATE_RUNNING"}},
+            {"name": "batches/1", "done": True, "state": {"name": "JOB_STATE_SUCCEEDED"}},
+        ]
+        call_n = {"n": 0}
+
+        def fake_get_batch(name):
+            i = min(call_n["n"], len(polls) - 1)
+            call_n["n"] += 1
+            return polls[i]
+
+        with _patched(fake), \
+                mock.patch("app.services.ai_mode.gemini_batch.create_batch",
+                          return_value={"name": "batches/1"}), \
+                mock.patch("app.services.ai_mode.gemini_batch.get_batch",
+                          side_effect=fake_get_batch), \
+                mock.patch("app.services.ai_mode.gemini_batch.collect_results",
+                          return_value=[]), \
+                mock.patch("time.sleep"):
+            counters = store.Counters(PREFIX, rows_total=1)
+            before = fake.put_calls
+            runner._run_gemini_batch(PREFIX, [("0", {})], counters)
+
+        # One non-terminal poll happened before the terminal one -> the heartbeat must
+        # have force-flushed status.json at least once in between.
+        self.assertGreater(fake.put_calls, before)
+        self.assertGreaterEqual(call_n["n"], 2)
+
+    def test_no_counters_given_is_still_safe(self) -> None:
+        """The default (counters=None) — existing callers/tests that don't pass one —
+        must not break."""
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake), \
+                mock.patch("app.services.ai_mode.gemini_batch.create_batch",
+                          return_value={"name": "batches/1"}), \
+                mock.patch("app.services.ai_mode.gemini_batch.get_batch",
+                          return_value={"name": "batches/1", "done": True,
+                                       "state": {"name": "JOB_STATE_SUCCEEDED"}}), \
+                mock.patch("app.services.ai_mode.gemini_batch.collect_results",
+                          return_value=[]):
+            result = runner._run_gemini_batch(PREFIX, [("0", {})])   # no counters arg
+        self.assertEqual(result, {})
+
+
+class SingleFlightTests(unittest.TestCase):
+    """I2(b): redrive_stale_runs and the queue consumer are two independent paths that
+    can both decide to drive the same run_id. Without a guard, the second driver's
+    pending = scraped - cleaned still contains every row the first driver already
+    submitted (cleaned/ objects don't appear until the batch completes), so it
+    re-submits a duplicate Gemini batch. drive_run must refuse to double-drive."""
+
+    def test_a_second_drive_run_for_an_in_flight_run_is_a_no_op(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        async def slow_scrape(p, c):
+            calls.append("scrape-start")
+            started.set()
+            await release.wait()
+            calls.append("scrape-end")
+
+        async def run_both():
+            with mock.patch.object(runner, "run_scrape_phase", slow_scrape), \
+                    mock.patch.object(runner, "run_verdict_phase",
+                                      lambda p, c: asyncio.sleep(0)), \
+                    mock.patch.object(runner, "write_outputs",
+                                      lambda p, c: {"status": "completed"}), \
+                    mock.patch.object(runner, "_notify_terminal"):
+                first = asyncio.create_task(runner.drive_run("run1"))
+                await started.wait()
+                # The first drive is still inside run_scrape_phase (blocked on
+                # `release`). A second drive_run for the SAME run_id must return
+                # immediately, without ever re-entering run_scrape_phase.
+                second = asyncio.create_task(runner.drive_run("run1"))
+                await second
+                calls.append("second-done")
+                release.set()
+                await first
+
+        with _patched(fake):
+            asyncio.run(run_both())
+
+        self.assertEqual(calls, ["scrape-start", "second-done", "scrape-end"])
+
+    def test_the_guard_is_cleared_after_a_run_finishes_so_a_later_drive_works(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+
+        order = []
+
+        async def phase(name, p, c):
+            order.append(name)
+
+        with _patched(fake), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: phase("scrape", p, c)), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: phase("verdict", p, c)), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: order.append("outputs") or {}), \
+                mock.patch.object(runner, "_notify_terminal"):
+            asyncio.run(runner.drive_run("run1"))
+            asyncio.run(runner.drive_run("run1"))   # must run again, not be skipped
+
+        self.assertEqual(order, ["scrape", "verdict", "outputs"] * 2)
+        self.assertNotIn("run1", runner._driving)
 
 
 if __name__ == "__main__":

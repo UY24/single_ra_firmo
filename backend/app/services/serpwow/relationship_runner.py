@@ -15,7 +15,10 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
+
+import aio_pika
 
 from app.services.common.env import get_int_env as _get_int_env
 from app.services.serpwow import relationship_store as store
@@ -30,6 +33,13 @@ _LOGGER = logging.getLogger(__name__)
 RELATIONSHIP_QUEUE = "relationship_runs"
 RELATIONSHIP_ROUTING_KEY = "relationship.run"
 _TERMINAL_PHASES = {"completed", "failed", "stopped"}
+
+# In-process single-flight guard: run_ids currently inside drive_run. redrive_stale_runs
+# and the queue consumer are two independent paths that can both decide to drive the same
+# run_id — the object-presence skip in each phase only protects against re-spend on rows a
+# PRIOR (finished) drive already did; it does nothing to stop two drivers racing on the
+# same in-flight Gemini shard *right now*. Checked and cleared in drive_run itself.
+_driving: set[str] = set()
 
 # Bounds stop-marker latency deterministically. With independently varying scrape
 # latencies, asyncio.wait(FIRST_COMPLETED) returns roughly one task at a time, so
@@ -172,11 +182,19 @@ def _max_inflight() -> int:
     return max(1, _get_int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
 
 
-def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]]) -> dict[str, dict]:
+def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
+                       counters: store.Counters | None = None) -> dict[str, dict]:
     """Submit one shard and block until it is terminal; returns {key: parsed_json}.
 
     Seam for tests — patched in test_relationship_runner. Sync on purpose: callers wrap
     it in asyncio.to_thread.
+
+    ``counters``, when given, is force-flushed on every poll iteration — a heartbeat.
+    Without it, a run legitimately waiting on a single Gemini batch (turnaround can run to
+    24h, see _max_inflight's docstring) writes status.json only once, at the top of
+    run_verdict_phase, then goes silent until the batch resolves — which blows straight
+    past RELATIONSHIP_STALE_SEC's 900s default, making redrive_stale_runs think a perfectly
+    healthy run is stale and start a second, re-spending drive_run on top of it.
     """
     import time as _time
 
@@ -191,6 +209,8 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]]) -> dict[str, d
         obj = gb.get_batch(name)
         if gb.is_terminal(gb.state_name(obj), bool(obj.get("done"))):
             break
+        if counters is not None:
+            counters.flush(force=True)
         _time.sleep(_get_int_env("GEMINI_BATCH_POLL_SEC", 30))
     out: dict[str, dict] = {}
     for record in gb.collect_results(obj):
@@ -249,7 +269,7 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
 
     async def submit(items: list[tuple[str, dict]],
                      item_meta: dict[str, tuple[list[str], str]]) -> None:
-        results = await asyncio.to_thread(_run_gemini_batch, prefix, items)
+        results = await asyncio.to_thread(_run_gemini_batch, prefix, items, counters)
         for key, _body in items:
             candidates, x_domain = item_meta.get(key, ([], ""))
             await asyncio.to_thread(
@@ -290,36 +310,55 @@ async def drive_run(run_id: str) -> None:
     """Run (or resume) one relationship run end to end. Idempotent and never raises.
 
     Every phase skips work that already has an object, so calling this on a run that is
-    partly or fully done costs no scrape.do credits and no Gemini tokens.
+    partly or fully done costs no scrape.do credits and no Gemini tokens. That property
+    only holds across SEPARATE drives, though — two drivers racing on the SAME run at the
+    same time can both see the same "pending" set and both submit it, which does re-spend.
+    _driving is the single-flight guard against that (see its module-level comment): the
+    queue consumer and redrive_stale_runs are the two paths that can otherwise collide.
     """
-    pointer = await asyncio.to_thread(store.read_run_pointer, run_id)
-    if not pointer:
-        _LOGGER.warning("relationship run %s: no pointer object, nothing to drive", run_id)
+    if run_id in _driving:
+        _LOGGER.info(
+            "relationship run %s: already being driven in this process, skipping", run_id)
         return
-    prefix = str(pointer.get("prefix") or "")
-    status = await asyncio.to_thread(store.read_status, prefix) or {}
-    counters = store.Counters(prefix, rows_total=int(status.get("rows_total") or 0))
-    for field in counters.values:
-        counters.values[field] = int(status.get(field) or 0)
-
+    _driving.add(run_id)
     try:
-        await run_scrape_phase(prefix, counters)
-        if await asyncio.to_thread(store.stop_requested, prefix):
-            counters.set_phase("stopped")
-            counters.flush(force=True)
+        pointer = await asyncio.to_thread(store.read_run_pointer, run_id)
+        if not pointer:
+            _LOGGER.warning(
+                "relationship run %s: no pointer object, nothing to drive", run_id)
             return
-        await run_verdict_phase(prefix, counters)
-        summary = await asyncio.to_thread(write_outputs, prefix, counters)
-        await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
-    except Exception as exc:
-        _LOGGER.exception("relationship run %s failed: %s", run_id, exc)
-        counters.set_phase("failed")
-        counters.flush(force=True)
+        prefix = str(pointer.get("prefix") or "")
+        status = await asyncio.to_thread(store.read_status, prefix) or {}
+        counters = store.Counters(prefix, rows_total=int(status.get("rows_total") or 0))
+        for field in counters.values:
+            counters.values[field] = int(status.get(field) or 0)
+
+        try:
+            await run_scrape_phase(prefix, counters)
+            if await asyncio.to_thread(store.stop_requested, prefix):
+                counters.set_phase("stopped")
+                counters.flush(force=True)
+                return
+            await run_verdict_phase(prefix, counters)
+            summary = await asyncio.to_thread(write_outputs, prefix, counters)
+            await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
+        except Exception as exc:
+            _LOGGER.exception("relationship run %s failed: %s", run_id, exc)
+            counters.set_phase("failed")
+            counters.flush(force=True)
+    finally:
+        _driving.discard(run_id)
 
 
 def _notify_terminal(run_id: str, pointer: dict[str, Any], summary: dict[str, Any]) -> None:
     """Best-effort Slack + Supabase at terminal status. Never raises — bookkeeping must
-    not fail a run that already produced its outputs."""
+    not fail a run that already produced its outputs.
+
+    "stopped" (see relationship_outputs.write_outputs) is a status the Runs list UI has no
+    specific CSS rule for — confirmed safe: static/js/ui.js's statusBadge() renders any
+    string as plain text with a data-status attribute, and app.css's unmatched-selector
+    fallback is just the neutral base badge style, not blank/broken.
+    """
     cost = summary.get("cost") or {}
     outcomes = summary.get("outcome_breakdown") or {}
     # write_outputs threads a distinct "stopped" status through when a stop was
@@ -330,24 +369,31 @@ def _notify_terminal(run_id: str, pointer: dict[str, Any], summary: dict[str, An
         "completed_with_errors" if outcomes.get("errored") else "completed")
 
     # Supabase: a relationship run has no state dict, so run_db_id rides in the pointer.
-    # _update_supabase_run reads a state-shaped dict; the shared REPORTING_PIPELINES
-    # branch there rebuilds stats from state["rows"], which this pipeline doesn't keep,
-    # so pass the already-computed numbers and accept that branch is a no-op for us.
+    # Deliberately NOT routed through engine._update_supabase_run: that helper is
+    # rows-shaped for gsearch/gmaps (it rebuilds success/failed counts, websites_found/
+    # not_found, cost, AND file_links from state["rows"]/state["upload_id"]), and this
+    # pipeline keeps none of that — every one of those would come back zeroed or empty
+    # instead of using the numbers write_outputs already computed. update_run() itself is
+    # just a partial `.update(fields)`, so calling it directly with the real numbers is no
+    # smaller a diff than fighting the shared helper's rows assumption, and it's correct.
     try:
-        from app.services.serpwow.engine import _update_supabase_run
+        from app.services.companies import get_company_service
 
-        if pointer.get("run_db_id"):
-            _update_supabase_run({
-                "run_db_id": pointer["run_db_id"],
-                "pipeline": "relationship",
-                "status": status,
-                "rows": [],
-                "websites_found": summary.get("websites_found"),
-                "websites_not_found": summary.get("websites_not_found"),
-                "success_count": summary.get("websites_found"),
-                "failed_count": outcomes.get("errored"),
-                "cost": cost,
-            })
+        run_db_id = pointer.get("run_db_id")
+        if run_db_id:
+            svc = get_company_service()
+            if svc is not None:
+                svc.update_run(
+                    run_db_id,
+                    status=status,
+                    total_rows=summary.get("total_rows"),
+                    success_count=summary.get("websites_found"),
+                    failed_count=outcomes.get("errored"),
+                    websites_found=summary.get("websites_found"),
+                    websites_not_found=summary.get("websites_not_found"),
+                    cost=cost,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
     except Exception:
         pass
 
@@ -412,13 +458,22 @@ async def redrive_stale_runs() -> int:
 
 
 async def consume_relationship_runs(channel) -> None:
-    """Declare the run queue and start consuming.
+    """Declare the run queue, bind it to the shared exchange, and start consuming.
 
     Own queue and channel, NOT the shared SerpWow queue: a run message occupies its
     consumer for the whole run, so on the shared queue it would permanently eat one of
-    WORKER_CONCURRENCY's slots.
+    WORKER_CONCURRENCY's slots. Bound to the SAME direct exchange AI Mode uses
+    (RABBITMQ_EXCHANGE, default "singleRA_search" — see ai_mode/broker.py) under
+    RELATIONSHIP_ROUTING_KEY: Task 9's publisher MUST publish there (exchange.publish(...,
+    routing_key=RELATIONSHIP_ROUTING_KEY)), not to the default exchange by queue name —
+    the latter silently drops every message, since a queue bound to a named exchange no
+    longer also listens on the default exchange under its own name.
     """
+    exchange = await channel.declare_exchange(
+        os.getenv("RABBITMQ_EXCHANGE", "singleRA_search"),
+        aio_pika.ExchangeType.DIRECT, durable=True)
     queue = await channel.declare_queue(RELATIONSHIP_QUEUE, durable=True)
+    await queue.bind(exchange, routing_key=RELATIONSHIP_ROUTING_KEY)
 
     async def on_message(message) -> None:
         # Ack FIRST — see redrive_stale_runs for why this pipeline inverts the repo's
@@ -429,7 +484,10 @@ async def consume_relationship_runs(channel) -> None:
         except Exception:
             _LOGGER.warning("relationship: undecodable run message, dropped")
             return
-        run_id = str(body.get("run_id") or "")
+        # body can be valid JSON that isn't an object (e.g. a bare list) — .get() on
+        # that would raise AttributeError, so guard rather than let a malformed-but-
+        # parseable message crash the consumer.
+        run_id = str(body.get("run_id") or "") if isinstance(body, dict) else ""
         if run_id:
             await drive_run(run_id)
 

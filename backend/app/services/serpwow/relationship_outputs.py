@@ -211,10 +211,13 @@ def _write_outputs(prefix: str, counters: store.Counters,
             + "\n")
 
     run_status = "completed_with_errors" if outcomes["errored"] else "completed"
-    # A stop can land mid-verdict or mid-reporting (run_scrape_phase's own check only
-    # catches a stop between phases 1 and 2) — surface that as a distinct status rather
-    # than mislabeling a deliberately-halted run "completed_with_errors". Every row up to
-    # the stop is still written out normally; only the label changes.
+    # This is a LABEL fix only, not a spend fix: a stop can land mid-verdict or
+    # mid-reporting (run_scrape_phase's own check only covers the gap between phases 1 and
+    # 2 — run_verdict_phase has no stop check of its own, out of this task's scope), and
+    # any Gemini batch shard already submitted by that point still runs to completion and
+    # gets billed regardless of this check. All this does is stop a deliberately-halted
+    # run from being mislabeled "completed_with_errors" once write_outputs does run; every
+    # row processed up to the stop is still written out normally.
     if store.stop_requested(prefix):
         run_status = "stopped"
 

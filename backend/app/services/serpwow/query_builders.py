@@ -2,11 +2,10 @@
 """Search-query construction for SerpWow modes (primary/fallback + phase queries)."""
 from __future__ import annotations
 
-import os
 import re
-from pathlib import Path
 from typing import Any, Optional
 
+from app.core.config import PROMPTS_DIR
 from app.services.serpwow.geo import _country_to_gl
 from app.services.serpwow.address import (
     _extract_address_component,
@@ -562,15 +561,15 @@ _RELATIONSHIP_PROMPT_CACHE: Optional[str] = None
 def load_relationship_prompt() -> str:
     """The single AI Mode search prompt, read once per process.
 
-    Lives in app/prompts/ so it can be tuned without a code change;
-    RELATIONSHIP_SEARCH_PROMPT_FILE points at an alternative for A/B runs.
+    Lives in app/prompts/ so it can be tuned without a code change — edit the file and
+    restart the worker. The filename is fixed, exactly like AI Mode's own prompts in
+    ``ai_mode/mode_config.py``.
     """
     global _RELATIONSHIP_PROMPT_CACHE
     if _RELATIONSHIP_PROMPT_CACHE is None:
-        name = os.getenv("RELATIONSHIP_SEARCH_PROMPT_FILE",
-                         "").strip() or "relationship_search.txt"
-        path = Path(__file__).resolve().parents[2] / "prompts" / name
-        _RELATIONSHIP_PROMPT_CACHE = path.read_text(encoding="utf-8").strip()
+        _RELATIONSHIP_PROMPT_CACHE = (
+            PROMPTS_DIR / "relationship_search.txt"
+        ).read_text(encoding="utf-8").strip()
     return _RELATIONSHIP_PROMPT_CACHE
 
 

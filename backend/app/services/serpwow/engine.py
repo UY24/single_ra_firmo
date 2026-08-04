@@ -3311,8 +3311,13 @@ async def publish_relationship_run(run_id: str) -> None:
     exchange consume_relationship_runs binds its queue to, and the one AI Mode and
     SerpWow already use, so every binding is visible in one place in the management UI.
 
-    Failure is tolerated: the worker's stale-run scan picks the run up within
-    RELATIONSHIP_REDRIVE_SCAN_SEC, so a broker hiccup delays a run, never loses it.
+    Failure is tolerated — and that tolerance lives HERE, not at the call sites, so every
+    caller (upload, retry-failed-rows, anything added later) gets it. Both callers reach
+    this only AFTER the run is fully created in S3, so letting a wait_for timeout or any
+    AMQP error propagate 500s the request with no upload_id while the run exists and the
+    re-drive scan starts spending money on it 300s later. Never raises: the worker's
+    stale-run scan picks the run up within RELATIONSHIP_REDRIVE_SCAN_SEC, so a broker
+    hiccup delays a run, never loses it.
     """
     from app.services.serpwow.relationship_runner import RELATIONSHIP_ROUTING_KEY
 
@@ -3320,17 +3325,21 @@ async def publish_relationship_run(run_id: str) -> None:
         print(f"[relationship] run {run_id} queued without a broker; "
               f"the re-drive scan will start it")
         return
-    await asyncio.wait_for(
-        rabbitmq_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({"run_id": run_id}).encode("utf-8"),
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                content_type="application/json",
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=RELATIONSHIP_ROUTING_KEY,
             ),
-            routing_key=RELATIONSHIP_ROUTING_KEY,
-        ),
-        timeout=5.0,
-    )
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[relationship] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
 
 
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
@@ -4286,10 +4295,9 @@ async def create_relationship_upload(
         parsed = parse_relationship_csv(raw)
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not parsed["pairs"]:
-        raise HTTPException(status_code=400,
-                            detail="No searchable rows — every Company_Name_Y is blank.")
 
+    # No empty-pairs guard: parse_relationship_csv raises on a blank required value and on
+    # a header-only CSV, so parsed["pairs"] is never empty when it returns.
     # SERPWOW_API_KEY is deliberately NOT checked: relationship left SerpWow in 2026-08.
     for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
         if not os.getenv(env_key, "").strip():

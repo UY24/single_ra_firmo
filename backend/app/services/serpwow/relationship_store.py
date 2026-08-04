@@ -18,11 +18,11 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 import time
 from typing import Any, Iterator, Optional
 
 from app.core import s3
+from app.services.common.env import get_float_env
 from app.services.common.text import slugify_company
 
 PIPELINE_SEGMENT = "relationship"
@@ -268,8 +268,11 @@ class Counters:
     scrape onward.
     """
 
+    # task_errors: row/shard tasks that raised (see relationship_runner._drain). Not a
+    # row count — one verdict-shard error can strand thousands of rows — but it is the
+    # only durable trace that something failed outside the per-row error markers.
     _FIELDS = ("rows_total", "rows_scraped", "rows_failed", "rows_billed_empty",
-               "rows_cleaned", "requests", "credits")
+               "rows_cleaned", "requests", "credits", "task_errors")
 
     def __init__(self, prefix: str, rows_total: int = 0, phase: str = "queued") -> None:
         self.prefix = prefix
@@ -291,7 +294,7 @@ class Counters:
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     def flush(self, force: bool = False) -> None:
-        interval = _flush_interval()
+        interval = max(0.0, get_float_env("RELATIONSHIP_STATUS_FLUSH_SEC", 2.0))
         now = time.monotonic()
         if not force and (now - self._last_flush) < interval:
             return
@@ -302,11 +305,3 @@ class Counters:
             # A missed counter flush is cosmetic — the objects are the truth. Never let
             # it kill a run that is otherwise progressing fine.
             pass
-
-
-def _flush_interval() -> float:
-    raw = os.getenv("RELATIONSHIP_STATUS_FLUSH_SEC", "").strip()
-    try:
-        return max(0.0, float(raw)) if raw else 2.0
-    except ValueError:
-        return 2.0

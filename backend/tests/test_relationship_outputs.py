@@ -77,6 +77,14 @@ class OutputTests(unittest.TestCase):
         confirmed = _read_csv(fake, "confirmed_relation.csv")
         self.assertEqual(confirmed[0]["Notes"], "keep-me")
         self.assertEqual(confirmed[0]["website_url"], "https://drinksanzo.com")
+        # The "confidence" column is NOT structurally dead (it was reviewed as "always
+        # 0" because build_relationship_prompt's schema has no confidence_score key):
+        # apply_relationship_gate WRITES confidence_score back onto the same `parsed`
+        # dict in place, as min(relationship, website) for a confirmed row that passed
+        # the URL gate — min(92, 88) here — and _out_row reads that same object.
+        self.assertEqual(confirmed[0]["confidence"], "88")
+        self.assertEqual(confirmed[0]["relationship_confidence"], "92")
+        self.assertEqual(confirmed[0]["website_confidence"], "88")
 
     def test_a_scrape_error_row_is_reported_with_its_source(self) -> None:
         fake = FakeS3()
@@ -276,6 +284,29 @@ class CostAccountingTests(unittest.TestCase):
         self.assertEqual(status["phase"], "stopped")
         from app.services.serpwow import relationship_runner as runner
         self.assertIn("stopped", runner._TERMINAL_PHASES)
+
+    def test_task_errors_label_the_run_completed_with_errors(self) -> None:
+        """A row/shard task that RAISED leaves no per-row error marker: its rows read as
+        plain "unclear"/llm_missing, every by_source count stays 0, and the run therefore
+        used to report a clean "completed" after silently discarding an already-paid-for
+        Gemini shard. counters.task_errors is the only trace, so the label must use it."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.put_bytes(store.input_key(COST_PREFIX),
+                            b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
+                            b"https://acme.com/p,Acme,Sanzo,US\n")
+            # Scraped fine, but no cleaned/ object — the shard that owned it died.
+            store.put_object(store.raw_key(COST_PREFIX, 0),
+                             {"credits": 10, "request_count": 1,
+                              "successful_requests": 1,
+                              "text_blocks": [{"snippet": "Acme invested."}]})
+            counters = store.Counters(COST_PREFIX, rows_total=1)
+            counters.bump(task_errors=1)
+            summary = outputs.write_outputs(COST_PREFIX, counters)
+
+        self.assertEqual(summary["status"], "completed_with_errors")
+        self.assertEqual(summary["outcome_breakdown"]["errored"], 0)   # no error marker
+        self.assertEqual(summary["error_breakdown"]["task_errors"], 1)
 
     def test_run_log_status_is_completed_when_nothing_errored(self) -> None:
         fake = FakeS3()

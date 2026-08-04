@@ -134,6 +134,32 @@ class ScrapePhaseTests(unittest.TestCase):
         self.assertEqual(counters.values["rows_failed"], 1)
         self.assertEqual(counters.values["rows_scraped"], 2)
 
+    def test_a_raising_row_task_is_counted_rather_than_swallowed(self) -> None:
+        """asyncio.wait hands back Tasks whose exception is only realised if someone
+        ASKS for it. The realistic trigger: the prompt file operators are invited to edit
+        goes through .format(), so one stray "{" makes build_relationship_search_query
+        raise KeyError on EVERY row. Unretrieved, that killed all tasks, wrote no object,
+        moved no counter, "completed" the phase normally, and left a GC warning as the
+        only trace."""
+        fake = FakeS3()
+        _seed(fake)
+
+        def boom(**kwargs):
+            raise KeyError("relationship_confidence_score")
+
+        with _patched(fake), \
+                mock.patch.object(runner, "build_relationship_search_query", boom), \
+                mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "2"}, clear=False):
+            counters = store.Counters(PREFIX, rows_total=3)
+            asyncio.run(runner.run_scrape_phase(PREFIX, counters))   # must not raise
+
+        self.assertEqual(counters.values["task_errors"], 3)
+        self.assertEqual(counters.values["rows_scraped"], 0)
+        with _patched(fake):
+            self.assertIsNone(store.get_object(store.raw_key(PREFIX, 0)))
+            # And it is durable, not just in memory: the operator sees it in status.json.
+            self.assertEqual(store.read_status(PREFIX)["task_errors"], 3)
+
 
 class StreamingTests(unittest.TestCase):
     def test_input_rows_are_never_materialised_as_a_list(self) -> None:
@@ -368,6 +394,91 @@ class VerdictPhaseTests(unittest.TestCase):
 
         self.assertEqual(submitted["keys"], [])
 
+    def test_a_zero_evidence_row_costs_zero_gemini_requests(self) -> None:
+        """A billed_empty row (HTTP 200, no text_blocks, no references) has a perfectly
+        parseable envelope, so the skip-if-unparseable gate let it into a shard and paid
+        for it — then build_row_result's has_evidence check threw the verdict away and
+        stamped REL_ERROR_NO_EVIDENCE anyway. ~15k wasted Batch requests at 500k rows
+        with 3% empty responses."""
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.put_object(store.raw_key(PREFIX, 0), {
+                **OK_ENVELOPE, "row_index": 0, "x_domain": "acme.com",
+                "text_blocks": [], "references": [], "billed_empty": True,
+                "fields": {"row_index": 0, "x_name": "Acme", "y_name": "Y0",
+                           "input_url": "https://acme.com/p", "city": "",
+                           "country": "US"}})
+        submitted: list[str] = []
+
+        def fake_batch(prefix_arg, items, counters=None):
+            submitted.extend(key for key, _body in items)
+            return {}
+
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch):
+            counters = store.Counters(PREFIX, rows_total=1)
+            asyncio.run(runner.run_verdict_phase(PREFIX, counters))
+
+        self.assertEqual(submitted, [])
+        # The cleaned object is still written, so phase 3 reaches the same verdict and a
+        # re-drive skips the row instead of re-considering it forever.
+        with _patched(fake):
+            cleaned = store.get_object(store.cleaned_key(PREFIX, 0))
+        self.assertIsNone(cleaned["parsed"])
+        self.assertEqual(counters.values["rows_cleaned"], 1)
+
+    def test_a_raising_shard_is_counted_not_silently_discarded(self) -> None:
+        """submit() wraps create_batch/collect_results AND a raising put_object. One
+        Gemini quota error or S3 blip used to discard a whole already-PAID-FOR 5000-row
+        shard with no trace: gather(return_exceptions=True) collected the exception and
+        nobody looked at it, and the rows resurfaced as plain unclear/llm_missing."""
+        fake = FakeS3()
+        self._seed_raw(fake)
+
+        def boom(prefix_arg, items, counters=None):
+            raise RuntimeError("gemini: quota exceeded for concurrent batches")
+
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", boom):
+            counters = store.Counters(PREFIX, rows_total=3)
+            asyncio.run(runner.run_verdict_phase(PREFIX, counters))   # must not raise
+
+        self.assertEqual(counters.values["task_errors"], 1)
+        self.assertEqual(counters.values["rows_cleaned"], 0)
+        with _patched(fake):
+            self.assertIsNone(store.get_object(store.cleaned_key(PREFIX, 0)))
+
+    def test_a_stop_stops_submitting_further_gemini_shards(self) -> None:
+        """Without a stop check in this loop, a stop at row 1 of a 500k run still bought
+        all 100 remaining shards. Checked once per shard boundary (not per row) and
+        BEFORE the shard goes out, so a stop costs zero further batches."""
+        fake = FakeS3()
+        self._seed_raw(fake)
+        with _patched(fake):
+            store.request_stop(PREFIX)
+        submitted: list[list[str]] = []
+
+        def fake_batch(prefix_arg, items, counters=None):
+            submitted.append([key for key, _body in items])
+            return {}
+
+        # Shard size 2 over 3 pending rows: the boundary is reached at row 1, which is
+        # where the stop check lives. The partial tail must not be bought either.
+        env = {"GEMINI_BATCH_SHARD_SIZE": "2"}
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch), \
+                mock.patch.dict(os.environ, env, clear=False):
+            asyncio.run(runner.run_verdict_phase(
+                PREFIX, store.Counters(PREFIX, rows_total=3)))
+            self.assertEqual(submitted, [])
+
+            # Control: the identical fixture with the stop lifted DOES submit, so the
+            # gate is the stop marker and not a broken shard-boundary path.
+            store.clear_stop(PREFIX)
+        with _patched(fake), mock.patch.object(runner, "_run_gemini_batch", fake_batch), \
+                mock.patch.dict(os.environ, env, clear=False):
+            asyncio.run(runner.run_verdict_phase(
+                PREFIX, store.Counters(PREFIX, rows_total=3)))
+        self.assertEqual(submitted, [["0", "1"], ["2"]])
+
 
 class DriveTests(unittest.TestCase):
     def test_drive_run_executes_all_three_phases_in_order(self) -> None:
@@ -414,7 +525,15 @@ class DriveTests(unittest.TestCase):
             asyncio.run(runner.drive_run("run1"))
         self.assertEqual(notified, [("run1", {"status": "completed"})])
 
-    def test_a_stop_between_phase_1_and_2_never_reaches_outputs_or_notify(self) -> None:
+    def test_a_stop_between_phase_1_and_2_still_writes_outputs_and_terminalizes(
+            self) -> None:
+        """A stop must SKIP the verdict phase, not discard the run. The earlier version of
+        this test pinned the opposite (return before write_outputs/_notify_terminal),
+        which meant "Stop" on day 3 of a 500k run threw away every scraped row: no
+        confirmed_relation.csv at all (write_outputs handles a missing cleaned/ object
+        fine — parsed=None -> "unclear"), Supabase left on create_run's "queued" forever,
+        and /status mapping phase="stopped" to "completed" so the detail page showed a
+        completed run with an empty Files card."""
         fake = FakeS3()
         _seed(fake)
         with _patched(fake):
@@ -424,14 +543,17 @@ class DriveTests(unittest.TestCase):
         with _patched(fake), \
                 mock.patch.object(runner, "run_scrape_phase",
                                   lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: called.append("verdict")
+                                  or asyncio.sleep(0)), \
                 mock.patch.object(runner, "write_outputs",
-                                  lambda p, c: called.append("outputs") or {}), \
+                                  lambda p, c: called.append("outputs")
+                                  or {"status": "stopped"}), \
                 mock.patch.object(runner, "_notify_terminal",
                                   lambda *a: called.append("notify")):
             asyncio.run(runner.drive_run("run1"))
-        self.assertEqual(called, [])
-        with _patched(fake):
-            self.assertEqual(store.read_status(PREFIX)["phase"], "stopped")
+        # Outputs and terminalization happen; only the money-spending phase is skipped.
+        self.assertEqual(called, ["outputs", "notify"])
 
     def test_a_phase_exception_marks_the_run_failed_not_crashing_the_caller(self) -> None:
         fake = FakeS3()
@@ -447,6 +569,68 @@ class DriveTests(unittest.TestCase):
 
         with _patched(fake):
             self.assertEqual(store.read_status(PREFIX)["phase"], "failed")
+
+    def _svc_statuses(self, svc) -> list:
+        return [call.kwargs.get("status") for call in svc.update_run.call_args_list]
+
+    def test_supabase_is_told_the_run_is_running_and_then_terminalized(self) -> None:
+        """_notify_terminal used to be the ONLY update_run call, so a healthy 6-day 500k
+        run read create_run's "queued" in the Runs list for its entire life."""
+        fake = FakeS3()
+        _seed(fake)
+        svc = mock.Mock()
+        with _patched(fake), \
+                mock.patch("app.services.companies.get_company_service",
+                           return_value=svc), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: {"status": "completed"}), \
+                mock.patch("app.core.notify.notify_run_complete"):
+            store.write_run_pointer("run1", PREFIX, "Acme", run_db_id="db-1")
+            asyncio.run(runner.drive_run("run1"))
+        self.assertEqual(self._svc_statuses(svc), ["running", "completed"])
+
+    def test_a_failed_run_terminalizes_supabase_instead_of_staying_queued(self) -> None:
+        fake = FakeS3()
+        _seed(fake)
+        svc = mock.Mock()
+
+        async def boom(p, c):
+            raise RuntimeError("scrape.do is on fire")
+
+        with _patched(fake), \
+                mock.patch("app.services.companies.get_company_service",
+                           return_value=svc), \
+                mock.patch.object(runner, "run_scrape_phase", boom):
+            store.write_run_pointer("run1", PREFIX, "Acme", run_db_id="db-1")
+            asyncio.run(runner.drive_run("run1"))
+        self.assertEqual(self._svc_statuses(svc), ["running", "failed"])
+
+    def test_supabase_failures_never_break_a_drive(self) -> None:
+        """Every Supabase call in this pipeline is bookkeeping — it must not fail a run
+        that is otherwise fine."""
+        fake = FakeS3()
+        _seed(fake)
+        svc = mock.Mock()
+        svc.update_run.side_effect = RuntimeError("supabase down")
+        with _patched(fake), \
+                mock.patch("app.services.companies.get_company_service",
+                           return_value=svc), \
+                mock.patch.object(runner, "run_scrape_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "run_verdict_phase",
+                                  lambda p, c: asyncio.sleep(0)), \
+                mock.patch.object(runner, "write_outputs",
+                                  lambda p, c: {"status": "completed"}), \
+                mock.patch("app.core.notify.notify_run_complete"):
+            store.write_run_pointer("run1", PREFIX, "Acme", run_db_id="db-1")
+            asyncio.run(runner.drive_run("run1"))   # must not raise
+        # Both attempts were made and both blew up harmlessly — the run still completed
+        # through write_outputs/_notify_terminal rather than diverting to the failed path.
+        self.assertEqual(self._svc_statuses(svc), ["running", "completed"])
 
 
 class NotifyTerminalTests(unittest.TestCase):

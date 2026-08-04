@@ -101,6 +101,28 @@ class UploadSideEffectTests(unittest.TestCase):
         self.assertEqual(svc.create_run.call_args.kwargs["pipeline"], "relationship")
         self.assertEqual(svc.create_run.call_args.kwargs["total_rows"], 1)
 
+    def test_upload_still_succeeds_when_publishing_fails(self) -> None:
+        """publish_relationship_run's own docstring says failure is tolerated, and the
+        re-drive scan is the safety net — but it only tolerated `exchange is None`. A
+        wait_for timeout or any AMQP error propagated, 500ing the user with no upload_id
+        AFTER the run was fully created in S3, and 300s later the scan started spending
+        money on a run the user believes never existed."""
+        fake = FakeS3()
+        exchange = mock.Mock()
+        exchange.publish = mock.AsyncMock(side_effect=RuntimeError("channel closed"))
+        with mock.patch.dict(os.environ, ENV, clear=False), _patched(fake), \
+                mock.patch("app.services.serpwow.engine.rabbitmq_exchange", exchange):
+            r = TestClient(app).post(
+                "/uploads/relationship",
+                files={"file": ("in.csv", GOOD_CSV, "text/csv")},
+                data={"company_id": "c1", "company_name": "Acme"})
+
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["upload_id"])
+        # And the run really is in S3, i.e. the re-drive scan has something to find.
+        with _patched(fake):
+            self.assertIsNotNone(store.read_run_pointer(r.json()["upload_id"]))
+
     def test_no_state_json_object_is_ever_written(self) -> None:
         """state.json is what this migration removed; its return would be a regression."""
         fake = FakeS3()
@@ -381,6 +403,21 @@ class FileStopAndRerunTests(unittest.TestCase):
         self.assertIn(store.raw_key(self.PREFIX, 4), fake.objects)
         self.assertNotIn(store.stop_key(self.PREFIX), fake.objects)
         published.assert_awaited_once_with("run2")
+
+    def test_rerun_failed_still_succeeds_when_publishing_fails(self) -> None:
+        """The second unguarded publish call site: the error markers are already deleted
+        by this point, so a 500 here leaves the user thinking nothing happened while the
+        re-drive scan proceeds to rescrape those rows."""
+        fake = self._seeded()
+        exchange = mock.Mock()
+        exchange.publish = mock.AsyncMock(side_effect=RuntimeError("channel closed"))
+        with _patched(fake):
+            store.put_object(store.error_key(self.PREFIX, 3), {"error": "boom"})
+        with _patched(fake), mock.patch(
+                "app.services.serpwow.engine.rabbitmq_exchange", exchange):
+            r = TestClient(app).post("/uploads/run2/retry-failed-rows")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["retried_rows"], 1)
 
 
 PREVIEW_CSV = (

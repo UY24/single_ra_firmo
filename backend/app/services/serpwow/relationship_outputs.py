@@ -51,8 +51,8 @@ def _passthrough_fieldnames(header: list[str]) -> list[tuple[str, str]]:
     Without this, an input column literally named e.g. "flags" produces a duplicate
     "flags" header, and row.update()'s computed "flags" silently overwrites the
     passthrough value in the row dict with no warning — breaking the "every original
-    column passes through" contract. Collisions get an __orig suffix (numbered on
-    further repeats) instead of being dropped.
+    column passes through" contract. A collision gets an "__orig" suffix, and a further
+    collision gets another one appended ("flags__orig__orig"), rather than being dropped.
     """
     seen = set(_RESERVED_COLUMNS)
     out: list[tuple[str, str]] = []
@@ -97,15 +97,6 @@ def _out_row(original: dict[str, str], passthrough: list[tuple[str, str]],
     return row
 
 
-def _text_temp_file() -> tuple[Any, io.TextIOWrapper]:
-    """A binary spooled temp file wrapped for text I/O: csv.writer needs text, S3's
-    upload_fileobj needs bytes. Returns (binary_file, text_wrapper) — write through the
-    text wrapper, flush() it (never close() it, which would close the binary file too),
-    then hand the binary file to store.put_fileobj."""
-    tmp = tempfile.TemporaryFile()
-    return tmp, io.TextIOWrapper(tmp, encoding="utf-8", newline="")
-
-
 def write_outputs(prefix: str, counters: store.Counters) -> dict[str, Any]:
     """Write the two CSVs, report.json and run.log to S3. Returns the summary."""
     counters.set_phase("reporting")
@@ -118,10 +109,16 @@ def write_outputs(prefix: str, counters: store.Counters) -> dict[str, Any]:
 def _write_outputs(prefix: str, counters: store.Counters,
                     stack: contextlib.ExitStack) -> dict[str, Any]:
     def _temp_file() -> tuple[Any, io.TextIOWrapper]:
-        """A tracked _text_temp_file(): its text wrapper (and, transitively, the
-        underlying binary file) is closed when write_outputs returns, however it
-        returns — otherwise every temp file leaks an fd (ResourceWarning) until GC."""
-        tmp, text = _text_temp_file()
+        """A binary spooled temp file wrapped for text I/O: csv.writer needs text, S3's
+        upload_fileobj needs bytes. Returns (binary_file, text_wrapper) — write through
+        the text wrapper, flush() it (never close() it, which would close the binary file
+        too), then hand the binary file to store.put_fileobj.
+
+        The wrapper (and, transitively, the underlying binary file) is closed when
+        write_outputs returns, however it returns — otherwise every temp file leaks an
+        fd (ResourceWarning) until GC."""
+        tmp = tempfile.TemporaryFile()
+        text = io.TextIOWrapper(tmp, encoding="utf-8", newline="")
         stack.callback(text.close)
         return tmp, text
 
@@ -210,14 +207,18 @@ def _write_outputs(prefix: str, counters: store.Counters,
             + (f" — {result['row_error']}" if result["row_error"] else "")
             + "\n")
 
-    run_status = "completed_with_errors" if outcomes["errored"] else "completed"
-    # This is a LABEL fix only, not a spend fix: a stop can land mid-verdict or
-    # mid-reporting (run_scrape_phase's own check only covers the gap between phases 1 and
-    # 2 — run_verdict_phase has no stop check of its own, out of this task's scope), and
-    # any Gemini batch shard already submitted by that point still runs to completion and
-    # gets billed regardless of this check. All this does is stop a deliberately-halted
-    # run from being mislabeled "completed_with_errors" once write_outputs does run; every
-    # row processed up to the stop is still written out normally.
+    # task_errors counts row/shard tasks that RAISED (relationship_runner._drain). Those
+    # leave no per-row error marker — a verdict shard that died takes its rows' verdicts
+    # with it and they read as plain "unclear"/llm_missing — so without this a run whose
+    # whole already-paid-for shard was discarded reported a clean "completed".
+    task_errors = int(counters.values.get("task_errors") or 0)
+    run_status = ("completed_with_errors" if outcomes["errored"] or task_errors
+                  else "completed")
+    # A stop can land mid-verdict or mid-reporting, and any Gemini batch shard already
+    # submitted by that point still runs to completion and gets billed regardless of this
+    # check (run_verdict_phase stops SUBMITTING new shards, it cannot un-buy live ones).
+    # All this does is keep a deliberately-halted run from being mislabeled
+    # "completed_with_errors"; every row processed up to the stop is written out normally.
     if store.stop_requested(prefix):
         run_status = "stopped"
 
@@ -229,7 +230,10 @@ def _write_outputs(prefix: str, counters: store.Counters,
         "websites_not_found": total_rows - found,
         "relationship_breakdown": counts,
         "outcome_breakdown": outcomes,
-        "error_breakdown": {"by_source": by_source, "by_category": by_category},
+        "error_breakdown": {"by_source": by_source, "by_category": by_category,
+                            # Why the run can be completed_with_errors while every
+                            # by_source count is 0: a task that raised has no error marker.
+                            "task_errors": task_errors},
         "empty_response_breakdown": {"empty": billed_empty},
         "confidence_mode": "llm",
         "cost": {

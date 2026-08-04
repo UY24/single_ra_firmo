@@ -59,6 +59,33 @@ _driving: set[str] = set()
 _STOP_CHECK_INTERVAL_SEC = 1.0
 
 
+def _drain(done: set[asyncio.Task], counters: store.Counters, phase: str) -> None:
+    """Retrieve every finished task's exception, log it, and count it.
+
+    NOT optional bookkeeping. asyncio.wait/gather hand back Task objects whose exception
+    is only realised when someone asks for it: an unretrieved one surfaces as a GC-time
+    "Task exception was never retrieved" warning and nothing else. Both phases have a
+    failure mode that is otherwise completely silent — _scrape_one formats the
+    OPERATOR-EDITABLE prompt file, so one stray "{" makes every row raise KeyError, and
+    submit() wraps create_batch/collect_results/put_object, so one Gemini quota error
+    discards an already-PAID-FOR shard. The counter is what makes either visible: it
+    lands in status.json and turns write_outputs' verdict into completed_with_errors
+    instead of a clean "completed".
+    """
+    failed = 0
+    for task in done:
+        if task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None:
+            failed += 1
+            _LOGGER.error("relationship %s task failed: %s: %s",
+                          phase, type(exc).__name__, exc, exc_info=exc)
+    if failed:
+        counters.bump(task_errors=failed)
+        counters.flush()
+
+
 def _concurrency() -> int:
     """Size of the live-task window = in-flight AI Mode calls for this pipeline.
 
@@ -167,7 +194,9 @@ async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
             tasks.add(asyncio.create_task(guarded(row)))
 
         if tasks:
-            _, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done_tasks, tasks = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED)
+            _drain(done_tasks, counters, "scrape")
 
     counters.flush(force=True)
 
@@ -197,8 +226,15 @@ def _max_inflight() -> int:
 
     At 500k rows and the default 5, this is 100 shards in 20 SEQUENTIAL waves, and the
     Batch API targets turnaround within 24h per job — so this knob, not the scraping,
-    is the likely wall-clock bottleneck. Raise it to your project's concurrent-batch
-    quota before a 500k run.
+    is the likely wall-clock bottleneck.
+
+    Do NOT just raise this: on its own it does nothing above ~6. Every shard is submitted
+    and polled through `asyncio.to_thread`, which uses the event loop's DEFAULT executor
+    (`ThreadPoolExecutor(max_workers=min(32, cpu_count + 4))` — 6 on a 2-vCPU box), and
+    submit() holds its thread for the shard's entire multi-hour poll. Set this above that
+    and the extra shards simply queue on the executor, never created, with no error. The
+    PREREQUISITE is a sized executor (`loop.set_default_executor(ThreadPoolExecutor(...))`
+    at worker startup, or an explicit per-shard executor) — deliberately not done yet.
     """
     return max(1, _get_int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
 
@@ -302,17 +338,45 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
             counters.bump(rows_cleaned=1)
         counters.flush()
 
+    stopped = False
     for idx in pending:
         envelope = await asyncio.to_thread(store.get_object, store.raw_key(prefix, idx))
         if not envelope:
             continue  # error marker or truncated object: no verdict to seek
         key, body, candidates, x_domain = _build_batch_item(envelope)
+        if not candidates and not envelope.get("text_blocks"):
+            # ZERO EVIDENCE (the billed_empty case: HTTP 200, no text_blocks, no
+            # references). The envelope parses fine, so the old skip-if-unparseable gate
+            # let it into a shard and paid for it — then build_row_result's has_evidence
+            # check (modes/relationship.py, ordered ahead of `parsed is None`) threw the
+            # answer away and stamped REL_ERROR_NO_EVIDENCE anyway. ~15k pointless Batch
+            # requests at 500k rows with 3% empty responses. Same gate, hoisted to before
+            # the money: write the cleaned object directly with parsed=None so phase 3
+            # reaches the identical verdict and a re-drive skips the row too.
+            await asyncio.to_thread(
+                store.put_object, store.cleaned_key(prefix, idx),
+                {"row_index": idx, "parsed": None, "candidates": candidates,
+                 "x_domain": x_domain, "error": None})
+            counters.bump(rows_cleaned=1)
+            counters.flush()
+            continue
         shard.append((key, body))
         meta[key] = (candidates, x_domain)
         if len(shard) >= _shard_size():
+            # Stop check at the SHARD boundary — once per GEMINI_BATCH_SHARD_SIZE rows,
+            # not per row: this is the only thing between a stop at row 1 of a 500k run
+            # and buying all 100 remaining Gemini shards. Checked BEFORE submitting the
+            # full shard, so a stop costs zero further batches (shards already in flight
+            # are paid for and run to completion — that latency is accepted).
+            if await asyncio.to_thread(store.stop_requested, prefix):
+                _LOGGER.info("relationship %s: stop requested, submitting no more shards",
+                             prefix)
+                stopped = True
+                break
             while len(inflight) >= _max_inflight():
-                _finished, inflight = await asyncio.wait(
+                finished, inflight = await asyncio.wait(
                     inflight, return_when=asyncio.FIRST_COMPLETED)
+                _drain(finished, counters, "verdict")
             inflight.add(asyncio.create_task(submit(shard, meta)))
             shard, meta = [], {}
 
@@ -320,10 +384,13 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
     # items: return {}" guard makes an empty flush a no-op (no batch job created, no
     # spend) — but it's what lets a run with zero net-pending rows (e.g. every
     # remaining row was an error marker) still resolve deterministically through the
-    # same seam the tests patch, instead of a special empty-run path.
-    inflight.add(asyncio.create_task(submit(shard, meta)))
+    # same seam the tests patch, instead of a special empty-run path. Skipped after a
+    # stop: the partial shard accumulated since the last boundary must not be bought.
+    if not stopped:
+        inflight.add(asyncio.create_task(submit(shard, meta)))
     if inflight:
-        await asyncio.gather(*inflight, return_exceptions=True)
+        finished, _ = await asyncio.wait(inflight)
+        _drain(finished, counters, "verdict")
     counters.flush(force=True)
 
 
@@ -354,21 +421,62 @@ async def drive_run(run_id: str) -> None:
         for field in counters.values:
             counters.values[field] = int(status.get(field) or 0)
 
+        # create_run stamps "queued" and _notify_terminal was the ONLY other update_run
+        # call, so a healthy 6-day 500k run read "queued" in the Runs list for its whole
+        # life. Best-effort, like every Supabase write in this pipeline.
+        await asyncio.to_thread(_update_supabase, pointer, status="running")
+
         try:
             await run_scrape_phase(prefix, counters)
-            if await asyncio.to_thread(store.stop_requested, prefix):
-                counters.set_phase("stopped")
-                counters.flush(force=True)
-                return
-            await run_verdict_phase(prefix, counters)
+            # A stop does NOT discard the run. Skip only the (money-spending) verdict
+            # phase: write_outputs already handles rows with no cleaned/ object fine
+            # (parsed=None -> "unclear"), and it is what produces confirmed_relation.csv,
+            # labels the run "stopped", and gives _notify_terminal something to send.
+            # Returning here instead threw away every scraped row of a multi-day run,
+            # left Supabase on "queued" forever, and showed a completed run with an
+            # empty Files card.
+            if not await asyncio.to_thread(store.stop_requested, prefix):
+                await run_verdict_phase(prefix, counters)
             summary = await asyncio.to_thread(write_outputs, prefix, counters)
             await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
         except Exception as exc:
             _LOGGER.exception("relationship run %s failed: %s", run_id, exc)
             counters.set_phase("failed")
             counters.flush(force=True)
+            # Terminalize Supabase too, or the Runs list shows "queued" forever for a run
+            # that is never coming back.
+            await asyncio.to_thread(
+                _update_supabase, pointer, status="failed",
+                finished_at=datetime.now(timezone.utc).isoformat())
     finally:
         _driving.discard(run_id)
+
+
+def _update_supabase(pointer: dict[str, Any], **fields: Any) -> None:
+    """Best-effort partial update of this run's Supabase row. NEVER raises.
+
+    Deliberately NOT routed through engine._update_supabase_run: that helper is
+    rows-shaped for gsearch/gmaps (it rebuilds success/failed counts, websites_found/
+    not_found, cost, AND file_links from state["rows"]/state["upload_id"]), and this
+    pipeline keeps none of that — every one of those would come back zeroed or empty
+    instead of using the numbers write_outputs already computed. update_run() itself is
+    just a partial `.update(fields)`, so calling it directly with the real numbers is no
+    smaller a diff than fighting the shared helper's rows assumption, and it's correct.
+
+    A relationship run has no state dict, so run_db_id rides in the pointer; no id means
+    Supabase was never configured for this run and there is nothing to update.
+    """
+    try:
+        from app.services.companies import get_company_service
+
+        run_db_id = pointer.get("run_db_id")
+        if not run_db_id:
+            return
+        svc = get_company_service()
+        if svc is not None:
+            svc.update_run(run_db_id, **fields)
+    except Exception:
+        pass
 
 
 def _notify_terminal(run_id: str, pointer: dict[str, Any], summary: dict[str, Any]) -> None:
@@ -383,40 +491,23 @@ def _notify_terminal(run_id: str, pointer: dict[str, Any], summary: dict[str, An
     cost = summary.get("cost") or {}
     outcomes = summary.get("outcome_breakdown") or {}
     # write_outputs threads a distinct "stopped" status through when a stop was
-    # requested mid-verdict/reporting (the scrape-phase stop is caught earlier, in
-    # drive_run, before this ever runs); fall back to the 2-way derivation for older
-    # summaries that predate that field.
+    # requested (the scrape-phase stop skips only the verdict phase now, so a stopped run
+    # reaches here too); fall back to the 2-way derivation for older summaries that
+    # predate that field.
     status = summary.get("status") or (
         "completed_with_errors" if outcomes.get("errored") else "completed")
 
-    # Supabase: a relationship run has no state dict, so run_db_id rides in the pointer.
-    # Deliberately NOT routed through engine._update_supabase_run: that helper is
-    # rows-shaped for gsearch/gmaps (it rebuilds success/failed counts, websites_found/
-    # not_found, cost, AND file_links from state["rows"]/state["upload_id"]), and this
-    # pipeline keeps none of that — every one of those would come back zeroed or empty
-    # instead of using the numbers write_outputs already computed. update_run() itself is
-    # just a partial `.update(fields)`, so calling it directly with the real numbers is no
-    # smaller a diff than fighting the shared helper's rows assumption, and it's correct.
-    try:
-        from app.services.companies import get_company_service
-
-        run_db_id = pointer.get("run_db_id")
-        if run_db_id:
-            svc = get_company_service()
-            if svc is not None:
-                svc.update_run(
-                    run_db_id,
-                    status=status,
-                    total_rows=summary.get("total_rows"),
-                    success_count=summary.get("websites_found"),
-                    failed_count=outcomes.get("errored"),
-                    websites_found=summary.get("websites_found"),
-                    websites_not_found=summary.get("websites_not_found"),
-                    cost=cost,
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                )
-    except Exception:
-        pass
+    _update_supabase(
+        pointer,
+        status=status,
+        total_rows=summary.get("total_rows"),
+        success_count=summary.get("websites_found"),
+        failed_count=outcomes.get("errored"),
+        websites_found=summary.get("websites_found"),
+        websites_not_found=summary.get("websites_not_found"),
+        cost=cost,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
 
     try:
         from app.core.notify import notify_run_complete

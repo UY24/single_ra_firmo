@@ -1,11 +1,15 @@
-What is the financial relationship, if any, between {x_name} (whose official website is {x_domain}, portfolio page {input_url}) and the company "{y_name}"?
+Investigate the relationship between Company X ({x_name}, domain: {x_domain}, source: {input_url}) and Company Y ({y_name}, extracted from logo on X's site).
 
-The name "{y_name}" was read by OCR from a logo on {x_name}'s own portfolio page, so it may be garbled, truncated, or padded with noise around the real company name. Work out which real company it refers to.
+### SEARCH STEPS
+1. Search `"{x_name}" "{y_name}"` with keywords: `investment`, `portfolio`, `acquired`, `funding`, `backed by`.
+2. Classify relation: Financial (investor/holding) vs non-financial (client/case study/vendor).
+3. Search for {y_name}'s primary corporate domain.
 
-Answer these three things explicitly:
+### OUTPUT DELIVERABLES
 
-1. RELATIONSHIP: Does {x_name} have a FINANCIAL relationship with that company - an investment, a portfolio holding, a funding round, an acquisition, or fund backing? Say clearly whether such a relationship is confirmed by evidence, is not supported by evidence, or is unclear. Being mentioned together, having similar names, or sharing an industry is NOT a financial relationship. Cite the specific sources that support your answer.
+1. RELATIONSHIP: State whether a FINANCIAL relationship (investment, funding, acquisition, portfolio holding) is [CONFIRMED], [NOT SUPPORTED], or [UNCLEAR]. State the exact connection type and cite sources.
 
-2. EVIDENCE: Quote the specific statements that establish the relationship - announcement, funding round name, date, amount, or acquisition notice - and name the source for each.
+2. EVIDENCE: Quote specific statements establishing the relationship (dates, amounts, funding rounds, or acquisition notices) with source names.
 
-3. WEBSITE: Type out the official website of "{y_name}" as plain text starting with https:// - not as a hyperlink or a link label. It must be that company's OWN domain. Do not give a Google Maps page, a social network profile (facebook, linkedin, instagram, x), a business directory, a marketplace listing, a Wikipedia page, or a news article. Never give {x_domain}, which belongs to {x_name}, not to "{y_name}". If you cannot find the company's own website, say plainly that no official website was found.
+3. WEBSITE: Type {y_name}'s official homepage as plain text starting with https:// (e.g., https://example.com).
+- Rules: Plain text only (NO markdown hyperlinks). NO social media (LinkedIn, X), NO directories/maps, and NEVER give {x_domain}. If not found, write: "No official website was found for {y_name}".

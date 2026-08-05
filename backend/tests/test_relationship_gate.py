@@ -117,7 +117,7 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
             "eastlinkcap.com")
         for needle in ("relationship_status", "confirmed", "not_confirmed", "unclear",
                        "official_website", "relationship_confidence_score",
-                       "website_confidence_score", "resolved_company_y_name",
+                       "website_confidence_score",
                        "relationship_evidence", "extra_flags",
                        "Eastlink invested in Modal", "Funding report",
                        "m25vc", "Sanzo", "financial",

@@ -757,7 +757,6 @@ def build_relationship_prompt(
         "the real company name (e.g. 'YUZU SPARKLINGWE SANZO POMELO' contains 'SANZO').\n"
         "Return strict JSON only with this schema:\n"
         "{\n"
-        '  "resolved_company_y_name": string|null,\n'
         '  "relationship_status": "confirmed"|"not_confirmed"|"unclear",\n'
         '  "relationship_summary": string,\n'
         '  "relationship_evidence": [string],\n'
@@ -793,14 +792,19 @@ def build_relationship_prompt(
         "  confidence that the relationship is real, NOT confidence in your verdict — so a\n"
         "  not_confirmed verdict must carry a LOW score.\n"
         "- website_confidence_score is 0-100 for the Company Y URL; use 0 when no URL is found.\n"
-        "- resolved_company_y_name must be evidence-backed; otherwise return null.\n"
         "- relationship_summary: 1-2 sentences quoting what the evidence says.\n"
         "- relationship_evidence: at most 3 concise statements from the supplied evidence.\n"
         "- extra_flags: optional short slugs like \"company_closed\" (evidence says company\n"
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"Normalized AI Mode evidence:\n{evidence_text}\n\n"
+        # Every string the provider's response contained, in order — not a rendering of the
+        # keys we happen to know about. AI Mode structures the same question differently from
+        # call to call (sometimes headings, sometimes one ordered_list, sometimes a single
+        # paragraph), so the answer's own sections are the only structure there is.
+        "AI Mode evidence — every line Google's answer contained, in order. Section\n"
+        "labels, prose, evidence bullets and any URL it cited all appear as plain lines:\n"
+        f"{evidence_text}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
 
@@ -816,8 +820,6 @@ def update_relationship_block(
 ) -> dict[str, Any]:
     relationship["status"] = status
     relationship["summary"] = str(parsed.get("relationship_summary") or "")
-    relationship["resolved_company_y_name"] = str(
-        parsed.get("resolved_company_y_name") or "")
     evidence = parsed.get("relationship_evidence") or []
     if isinstance(evidence, str):
         evidence = [evidence]

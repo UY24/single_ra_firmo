@@ -5326,7 +5326,10 @@ async def _relationship_failure_analysis(
             rows.append({
                 "row_index": envelope.get("row_index"),
                 "company_name": fields.get("y_name"),
-                "country": fields.get("country"),
+                # How many scrape.do calls this row actually cost before it died. Without
+                # it a row that burned all SCRAPEDO_MAX_RETRIES reads exactly like a row
+                # that was tried once, and the retries look like they were never there.
+                "attempts": envelope.get("request_count"),
                 # Only scrape.do can produce an error object — the verdict and reporting
                 # phases never write one (see relationship_runner._scrape_one).
                 "error_source": "scrapedo",

@@ -74,49 +74,59 @@ def ai_mode_arrays(envelope: dict[str, Any]) -> tuple[list[Any], list[Any]]:
             refs if isinstance(refs, list) else [])
 
 
-def flatten_text_blocks(blocks: list[Any]) -> str:
-    """Every block AI Mode returned, in order, with its structure kept.
+# Keys dropped from the evidence text. This is an EXCLUDE list on purpose — the inverse of
+# the include-list that kept losing content (first `list` items, then `snippet_links`). A key
+# scrape.do adds tomorrow is unknown to this set, so it survives; only these named ones go:
+#   search_parameters — our own ~1.2KB prompt echoed back. The model is already given the
+#     task; re-reading our instructions as "evidence" is pure token cost, and it is where the
+#     https://example.com format example and X's portfolio URL live.
+#   type/level/index/reference_indexes — structural metadata, never prose. Their VALUES are
+#     block-type names and numbers ("paragraph", 3), so emitting them adds noise, not text.
+_NON_EVIDENCE_KEYS = frozenset(
+    {"search_parameters", "type", "level", "index", "reference_indexes"})
 
-    Reading only each block's ``snippet`` silently dropped the most valuable part of the
-    answer: a ``list`` block has no ``snippet`` at all — its content lives in ``list`` —
-    and that is exactly where AI Mode puts the EVIDENCE bullets with the dates, amounts,
-    round names and source attributions. The verdict LLM was being asked to confirm a
-    financial relationship while the citations proving it were thrown away.
 
-    Headings are kept as headings so the answer's own sections survive, and list items
-    become bullets. Recursive, because a list item may itself carry a nested list.
+def evidence_text(envelope: dict[str, Any]) -> str:
+    """Every string in the provider's response, in order, one per line.
+
+    Plain text, not JSON: the model reads the answer, not our serialisation of it, and the
+    braces/quotes/indentation were ~25% of the evidence tokens on every row.
+
+    Nothing is selected BY key. It walks whatever is there and emits each string it finds at
+    any depth, so `snippet`, `list`/`ordered_list` items, `snippet_links[].text` and
+    `snippet_links[].link` all come through — the last one being the resolved target of an
+    inline link, and on a real 100-row run the ONLY link source scrape.do gave us, since
+    `references[]` came back empty for all 100 rows.
     """
+    payload = envelope.get("response")
+    if not isinstance(payload, dict):
+        payload = envelope
     lines: list[str] = []
 
-    def walk(node: Any, depth: int = 0) -> None:
+    def walk(node: Any) -> None:
         if isinstance(node, str):
             if node.strip():
-                lines.append(f"{'  ' * depth}- {node.strip()}")
-            return
-        if not isinstance(node, dict):
-            return
-        snippet = str(node.get("snippet") or "").strip()
-        kind = str(node.get("type") or "")
-        children = node.get("list")
-        if kind == "heading" and snippet:
-            lines.append("")
-            lines.append(f"{snippet}")
-        elif snippet:
-            lines.append(f"{'  ' * depth}- {snippet}" if depth else snippet)
-        if isinstance(children, list):
-            for child in children:
-                walk(child, depth + 1 if snippet else depth)
+                lines.append(node.strip())
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if key not in _NON_EVIDENCE_KEYS:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        # numbers/bools/None: no prose in them, and a bare "3" is noise to the reader.
 
-    for block in blocks or []:
-        walk(block)
-    return "\n".join(lines).strip()
+    walk(payload)
+    return "\n".join(lines)
 
 
 def extract_https_urls(text: str) -> list[str]:
-    """Plain-text https:// URLs typed into the AI Mode prose.
+    """Every https:// URL in the evidence text, wherever it sat in the response.
 
-    The prompt asks for the website as text rather than a hyperlink precisely so it
-    lands here, and not only in references[].
+    Because that text is every string the response contained, this collects URLs typed into
+    the prose (what the search prompt asks for), ``snippet_links[].link`` (where AI Mode puts
+    the target when it renders the website as linked text instead) and ``references[].link``
+    — without knowing which key any of them came from.
     """
     seen: set[str] = set()
     urls: list[str] = []
@@ -131,40 +141,44 @@ def extract_https_urls(text: str) -> list[str]:
 def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
     """Turn one AI Mode envelope into the arguments build_relationship_prompt expects.
 
-    The candidate set is references[] plus any URL typed into the prose, minus
-    directory/social/file URLs and minus Company X's own domain. That set is what the
+    The evidence text is every string in the response (see evidence_text). The candidate set
+    is every https:// URL in that same text — prose, ``snippet_links``, ``references`` —
+    minus directory/social/file URLs and minus Company X's own domain. That set is what the
     gate validates the model's answer against, so it is the thing that stops a
     hallucinated URL being reported as Company Y's website.
+
+    One text, one candidate source: since ``search_parameters`` is already excluded from it,
+    the ``https://example.com`` the prompt uses to show the required format and X's own
+    portfolio URL cannot leak into the allow-list as pickable websites for Company Y.
     """
     blocks, references = ai_mode_arrays(envelope)
-    text = flatten_text_blocks(blocks)
+    text = evidence_text(envelope)
 
     sources: list[dict[str, str]] = []
-    raw_candidates: list[str] = []
     for ref in references:
-        if not isinstance(ref, dict):
-            continue
-        link = str(ref.get("link") or "").strip()
-        if not link:
-            continue
-        raw_candidates.append(link)
-        sources.append({
-            "name": str(ref.get("title") or ref.get("source") or link).strip(),
-            "url": link,
-        })
-    raw_candidates.extend(extract_https_urls(text))
+        if isinstance(ref, dict) and str(ref.get("link") or "").strip():
+            link = str(ref["link"]).strip()
+            sources.append({
+                "name": str(ref.get("title") or ref.get("source") or link).strip(),
+                "url": link,
+            })
 
     candidates = dedupe_candidate_urls([
-        c for c in raw_candidates
+        c for c in extract_https_urls(text)
         if c and not is_disallowed_official_url(c) and not url_matches_domain(c, x_domain)
     ])
 
     error = envelope.get("error")
+    # "Did AI Mode answer" is a question about the BLOCKS, not about the evidence text: a
+    # response whose text_blocks came back empty can still have non-empty text.
+    answered = bool(blocks)
     ai_overview_evidence: list[dict[str, Any]] = []
-    if text:
+    if blocks or references:
         ai_overview_evidence.append({
             "phase": "ai_mode",
-            "query": envelope.get("query") or "",
+            # No "query" key: the response's own search_parameters.q inside `text` IS the
+            # query, verbatim. Repeating our ~1.2KB prompt as a header — and again in the
+            # search_attempts dump — cost three copies of it in every row's verdict prompt.
             "text": text,
             "sources": sources,
         })
@@ -174,20 +188,19 @@ def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
         result_summary = str(error)
     elif candidates:
         status = "candidates_found"
-        result_summary = (f"{'AI Mode answered' if text else 'No AI Mode text'}; "
+        result_summary = (f"{'AI Mode answered' if answered else 'No AI Mode text'}; "
                           f"{len(candidates)} candidate(s)")
     else:
         status = "no_candidates"
-        result_summary = (f"{'AI Mode answered' if text else 'No AI Mode text'}; "
+        result_summary = (f"{'AI Mode answered' if answered else 'No AI Mode text'}; "
                           f"0 candidates")
 
     search_attempts = [{
         "attempt": "ai_mode",
-        "query": envelope.get("query") or "",
         "status": status,
         "error": error,
         "result": result_summary,
-        "ai_overview_present": bool(text),
+        "ai_overview_present": answered,
         "candidate_count": len(candidates),
         # A billed 200 that returned nothing. The run-level count comes off the
         # envelope in relationship_outputs; this copy is what the verdict prompt sees.

@@ -440,11 +440,14 @@ function failedRowsSection(ref, count, companyLabel) {
         const rows = data.sample_failed_rows ?? [];
         const table = el("table", { class: "data-table w-full text-xs" },
           el("thead", {}, el("tr", { class: "data-row" },
-            ...["CSV row", companyLabel, "Error source", "Category", "Error"]
+            ...["CSV row", companyLabel, "Attempts", "Error source", "Category", "Error"]
               .map((heading) => el("th", {}, heading)))),
           el("tbody", {}, ...rows.map((row) => el("tr", { class: "data-row" },
             el("td", {}, row.row_index ?? "—"),
             el("td", {}, row.company_name ?? "—"),
+            // Calls this row cost before it died. A "4" here is the retries working:
+            // the row was tried the full SCRAPEDO_MAX_RETRIES + 1 times.
+            el("td", {}, row.attempts != null ? fmtNum(row.attempts) : "—"),
             el("td", {}, row.error_source ?? "—"),
             el("td", {}, row.error_category ?? "—"),
             el("td", {}, row.error ?? "—"),

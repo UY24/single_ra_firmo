@@ -33,7 +33,7 @@ from app.services.serpwow.modes.relationship import (
 )
 
 EXTRA_COLUMNS = [
-    "website_url", "resolved_company_y_name", "relationship_status",
+    "website_url", "relationship_status",
     "relationship_summary", "relationship_evidence", "relationship_confidence",
     "website_confidence", "confidence", "flags", "attempt_log",
     "error_source", "error_reason",
@@ -87,8 +87,6 @@ def _out_row(original: dict[str, str], passthrough: list[tuple[str, str]],
            for out_name, src_name in passthrough}
     row.update({
         "website_url": result["official_website"],
-        "resolved_company_y_name": str(rel.get("resolved_company_y_name")
-                                       or parsed.get("resolved_company_y_name") or ""),
         "relationship_status": result["relationship_status"],
         "relationship_summary": str(rel.get("summary") or ""),
         "relationship_evidence": "\n".join(

@@ -84,8 +84,9 @@ editable prompt at `prompts/relationship_search.txt`, whose only placeholders ar
 `{x_name}`, `{y_name}`, `{x_domain}` and `{input_url}` (a test enforces that set — the
 file goes through `.format()`, so an unsupported one KeyErrors on every row).
 The LLM half is unchanged: `build_relationship_prompt` / `apply_relationship_gate` /
-`update_relationship_block` keep their rules, and `references[]` + typed-out URLs from
-`text_blocks` are the candidate set the gate validates against.
+`update_relationship_block` keep their rules, and **every `https://` URL anywhere in the
+answer** — prose, `snippet_links[].link`, `references[].link` — is the candidate set the
+gate validates against, minus disallowed hosts and Company X's own domain.
 
 **No `state.json` and no local disk.** S3 object presence IS the state
 (`raw/<shard>/row_NNNNNN.json` = done, `errors/<shard>/row_NNNNNN.json` = dead,
@@ -102,10 +103,23 @@ credits are `CREDITS_PER_CALL` per billed 200, and the run's attempt total is a 
 `write_outputs` takes `scrapedo_requests` from the counter. `store.read_row` supplies the
 implied counts so all row logic still sees one envelope with the body under `response`.
 `modes.relationship.ai_mode_arrays` is the single reader of `text_blocks`/`references`
-(with a fallback for pre-split objects), and **`flatten_text_blocks` is what turns blocks
-into evidence text** — it walks `list` blocks too, which have no `snippet` and are exactly
-where AI Mode puts the EVIDENCE bullets (dates, amounts, round names, sources); reading
-only `snippet` silently dropped all of them. This layout makes the EC2 instance disposable and a re-drive resumes for free. `status.json`
+(with a fallback for pre-split objects), and **`evidence_text` is what the verdict LLM
+reads: EVERY string in the stored response, in order, one per line** (2026-08-05). Plain
+text, not JSON — the braces were ~25% of the evidence tokens. Nothing is selected by key;
+it walks whatever is there, because every rendering of "just the parts we need" lost
+something real — first the EVIDENCE bullets (they live under `list`, which carries no
+`snippet`), then `snippet_links[].link`, the resolved target of an inline link and, on a
+real 100-row run where `references[]` came back empty for all 100 rows, the ONLY link
+source scrape.do gave us. `_NON_EVIDENCE_KEYS` is an **exclude** list, the inverse of the
+include-list that kept losing content, so a key the provider adds tomorrow survives by
+default: it drops only `search_parameters` (our own ~1.2KB prompt echoed back, and where
+the `https://example.com` format example and X's portfolio URL live — both would otherwise
+be pickable as Y's website) and `type`/`level`/`index`/`reference_indexes` (structural
+metadata whose values are block-type names and numbers). The candidate set comes from that
+same text, so there is one source of truth for both.
+AI Mode also structures the same question differently from call to call — sometimes
+headings, sometimes one `ordered_list`, sometimes a single paragraph — which is why nothing
+may key off block types. This layout makes the EC2 instance disposable and a re-drive resumes for free. `status.json`
 holds O(1) counters only (~2KB at any run size) and is a cache — the phase barrier
 re-LISTs. Resume is ONE paginated LIST building an in-memory index set, not 500k HEADs.
 Writes go through `relationship_store.put_object`, which **raises** — unlike

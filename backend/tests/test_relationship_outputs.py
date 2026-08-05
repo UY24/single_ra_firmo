@@ -33,7 +33,6 @@ def _seed(fake):
                        "official_website": "https://drinksanzo.com",
                        "relationship_summary": "Acme led the Series A.",
                        "relationship_evidence": ["Series A, 2021"],
-                       "resolved_company_y_name": "Sanzo",
                        "relationship_confidence_score": 92,
                        "website_confidence_score": 88}})
         store.write_row(PREFIX, 1, {"response": BODY})
@@ -269,8 +268,7 @@ class PassthroughCollisionTests(unittest.TestCase):
                 "parsed": {"relationship_status": "confirmed",
                            "official_website": "https://drinksanzo.com",
                            "relationship_summary": "s",
-                           "resolved_company_y_name": "Sanzo",
-                           "relationship_confidence_score": 90,
+                               "relationship_confidence_score": 90,
                            "website_confidence_score": 80}})
             outputs.write_outputs(COLLISION_PREFIX,
                                   store.Counters(COLLISION_PREFIX, rows_total=1))
@@ -298,7 +296,7 @@ def _seed_cost_rows(fake) -> None:
             "row_index": 0, "candidates": ["https://x.example"], "x_domain": "acme.com",
             "parsed": {"relationship_status": "confirmed",
                        "official_website": "https://x.example",
-                       "relationship_summary": "s", "resolved_company_y_name": "Confirmed",
+                       "relationship_summary": "s",
                        "relationship_confidence_score": 90, "website_confidence_score": 80}})
         # row_index 1: a BILLED error-body — HTTP 200 (successful_requests=1, credits
         # spent) but the response body itself reported a provider error. This must NOT
@@ -399,8 +397,7 @@ class CostAccountingTests(unittest.TestCase):
                 "parsed": {"relationship_status": "confirmed",
                            "official_website": "https://drinksanzo.com",
                            "relationship_summary": "s",
-                           "resolved_company_y_name": "Sanzo",
-                           "relationship_confidence_score": 90,
+                               "relationship_confidence_score": 90,
                            "website_confidence_score": 80}})
             outputs.write_outputs(COST_PREFIX, store.Counters(COST_PREFIX, rows_total=1))
             log = store.get_bytes(f"{COST_PREFIX}/run.log").decode()

@@ -55,6 +55,23 @@ any `static/js` file.
    preview and upload (>1GB twice at 500k); `/uploads/{id}/result` reads a whole several-hundred-MB
    CSV into memory instead of streaming the boto3 body.
 
+## Settled by live probes (2026-08-05, 16 calls / 160 credits)
+
+- **We were never truncating the AI Mode answer.** `raw/` is byte-identical to the wire
+  (verified against run `6a71458d…`: top-level keys are exactly scrape.do's, and the
+  `💡 …dive deeper…` closing paragraphs are present in 5 stored rows). What dropped content
+  was the *read* side — see `evidence_json` in CLAUDE.md.
+- **The answer's SHAPE is nondeterministic, and that is Google's, not ours.** 13 successful
+  calls with the same query: 10 returned a single `paragraph`, 2 an `ordered_list`, 1 the
+  heading form ending at `WEBSITE` with nothing after it. Serial vs an 8-way burst vs
+  Postman-style (`token`+`q` only, literal `\n`) made **no difference** — so neither
+  `SCRAPEDO_CONCURRENCY` nor the query encoding causes the cut answers, and there is no
+  wait/render param on that endpoint to tune. A complete answer can arrive as one
+  `ordered_list` whose last item is `"WEBSITE: https://www.pitchly.com"`.
+- **502 rate is ~7% even serially** (1 of 14 calls, body `{"error":"folwr request failed"}`),
+  and the retries do run: the Nodai row's error object records `request_count=4`. An HTTP
+  200 is deliberately never retried — the credits are already spent.
+
 ## Unproven numbers
 
 - **`SCRAPEDO_CONCURRENCY=100` is a target, not a measurement.** On the *Maps* endpoint, 100

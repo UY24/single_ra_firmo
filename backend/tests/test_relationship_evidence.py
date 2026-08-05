@@ -3,8 +3,8 @@ import unittest
 
 from app.services.serpwow.modes.relationship import (
     build_evidence,
+    evidence_text,
     extract_https_urls,
-    flatten_text_blocks,
     row_fields,
 )
 
@@ -120,17 +120,21 @@ STRUCTURED = {
             {"snippet": "From Parsers VC: ... associated with the domain pitchly.com."},
         ]},
         {"type": "heading", "snippet": "3. WEBSITE", "level": 3},
-        {"type": "paragraph", "snippet": "See https://www.pitchly.com for details."},
+        {"type": "paragraph", "snippet": "See https://www.pitchly.com for details.",
+         "snippet_links": [{"text": "See", "link": "https://www.pitchly.com/"}]},
     ],
     "references": [],
 }
 
 
-class FlattenTextBlocksTests(unittest.TestCase):
-    """The EVIDENCE bullets — dates, amounts, round names, source attributions — live in
-    `list` blocks, which have no `snippet`. Reading only `snippet` dropped every one of
-    them, so the verdict LLM was asked to confirm a financial relationship with the
-    citations proving it removed."""
+class WholeResponseTests(unittest.TestCase):
+    """No key whitelist: every string in the stored response reaches the model.
+
+    Every rendering of "just the parts we need" has lost something real — first the
+    EVIDENCE bullets (they live under `list`, which has no `snippet`), then
+    `snippet_links` (the resolved target of an inline link, and the ONLY link source on a
+    real 100-row run where `references[]` came back empty for every row).
+    """
 
     def test_list_items_reach_the_evidence_text(self) -> None:
         text = build_evidence({"response": STRUCTURED}, "gnv.com")[
@@ -139,12 +143,11 @@ class FlattenTextBlocksTests(unittest.TestCase):
         self.assertIn("Founder Lodge", text)
         self.assertIn("Parsers VC", text)
 
-    def test_the_answers_own_sections_survive(self) -> None:
+    def test_the_answers_own_sections_survive_in_order(self) -> None:
         text = build_evidence({"response": STRUCTURED}, "gnv.com")[
             "ai_overview_evidence"][0]["text"]
         for heading in ("1. RELATIONSHIP", "2. EVIDENCE", "3. WEBSITE"):
             self.assertIn(heading, text)
-        # Order preserved, so the model reads the sections as written.
         self.assertLess(text.index("1. RELATIONSHIP"), text.index("2. EVIDENCE"))
         self.assertLess(text.index("2. EVIDENCE"), text.index("3. WEBSITE"))
 
@@ -152,13 +155,52 @@ class FlattenTextBlocksTests(unittest.TestCase):
         ev = build_evidence({"response": STRUCTURED}, "gnv.com")
         self.assertIn("https://www.pitchly.com", ev["candidates"])
 
-    def test_a_nested_list_is_not_dropped(self) -> None:
-        blocks = [{"type": "list", "list": [
-            {"snippet": "outer", "list": [{"snippet": "inner detail"}]}]}]
-        self.assertIn("inner detail", flatten_text_blocks(blocks))
+    def test_a_url_only_in_snippet_links_becomes_a_candidate(self) -> None:
+        """AI Mode often renders the website as linked TEXT — the URL exists only as
+        snippet_links[].link. Dropping that key left 52 of 99 rows in a real run with no
+        candidate at all, so the gate had nothing to pick Company Y's website from."""
+        linked_only = {"text_blocks": [
+            {"type": "paragraph", "snippet": "Their site is here.",
+             "snippet_links": [{"text": "here", "link": "https://drinksanzo.com/"}]}],
+            "references": []}
+        ev = build_evidence({"response": linked_only}, "acme.com")
+        self.assertIn("https://drinksanzo.com/", ev["candidates"])
+        self.assertIn("https://drinksanzo.com/", ev["ai_overview_evidence"][0]["text"])
+
+    def test_a_key_we_have_never_seen_still_reaches_the_model(self) -> None:
+        """The point of the exclude-list: a key scrape.do adds tomorrow needs no code
+        change to be read, at any depth and at the top level."""
+        text = evidence_text({"response": {
+            "text_blocks": [{"type": "future_block", "markdown": "the closing paragraph"}],
+            "brand_new_key": ["something else"]}})
+        self.assertIn("the closing paragraph", text)
+        self.assertIn("something else", text)
+
+    def test_our_own_prompt_echo_is_not_evidence(self) -> None:
+        """search_parameters is the query WE sent, echoed back: ~1.2KB of our own
+        instructions, containing the https://example.com format example and X's portfolio
+        page. It is not evidence, it costs tokens on every row, and both of those URLs
+        would otherwise be pickable as Company Y's website."""
+        ev = build_evidence({"response": {
+            "search_parameters": {"q": "... NEVER give gnv.com ... e.g., "
+                                       "https://example.com ... source: "
+                                       "https://gnv.com/portfolio"},
+            "text_blocks": [{"type": "paragraph", "snippet": "https://www.pitchly.com"}],
+            "references": []}}, "gnv.com")
+        self.assertEqual(ev["candidates"], ["https://www.pitchly.com"])
+        self.assertNotIn("example.com", ev["ai_overview_evidence"][0]["text"])
+
+    def test_structural_metadata_is_not_emitted_as_prose(self) -> None:
+        """Block type names and heading levels are structure, not text: emitting them puts
+        a bare "paragraph"/"3" on its own line in the model's evidence."""
+        text = evidence_text({"response": {"text_blocks": [
+            {"type": "heading", "snippet": "3. WEBSITE", "level": 3}]}})
+        self.assertEqual(text, "3. WEBSITE")
 
     def test_junk_blocks_are_skipped_not_crashed_on(self) -> None:
-        self.assertEqual(flatten_text_blocks([None, 7, {}, {"type": "list"}]), "")
+        ev = build_evidence({"response": {"text_blocks": [None, 7, {}, {"type": "list"}],
+                                          "references": []}}, "acme.com")
+        self.assertEqual(ev["candidates"], [])
 
 
 if __name__ == "__main__":

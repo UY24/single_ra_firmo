@@ -407,7 +407,7 @@ function emptyResponsesSection(eb, isRel) {
       ];
   return el("section", { class: "detail-section" },
     sectionHeading("Empty responses (HTTP 200)",
-      "Rows where SerpWow returned 200 but no AI overview and no candidates."),
+      "Rows where ScrapeDo returned 200 but no AI Mode info got"),
     el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
   );
 }

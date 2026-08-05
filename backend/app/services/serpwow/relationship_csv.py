@@ -4,6 +4,12 @@ Input: OCR-results CSV with required Input_URL, Company_Name_X and Company_Name_
 values on every row, plus arbitrary passthrough columns. Those three are the ONLY
 fields this pipeline gets — there is no location, because the OCR'd portfolio page
 does not carry one. Every row is processed independently: one row in, one row out.
+
+Every row is VALIDATED, but only the first ``sample_limit`` are kept in memory. This
+runs in the API process, so materialising 500k dicts (twice, as it used to — once for
+the originals and once for the parsed rows) meant ~2GB per upload for data neither
+caller wants: the preview shows a handful of rows, and the upload path only needs the
+row COUNT plus the raw bytes, which go straight to S3 for the worker to stream.
 """
 from __future__ import annotations
 
@@ -32,7 +38,11 @@ def _find_column(normalized: dict[str, str], aliases: tuple[str, ...]) -> str | 
     return None
 
 
-def parse_relationship_csv(raw: bytes) -> dict:
+SAMPLE_LIMIT = 10
+
+
+def parse_relationship_csv(raw: bytes, sample_limit: int = SAMPLE_LIMIT) -> dict:
+    """Validate every row; return the count plus the first ``sample_limit`` rows."""
     text = raw.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
@@ -58,15 +68,14 @@ def parse_relationship_csv(raw: bytes) -> dict:
             "Missing required column Input_URL. "
             f"Found: {header}"
         )
-    original_rows: list[dict[str, str]] = []
     rows: list[dict] = []
+    total_rows = 0
 
     for idx, row in enumerate(reader):
-        clean = {h: (row.get(h) or "").strip() for h in header}
-        original_rows.append(clean)
-        y_name = clean.get(y_col, "")
-        x_name = clean.get(x_col, "")
-        input_url = clean.get(url_col, "")
+        total_rows += 1
+        y_name = (row.get(y_col) or "").strip()
+        x_name = (row.get(x_col) or "").strip()
+        input_url = (row.get(url_col) or "").strip()
         missing = [name for name, value in (
             ("Input_URL", input_url),
             ("Company_Name_X", x_name),
@@ -76,22 +85,23 @@ def parse_relationship_csv(raw: bytes) -> dict:
             raise InvalidRelationshipCSV(
                 f"CSV row {idx + 2} missing required value(s): {', '.join(missing)}"
             )
-        rows.append({
-            "row_index": idx,
-            "x_name": x_name,
-            "y_name": y_name,
-            "input_url": input_url,
-        })
+        # Validation above runs on EVERY row — only retention is capped.
+        if len(rows) < max(0, sample_limit):
+            rows.append({
+                "row_index": idx,
+                "x_name": x_name,
+                "y_name": y_name,
+                "input_url": input_url,
+            })
 
-    if not original_rows:
+    if not total_rows:
         raise InvalidRelationshipCSV("CSV has a header but no data rows.")
 
     return {
         "header": header,
-        "original_rows": original_rows,
-        # NOTE there is no "blank rows" list and no empty case: a blank required value
-        # raises above, and a header-only CSV raises too, so `rows` is non-empty
-        # whenever this returns. Callers need no guard for it.
+        "total_rows": total_rows,
+        # The first `sample_limit` rows only — never the whole file. Nothing downstream
+        # reads rows from here: the worker streams input.csv from S3.
         "rows": rows,
         # Which actual CSV header matched each logical field — surfaced by the
         # upload-preview endpoint.

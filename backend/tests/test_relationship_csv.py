@@ -18,7 +18,7 @@ class TestParseRelationshipCSV(unittest.TestCase):
     def test_every_row_becomes_its_own_row_no_dedup(self):
         parsed = parse_relationship_csv(CSV_OK)
         self.assertEqual(parsed["header"][0], "Input_URL")
-        self.assertEqual(len(parsed["original_rows"]), 4)
+        self.assertEqual(parsed["total_rows"], 4)
         # No (X, Y) dedup: 4 rows in -> 4 rows out, each with its own index.
         self.assertEqual(len(parsed["rows"]), 4)
         for i, r in enumerate(parsed["rows"]):
@@ -106,3 +106,34 @@ class TestParseRelationshipCSV(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SampleLimitTests(unittest.TestCase):
+    """Only the sample is retained; every row is still counted and validated. This runs
+    in the API process, so a 500k CSV must not become 500k dicts in memory."""
+
+    @staticmethod
+    def _csv(n):
+        head = b"Input_URL,Company_Name_X,Company_Name_Y\n"
+        return head + b"".join(
+            b"https://x.test/p,X Co,Y %d\n" % i for i in range(n))
+
+    def test_row_count_is_full_but_retained_rows_are_capped(self):
+        parsed = parse_relationship_csv(self._csv(50), sample_limit=10)
+        self.assertEqual(parsed["total_rows"], 50)
+        self.assertEqual(len(parsed["rows"]), 10)
+        self.assertEqual(parsed["rows"][0]["y_name"], "Y 0")
+        self.assertEqual(parsed["rows"][9]["row_index"], 9)
+
+    def test_upload_path_keeps_no_rows_at_all(self):
+        parsed = parse_relationship_csv(self._csv(50), sample_limit=0)
+        self.assertEqual(parsed["total_rows"], 50)
+        self.assertEqual(parsed["rows"], [])
+
+    def test_a_bad_row_past_the_sample_still_fails(self):
+        # The cap is on RETENTION, not validation — a blank required value at row 40
+        # must still 400 the upload, not slip through because the sample ended at 10.
+        raw = self._csv(50) + b",,\n"
+        with self.assertRaises(InvalidRelationshipCSV) as ctx:
+            parse_relationship_csv(raw, sample_limit=10)
+        self.assertIn("row 52", str(ctx.exception))

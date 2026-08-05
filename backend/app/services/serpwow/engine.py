@@ -4250,8 +4250,8 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    rows = parsed["rows"]
-    total = len(parsed["original_rows"])
+    rows = parsed["rows"]          # first SAMPLE_LIMIT only, never the whole file
+    total = parsed["total_rows"]
     warnings: list[str] = []
     if not rows:
         warnings.append("No searchable rows — the CSV contains no data rows.")
@@ -4268,7 +4268,7 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
                 "company_name_y": r["y_name"],
                 "input_url": r["input_url"],
             }
-            for r in rows[:5]
+            for r in rows
         ],
     }
 
@@ -4291,12 +4291,14 @@ async def create_relationship_upload(
     raw = await file.read()
     # CSV first: a bad CSV must report the CSV problem, not a config problem.
     try:
-        parsed = parse_relationship_csv(raw)
+        # sample_limit=0: the upload path needs the row COUNT and the raw bytes, which
+        # go straight to S3 for the worker to stream. It never looks at parsed rows.
+        parsed = parse_relationship_csv(raw, sample_limit=0)
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # No empty-rows guard: parse_relationship_csv raises on a blank required value and on
-    # a header-only CSV, so parsed["rows"] is never empty when it returns.
+    # No empty-rows guard: parse_relationship_csv raises on a blank required value and
+    # on a header-only CSV, so total_rows is never 0 when it returns.
     for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
         if not os.getenv(env_key, "").strip():
             raise HTTPException(
@@ -4312,7 +4314,7 @@ async def create_relationship_upload(
 
     run_id = uuid.uuid4().hex
     prefix = rel_store.run_prefix(company_name or company_id, run_id)
-    total = len(parsed["original_rows"])
+    total = parsed["total_rows"]
 
     # Best-effort Supabase run row; create_run never raises (returns None untracked).
     # get_company_service() itself is None when Supabase is unconfigured.

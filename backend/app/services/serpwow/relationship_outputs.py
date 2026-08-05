@@ -26,7 +26,11 @@ from typing import Any
 
 from app.services.serpwow import relationship_store as store
 from app.services.serpwow.cost import calculate_gemini_cost_usd
-from app.services.serpwow.modes.relationship import build_row_result, row_fields
+from app.services.serpwow.modes.relationship import (
+    ai_mode_arrays,
+    build_row_result,
+    row_fields,
+)
 
 EXTRA_COLUMNS = [
     "website_url", "resolved_company_y_name", "relationship_status",
@@ -155,6 +159,11 @@ def _write_outputs(prefix: str, counters: store.Counters,
     by_source: dict[str, int] = {}
     by_category: dict[str, int] = {}
     requests = successes = credits = billed_empty = error_requests = 0
+    # Rows scrape.do answered (HTTP 200, no error) where AI Mode wrote no prose. This is
+    # the number that says whether the SEARCH PROMPT is working: references alone give
+    # the gate URLs to pick from but nothing to verify a relationship against, so a run
+    # with a high count here will read not_confirmed almost everywhere.
+    no_ai_text = 0
     total_rows = found = 0
     prompt_tokens = completion_tokens = 0
     llm_usd = 0.0
@@ -182,6 +191,8 @@ def _write_outputs(prefix: str, counters: store.Counters,
         credits += int(envelope.get("credits") or 0)
         if envelope.get("billed_empty"):
             billed_empty += 1
+        if not envelope.get("error") and not ai_mode_arrays(envelope)[0]:
+            no_ai_text += 1
         if envelope.get("error"):
             # Only the attempts that never got a billed 200 count as "error requests"
             # — a billed HTTP-200-with-error-body call (successful_requests=1) is a
@@ -258,7 +269,12 @@ def _write_outputs(prefix: str, counters: store.Counters,
                             # Why the run can be completed_with_errors while every
                             # by_source count is 0: a task that raised has no error marker.
                             "task_errors": task_errors},
-        "empty_response_breakdown": {"empty": billed_empty},
+        # ONE number, because there is ONE call per row — no phases to split by. It
+        # counts empty text_blocks rather than billed_empty (which needs BOTH arrays
+        # empty) because that is the broader signal: references with no prose still
+        # leaves the gate nothing to verify a relationship against. The stricter
+        # "spent credits for literally nothing" number is cost.scrapedo_billed_empty.
+        "empty_response_breakdown": {"no_ai_text": no_ai_text},
         "confidence_mode": "llm",
         # Hardcoded, not derived: this pipeline has no per-row LLM path at all — phase 2 is
         # always the Gemini Batch verdict pass. Leaving it unset made run_detail.js read

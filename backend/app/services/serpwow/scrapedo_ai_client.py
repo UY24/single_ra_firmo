@@ -40,16 +40,18 @@ def _envelope(
     *,
     request_count: int = 0,
     successful_requests: int = 0,
-    text_blocks: Optional[list[Any]] = None,
-    references: Optional[list[Any]] = None,
+    response: Optional[dict[str, Any]] = None,
     error: Optional[str] = None,
     error_category: Optional[str] = None,
     billed_empty: bool = False,
 ) -> dict[str, Any]:
-    """The envelope the relationship row executor consumes.
+    """The envelope the relationship row executor consumes and the store persists.
 
-    ``text_blocks``/``references`` are the provider's arrays VERBATIM: this envelope is
-    persisted as the row's durable artifact, so it must stay faithful.
+    ``response`` is scrape.do's decoded JSON body VERBATIM — the whole object, not a
+    selection of fields. This envelope IS the row's durable artifact (there is no local
+    copy), so what lands in ``raw/`` has to be exactly what the provider sent; anything
+    less makes the artifact useless for judging the search prompt. Everything else here
+    is call bookkeeping the provider does not report.
 
     ``credits`` is DERIVED from the HTTP-200 count, never counted by hand, so a run
     always reconciles as ``request_count == successful_requests + failed_requests``.
@@ -61,8 +63,7 @@ def _envelope(
         "successful_requests": successful_requests,
         "failed_requests": max(0, request_count - successful_requests),
         "credits": CREDITS_PER_CALL * successful_requests,
-        "text_blocks": text_blocks if isinstance(text_blocks, list) else [],
-        "references": references if isinstance(references, list) else [],
+        "response": response if isinstance(response, dict) else None,
         # A BILLED (200) call that returned no text and no references: credits spent for
         # no data. Counted for the scrape.do refund claim; never retried, since the money
         # is already gone and a second call cannot be told apart from the first.
@@ -128,28 +129,29 @@ async def search_ai_mode(
                     status, f"{type(exc).__name__}: {exc}"),
             )
 
-        # HTTP 200 == a billed call, even when the body then reports a problem.
+        # HTTP 200 == a billed call, even when the body then reports a problem. The body
+        # is still kept: it is what the provider actually sent for the credits spent.
         if isinstance(payload, dict) and payload.get("error"):
             message = _redact(payload["error"])
             return _envelope(
                 query, gl,
                 request_count=request_count,
                 successful_requests=1,
+                response=payload,
                 error=f"scrape.do ai-mode search failed: {message}",
                 error_category=categorize_http_error(None, message),
             )
 
-        blocks = payload.get("text_blocks") if isinstance(payload, dict) else None
-        refs = payload.get("references") if isinstance(payload, dict) else None
-        blocks = blocks if isinstance(blocks, list) else []
-        refs = refs if isinstance(refs, list) else []
+        body = payload if isinstance(payload, dict) else {}
+        blocks = body.get("text_blocks")
+        refs = body.get("references")
         return _envelope(
             query, gl,
             request_count=request_count,
             successful_requests=1,
-            text_blocks=blocks,
-            references=refs,
-            billed_empty=not blocks and not refs,
+            response=body,
+            billed_empty=not (blocks if isinstance(blocks, list) else [])
+                         and not (refs if isinstance(refs, list) else []),
         )
 
     # Unreachable: the loop either returns or exhausts into the error path above.

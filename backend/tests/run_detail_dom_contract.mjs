@@ -329,7 +329,7 @@ async function counterDrivenRelationshipTerminal() {
       relationship_breakdown: { confirmed: 3, not_confirmed: 2, unclear: 0 },
       outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
       error_breakdown: { by_source: {}, by_category: {} },
-      empty_response_breakdown: { empty: 1 },
+      empty_response_breakdown: { no_ai_text: 1 },
       confidence_mode: "llm",
       available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
         "report.json", "run.log"],
@@ -346,13 +346,15 @@ async function counterDrivenRelationshipTerminal() {
   assert(root.textContent.includes("Relationship verdict"), "verdict section missing");
   assert(root.textContent.includes("Scrape.do"), "scrape.do cost card missing");
   assert(root.textContent.includes("50"), "scrape.do credits missing");
-  // One AI Mode call per row means one empty-response number. The SerpWow-era
-  // per-phase split (Both phases / Phase 1 only / Phase 2 only) rendered three
-  // permanent zeroes here and never showed the actual count.
-  assert(root.textContent.includes("Empty responses (HTTP 200)"),
-    "empty-responses section missing");
-  assert(!root.textContent.includes("Phase 1 only"),
-    "relationship still renders the SerpWow per-phase empty split");
+  // One AI Mode call per row means ONE empty-response number, keyed on text_blocks.
+  // The SerpWow-era per-phase split (Both phases / Phase 1 only / Phase 2 only)
+  // rendered three permanent zeroes here and never showed the actual count.
+  assert(root.textContent.includes("Empty AI Mode answers (HTTP 200)"),
+    "empty AI Mode answers section missing");
+  assert(root.textContent.includes("No AI Mode text"),
+    "no_ai_text chip missing");
+  assert(!/Phase 1 only|All phases|SerpWow/.test(root.textContent),
+    "relationship still renders SerpWow-shaped empty-response chips");
   assert(!byText(root, "button", "Stop run"), "terminal run still offered Stop");
   const files = byClass(root, "files-section")[0];
   assert(files, "counter-driven terminal run rendered no Files card");
@@ -381,7 +383,7 @@ async function counterDrivenRelationshipFailedMidScrape() {
       total_rows: 5, websites_found: 0, websites_not_found: 3,
       confidence_mode: "llm", available_files: [],
       outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
-      empty_response_breakdown: { empty: 0 },
+      empty_response_breakdown: { no_ai_text: 0 },
       cost: {
         scrapedo_requests: 2, scrapedo_credits: 20,
         scrapedo_error_requests: 0, scrapedo_billed_empty: 0,
@@ -410,7 +412,7 @@ async function counterDrivenRelationshipRunning() {
       total_rows: 500000, websites_found: 0, websites_not_found: 498764,
       confidence_mode: "llm", available_files: [],
       outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
-      empty_response_breakdown: { empty: 5 },
+      empty_response_breakdown: { no_ai_text: 5 },
       cost: {
         scrapedo_requests: 1240, scrapedo_credits: 12340,
         scrapedo_error_requests: 0, scrapedo_billed_empty: 5,

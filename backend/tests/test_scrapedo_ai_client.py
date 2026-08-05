@@ -51,8 +51,9 @@ class SuccessTests(unittest.TestCase):
 
         env = _run(handler)
 
-        self.assertEqual(env["text_blocks"], PAYLOAD["text_blocks"])
-        self.assertEqual(env["references"], PAYLOAD["references"])
+        # The WHOLE provider body, byte-for-byte — raw/ is the only copy of it, so a
+        # selection of fields would make the artifact useless for judging the prompt.
+        self.assertEqual(env["response"], PAYLOAD)
         self.assertIsNone(env["error"])
         self.assertIn("token=test-token", seen["url"])
         self.assertIn("gl=us", seen["url"])

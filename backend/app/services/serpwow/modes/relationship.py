@@ -58,6 +58,22 @@ def row_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ai_mode_arrays(envelope: dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """(text_blocks, references) out of one row's stored envelope.
+
+    They live inside ``envelope["response"]`` — scrape.do's body kept verbatim, so the
+    raw/ object is an exact copy of what the provider sent. Envelopes written before
+    that change inlined the two arrays at the top level; the fallback reads those.
+    """
+    payload = envelope.get("response")
+    if not isinstance(payload, dict):
+        payload = envelope
+    blocks = payload.get("text_blocks")
+    refs = payload.get("references")
+    return (blocks if isinstance(blocks, list) else [],
+            refs if isinstance(refs, list) else [])
+
+
 def extract_https_urls(text: str) -> list[str]:
     """Plain-text https:// URLs typed into the AI Mode prose.
 
@@ -82,7 +98,7 @@ def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
     gate validates the model's answer against, so it is the thing that stops a
     hallucinated URL being reported as Company Y's website.
     """
-    blocks = envelope.get("text_blocks") or []
+    blocks, references = ai_mode_arrays(envelope)
     text = "\n\n".join(
         str(b.get("snippet") or "").strip()
         for b in blocks
@@ -91,7 +107,7 @@ def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
 
     sources: list[dict[str, str]] = []
     raw_candidates: list[str] = []
-    for ref in envelope.get("references") or []:
+    for ref in references:
         if not isinstance(ref, dict):
             continue
         link = str(ref.get("link") or "").strip()
@@ -169,8 +185,9 @@ def build_row_result(
     row_error: Optional[str] = None
     status = "unclear"
 
+    blocks, _refs = ai_mode_arrays(envelope)
     has_x = bool(str(row.get("x_name") or "").strip())
-    has_evidence = bool(candidates or envelope.get("text_blocks"))
+    has_evidence = bool(candidates or blocks)
 
     if envelope.get("error"):
         status = "not_confirmed"
@@ -231,8 +248,7 @@ def build_attempt_log(envelope: dict[str, Any], candidates: list[str]) -> str:
     Newline-joined, matching EntityResult.attempt_log_csv: each line renders on its own
     row INSIDE one quoted CSV cell.
     """
-    blocks = envelope.get("text_blocks") or []
-    refs = envelope.get("references") or []
+    blocks, refs = ai_mode_arrays(envelope)
     lines = [
         f"provider: scrape.do google/search/ai-mode",
         f"attempts: {envelope.get('request_count') or 0} "

@@ -60,17 +60,28 @@ def _patched(fake):
 
 
 class KeyLayoutTests(unittest.TestCase):
-    def test_rows_are_sharded_by_thousands(self) -> None:
+    def test_filenames_count_from_one_and_shard_by_thousands(self) -> None:
+        # The index is 0-based in code; the FILENAME is 1-based, so the first data row
+        # of input.csv is row_000001 and matches what a spreadsheet shows.
         p = "acme/relationship/run1"
-        self.assertEqual(store.raw_key(p, 0), f"{p}/raw/0/row_000000.json")
-        self.assertEqual(store.raw_key(p, 999), f"{p}/raw/0/row_000999.json")
-        self.assertEqual(store.raw_key(p, 1000), f"{p}/raw/1/row_001000.json")
-        self.assertEqual(store.raw_key(p, 499999), f"{p}/raw/499/row_499999.json")
+        self.assertEqual(store.raw_key(p, 0), f"{p}/raw/0/row_000001.json")
+        self.assertEqual(store.raw_key(p, 999), f"{p}/raw/0/row_001000.json")
+        self.assertEqual(store.raw_key(p, 1000), f"{p}/raw/1/row_001001.json")
+        self.assertEqual(store.raw_key(p, 499999), f"{p}/raw/499/row_500000.json")
+
+    def test_the_key_round_trips_back_to_the_index(self) -> None:
+        # list_done_rows resumes off these names: an off-by-one here re-scrapes (or
+        # skips) every row of a resumed run.
+        p = "acme/relationship/run1"
+        for idx in (0, 1, 999, 1000, 499999):
+            self.assertEqual(store._idx_from_key(store.raw_key(p, idx)), idx)
+            self.assertEqual(store._idx_from_key(store.error_key(p, idx)), idx)
+            self.assertEqual(store._idx_from_key(store.cleaned_key(p, idx)), idx)
 
     def test_error_and_cleaned_keys_share_the_shard_scheme(self) -> None:
         p = "acme/relationship/run1"
-        self.assertEqual(store.error_key(p, 5), f"{p}/raw/0/row_000005.error.json")
-        self.assertEqual(store.cleaned_key(p, 5), f"{p}/cleaned/0/row_000005.json")
+        self.assertEqual(store.error_key(p, 5), f"{p}/raw/0/row_000006.error.json")
+        self.assertEqual(store.cleaned_key(p, 5), f"{p}/cleaned/0/row_000006.json")
 
     def test_run_prefix_uses_the_shared_company_slug(self) -> None:
         self.assertEqual(store.run_prefix("ISI Market Test", "abc"),

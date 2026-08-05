@@ -25,8 +25,9 @@ class RowFieldsTests(unittest.TestCase):
         self.assertEqual(fields["input_url"], "")
         self.assertEqual(fields["x_name"], "")
 
-ENVELOPE = {
-    "query": "prompt",
+# Current shape: scrape.do's body sits VERBATIM under "response" (raw/ is its only
+# copy). Every EvidenceTests case below therefore exercises the real stored shape.
+PAYLOAD = {
     "text_blocks": [
         {"type": "paragraph", "snippet": "Acme Capital led Sanzo's Series A."},
         {"type": "paragraph",
@@ -40,9 +41,8 @@ ENVELOPE = {
         {"title": "Crunchbase", "link": "https://crunchbase.com/org/sanzo",
          "source": "crunchbase.com"},
     ],
-    "error": None,
-    "billed_empty": False,
 }
+ENVELOPE = {"query": "prompt", "response": PAYLOAD, "error": None, "billed_empty": False}
 
 
 class UrlExtractionTests(unittest.TestCase):
@@ -56,6 +56,13 @@ class UrlExtractionTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_envelopes_written_before_the_response_key_still_read(self) -> None:
+        """Runs scraped before the raw artifact became a verbatim copy inlined the two
+        arrays at the top level. Those objects are still on S3 and must keep resolving."""
+        legacy = {"query": "prompt", "error": None, **PAYLOAD}
+        self.assertEqual(build_evidence(legacy, x_domain="acme.com")["candidates"],
+                         build_evidence(ENVELOPE, x_domain="acme.com")["candidates"])
+
     def test_references_and_typed_urls_both_become_candidates(self) -> None:
         ev = build_evidence(ENVELOPE, x_domain="acme.com")
         self.assertIn("https://drinksanzo.com", ev["candidates"])

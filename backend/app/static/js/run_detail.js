@@ -391,22 +391,24 @@ function verdictSection(rb) {
   );
 }
 
-// Rows billed for an HTTP 200 that carried nothing usable. Branch on the DATA:
-// relationship makes ONE scrape.do AI Mode call per row and reports {empty: N};
-// gsearch runs several SerpWow phases per row and splits them all / some.
+// Rows the provider answered with nothing usable. Branch on the DATA, not the pipeline:
+// relationship makes ONE scrape.do AI Mode call per row, so it reports a single
+// {no_ai_text: N} — there are no phases to split by. gsearch runs several SerpWow
+// phases per row and splits them all / some.
 // `eb` is serpwow_summary.empty_response_breakdown.
 function emptyResponsesSection(eb) {
-  const single = eb.empty != null;
-  const chips = single
-    ? [chip("Empty", fmtNum(eb.empty), eb.empty ? "danger" : "muted")]
+  const aiMode = eb.no_ai_text != null;
+  const chips = aiMode
+    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
       ];
   return el("section", { class: "detail-section" },
-    sectionHeading("Empty responses (HTTP 200)",
-      single
-        ? "Rows where scrape.do returned 200 with no AI Mode text and no references"
+    sectionHeading(
+      aiMode ? "Empty AI Mode answers (HTTP 200)" : "Empty responses (HTTP 200)",
+      aiMode
+        ? "Rows scrape.do billed and answered, but where AI Mode wrote no text_blocks"
         : "Rows where the provider returned 200 but no AI overview and no candidates"),
     el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
   );

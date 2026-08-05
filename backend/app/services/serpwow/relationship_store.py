@@ -6,6 +6,11 @@ There is NO local disk and NO state.json. Object presence IS the state:
   raw/<shard>/row_NNNNNN.error.json  -> the row died after every retry
   cleaned/<shard>/row_NNNNNN.json    -> the row has a Gemini verdict
 
+NNNNNN counts from 1 (input.csv's first data row is row_000001); <shard> is that row's
+0-based index // SHARD_SIZE, so folder 0 holds rows 1-1000, folder 1 holds 1001-2000.
+The sharding exists because 500k objects under one prefix make every LIST slow and
+hot-key a single S3 partition.
+
 That makes the EC2 instance disposable: nothing to size, nothing to rehydrate, and a
 replaced box just re-drives. It is the model gmaps already uses for raw responses.
 
@@ -51,16 +56,26 @@ def _shard(idx: int) -> int:
     return int(idx) // SHARD_SIZE
 
 
+def _row_name(idx: int) -> str:
+    """Filename stem for a 0-based row index, numbered from 1.
+
+    The index stays 0-based everywhere in code (it is the CSV's enumerate() position and
+    the Gemini batch key); only the FILENAME is 1-based, so row_000001.json is the first
+    data row of input.csv and matches what a spreadsheet shows. _idx_from_key undoes it.
+    """
+    return f"row_{int(idx) + 1:06d}"
+
+
 def raw_key(prefix: str, idx: int) -> str:
-    return f"{prefix}/raw/{_shard(idx)}/row_{int(idx):06d}.json"
+    return f"{prefix}/raw/{_shard(idx)}/{_row_name(idx)}.json"
 
 
 def error_key(prefix: str, idx: int) -> str:
-    return f"{prefix}/raw/{_shard(idx)}/row_{int(idx):06d}.error.json"
+    return f"{prefix}/raw/{_shard(idx)}/{_row_name(idx)}.error.json"
 
 
 def cleaned_key(prefix: str, idx: int) -> str:
-    return f"{prefix}/cleaned/{_shard(idx)}/row_{int(idx):06d}.json"
+    return f"{prefix}/cleaned/{_shard(idx)}/{_row_name(idx)}.json"
 
 
 def status_key(prefix: str) -> str:
@@ -142,11 +157,16 @@ def iter_keys(prefix: str) -> Iterator[str]:
 # ---------------------------------------------------------------- resume
 
 def _idx_from_key(key: str) -> Optional[int]:
+    """0-based row index from a 1-based filename (see _row_name). Inverse of raw_key."""
     name = key.rsplit("/", 1)[-1]
     if not name.startswith("row_"):
         return None
     digits = name[4:10]
-    return int(digits) if digits.isdigit() else None
+    if not digits.isdigit():
+        return None
+    # row_000000 can only come from a pre-1-based run; clamp rather than return -1,
+    # which would silently mark a phantom row done.
+    return max(0, int(digits) - 1)
 
 
 def list_done_rows(prefix: str) -> set[int]:

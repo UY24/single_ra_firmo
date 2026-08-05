@@ -89,7 +89,11 @@ The LLM half is unchanged: `build_relationship_prompt` / `apply_relationship_gat
 
 **No `state.json` and no local disk.** S3 object presence IS the state
 (`raw/<idx//1000>/row_NNNNNN.json` = done, `.error.json` = dead, `cleaned/…` = has a
-verdict), so the EC2 instance is disposable and a re-drive resumes for free. `status.json`
+verdict; `NNNNNN` counts from **1**, so input.csv's first data row is `row_000001` while
+the index stays 0-based in code — `relationship_store._idx_from_key` undoes it. The raw
+object holds scrape.do's decoded body VERBATIM under `response`, plus call bookkeeping;
+`modes.relationship.ai_mode_arrays` is the single reader, with a fallback for objects
+written before that key existed), so the EC2 instance is disposable and a re-drive resumes for free. `status.json`
 holds O(1) counters only (~2KB at any run size) and is a cache — the phase barrier
 re-LISTs. Resume is ONE paginated LIST building an in-memory index set, not 500k HEADs.
 Writes go through `relationship_store.put_object`, which **raises** — unlike

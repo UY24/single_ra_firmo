@@ -32,7 +32,11 @@ import aio_pika
 from app.services.common.env import get_int_env as _get_int_env
 from app.services.common.provider_limits import scrapedo_limit
 from app.services.serpwow import relationship_store as store
-from app.services.serpwow.modes.relationship import build_evidence, row_fields
+from app.services.serpwow.modes.relationship import (
+    ai_mode_arrays,
+    build_evidence,
+    row_fields,
+)
 from app.services.serpwow.query_builders import build_relationship_search_query
 from app.services.serpwow.relationship_outputs import write_outputs
 from app.services.serpwow.row_logging import _log_row_stage
@@ -150,10 +154,11 @@ async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters
     # Per-row trace via the repo's existing helper, which PRINTS. _LOGGER alone was the
     # reason `python worker.py` sat silent through a whole relationship run while gmaps and
     # AI Mode filled the terminal: nothing configures a logging handler in the worker.
+    blocks, refs = ai_mode_arrays(envelope)
     _log_row_stage(
         "relationship.scrape",
-        (f"y={fields['y_name']!r} refs={len(envelope.get('references') or [])} "
-         f"blocks={len(envelope.get('text_blocks') or [])} "
+        (f"y={fields['y_name']!r} refs={len(refs)} "
+         f"blocks={len(blocks)} "
          f"attempts={envelope.get('request_count')} credits={envelope.get('credits')}"
          + (f" billed_empty=1" if envelope.get("billed_empty") else "")
          + (f" error={envelope['error']}" if envelope.get("error") else "")),
@@ -384,7 +389,7 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
         if not envelope:
             continue  # error marker or truncated object: no verdict to seek
         key, body, candidates, x_domain = _build_batch_item(envelope)
-        if not candidates and not envelope.get("text_blocks"):
+        if not candidates and not ai_mode_arrays(envelope)[0]:
             # ZERO EVIDENCE (the billed_empty case: HTTP 200, no text_blocks, no
             # references). The envelope parses fine, so the old skip-if-unparseable gate
             # let it into a shard and paid for it — then build_row_result's has_evidence

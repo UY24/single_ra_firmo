@@ -1,5 +1,6 @@
 """S3-only run store: object presence is the state, and writes must be strict."""
 import io
+import json
 import os
 import unittest
 from unittest import mock
@@ -35,6 +36,15 @@ class FakeS3:
 
     def delete_object(self, Bucket, Key):
         self.objects.pop(Key, None)
+
+    def delete_objects(self, Bucket, Delete):
+        deleted = []
+        for entry in Delete["Objects"]:
+            if entry["Key"] in self.fail_keys:
+                continue        # unconfirmed, exactly like a real per-key failure
+            self.objects.pop(entry["Key"], None)
+            deleted.append({"Key": entry["Key"]})
+        return {"Deleted": deleted}
 
     def get_paginator(self, _name):
         objects = self.objects
@@ -78,9 +88,44 @@ class KeyLayoutTests(unittest.TestCase):
             self.assertEqual(store._idx_from_key(store.error_key(p, idx)), idx)
             self.assertEqual(store._idx_from_key(store.cleaned_key(p, idx)), idx)
 
+    def test_a_scraped_row_is_ONE_object_holding_only_the_provider_body(self) -> None:
+        """raw/ is read by hand to judge the search prompt, so nothing of ours goes in it
+        — and nothing of ours needs to: the query comes back inside search_parameters, the
+        index is the filename, the CSV fields are in input.csv, and credits are a constant
+        per billed call."""
+        fake = FakeS3()
+        wire = '{"search_parameters":{"q":"prompt"},"text_blocks":[{"snippet":"hi"}]}'
+        env = {"query": "prompt", "credits": 10, "request_count": 4, "error": None,
+               "fields": {"y_name": "Y"}, "x_domain": "acme.com",
+               "response": json.loads(wire), "response_text": wire}
+        with _patched(fake):
+            store.write_row("p", 0, env)
+            written = sorted(fake.objects)
+            raw = fake.objects["p/raw/0/row_000001.json"].decode()
+            rebuilt = store.read_row("p", 0)
+        # Exactly one object, and byte-for-byte what came off the wire.
+        self.assertEqual(written, ["p/raw/0/row_000001.json"])
+        self.assertEqual(raw, wire)
+        self.assertEqual(sorted(json.loads(raw)), ["search_parameters", "text_blocks"])
+        # read_row supplies the counts a billed 200 implies.
+        self.assertEqual(rebuilt["response"], env["response"])
+        self.assertEqual(rebuilt["credits"], store.CREDITS_PER_CALL)
+        self.assertEqual(rebuilt["successful_requests"], 1)
+        self.assertIsNone(rebuilt["error"])
+
+    def test_a_dead_row_writes_our_record_and_no_raw_object(self) -> None:
+        fake = FakeS3()
+        with _patched(fake):
+            store.write_row("p", 4, {"error": "HTTP 529", "error_category": "rate_limit",
+                                     "request_count": 4, "fields": {"y_name": "Y"},
+                                     "response": None, "response_text": None})
+            self.assertEqual(sorted(fake.objects), ["p/errors/0/row_000005.json"])
+            self.assertEqual(store.list_done_rows("p"), {4})
+            self.assertEqual(store.read_row("p", 4)["error"], "HTTP 529")
+
     def test_error_and_cleaned_keys_share_the_shard_scheme(self) -> None:
         p = "acme/relationship/run1"
-        self.assertEqual(store.error_key(p, 5), f"{p}/raw/0/row_000006.error.json")
+        self.assertEqual(store.error_key(p, 5), f"{p}/errors/0/row_000006.json")
         self.assertEqual(store.cleaned_key(p, 5), f"{p}/cleaned/0/row_000006.json")
 
     def test_run_prefix_uses_the_shared_company_slug(self) -> None:
@@ -201,6 +246,42 @@ class HermeticityTests(unittest.TestCase):
                     "AWS_SECRET_ACCESS_KEY"):
             self.assertEqual(os.environ.get(key, ""), "",
                              f"{key} leaked into the test process")
+
+
+class BulkDeleteTests(unittest.TestCase):
+    """"Rerun failed" deletes one error marker per dead row. One HTTPS call per key took
+    20+ minutes on 50k rows and timed out the web request; delete_objects does 1000 a
+    call. The COUNT has to be what S3 confirmed, because reporting a row as retried when
+    its marker survived means the row is never rescraped."""
+
+    def test_it_deletes_in_chunks_of_a_thousand(self) -> None:
+        fake = FakeS3()
+        keys = [f"p/raw/0/row_{i:06d}.error.json" for i in range(2500)]
+        with _patched(fake):
+            for key in keys:
+                store.put_bytes(key, b"{}")
+            calls = []
+            original = fake.delete_objects
+            fake.delete_objects = lambda Bucket, Delete: (
+                calls.append(len(Delete["Objects"])) or original(Bucket=Bucket, Delete=Delete))
+            deleted = store.delete_objects(keys)
+        self.assertEqual(deleted, 2500)
+        self.assertEqual(calls, [1000, 1000, 500])
+        self.assertEqual(fake.objects, {})
+
+    def test_an_unconfirmed_delete_is_not_counted(self) -> None:
+        fake = FakeS3(fail_keys={"p/b.json"})
+        with _patched(fake):
+            store.put_bytes("p/a.json", b"{}")
+            deleted = store.delete_objects(["p/a.json", "p/b.json"])
+        # 1, not 2: b was never confirmed gone, so it must not be reported as retried.
+        self.assertEqual(deleted, 1)
+
+    def test_no_keys_makes_no_calls(self) -> None:
+        fake = FakeS3()
+        fake.delete_objects = lambda **_kw: self.fail("called with nothing to delete")
+        with _patched(fake):
+            self.assertEqual(store.delete_objects([]), 0)
 
 
 if __name__ == "__main__":

@@ -41,17 +41,18 @@ def _envelope(
     request_count: int = 0,
     successful_requests: int = 0,
     response: Optional[dict[str, Any]] = None,
+    response_text: Optional[str] = None,
     error: Optional[str] = None,
     error_category: Optional[str] = None,
     billed_empty: bool = False,
 ) -> dict[str, Any]:
-    """The envelope the relationship row executor consumes and the store persists.
+    """The envelope the relationship row executor consumes.
 
-    ``response`` is scrape.do's decoded JSON body VERBATIM — the whole object, not a
-    selection of fields. This envelope IS the row's durable artifact (there is no local
-    copy), so what lands in ``raw/`` has to be exactly what the provider sent; anything
-    less makes the artifact useless for judging the search prompt. Everything else here
-    is call bookkeeping the provider does not report.
+    ``response`` is scrape.do's decoded body, for in-process logic. ``response_text`` is
+    the response body EXACTLY as it came off the wire — that string, not a re-serialised
+    copy of it, is what gets written to ``raw/``, so the object in the bucket is
+    byte-for-byte what scrape.do sent. Everything else here is call bookkeeping the
+    provider does not report, and it is stored separately (see relationship_store).
 
     ``credits`` is DERIVED from the HTTP-200 count, never counted by hand, so a run
     always reconciles as ``request_count == successful_requests + failed_requests``.
@@ -64,6 +65,7 @@ def _envelope(
         "failed_requests": max(0, request_count - successful_requests),
         "credits": CREDITS_PER_CALL * successful_requests,
         "response": response if isinstance(response, dict) else None,
+        "response_text": response_text,
         # A BILLED (200) call that returned no text and no references: credits spent for
         # no data. Counted for the scrape.do refund claim; never retried, since the money
         # is already gone and a second call cannot be told apart from the first.
@@ -105,6 +107,7 @@ async def search_ai_mode(
             async with scrapedo_slot():
                 response = await client.get(AI_MODE_SEARCH_URL, params=params)
             response.raise_for_status()
+            body_text = response.text
             payload = response.json()
         except Exception as exc:
             status = getattr(response, "status_code", None)
@@ -138,6 +141,7 @@ async def search_ai_mode(
                 request_count=request_count,
                 successful_requests=1,
                 response=payload,
+                response_text=body_text,
                 error=f"scrape.do ai-mode search failed: {message}",
                 error_category=categorize_http_error(None, message),
             )
@@ -150,6 +154,7 @@ async def search_ai_mode(
             request_count=request_count,
             successful_requests=1,
             response=body,
+            response_text=body_text,
             billed_empty=not (blocks if isinstance(blocks, list) else [])
                          and not (refs if isinstance(refs, list) else []),
         )

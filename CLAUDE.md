@@ -88,12 +88,24 @@ The LLM half is unchanged: `build_relationship_prompt` / `apply_relationship_gat
 `text_blocks` are the candidate set the gate validates against.
 
 **No `state.json` and no local disk.** S3 object presence IS the state
-(`raw/<idx//1000>/row_NNNNNN.json` = done, `.error.json` = dead, `cleaned/…` = has a
-verdict; `NNNNNN` counts from **1**, so input.csv's first data row is `row_000001` while
-the index stays 0-based in code — `relationship_store._idx_from_key` undoes it. The raw
-object holds scrape.do's decoded body VERBATIM under `response`, plus call bookkeeping;
-`modes.relationship.ai_mode_arrays` is the single reader, with a fallback for objects
-written before that key existed), so the EC2 instance is disposable and a re-drive resumes for free. `status.json`
+(`raw/<shard>/row_NNNNNN.json` = done, `errors/<shard>/row_NNNNNN.json` = dead,
+`cleaned/…` = has a verdict; `NNNNNN` counts from **1**, so input.csv's first data row is
+`row_000001` while the index stays 0-based in code — `relationship_store._idx_from_key`
+undoes it). **A scraped row is ONE object holding scrape.do's response body and nothing
+else** — the exact bytes off the wire, not a wrapper and not re-serialised JSON, because
+it is read by hand to judge the search prompt. There is deliberately no sidecar: the query
+and locale come back inside the response's own `search_parameters`, the row index IS the
+filename, the CSV fields are in input.csv (which the verdict phase now streams via
+`_iter_scraped_rows`, so dropping the sidecar also removed a GET per row from that phase),
+credits are `CREDITS_PER_CALL` per billed 200, and the run's attempt total is a counter in
+`status.json` — the one figure not recoverable from the objects, which is why
+`write_outputs` takes `scrapedo_requests` from the counter. `store.read_row` supplies the
+implied counts so all row logic still sees one envelope with the body under `response`.
+`modes.relationship.ai_mode_arrays` is the single reader of `text_blocks`/`references`
+(with a fallback for pre-split objects), and **`flatten_text_blocks` is what turns blocks
+into evidence text** — it walks `list` blocks too, which have no `snippet` and are exactly
+where AI Mode puts the EVIDENCE bullets (dates, amounts, round names, sources); reading
+only `snippet` silently dropped all of them. This layout makes the EC2 instance disposable and a re-drive resumes for free. `status.json`
 holds O(1) counters only (~2KB at any run size) and is a cache — the phase barrier
 re-LISTs. Resume is ONE paginated LIST building an in-memory index set, not 500k HEADs.
 Writes go through `relationship_store.put_object`, which **raises** — unlike
@@ -110,6 +122,16 @@ is irrelevant here: it sets RabbitMQ prefetch, and there is one message per run.
 `redrive_stale_runs` instead, which also covers a worker that was down at publish time or
 an instance that was replaced. One message means no barrier machinery: phase 2 is simply
 the next statement after phase 1.
+
+**In-flight Gemini shards are remembered.** A Batch job runs on Google's side and is billed
+whether or not we are still polling, so each shard's job name is written to
+`<run>/batches/<first>-<last>.json` before the first poll and cleared only once its
+verdicts are durable in `cleaned/`. `_reattach_batches` runs at the top of the verdict
+phase and re-polls any surviving record, so a timeout, worker restart or crash re-attaches
+to the job already paid for instead of submitting an identical one. The wait is bounded by
+**`RELATIONSHIP_BATCH_TIMEOUT_SEC`** (48h = Gemini's job expiry) — deliberately its own key,
+not the shared `GEMINI_BATCH_TIMEOUT_SEC`, which bounds gsearch's per-row batches and is
+1800 in real deployments.
 
 Billing is credits only, `10 × HTTP-200`, same keys as gmaps so `run_detail.js` renders it
 unchanged. `report.json` is **summary only** — no per-row array, which at 500k would be

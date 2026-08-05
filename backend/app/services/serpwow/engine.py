@@ -4354,12 +4354,17 @@ async def retry_failed_rows(
     pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
     if pointer:
         prefix = pointer["prefix"]
-        removed = 0
-        for key in await asyncio.to_thread(
-                lambda: [k for k in rel_store.iter_keys(f"{prefix}/raw/")
-                         if k.endswith(".error.json")]):
-            await asyncio.to_thread(rel_store.delete_object, key)
-            removed += 1
+
+        def _dead_markers() -> list[str]:
+            keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
+            # `limit` used to be accepted and then ignored, so a cautious "retry 100 of
+            # them" silently tried all 50k.
+            return keys[:limit] if limit else keys
+
+        # Bulk delete: 1000 keys per call instead of one call per row, which is what made
+        # this time out on any run with a lot of dead rows.
+        removed = await asyncio.to_thread(
+            lambda: rel_store.delete_objects(_dead_markers()))
         await asyncio.to_thread(rel_store.clear_stop, prefix)
         await publish_relationship_run(upload_id)
         return {"upload_id": upload_id, "retried_rows": removed,
@@ -5287,13 +5292,13 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
 async def _relationship_failure_analysis(
     run_id: str, sample_limit: int,
 ) -> Optional[dict[str, Any]]:
-    """build_failure_analysis's shape, sourced from raw/*.error.json instead of rows[].
+    """build_failure_analysis's shape, sourced from errors/ objects instead of rows[].
 
     The "View failed rows" control run_detail.js offers whenever outcome_breakdown.errored
     is non-zero calls this; without a branch here a relationship run answered 404 and the
     page showed a red error under its own button.
 
-    ``failed_rows`` is exact (one LIST of raw/, the same scan list_done_rows does). The
+    ``failed_rows`` is exact (one LIST of errors/, the same scan list_done_rows does). The
     aggregate buckets are computed over the SAMPLE only — the alternative is GETting up to
     500k error objects to answer a debug panel that reads neither.
     """
@@ -5306,15 +5311,14 @@ async def _relationship_failure_analysis(
     limit = max(1, int(sample_limit))
 
     def _by_row_index(key: str) -> tuple[int, int, str]:
-        # NOT plain sorted(): shard directories are numeric but unpadded, so raw/10/
-        # sorts before raw/2/ and the "first N" sample becomes a lexicographic slice
+        # NOT plain sorted(): shard directories are numeric but unpadded, so errors/10/
+        # sorts before errors/2/ and the "first N" sample becomes a lexicographic slice
         # once a run exceeds ten shards.
         idx = rel_store._idx_from_key(key)
         return (1, 0, key) if idx is None else (0, idx, "")
 
     def _collect() -> tuple[int, list[dict[str, Any]]]:
-        keys = [k for k in rel_store.iter_keys(f"{prefix}/raw/")
-                if k.endswith(".error.json")]
+        keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
         rows: list[dict[str, Any]] = []
         for key in sorted(keys, key=_by_row_index)[:limit]:
             envelope = rel_store.get_object(key) or {}

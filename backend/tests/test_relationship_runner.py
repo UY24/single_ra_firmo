@@ -1,11 +1,15 @@
 """Phase 1: resume-by-object-presence, concurrency, and credit accounting."""
 import asyncio
+import json
 import os
 import time
 import unittest
 from unittest import mock
 
 from app.services import ai_mode as ai_mode_pkg
+# Imported for its side effect: mock.patch.object(ai_mode_pkg, "gemini_batch") below
+# needs the submodule attribute to exist, and only an import sets it.
+from app.services.ai_mode import gemini_batch as _gemini_batch  # noqa: F401
 from app.services.serpwow import relationship_runner as runner
 from app.services.serpwow import relationship_store as store
 from tests.test_relationship_store import FakeS3, _patched
@@ -15,15 +19,19 @@ CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
        b"https://acme.com/p,Acme,Yuzu,US\n"
        b"https://acme.com/p,Acme,Pomelo,US\n")
 
+# The shape search_ai_mode returns: the provider's body under "response" (and the exact
+# wire text alongside it), our call bookkeeping at the top level. write_row splits them
+# so raw/ holds only the body.
+OK_BODY = {"text_blocks": [{"snippet": "Acme invested in it."}],
+           "references": [{"title": "Y", "link": "https://y.com"}]}
 OK_ENVELOPE = {
     "query": "q", "request_count": 1, "successful_requests": 1, "failed_requests": 0,
-    "credits": 10, "text_blocks": [{"snippet": "Acme invested in it."}],
-    "references": [{"title": "Y", "link": "https://y.com"}],
+    "credits": 10, "response": OK_BODY, "response_text": json.dumps(OK_BODY),
     "billed_empty": False, "error": None, "error_category": None,
 }
 ERR_ENVELOPE = {
     "query": "q", "request_count": 4, "successful_requests": 0, "failed_requests": 4,
-    "credits": 0, "text_blocks": [], "references": [], "billed_empty": False,
+    "credits": 0, "response": None, "response_text": None, "billed_empty": False,
     "error": "HTTP 529", "error_category": "rate_limit",
 }
 
@@ -76,7 +84,7 @@ class ScrapePhaseTests(unittest.TestCase):
         fake = FakeS3()
         _seed(fake)
         with _patched(fake):
-            store.put_object(store.raw_key(PREFIX, 0), OK_ENVELOPE)
+            store.write_row(PREFIX, 0, OK_ENVELOPE)
             store.put_object(store.error_key(PREFIX, 1), ERR_ENVELOPE)
 
         calls, _ = _drive(fake, [OK_ENVELOPE])
@@ -88,7 +96,7 @@ class ScrapePhaseTests(unittest.TestCase):
         _seed(fake)
         with _patched(fake):
             for idx in (0, 1, 2):
-                store.put_object(store.raw_key(PREFIX, idx), OK_ENVELOPE)
+                store.write_row(PREFIX, idx, OK_ENVELOPE)
         calls, _ = _drive(fake, [OK_ENVELOPE])
         self.assertEqual(calls, [])
 
@@ -343,8 +351,10 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
     def test_a_batch_that_never_finishes_raises_instead_of_hanging(self) -> None:
         gb = self._never_terminal()
         slept = []
-        with mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
-                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "60",
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
+                mock.patch.dict(os.environ, {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "60",
                                              "GEMINI_BATCH_POLL_SEC": "30"}, clear=False), \
                 mock.patch("time.sleep", slept.append), \
                 mock.patch("time.monotonic", side_effect=[0.0, 10.0, 70.0, 70.0]):
@@ -359,8 +369,10 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
         gb.is_terminal.side_effect = [False, True]
         gb.collect_results.return_value = [{"key": "0", "text": "{}"}]
         gb.parse_json_from_text.return_value = {}
-        with mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
-                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "99999"},
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
+                mock.patch.dict(os.environ, {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "99999"},
                                 clear=False), \
                 mock.patch("time.sleep", lambda _s: None):
             out = runner._run_gemini_batch(PREFIX, [("0", {})])
@@ -376,7 +388,7 @@ class VerdictPhaseTests(unittest.TestCase):
         _seed(fake)
         with _patched(fake):
             for idx in range(n):
-                store.put_object(store.raw_key(PREFIX, idx), {
+                store.write_row(PREFIX, idx, {
                     **OK_ENVELOPE, "row_index": idx, "x_domain": "acme.com",
                     "fields": {"row_index": idx, "x_name": "Acme", "y_name": f"Y{idx}",
                                "input_url": "https://acme.com/p", "city": "",
@@ -452,9 +464,12 @@ class VerdictPhaseTests(unittest.TestCase):
         fake = FakeS3()
         _seed(fake)
         with _patched(fake):
-            store.put_object(store.raw_key(PREFIX, 0), {
+            store.write_row(PREFIX, 0, {
                 **OK_ENVELOPE, "row_index": 0, "x_domain": "acme.com",
-                "text_blocks": [], "references": [], "billed_empty": True,
+                # Empty ARRAYS, which now live inside the provider body.
+                "response": {"text_blocks": [], "references": []},
+                "response_text": '{"text_blocks":[],"references":[]}',
+                "billed_empty": True,
                 "fields": {"row_index": 0, "x_name": "Acme", "y_name": "Y0",
                            "input_url": "https://acme.com/p", "city": "",
                            "country": "US"}})
@@ -807,6 +822,56 @@ class RedriveTests(unittest.TestCase):
             asyncio.run(runner.redrive_stale_runs())
         self.assertEqual(driven, [])
 
+    def _redrive(self, fake):
+        driven = []
+        with _patched(fake), mock.patch.object(
+                runner, "drive_run",
+                lambda rid: driven.append(rid) or asyncio.sleep(0)):
+            asyncio.run(runner.redrive_stale_runs())
+        return driven
+
+    def test_a_failed_run_is_retried(self) -> None:
+        """"failed" means drive_run hit an exception, which on a multi-day run is usually
+        transient. It used to be a dead end: recovery meant hand-typing the run id into
+        the Operations page, even though a re-drive costs nothing."""
+        fake = FakeS3()
+        self._pointer(fake, {"phase": "failed", "drive_attempts": 1,
+                             "updated_at": "2000-01-01T00:00:00Z"})
+        self.assertEqual(self._redrive(fake), ["run1"])
+
+    def test_a_repeatedly_failing_run_stops_being_retried(self) -> None:
+        fake = FakeS3()
+        self._pointer(fake, {"phase": "failed", "drive_attempts": 3,
+                             "updated_at": "2000-01-01T00:00:00Z"})
+        self.assertEqual(self._redrive(fake), [])
+
+    def test_a_failed_run_still_waits_for_the_staleness_window(self) -> None:
+        """Otherwise a run that dies instantly burns all its attempts in one scan pass."""
+        import time as _t
+        fake = FakeS3()
+        fresh = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+        self._pointer(fake, {"phase": "failed", "drive_attempts": 0,
+                             "updated_at": fresh})
+        self.assertEqual(self._redrive(fake), [])
+
+    def test_a_dying_drive_counts_its_attempt(self) -> None:
+        """The counter has to be persisted, or the bound above can never be reached."""
+        fake = FakeS3()
+        _seed(fake)
+        with _patched(fake):
+            store.write_run_pointer("run1", PREFIX, "Acme")
+            store.put_object(store.status_key(PREFIX), {"rows_total": 2, "phase": "queued"})
+
+        async def boom(*_a, **_k):
+            raise RuntimeError("S3 stream dropped")
+
+        with _patched(fake), mock.patch.object(runner, "run_scrape_phase", boom):
+            asyncio.run(runner.drive_run("run1"))
+        with _patched(fake):
+            status = store.read_status(PREFIX)
+        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(status["drive_attempts"], 1)
+
 
 class _FakeExchange:
     pass
@@ -1024,6 +1089,114 @@ class SingleFlightTests(unittest.TestCase):
 
         self.assertEqual(order, ["scrape", "verdict", "outputs"] * 2)
         self.assertNotIn("run1", runner._driving)
+
+
+class BatchReattachTests(unittest.TestCase):
+    """A Gemini Batch job runs on Google's side and is billed whether or not we are still
+    listening. Losing its NAME (timeout, worker restart, crash) therefore means paying for
+    the shard a second time, because the next drive sees rows with no verdict and submits
+    an identical batch. These cover the record that prevents that."""
+
+    def _seed_raw(self, fake, n=2):
+        _seed(fake)
+        with _patched(fake):
+            for idx in range(n):
+                store.write_row(PREFIX, idx, {
+                    **OK_ENVELOPE, "row_index": idx, "x_domain": "acme.com",
+                    "fields": {"row_index": idx, "x_name": "Acme", "y_name": f"Y{idx}",
+                               "input_url": "https://acme.com/p"},
+                })
+
+    @staticmethod
+    def _gb(*, terminal, name="batches/live"):
+        gb = mock.Mock()
+        gb.create_batch.return_value = {"name": name}
+        gb.batch_name_from_create.return_value = name
+        gb.get_batch.return_value = {"name": name, "done": terminal}
+        gb.state_name.return_value = "JOB_STATE_SUCCEEDED"
+        gb.is_terminal.return_value = terminal
+        gb.collect_results.return_value = [
+            {"key": "0", "text": "{}"}, {"key": "1", "text": "{}"}]
+        gb.parse_json_from_text.return_value = {"relationship_status": "unclear"}
+        return gb
+
+    def test_the_job_name_is_persisted_before_the_first_poll(self) -> None:
+        fake = FakeS3()
+        self._seed_raw(fake)
+        gb = self._gb(terminal=False)
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
+                mock.patch.dict(os.environ,
+                                {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "60",
+                                 "GEMINI_BATCH_POLL_SEC": "1"}, clear=False), \
+                mock.patch("time.sleep", lambda _s: None), \
+                mock.patch("time.monotonic", side_effect=[0.0, 70.0, 70.0]):
+            with self.assertRaises(TimeoutError):
+                runner._run_gemini_batch(PREFIX, [("0", {}), ("1", {})])
+        # Abandoning the wait must NOT abandon the job: the record survives the timeout.
+        with _patched(fake):
+            records = store.list_batch_records(PREFIX)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["name"], "batches/live")
+        self.assertEqual(records[0]["indices"], [0, 1])
+
+    def test_a_redrive_reattaches_instead_of_submitting_a_second_batch(self) -> None:
+        fake = FakeS3()
+        self._seed_raw(fake)
+        # A previous drive got as far as creating the job and writing the record.
+        with _patched(fake):
+            store.put_object(store.batch_record_key(PREFIX, [0, 1]),
+                             {"name": "batches/paid-for", "model": "m",
+                              "indices": [0, 1]})
+        gb = self._gb(terminal=True)
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb):
+            counters = store.Counters(PREFIX, rows_total=2)
+            asyncio.run(runner.run_verdict_phase(PREFIX, counters))
+
+        gb.get_batch.assert_called_with("batches/paid-for")
+        gb.create_batch.assert_not_called()       # the money assertion
+        with _patched(fake):
+            self.assertIsNotNone(store.get_object(store.cleaned_key(PREFIX, 0)))
+            self.assertIsNotNone(store.get_object(store.cleaned_key(PREFIX, 1)))
+            # Collected and durable -> the record is cleared, so the NEXT drive is a no-op.
+            self.assertEqual(store.list_batch_records(PREFIX), [])
+
+    def test_a_record_whose_rows_are_already_verdicted_is_just_cleared(self) -> None:
+        """The normal path: a drive completed, so the record is stale. Clearing it must
+        not cost a poll — the job is long finished and the rows already have verdicts."""
+        fake = FakeS3()
+        self._seed_raw(fake)
+        with _patched(fake):
+            store.put_object(store.batch_record_key(PREFIX, [0, 1]),
+                             {"name": "batches/old", "model": "m", "indices": [0, 1]})
+            for idx in (0, 1):
+                store.put_object(store.cleaned_key(PREFIX, idx),
+                                 {"row_index": idx, "parsed": {}})
+        gb = self._gb(terminal=True)
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb):
+            counters = store.Counters(PREFIX, rows_total=2)
+            asyncio.run(runner._reattach_batches(PREFIX, counters))
+        gb.get_batch.assert_not_called()
+        with _patched(fake):
+            self.assertEqual(store.list_batch_records(PREFIX), [])
+
+    def test_a_failed_record_write_does_not_abandon_a_paid_for_batch(self) -> None:
+        """put_object raises by design here, but raising would discard a batch Google is
+        already billing — the very double-spend the record exists to prevent."""
+        fake = FakeS3()
+        self._seed_raw(fake)
+        gb = self._gb(terminal=True)
+        fake.fail_keys.add(store.batch_record_key(PREFIX, [0, 1]))
+        with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb):
+            out = runner._run_gemini_batch(PREFIX, [("0", {}), ("1", {})])
+        self.assertEqual(set(out), {"0", "1"})
+
+    def test_the_shared_gsearch_timeout_key_is_not_what_bounds_a_shard(self) -> None:
+        """.env sets GEMINI_BATCH_TIMEOUT_SEC=1800 for gsearch's per-row batches. Reading
+        it here abandoned every relationship shard after 30 minutes."""
+        with mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "1800"},
+                             clear=False):
+            os.environ.pop("RELATIONSHIP_BATCH_TIMEOUT_SEC", None)
+            self.assertEqual(runner._batch_timeout_sec(), 172800)
 
 
 if __name__ == "__main__":

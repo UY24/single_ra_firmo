@@ -47,7 +47,11 @@ _LOGGER = logging.getLogger(__name__)
 
 RELATIONSHIP_QUEUE = "relationship_runs"
 RELATIONSHIP_ROUTING_KEY = "relationship.run"
-_TERMINAL_PHASES = {"completed", "failed", "stopped"}
+# Genuinely finished — never re-driven. "failed" is deliberately NOT here: it means
+# drive_run hit an exception, which over a multi-day run is usually something transient
+# (an S3 stream drop, a SlowDown past boto3's retries), and a re-drive is free because
+# every row that already has an object is skipped. See _redrivable_failure.
+_TERMINAL_PHASES = {"completed", "stopped"}
 
 # In-process single-flight guard: run_ids currently inside drive_run. redrive_stale_runs
 # and the queue consumer are two independent paths that can both decide to drive the same
@@ -130,11 +134,8 @@ async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters
     counters.bump(requests=int(envelope.get("request_count") or 0),
                   credits=int(envelope.get("credits") or 0))
 
-    # A row that died after every retry gets an error marker, so a re-drive knows not to
-    # retry it for free forever, and "Rerun failed" can find it.
-    key = store.error_key(prefix, idx) if envelope.get("error") else store.raw_key(prefix, idx)
     try:
-        await asyncio.to_thread(store.put_object, key, envelope)
+        await asyncio.to_thread(store.write_row, prefix, idx, envelope)
     except Exception as exc:
         # S3 is the ONLY copy. A failed PUT means this row's work is gone, so it must
         # count as failed and be redone on the next drive — never silently swallowed.
@@ -265,48 +266,50 @@ def _max_inflight() -> int:
     return max(1, _get_int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
 
 
-def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
-                       counters: store.Counters | None = None) -> dict[str, dict]:
-    """Submit one shard and block until it is terminal; returns {key: parsed_json}.
+def _batch_timeout_sec() -> int:
+    """How long to keep polling ONE Gemini shard.
 
-    Seam for tests — patched in test_relationship_runner. Sync on purpose: callers wrap
-    it in asyncio.to_thread.
+    Its OWN key, not the shared `GEMINI_BATCH_TIMEOUT_SEC`: that one bounds gsearch's
+    per-row batches and is set to 1800 in real deployments, which would abandon every
+    relationship shard after 30 minutes when the Batch API's own target is "within 24h
+    per job". Default 48h = Gemini's hard job expiry, past which the job cannot succeed.
+    """
+    return max(60, _get_int_env("RELATIONSHIP_BATCH_TIMEOUT_SEC", 172800))
 
-    ``counters``, when given, is force-flushed on every poll iteration — a heartbeat.
-    Without it, a run legitimately waiting on a single Gemini batch (turnaround can run to
-    24h, see _max_inflight's docstring) writes status.json only once, at the top of
-    run_verdict_phase, then goes silent until the batch resolves — which blows straight
-    past RELATIONSHIP_STALE_SEC's 900s default, making redrive_stale_runs think a perfectly
-    healthy run is stale and start a second, re-spending drive_run on top of it.
+
+def _poll_to_terminal(gb, name: str, counters: store.Counters | None) -> dict:
+    """Block until this Gemini job is terminal; return the job object.
+
+    Bounded, unlike the `while True` this replaced. A shard that never terminalises used
+    to park the thread forever: the run sat in phase="cleaning" with the heartbeat keeping
+    it looking healthy, so redrive_stale_runs never rescued it either.
+
+    ``counters``, when given, is force-flushed every poll — a heartbeat. Without it a run
+    legitimately waiting hours on one batch writes status.json once and then goes silent,
+    blowing past RELATIONSHIP_STALE_SEC and making redrive_stale_runs start a second,
+    re-spending drive on top of a perfectly healthy run.
     """
     import time as _time
 
-    from app.services.ai_mode import gemini_batch as gb
-
-    if not items:
-        return {}
-    model = os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite")
-    created = gb.create_batch(model, items, display_name=f"relationship-{prefix}")
-    name = gb.batch_name_from_create(created)
-    # Bounded, unlike the `while True` this replaced. A shard that never reaches a terminal
-    # state used to park this thread forever: the run sat in phase="cleaning" with the
-    # heartbeat keeping it looking healthy, so redrive_stale_runs never rescued it either.
-    # AI Mode already bounds its equivalent wait (AI_MODE_BATCH_TIMEOUT_SEC); 48h is
-    # Gemini's own hard job expiry, so past it the job cannot still succeed.
-    deadline = _time.monotonic() + _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 172800)
+    deadline = _time.monotonic() + _batch_timeout_sec()
     while True:
         obj = gb.get_batch(name)
         if gb.is_terminal(gb.state_name(obj), bool(obj.get("done"))):
-            break
+            return obj
         if _time.monotonic() >= deadline:
-            # Raise rather than return {}: _drain counts it, the run reports
-            # completed_with_errors, and the rows stay without a cleaned/ object so the
-            # next drive redoes exactly them.
+            # Raise rather than return {}: _drain counts it and the run reports
+            # completed_with_errors. The rows keep no cleaned/ object AND the batch
+            # record survives, so the next drive RE-ATTACHES to this same job instead of
+            # paying for a second one (see _reattach_batches).
             raise TimeoutError(
-                f"Gemini batch {name} did not finish within GEMINI_BATCH_TIMEOUT_SEC")
+                f"Gemini batch {name} did not finish within "
+                f"RELATIONSHIP_BATCH_TIMEOUT_SEC")
         if counters is not None:
             counters.flush(force=True)
         _time.sleep(_get_int_env("GEMINI_BATCH_POLL_SEC", 30))
+
+
+def _collect(gb, obj: dict, model: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for record in gb.collect_results(obj):
         key = str(record.get("key") or "")
@@ -319,6 +322,152 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
             out[key] = {"parsed": parsed or {}, "usage": record.get("usage"),
                         "model": model}
     return out
+
+
+def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
+                       counters: store.Counters | None = None) -> dict[str, dict]:
+    """Submit one shard and block until it is terminal; returns {key: result}.
+
+    Seam for tests — patched in test_relationship_runner. Sync on purpose: callers wrap
+    it in asyncio.to_thread.
+
+    The job NAME is written to S3 before the first poll. A Gemini batch runs on Google's
+    side and is billed whether or not we are still listening, so losing the name (worker
+    restart, timeout, crash) used to mean paying for the shard twice: the next drive saw
+    rows with no verdict and submitted an identical batch. The record is what lets a
+    re-drive re-attach instead. It is cleared by the caller, once the verdicts are
+    durable — not here, or a crash in between would lose both the name and the results.
+    """
+    from app.services.ai_mode import gemini_batch as gb
+
+    if not items:
+        return {}
+    model = os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite")
+    created = gb.create_batch(model, items, display_name=f"relationship-{prefix}")
+    name = gb.batch_name_from_create(created)
+    indices = sorted(int(key) for key, _body in items)
+    try:
+        store.put_object(store.batch_record_key(prefix, indices),
+                         {"name": name, "model": model, "indices": indices})
+    except Exception as exc:
+        # BEST-EFFORT, unlike every other write in this pipeline. put_object raises by
+        # design, but raising here would abandon a batch Google is already billing us for
+        # — the exact double-spend this record exists to prevent. This process still has
+        # the name in memory and polls on regardless; only crash-recovery is lost.
+        _LOGGER.warning("relationship %s: could not record batch %s (%s: %s) — "
+                        "a restart before it resolves will resubmit these rows",
+                        prefix, name, type(exc).__name__, exc)
+    return _collect(gb, _poll_to_terminal(gb, name, counters), model)
+
+
+async def _iter_scraped_rows(prefix: str, wanted: set[int]):
+    """Yield (idx, envelope) for each wanted row that has a provider response.
+
+    The envelope's CSV fields come from streaming input.csv, not from a per-row sidecar
+    object in S3: they were already in the CSV, and a sidecar would have meant a second
+    GET per row on top of the response — 500k extra round-trips in this phase alone.
+    """
+    it = store.iter_input_rows(prefix)
+    while True:
+        row = await asyncio.to_thread(_next_or_exhausted, it)
+        if row is _EXHAUSTED:
+            return
+        idx = int(row["row_index"])
+        if idx not in wanted:
+            continue
+        envelope = await asyncio.to_thread(store.read_row, prefix, idx)
+        if not envelope or envelope.get("response") is None:
+            continue   # an error row: no body, so no verdict to seek
+        fields = row_fields(row)
+        envelope["row_index"] = idx
+        envelope["fields"] = fields
+        envelope["x_domain"] = x_domain_from_input_url(fields["input_url"])
+        yield idx, envelope
+
+
+async def _shard_meta(prefix: str, wanted: set[int]) -> dict[str, tuple[list[str], str]]:
+    """{row key: (candidates, x_domain)} for rows whose verdicts came from a batch this
+    process did not submit. Rebuilt locally from the stored response — no LLM, no scrape."""
+    out: dict[str, tuple[list[str], str]] = {}
+    async for idx, envelope in _iter_scraped_rows(prefix, wanted):
+        _key, _body, candidates, x_domain = _build_batch_item(envelope)
+        out[str(idx)] = (candidates, x_domain)
+    return out
+
+
+async def _reattach_batches(prefix: str, counters: store.Counters) -> None:
+    """Finish any shard a previous drive paid for but never collected.
+
+    Runs before this drive computes its own pending set, so those rows get their verdicts
+    from the batch Google already ran instead of being resubmitted. Rows that DID land a
+    cleaned object are skipped, which makes a stale record (deleted mid-flight, or written
+    by a drive that then completed normally) free to clear.
+    """
+    from app.services.ai_mode import gemini_batch as gb
+
+    records = await asyncio.to_thread(store.list_batch_records, prefix)
+    if not records:
+        return
+    cleaned_already = await asyncio.to_thread(store.list_cleaned_rows, prefix)
+    outstanding = {
+        record["record_key"]: [int(i) for i in (record.get("indices") or [])
+                               if int(i) not in cleaned_already]
+        for record in records
+    }
+    for record in records:
+        if not outstanding[record["record_key"]]:
+            await asyncio.to_thread(store.delete_object, record["record_key"])
+    live = [r for r in records if outstanding[r["record_key"]]]
+    if not live:
+        return
+    # ONE csv pass for every outstanding record, not one per record.
+    meta = await _shard_meta(prefix, {i for r in live for i in outstanding[r["record_key"]]})
+    for record in live:
+        pending = outstanding[record["record_key"]]
+        name = str(record["name"])
+        model = str(record.get("model") or "")
+        _log_row_stage("relationship.phase",
+                       f"LLM phase: re-attaching to Gemini batch {name} "
+                       f"({len(pending)} row(s) still without a verdict)",
+                       upload_id=prefix.rsplit("/", 1)[-1])
+        obj = await asyncio.to_thread(_poll_to_terminal, gb, name, counters)
+        results = await asyncio.to_thread(_collect, gb, obj, model)
+        await _write_verdicts(prefix, [str(i) for i in pending], results, counters,
+                              meta=meta)
+        await asyncio.to_thread(store.delete_object, record["record_key"])
+
+
+async def _write_verdicts(prefix: str, keys: list[str], results: dict[str, dict],
+                          counters: store.Counters,
+                          meta: dict[str, tuple[list[str], str]] | None = None) -> None:
+    """Persist one shard's verdicts as cleaned/ objects, one per row.
+
+    ``meta`` carries the candidate set this drive already built. It is absent only when
+    re-attaching to a shard a PREVIOUS drive submitted, in which case it is rebuilt from
+    the row's raw object — a local re-parse, no LLM call and no scrape. Passing it on the
+    normal path keeps this from adding a second S3 GET per row.
+    """
+    for key in keys:
+        idx = int(key)
+        if meta is not None:
+            candidates, x_domain = meta.get(key, ([], ""))
+        else:
+            envelope = await asyncio.to_thread(store.read_row, prefix, idx)
+            candidates, x_domain = ([], "")
+            if envelope:
+                _k, _b, candidates, x_domain = _build_batch_item(envelope)
+        result = results.get(key) or {}
+        await asyncio.to_thread(
+            store.put_object, store.cleaned_key(prefix, idx),
+            {"row_index": idx, "parsed": result.get("parsed"),
+             # Stored so phase 3 reads cleaned/ alone: re-deriving the candidate set
+             # would mean fetching every raw object a second time.
+             "candidates": candidates, "x_domain": x_domain, "error": None,
+             # Per-row LLM usage + model, so write_outputs can report token counts,
+             # the model name and the Gemini cost the UI already has tiles for.
+             "usage": result.get("usage"), "model": result.get("model")})
+        counters.bump(rows_cleaned=1)
+    counters.flush()
 
 
 def _build_batch_item(envelope: dict[str, Any]) -> tuple[str, dict, list[str], str]:
@@ -357,9 +506,13 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
                    f"(shard_size={_shard_size()} max_inflight={_max_inflight()})",
                    upload_id=prefix.rsplit("/", 1)[-1])
 
+    # BEFORE computing pending: collect any shard a previous drive paid Google for but
+    # never got the answer to. Skipping this would resubmit those rows and pay twice.
+    await _reattach_batches(prefix, counters)
+
     scraped = await asyncio.to_thread(store.list_done_rows, prefix)
     already = await asyncio.to_thread(store.list_cleaned_rows, prefix)
-    pending = sorted(scraped - already)
+    pending = scraped - already
 
     shard: list[tuple[str, dict]] = []
     meta: dict[str, tuple[list[str], str]] = {}
@@ -368,26 +521,16 @@ async def run_verdict_phase(prefix: str, counters: store.Counters) -> None:
     async def submit(items: list[tuple[str, dict]],
                      item_meta: dict[str, tuple[list[str], str]]) -> None:
         results = await asyncio.to_thread(_run_gemini_batch, prefix, items, counters)
-        for key, _body in items:
-            candidates, x_domain = item_meta.get(key, ([], ""))
-            result = results.get(key) or {}
+        keys = [key for key, _body in items]
+        await _write_verdicts(prefix, keys, results, counters, meta=item_meta)
+        # Only now that every verdict is durable is the in-flight record safe to clear.
+        if keys:
             await asyncio.to_thread(
-                store.put_object, store.cleaned_key(prefix, int(key)),
-                {"row_index": int(key), "parsed": result.get("parsed"),
-                 # Stored so phase 3 reads cleaned/ alone: re-deriving the candidate set
-                 # would mean fetching every raw object a second time.
-                 "candidates": candidates, "x_domain": x_domain, "error": None,
-                 # Per-row LLM usage + model, so write_outputs can report token counts,
-                 # the model name and the Gemini cost the UI already has tiles for.
-                 "usage": result.get("usage"), "model": result.get("model")})
-            counters.bump(rows_cleaned=1)
-        counters.flush()
+                store.delete_object,
+                store.batch_record_key(prefix, sorted(int(k) for k in keys)))
 
     stopped = False
-    for idx in pending:
-        envelope = await asyncio.to_thread(store.get_object, store.raw_key(prefix, idx))
-        if not envelope:
-            continue  # error marker or truncated object: no verdict to seek
+    async for idx, envelope in _iter_scraped_rows(prefix, pending):
         key, body, candidates, x_domain = _build_batch_item(envelope)
         if not candidates and not ai_mode_arrays(envelope)[0]:
             # ZERO EVIDENCE (the billed_empty case: HTTP 200, no text_blocks, no
@@ -493,6 +636,9 @@ async def drive_run(run_id: str) -> None:
             await asyncio.to_thread(_notify_terminal, run_id, pointer, summary)
         except Exception as exc:
             _LOGGER.exception("relationship run %s failed: %s", run_id, exc)
+            # Counted so the re-drive scan can retry a bounded number of times — one
+            # transient error must not park a multi-day run permanently.
+            counters.bump(drive_attempts=1)
             counters.set_phase("failed")
             counters.flush(force=True)
             # Terminalize Supabase too, or the Runs list shows "queued" forever for a run
@@ -593,6 +739,28 @@ def _age_seconds(updated_at: str) -> float:
     return max(0.0, time.time() - calendar.timegm(parsed))
 
 
+def _max_drive_attempts() -> int:
+    return max(1, _get_int_env("RELATIONSHIP_MAX_DRIVE_ATTEMPTS", 3))
+
+
+def _redrivable(status: dict[str, Any]) -> bool:
+    """Should the scan pick this run up?
+
+    A run whose phase is "failed" is worth retrying: drive_run died on an exception, and
+    on a multi-day run that is usually transient. A re-drive costs nothing — every row
+    with an object is skipped, so no scrape.do credits and no Gemini tokens — which is why
+    "failed" used to be a dead end for no good reason: recovery meant hand-typing the run
+    id into the Operations page. Bounded by drive_attempts so a genuinely broken run still
+    stops instead of looping forever.
+    """
+    phase = str(status.get("phase") or "")
+    if phase in _TERMINAL_PHASES:
+        return False
+    if phase == "failed":
+        return int(status.get("drive_attempts") or 0) < _max_drive_attempts()
+    return True
+
+
 async def redrive_stale_runs() -> int:
     """Re-drive runs that stopped making progress. Returns how many were re-driven.
 
@@ -611,8 +779,10 @@ async def redrive_stale_runs() -> int:
         if not prefix or not run_id:
             continue
         status = await asyncio.to_thread(store.read_status, prefix) or {}
-        if str(status.get("phase") or "") in _TERMINAL_PHASES:
+        if not _redrivable(status):
             continue
+        # The staleness gate applies to failed runs too, so a run that dies instantly
+        # cannot hot-loop through its attempts in one scan pass.
         if _age_seconds(status.get("updated_at")) < _stale_seconds():
             continue
         _LOGGER.info("relationship %s: stale, re-driving", run_id)

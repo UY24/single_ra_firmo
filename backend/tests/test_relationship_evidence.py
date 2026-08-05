@@ -4,6 +4,7 @@ import unittest
 from app.services.serpwow.modes.relationship import (
     build_evidence,
     extract_https_urls,
+    flatten_text_blocks,
     row_fields,
 )
 
@@ -106,6 +107,58 @@ class EvidenceTests(unittest.TestCase):
             x_domain="acme.com")
         self.assertEqual(ev["search_attempts"][0]["status"], "error")
         self.assertEqual(ev["search_attempts"][0]["error"], "HTTP 529")
+
+
+STRUCTURED = {
+    "text_blocks": [
+        {"type": "heading", "snippet": "1. RELATIONSHIP", "level": 3},
+        {"type": "paragraph", "snippet": "A FINANCIAL relationship is [CONFIRMED]."},
+        {"type": "heading", "snippet": "2. EVIDENCE", "level": 3},
+        {"type": "list", "list": [
+            {"snippet": "From Founder Lodge: \"Pitchly, March 14 2023, Series A, "
+                        "$7,000,000\" backed by Great North Ventures."},
+            {"snippet": "From Parsers VC: ... associated with the domain pitchly.com."},
+        ]},
+        {"type": "heading", "snippet": "3. WEBSITE", "level": 3},
+        {"type": "paragraph", "snippet": "See https://www.pitchly.com for details."},
+    ],
+    "references": [],
+}
+
+
+class FlattenTextBlocksTests(unittest.TestCase):
+    """The EVIDENCE bullets — dates, amounts, round names, source attributions — live in
+    `list` blocks, which have no `snippet`. Reading only `snippet` dropped every one of
+    them, so the verdict LLM was asked to confirm a financial relationship with the
+    citations proving it removed."""
+
+    def test_list_items_reach_the_evidence_text(self) -> None:
+        text = build_evidence({"response": STRUCTURED}, "gnv.com")[
+            "ai_overview_evidence"][0]["text"]
+        self.assertIn("$7,000,000", text)
+        self.assertIn("Founder Lodge", text)
+        self.assertIn("Parsers VC", text)
+
+    def test_the_answers_own_sections_survive(self) -> None:
+        text = build_evidence({"response": STRUCTURED}, "gnv.com")[
+            "ai_overview_evidence"][0]["text"]
+        for heading in ("1. RELATIONSHIP", "2. EVIDENCE", "3. WEBSITE"):
+            self.assertIn(heading, text)
+        # Order preserved, so the model reads the sections as written.
+        self.assertLess(text.index("1. RELATIONSHIP"), text.index("2. EVIDENCE"))
+        self.assertLess(text.index("2. EVIDENCE"), text.index("3. WEBSITE"))
+
+    def test_a_url_typed_inside_the_answer_is_still_a_candidate(self) -> None:
+        ev = build_evidence({"response": STRUCTURED}, "gnv.com")
+        self.assertIn("https://www.pitchly.com", ev["candidates"])
+
+    def test_a_nested_list_is_not_dropped(self) -> None:
+        blocks = [{"type": "list", "list": [
+            {"snippet": "outer", "list": [{"snippet": "inner detail"}]}]}]
+        self.assertIn("inner detail", flatten_text_blocks(blocks))
+
+    def test_junk_blocks_are_skipped_not_crashed_on(self) -> None:
+        self.assertEqual(flatten_text_blocks([None, 7, {}, {"type": "list"}]), "")
 
 
 if __name__ == "__main__":

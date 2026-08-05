@@ -16,11 +16,16 @@ CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country,Notes\n"
        b"https://acme.com/p,Acme,Dead,US,third\n")
 
 
+# A minimal scrape.do body: what write_row stores, and all read_row needs to conclude the
+# row was one billed 200.
+BODY = {"text_blocks": [{"snippet": "Acme invested in it."}],
+        "references": [{"title": "Y", "link": "https://y.example"}]}
+
+
 def _seed(fake):
     with _patched(fake):
         store.put_bytes(store.input_key(PREFIX), CSV)
-        store.put_object(store.raw_key(PREFIX, 0), {"credits": 10, "request_count": 1,
-                                                    "successful_requests": 1})
+        store.write_row(PREFIX, 0, {"response": BODY})
         store.put_object(store.cleaned_key(PREFIX, 0), {
             "row_index": 0, "candidates": ["https://drinksanzo.com"],
             "x_domain": "acme.com",
@@ -31,8 +36,7 @@ def _seed(fake):
                        "resolved_company_y_name": "Sanzo",
                        "relationship_confidence_score": 92,
                        "website_confidence_score": 88}})
-        store.put_object(store.raw_key(PREFIX, 1), {"credits": 10, "request_count": 1,
-                                                    "successful_requests": 1})
+        store.write_row(PREFIX, 1, {"response": BODY})
         store.put_object(store.cleaned_key(PREFIX, 1), {
             "row_index": 1, "candidates": ["https://yuzu.com"], "x_domain": "acme.com",
             "parsed": {"relationship_status": "not_confirmed",
@@ -258,8 +262,7 @@ class PassthroughCollisionTests(unittest.TestCase):
         fake = FakeS3()
         with _patched(fake):
             store.put_bytes(store.input_key(COLLISION_PREFIX), COLLISION_CSV)
-            store.put_object(store.raw_key(COLLISION_PREFIX, 0),
-                             {"credits": 10, "request_count": 1, "successful_requests": 1})
+            store.write_row(COLLISION_PREFIX, 0, {"response": BODY})
             store.put_object(store.cleaned_key(COLLISION_PREFIX, 0), {
                 "row_index": 0, "candidates": ["https://drinksanzo.com"],
                 "x_domain": "acme.com",
@@ -290,8 +293,7 @@ COST_CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
 def _seed_cost_rows(fake) -> None:
     with _patched(fake):
         store.put_bytes(store.input_key(COST_PREFIX), COST_CSV)
-        store.put_object(store.raw_key(COST_PREFIX, 0),
-                         {"credits": 10, "request_count": 1, "successful_requests": 1})
+        store.write_row(COST_PREFIX, 0, {"response": BODY})
         store.put_object(store.cleaned_key(COST_PREFIX, 0), {
             "row_index": 0, "candidates": ["https://x.example"], "x_domain": "acme.com",
             "parsed": {"relationship_status": "confirmed",
@@ -373,10 +375,9 @@ class CostAccountingTests(unittest.TestCase):
                             b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
                             b"https://acme.com/p,Acme,Sanzo,US\n")
             # Scraped fine, but no cleaned/ object — the shard that owned it died.
-            store.put_object(store.raw_key(COST_PREFIX, 0),
-                             {"credits": 10, "request_count": 1,
-                              "successful_requests": 1,
-                              "text_blocks": [{"snippet": "Acme invested."}]})
+            store.write_row(COST_PREFIX, 0,
+                             {"response": {"text_blocks": [{"snippet": "Acme invested."}],
+                                           "references": []}})
             counters = store.Counters(COST_PREFIX, rows_total=1)
             counters.bump(task_errors=1)
             summary = outputs.write_outputs(COST_PREFIX, counters)
@@ -391,8 +392,7 @@ class CostAccountingTests(unittest.TestCase):
             store.put_bytes(store.input_key(COST_PREFIX),
                             b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
                             b"https://acme.com/p,Acme,Sanzo,US\n")
-            store.put_object(store.raw_key(COST_PREFIX, 0),
-                             {"credits": 10, "request_count": 1, "successful_requests": 1})
+            store.write_row(COST_PREFIX, 0, {"response": BODY})
             store.put_object(store.cleaned_key(COST_PREFIX, 0), {
                 "row_index": 0, "candidates": ["https://drinksanzo.com"],
                 "x_domain": "acme.com",

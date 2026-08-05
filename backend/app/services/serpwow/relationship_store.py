@@ -2,9 +2,19 @@
 """S3-only run store for the relationship pipeline.
 
 There is NO local disk and NO state.json. Object presence IS the state:
-  raw/<shard>/row_NNNNNN.json        -> the row is scraped (done)
-  raw/<shard>/row_NNNNNN.error.json  -> the row died after every retry
-  cleaned/<shard>/row_NNNNNN.json    -> the row has a Gemini verdict
+  raw/<shard>/row_NNNNNN.json      -> scrape.do's response body, EXACTLY as sent
+  errors/<shard>/row_NNNNNN.json   -> the row died after every retry, and why
+  cleaned/<shard>/row_NNNNNN.json  -> the row has a Gemini verdict
+  batches/<first>-<last>.json      -> a Gemini shard is IN FLIGHT for those rows
+
+``raw/`` holds NOTHING but the provider's own bytes — no wrapper, no fields of ours, not
+even re-serialised JSON. There is no sidecar object either: everything a sidecar would
+have carried is already somewhere else. The query and locale come back inside the
+response's own ``search_parameters``; the row index IS the filename; the row's CSV fields
+are in input.csv, which both later phases stream anyway; credits are 10 per successful
+call; and the run's request total is a counter in status.json.
+
+A row is DONE when its raw object exists, or its error object does.
 
 NNNNNN counts from 1 (input.csv's first data row is row_000001); <shard> is that row's
 0-based index // SHARD_SIZE, so folder 0 holds rows 1-1000, folder 1 holds 1001-2000.
@@ -67,15 +77,40 @@ def _row_name(idx: int) -> str:
 
 
 def raw_key(prefix: str, idx: int) -> str:
+    """The provider's response body, verbatim. Nothing of ours goes in here."""
     return f"{prefix}/raw/{_shard(idx)}/{_row_name(idx)}.json"
 
 
 def error_key(prefix: str, idx: int) -> str:
-    return f"{prefix}/raw/{_shard(idx)}/{_row_name(idx)}.error.json"
+    """A row that died after every retry. NOT under raw/ — raw/ is the provider's bytes,
+    and this is our record of a call that never produced any."""
+    return f"{prefix}/errors/{_shard(idx)}/{_row_name(idx)}.json"
 
 
 def cleaned_key(prefix: str, idx: int) -> str:
     return f"{prefix}/cleaned/{_shard(idx)}/{_row_name(idx)}.json"
+
+
+def batch_record_key(prefix: str, indices: list[int]) -> str:
+    """Where one in-flight Gemini shard's job name is remembered.
+
+    Derived from the shard's first and last row index so the submitter and the code that
+    clears it can both compute it without passing it around. Indices within a run are
+    disjoint, so two live shards can never collide.
+    """
+    first, last = (int(indices[0]), int(indices[-1])) if indices else (0, 0)
+    return f"{prefix}/batches/{first + 1:06d}-{last + 1:06d}.json"
+
+
+def list_batch_records(prefix: str) -> list[dict[str, Any]]:
+    """Every remembered in-flight shard, each with the key it lives at so the caller can
+    delete it once its verdicts are durable."""
+    out: list[dict[str, Any]] = []
+    for key in iter_keys(f"{prefix}/batches/"):
+        record = get_object(key)
+        if record and record.get("name"):
+            out.append({**record, "record_key": key})
+    return out
 
 
 def status_key(prefix: str) -> str:
@@ -147,11 +182,92 @@ def delete_object(key: str) -> None:
         pass
 
 
+DELETE_BATCH_SIZE = 1000   # S3's per-request maximum for delete_objects
+
+
+def delete_objects(keys: list[str]) -> int:
+    """Delete many keys and return how many S3 CONFIRMED gone.
+
+    Not a loop over delete_object: that is one HTTPS round-trip per key, so clearing 50k
+    error markers took 20+ minutes inside a single web request and timed the client out.
+    delete_objects takes 1000 keys per call, turning 50k deletes into 50 calls.
+
+    The count is confirmed, not assumed — a swallowed failure would be reported to the
+    user as a retried row that then never gets rescraped, because its error marker is
+    still there and marks it done.
+    """
+    deleted = 0
+    for start in range(0, len(keys), DELETE_BATCH_SIZE):
+        chunk = keys[start:start + DELETE_BATCH_SIZE]
+        try:
+            response = _client().delete_objects(
+                Bucket=_bucket(),
+                Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": False},
+            )
+        except Exception:
+            continue   # whole chunk unconfirmed; the next re-drive can retry it
+        deleted += len(response.get("Deleted") or [])
+    return deleted
+
+
 def iter_keys(prefix: str) -> Iterator[str]:
     paginator = _client().get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
         for obj in page.get("Contents", []) or []:
             yield obj["Key"]
+
+
+# Credits per successful (HTTP 200) scrape.do call. Duplicated from
+# scrapedo_maps_client.CREDITS_PER_CALL rather than imported, to keep this store free of
+# any provider-client dependency.
+CREDITS_PER_CALL = 10
+
+
+def write_row(prefix: str, idx: int, envelope: dict[str, Any]) -> None:
+    """Persist one scraped row: ONE object, holding the provider's body and nothing else.
+
+    ``response_text`` is written as bytes exactly as scrape.do sent them — no re-encoding,
+    no re-serialisation, no wrapper. This object is read by hand to judge the search
+    prompt, so anything of ours in it is in the way.
+
+    Nothing of ours is lost by that, because none of it was ours to begin with: the query
+    and locale come back inside ``search_parameters``, the row index is the filename, the
+    CSV fields are in input.csv, credits are 10 per successful call, and the run's request
+    total already lives in status.json's counters.
+
+    A row that died after every retry has no body worth keeping, so it gets an object
+    under ``errors/`` instead — that one IS ours (attempts, message, category), which is
+    how a re-drive knows not to retry it free forever and "Rerun failed" can find it.
+    """
+    body = envelope.get("response_text")
+    if not isinstance(body, str) and isinstance(envelope.get("response"), dict):
+        # No wire text captured (an injected/synthesised envelope): serialise the parsed
+        # body rather than writing an empty object. Still only the provider's fields.
+        body = json.dumps(envelope["response"], ensure_ascii=False)
+    if envelope.get("error"):
+        put_object(error_key(prefix, idx),
+                   {k: v for k, v in envelope.items()
+                    if k not in ("response", "response_text")})
+        return
+    put_bytes(raw_key(prefix, idx),
+              (body if isinstance(body, str) else "").encode("utf-8"),
+              content_type="application/json")
+
+
+def read_row(prefix: str, idx: int) -> Optional[dict[str, Any]]:
+    """One row's envelope: the stored provider body plus the counts implied by it.
+
+    A row with a raw object was, by definition, one billed HTTP 200 — so credits and the
+    success count are constants, not something worth a second object per row. The one
+    figure that genuinely cannot be recovered is how many ATTEMPTS the row took before
+    that 200; the run-level total is in status.json's ``requests`` counter instead.
+    """
+    response = get_object(raw_key(prefix, idx))
+    if response is not None:
+        return {"response": response, "request_count": 1, "successful_requests": 1,
+                "failed_requests": 0, "credits": CREDITS_PER_CALL,
+                "error": None, "error_category": None}
+    return get_object(error_key(prefix, idx))
 
 
 # ---------------------------------------------------------------- resume
@@ -170,13 +286,18 @@ def _idx_from_key(key: str) -> Optional[int]:
 
 
 def list_done_rows(prefix: str) -> set[int]:
-    """Row indices that already have a raw OR error object.
+    """Row indices that have a provider response, or a terminal error marker.
 
-    ONE paginated LIST — 500 requests at 1000 keys/page for 500k rows, a few seconds —
-    instead of 500k HEADs. Every later skip check is an in-memory set lookup.
+    Paginated LISTs — a few seconds for 500k rows — instead of 500k HEADs. Every later
+    skip check is an in-memory set lookup.
+
     """
     done: set[int] = set()
     for key in iter_keys(f"{prefix}/raw/"):
+        idx = _idx_from_key(key)
+        if idx is not None:
+            done.add(idx)
+    for key in iter_keys(f"{prefix}/errors/"):
         idx = _idx_from_key(key)
         if idx is not None:
             done.add(idx)
@@ -299,9 +420,12 @@ class Counters:
     # scrape_seconds / llm_seconds are cumulative per-phase wall clock, so the run can
     # answer "how long did scrape.do take vs the LLM" without a second store. Integers
     # like every other field, so status.json stays ~2KB at any run size.
+    # drive_attempts: how many times drive_run has died on this run. Lets the re-drive
+    # scan retry a run whose phase is "failed" a bounded number of times instead of
+    # treating one transient error as permanent — see relationship_runner.
     _FIELDS = ("rows_total", "rows_scraped", "rows_failed", "rows_billed_empty",
                "rows_cleaned", "requests", "credits", "task_errors",
-               "scrape_seconds", "llm_seconds")
+               "scrape_seconds", "llm_seconds", "drive_attempts")
 
     def __init__(self, prefix: str, rows_total: int = 0, phase: str = "queued",
                  created_at: str | None = None) -> None:

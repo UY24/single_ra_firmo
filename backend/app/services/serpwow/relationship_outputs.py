@@ -174,10 +174,8 @@ def _write_outputs(prefix: str, counters: store.Counters,
         idx = int(original["row_index"])
         fields = row_fields(original)
 
-        envelope = store.get_object(store.raw_key(prefix, idx))
+        envelope = store.read_row(prefix, idx)
         row_never_processed = False
-        if envelope is None:
-            envelope = store.get_object(store.error_key(prefix, idx))
         if envelope is None:
             # Not a scrape.do failure — this row never got a raw or error object at
             # all (crash before either write landed). Attributing it to "scrapedo"
@@ -189,10 +187,14 @@ def _write_outputs(prefix: str, counters: store.Counters,
         requests += int(envelope.get("request_count") or 0)
         successes += row_successes
         credits += int(envelope.get("credits") or 0)
-        if envelope.get("billed_empty"):
-            billed_empty += 1
-        if not envelope.get("error") and not ai_mode_arrays(envelope)[0]:
-            no_ai_text += 1
+        # Derived from the stored response, not from a flag written beside it: a billed
+        # 200 that returned neither prose nor citations.
+        blocks, refs = ai_mode_arrays(envelope)
+        if not envelope.get("error"):
+            if not blocks and not refs:
+                billed_empty += 1
+            if not blocks:
+                no_ai_text += 1
         if envelope.get("error"):
             # Only the attempts that never got a billed 200 count as "error requests"
             # — a billed HTTP-200-with-error-body call (successful_requests=1) is a
@@ -246,6 +248,11 @@ def _write_outputs(prefix: str, counters: store.Counters,
     # leave no per-row error marker — a verdict shard that died takes its rows' verdicts
     # with it and they read as plain "unclear"/llm_missing — so without this a run whose
     # whole already-paid-for shard was discarded reported a clean "completed".
+    # ATTEMPTS, unlike every other figure here, cannot be recovered from the objects: a
+    # row that took four tries and a row that took one both leave a single response. The
+    # live counter is the only place that total exists, so it wins when it is higher.
+    requests = max(requests, int(counters.values.get("requests") or 0))
+
     task_errors = int(counters.values.get("task_errors") or 0)
     run_status = ("completed_with_errors" if outcomes["errored"] or task_errors
                   else "completed")

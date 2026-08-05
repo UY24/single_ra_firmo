@@ -310,7 +310,7 @@ class FailureAnalysisTests(unittest.TestCase):
                     "row_index": idx, "error": f"boom {idx}",
                     "error_category": category,
                     "fields": {"y_name": f"Y{idx}"}})
-            store.put_object(store.raw_key(self.PREFIX, 3), {"row_index": 3})
+            store.write_row(self.PREFIX, 3, {"row_index": 3})
             r = TestClient(app).get("/uploads/run7/failure-analysis",
                                     params={"sample_limit": 100})
 
@@ -418,7 +418,7 @@ class FileStopAndRerunTests(unittest.TestCase):
         published = mock.AsyncMock()
         with _patched(fake):
             store.put_object(store.error_key(self.PREFIX, 3), {"error": "boom"})
-            store.put_object(store.raw_key(self.PREFIX, 4), {"ok": True})
+            store.write_row(self.PREFIX, 4, {"ok": True})
             store.request_stop(self.PREFIX)
         with _patched(fake), mock.patch(
                 "app.services.serpwow.engine.publish_relationship_run", new=published):

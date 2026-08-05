@@ -74,6 +74,44 @@ def ai_mode_arrays(envelope: dict[str, Any]) -> tuple[list[Any], list[Any]]:
             refs if isinstance(refs, list) else [])
 
 
+def flatten_text_blocks(blocks: list[Any]) -> str:
+    """Every block AI Mode returned, in order, with its structure kept.
+
+    Reading only each block's ``snippet`` silently dropped the most valuable part of the
+    answer: a ``list`` block has no ``snippet`` at all — its content lives in ``list`` —
+    and that is exactly where AI Mode puts the EVIDENCE bullets with the dates, amounts,
+    round names and source attributions. The verdict LLM was being asked to confirm a
+    financial relationship while the citations proving it were thrown away.
+
+    Headings are kept as headings so the answer's own sections survive, and list items
+    become bullets. Recursive, because a list item may itself carry a nested list.
+    """
+    lines: list[str] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if isinstance(node, str):
+            if node.strip():
+                lines.append(f"{'  ' * depth}- {node.strip()}")
+            return
+        if not isinstance(node, dict):
+            return
+        snippet = str(node.get("snippet") or "").strip()
+        kind = str(node.get("type") or "")
+        children = node.get("list")
+        if kind == "heading" and snippet:
+            lines.append("")
+            lines.append(f"{snippet}")
+        elif snippet:
+            lines.append(f"{'  ' * depth}- {snippet}" if depth else snippet)
+        if isinstance(children, list):
+            for child in children:
+                walk(child, depth + 1 if snippet else depth)
+
+    for block in blocks or []:
+        walk(block)
+    return "\n".join(lines).strip()
+
+
 def extract_https_urls(text: str) -> list[str]:
     """Plain-text https:// URLs typed into the AI Mode prose.
 
@@ -99,11 +137,7 @@ def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
     hallucinated URL being reported as Company Y's website.
     """
     blocks, references = ai_mode_arrays(envelope)
-    text = "\n\n".join(
-        str(b.get("snippet") or "").strip()
-        for b in blocks
-        if isinstance(b, dict) and str(b.get("snippet") or "").strip()
-    )
+    text = flatten_text_blocks(blocks)
 
     sources: list[dict[str, str]] = []
     raw_candidates: list[str] = []

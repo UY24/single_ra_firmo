@@ -6,7 +6,6 @@ from unittest.mock import patch
 from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
     build_relationship_prompt,
-    choose_relationship_and_website,
     update_relationship_block,
 )
 
@@ -110,53 +109,10 @@ class TestApplyRelationshipGate(unittest.TestCase):
         self.assertEqual(status, "unclear")
 
 
-class TestChooseRelationshipAndWebsite(unittest.TestCase):
-    def test_happy_path_parses_json_and_returns_usage(self):
-        llm_json = json.dumps({
-            "resolved_company_y_name": "Modal Labs",
-            "relationship_status": "confirmed",
-            "relationship_summary": "Eastlink is an investor in Modal Labs.",
-            "relationship_evidence": ["Eastlink participated in Modal's Series A."],
-            "official_website": "https://modal.com/",
-            "relationship_confidence_score": 96,
-            "website_confidence_score": 92,
-            "reason": "AI overview names both parties.",
-            "extra_flags": [],
-        })
-        usage = {"promptTokenCount": 100, "candidatesTokenCount": 50}
-        with patch("app.services.serpwow.gemini_llm._gemini_generate_content_json",
-                   return_value=(llm_json, usage, None)) as seam:
-            parsed, error, model, out_usage = choose_relationship_and_website(
-                "eastlinkcap", "Modal", "https://eastlinkcap.com/portfolio", "", "",
-                CANDS, EVIDENCE,
-                [{"attempt": "phase1_relationship_and_url", "query": "q"}],
-                "eastlinkcap.com")
-        self.assertIsNone(error)
-        self.assertEqual(parsed["relationship_status"], "confirmed")
-        self.assertEqual(out_usage, usage)
-        prompt_sent = seam.call_args[0][1]
-        self.assertIn("eastlinkcap", prompt_sent)
-        self.assertIn("Modal", prompt_sent)
-        self.assertIn("modal.com", prompt_sent)
-        self.assertIn("eastlinkcap.com", prompt_sent)
-        self.assertIn("company_x_domain", prompt_sent)
-        self.assertIn("official portfolio page", prompt_sent)
-        self.assertIn("1. Website: https://modal.com/", prompt_sent)
-        self.assertNotIn('"type"', prompt_sent)
-
-    def test_http_error_surfaces(self):
-        with patch("app.services.serpwow.gemini_llm._gemini_generate_content_json",
-                   return_value=(None, None, "Gemini HTTPError: 500")):
-            parsed, error, model, usage = choose_relationship_and_website(
-                "x", "y", "https://x.test/p", "", "", CANDS, [], [], "x.test")
-        self.assertIsNone(parsed)
-        self.assertIn("500", error)
-
-
 class TestBuildRelationshipPrompt(unittest.TestCase):
     def test_prompt_contains_contract_and_evidence(self):
         prompt = build_relationship_prompt(
-            "m25vc", "Sanzo", "https://m25vc.com/portfolio", "NYC", "US", CANDS,
+            "m25vc", "Sanzo", "https://m25vc.com/portfolio", CANDS,
             EVIDENCE, [{"attempt": "phase1_relationship_and_url", "query": "q1"}],
             "eastlinkcap.com")
         for needle in ("relationship_status", "confirmed", "not_confirmed", "unclear",
@@ -171,7 +127,7 @@ class TestBuildRelationshipPrompt(unittest.TestCase):
     def test_prompt_falls_back_to_name_when_no_domain(self):
         # No domain: company_x_domain serializes to null but the X name is still present.
         prompt = build_relationship_prompt(
-            "m25vc", "Sanzo", "https://m25vc.com/portfolio", "NYC", "US", CANDS,
+            "m25vc", "Sanzo", "https://m25vc.com/portfolio", CANDS,
             EVIDENCE, [{"attempt": "phase1_relationship_and_url", "query": "q1"}],
             "")
         self.assertIn("company_x_domain", prompt)

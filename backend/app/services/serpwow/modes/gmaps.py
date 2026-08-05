@@ -1,9 +1,10 @@
 # backend/app/services/serpwow/modes/gmaps.py
 """gmaps mode executor (scrape.do Google Maps search).
 
-Migrated off SerpWow Places 2026-08: one scrape.do request per row instead of a
-places search plus one place_details call per result. Billing is credits, not USD —
-this executor emits no ``serpwow_*`` cost keys. See ``scrapedo_maps_client``.
+One scrape.do request per row: ``local_results[]`` already carries website/title/
+address/phone/rating/reviews/type inline, which is everything this pipeline reads.
+Billing is credits, not USD, so this executor emits no ``serpwow_*`` cost keys.
+See ``scrapedo_maps_client``.
 """
 from __future__ import annotations
 
@@ -73,12 +74,10 @@ async def execute_gmaps_lookup(
     phone = first_place.get("phone")
     rating = first_place.get("rating")
     reviews = first_place.get("reviews")
-    # scrape.do names these `types` (list) / `type` (str); the SerpWow shape used
-    # `categories`/`category`. Read both so old and new payloads fill `industry`.
+    # scrape.do names these `types` (list) / `type` (str).
     categories = (
-        first_place.get("categories")
-        or first_place.get("types")
-        or [c for c in (first_place.get("category"), first_place.get("type")) if c]
+        first_place.get("types")
+        or [c for c in (first_place.get("type"),) if c]
     )
 
     summary = "Google Maps details lookup successfully resolved." if gmaps_context.get("used") else "Google Maps lookup failed."
@@ -162,8 +161,6 @@ async def execute_gmaps_lookup(
     context: dict[str, Any] = {
         "pipeline": PIPELINE_GMAPS,
         "success": bool(official_website),
-        "used_proxy": False,
-        "blocked": False,
         "error": gmaps_context.get("error"),
         # WITHOUT raw_response: that payload is already persisted verbatim as this
         # row's serpwow_response/ artifact (+ S3 mirror), and nothing reads it back
@@ -191,10 +188,11 @@ async def execute_gmaps_lookup(
             "no_results": gmaps_no_results,
             "billed_empty": gmaps_billed_empty,
         }],
-        # No serpwow_* keys: gmaps left SerpWow in 2026-08 and scrape.do bills credits,
-        # not per-search USD. build_summary routes on the scrapedo_* keys and skips
-        # SerpWow accounting for this row entirely. total/gemini stay because the
-        # GMAPS_CONFIDENCE_MODE=llm path is a real USD cost.
+        # scrape.do bills credits, not per-search USD, so there are no serpwow_* keys
+        # here — and their ABSENCE is load-bearing: build_summary routes on the
+        # scrapedo_* keys and would otherwise price this row's single call at
+        # SERPWOW_USD_PER_SEARCH. total/gemini stay because GMAPS_CONFIDENCE_MODE=llm
+        # is a real USD cost.
         "cost_breakdown": {
             # requests == successful + failed, so a run reconciles as
             # "N calls = X succeeded + Y failed"; only the successful ones are billed.
@@ -233,6 +231,7 @@ async def execute_gmaps_lookup(
         services=[],
         # massive_proxy_cost_usd / serpwow_cost_usd left unset (None): neither provider
         # is involved in a gmaps row, so "not applicable" beats a meaningless $0.00.
+        # They stay on the shared CrawlResponse for gsearch/firmographics.
         gemini_cost_usd=gemini_cost_usd,
         total_cost_usd=gemini_cost_usd,
         context=context,

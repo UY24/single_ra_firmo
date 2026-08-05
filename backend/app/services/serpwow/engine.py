@@ -2460,12 +2460,16 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
-    names = ["state.json", "output.json"]
     if pipe == PIPELINE_RELATIONSHIP:
-        names += ["confirmed_relation.csv", "notconfirmed_relation.csv",
-                  "report.json", "run.log"]
-    elif pipe in REPORTING_PIPELINES:
-        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
+        # No state.json / output.json: this pipeline keeps no state dict and no local
+        # disk — S3 object presence IS its state. Advertising them produced two links
+        # to objects that never exist.
+        names = ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                 "report.json", "run.log"]
+    else:
+        names = ["state.json", "output.json"]
+        if pipe in REPORTING_PIPELINES:
+            names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -4014,7 +4018,6 @@ async def _create_upload_with_rows(
     extra_state: Optional[dict[str, Any]] = None,
     run_total_rows: Optional[int] = None,
 ) -> dict[str, Any]:
-    _PAIR_EXTRA_KEYS = ("x_name", "input_url", "city", "source_row_indices")
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
 
@@ -4102,7 +4105,6 @@ async def _create_upload_with_rows(
                 "s3_html_key": None,
                 "s3_serpwow_json_key": None,
                 "result": None,
-                **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row},
             }
             for row in parsed_rows
         ],
@@ -4136,7 +4138,6 @@ async def _create_upload_with_rows(
             "phase": phase,
             "uploaded_at": _now_iso(),
             "upload_company_name": company_name,
-            **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row and k != "source_row_indices"},
         }
         try:
             await publish_job(job)
@@ -4249,7 +4250,7 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    rows = parsed["pairs"]  # one entry per CSV data row (no dedup)
+    rows = parsed["rows"]
     total = len(parsed["original_rows"])
     warnings: list[str] = []
     if not rows:
@@ -4260,16 +4261,14 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
         "relationship": True,
         "warnings": warnings,
         "columns_detected": parsed["columns_detected"],
-        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url"],
         "sample_rows": [
             {
-                "company_name_x": p["x_name"],
-                "company_name_y": p["y_name"],
-                "input_url": p["input_url"],
-                "city": p["city"],
-                "country": p["country"],
+                "company_name_x": r["x_name"],
+                "company_name_y": r["y_name"],
+                "input_url": r["input_url"],
             }
-            for p in rows[:5]
+            for r in rows[:5]
         ],
     }
 
@@ -4296,9 +4295,8 @@ async def create_relationship_upload(
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # No empty-pairs guard: parse_relationship_csv raises on a blank required value and on
-    # a header-only CSV, so parsed["pairs"] is never empty when it returns.
-    # SERPWOW_API_KEY is deliberately NOT checked: relationship left SerpWow in 2026-08.
+    # No empty-rows guard: parse_relationship_csv raises on a blank required value and on
+    # a header-only CSV, so parsed["rows"] is never empty when it returns.
     for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
         if not os.getenv(env_key, "").strip():
             raise HTTPException(
@@ -5240,9 +5238,11 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "is_batch": gs["is_batch"],
                 "cost": gs["cost"],
                 "token_usage": gs["token_usage"],
-                **{k: gs[k] for k in ("blank_rows", "searchable_rows", "unique_pairs",
-                                      "relationship_breakdown", "empty_response_breakdown") if k in gs},
-                **({"total_rows_original": gs["total_rows"]} if "unique_pairs" in gs else {}),
+                # blank_rows / searchable_rows / unique_pairs / total_rows_original were
+                # dropped with relationship's (X, Y) dedup — nothing produces them and
+                # nothing in the UI reads them.
+                **{k: gs[k] for k in ("relationship_breakdown",
+                                      "empty_response_breakdown") if k in gs},
             }
         except Exception:
             serpwow_summary = None

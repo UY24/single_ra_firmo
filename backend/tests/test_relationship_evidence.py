@@ -15,12 +15,14 @@ class RowFieldsTests(unittest.TestCase):
                              "row_index": 4})
         self.assertEqual(fields["x_name"], "Acme")
         self.assertEqual(fields["y_name"], "Sanzo")
-        self.assertEqual(fields["country"], "US")
+        self.assertEqual(fields["input_url"], "https://acme.com/p")
         self.assertEqual(fields["row_index"], 4)
+        # A Country column in the CSV is ignored: this pipeline has no location input.
+        self.assertNotIn("country", fields)
 
-    def test_absent_optional_columns_become_empty_strings(self) -> None:
+    def test_absent_columns_become_empty_strings(self) -> None:
         fields = row_fields({"Company_Name_Y": "Y", "row_index": 0})
-        self.assertEqual(fields["city"], "")
+        self.assertEqual(fields["input_url"], "")
         self.assertEqual(fields["x_name"], "")
 
 ENVELOPE = {

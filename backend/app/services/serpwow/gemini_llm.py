@@ -718,21 +718,20 @@ def build_relationship_prompt(
     x_name: str,
     y_name: str,
     input_url: str,
-    city: str,
-    country: str,
     candidates: list[str],
     ai_overview_evidence: list[dict[str, Any]],
     search_attempts: list[dict[str, Any]],
     x_domain: str = "",
 ) -> str:
-    """Prompt for the relationship pipeline (spec §4). Shared by the per-row
-    call (choose_relationship_and_website) and the Gemini-batch item builder so
-    both modes judge with identical instructions."""
+    """Verdict prompt for the relationship pipeline's Gemini Batch phase.
+
+    The row has three inputs and no location: Company X, Company Y and X's portfolio
+    page (x_domain is derived from that URL).
+    """
     input_obj = {
         "company_x": x_name, "company_x_domain": x_domain or None,
         "company_x_official_portfolio_page": input_url,
         "company_y": y_name,
-        "city": city or None, "country": country or None,
     }
     evidence_sections: list[str] = []
     for item in ai_overview_evidence or []:
@@ -789,7 +788,7 @@ def build_relationship_prompt(
         "- Set official_website to null unless relationship_status is 'confirmed'.\n"
         "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
         "- relationship_confidence_score is 0-100 = how strongly the provided evidence\n"
-        "  (AI Overview text/sources) shows a FINANCIAL relationship EXISTS between company_x\n"
+        "  (AI Mode text/sources) shows a FINANCIAL relationship EXISTS between company_x\n"
         "  and company_y: 0 = no relationship or no evidence, 100 = clearly evidenced. This is\n"
         "  confidence that the relationship is real, NOT confidence in your verdict — so a\n"
         "  not_confirmed verdict must carry a LOW score.\n"
@@ -801,46 +800,9 @@ def build_relationship_prompt(
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"Normalized AI Overview evidence:\n{evidence_text}\n\n"
+        f"Normalized AI Mode evidence:\n{evidence_text}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
-
-
-def choose_relationship_and_website(
-    x_name: str,
-    y_name: str,
-    input_url: str,
-    city: str,
-    country: str,
-    candidates: list[str],
-    ai_overview_evidence: list[dict[str, Any]],
-    search_attempts: list[dict[str, Any]],
-    x_domain: str = "",
-) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
-    """Per-pair relationship verdict + URL pick. Returns (parsed, error, model, usage)
-    following choose_final_website_with_gemini's convention. Validation of the parsed
-    output (candidate-set, X-domain, the confirmed-gate) lives in
-    apply_relationship_gate — callers MUST run it; this function only calls the model."""
-    configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    ordered_models: list[str] = []
-    for model_name in (configured_model, "gemini-2.5-flash-lite"):
-        if model_name and model_name not in ordered_models:
-            ordered_models.append(model_name)
-    prompt = build_relationship_prompt(
-        x_name, y_name, input_url, city, country, candidates,
-        ai_overview_evidence, search_attempts, x_domain)
-    last_error: Optional[str] = None
-    for model in ordered_models:
-        text, usage, error = _gemini_generate_content_json(model, prompt)
-        if error:
-            last_error = error
-            continue
-        parsed = _parse_json_from_text(text or "")
-        if parsed is None:
-            last_error = "Gemini returned non-JSON output for relationship prompt."
-            continue
-        return parsed, None, model, usage
-    return None, last_error or "Gemini relationship call failed.", None, None
 
 
 _VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}

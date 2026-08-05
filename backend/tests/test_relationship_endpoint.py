@@ -309,7 +309,7 @@ class FailureAnalysisTests(unittest.TestCase):
                 store.put_object(store.error_key(self.PREFIX, idx), {
                     "row_index": idx, "error": f"boom {idx}",
                     "error_category": category,
-                    "fields": {"y_name": f"Y{idx}", "country": "us"}})
+                    "fields": {"y_name": f"Y{idx}"}})
             store.put_object(store.raw_key(self.PREFIX, 3), {"row_index": 3})
             r = TestClient(app).get("/uploads/run7/failure-analysis",
                                     params={"sample_limit": 100})
@@ -476,7 +476,7 @@ class TestRelationshipPreviewEndpoint(unittest.TestCase):
         self.assertNotIn("unique_pairs", body)
         self.assertEqual(body["columns_detected"]["company_name_y"], "Company_Name_Y")
         self.assertEqual(body["columns_detected"]["input_url"], "Input_URL")
-        self.assertIsNone(body["columns_detected"]["city"])
+        self.assertNotIn("city", body["columns_detected"])
         self.assertEqual(len(body["sample_rows"]), 2)
         sample = body["sample_rows"][0]
         self.assertEqual(sample["company_name_x"], "eastlinkcap")

@@ -391,23 +391,23 @@ function verdictSection(rb) {
   );
 }
 
-// Empty 200-OK SerpWow responses (no AI overview + 0 candidates). relationship
-// splits by phase (both / phase 1 only / phase 2 only); gsearch by all / some.
+// Rows billed for an HTTP 200 that carried nothing usable. Branch on the DATA:
+// relationship makes ONE scrape.do AI Mode call per row and reports {empty: N};
+// gsearch runs several SerpWow phases per row and splits them all / some.
 // `eb` is serpwow_summary.empty_response_breakdown.
-function emptyResponsesSection(eb, isRel) {
-  const chips = isRel
-    ? [
-        chip("Both phases", fmtNum(eb.both_phases ?? 0), (eb.both_phases ?? 0) ? "danger" : "muted"),
-        chip("Phase 1 only", fmtNum(eb.phase1_only ?? 0), (eb.phase1_only ?? 0) ? "warn" : "muted"),
-        chip("Phase 2 only", fmtNum(eb.phase2_only ?? 0), (eb.phase2_only ?? 0) ? "warn" : "muted"),
-      ]
+function emptyResponsesSection(eb) {
+  const single = eb.empty != null;
+  const chips = single
+    ? [chip("Empty", fmtNum(eb.empty), eb.empty ? "danger" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
       ];
   return el("section", { class: "detail-section" },
     sectionHeading("Empty responses (HTTP 200)",
-      "Rows where ScrapeDo returned 200 but no AI Mode info got"),
+      single
+        ? "Rows where scrape.do returned 200 with no AI Mode text and no references"
+        : "Rows where the provider returned 200 but no AI overview and no candidates"),
     el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
   );
 }
@@ -784,7 +784,7 @@ function renderLegacyStatus(root, ref, s) {
       : costSection(g));
   }
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
-  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
   }

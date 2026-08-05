@@ -1,10 +1,9 @@
 # backend/app/services/serpwow/modes/relationship.py
 """Relationship row logic over scrape.do Google AI Mode evidence.
 
-The LLM half of this pipeline is UNCHANGED — build_relationship_prompt,
-apply_relationship_gate and update_relationship_block keep their rules. What changed in
-the 2026-08 migration is only the evidence handed to them: one scrape.do AI Mode call
-per row (text_blocks + references) instead of three SerpWow AI-Overview searches.
+One AI Mode call per row supplies the evidence (text_blocks + references);
+build_relationship_prompt, apply_relationship_gate and update_relationship_block turn
+it into a verdict.
 
 Everything here is a pure function. Orchestration lives in relationship_runner.py.
 """
@@ -41,7 +40,11 @@ def _column(row: dict[str, Any], *aliases: str) -> str:
 
 
 def row_fields(row: dict[str, Any]) -> dict[str, Any]:
-    """The five logical fields the prompt needs, from arbitrary CSV headers.
+    """The three logical fields the prompt needs, from arbitrary CSV headers.
+
+    Three, not five: an OCR'd portfolio page yields a Company X name, a Company Y name
+    and the page's own URL — no location. City/country were carried over from the
+    SerpWow pipeline, where they narrowed a keyword search; nothing supplies them here.
 
     Lives here rather than in relationship_runner so relationship_outputs can use it
     without importing the runner — the runner imports write_outputs, so the reverse
@@ -52,8 +55,6 @@ def row_fields(row: dict[str, Any]) -> dict[str, Any]:
         "x_name": _column(row, "company_name_x", "company_x"),
         "y_name": _column(row, "company_name_y", "company_y"),
         "input_url": _column(row, "input_url"),
-        "city": _column(row, "city", "town"),
-        "country": _column(row, "country", "country_name", "nation"),
     }
 
 
@@ -138,7 +139,8 @@ def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
         "result": result_summary,
         "ai_overview_present": bool(text),
         "candidate_count": len(candidates),
-        # Kept so empty_response_breakdown can spot a billed 200 that returned nothing.
+        # A billed 200 that returned nothing. The run-level count comes off the
+        # envelope in relationship_outputs; this copy is what the verdict prompt sees.
         "billed_empty": bool(envelope.get("billed_empty")),
     }]
 
@@ -221,10 +223,10 @@ def build_row_result(
 def build_attempt_log(envelope: dict[str, Any], candidates: list[str]) -> str:
     """The row's audit trail, one line per fact, for the output CSVs' attempt_log cell.
 
-    One AI Mode call replaced three SerpWow phase queries, so there is a single attempt
-    rather than a per-phase list — but "one attempt" is not "nothing worth recording":
-    without this there is no way to tell a verdict reached on 12 references from one
-    reached on an empty response, which is exactly what you need when judging the prompt.
+    There is a single attempt per row rather than a per-phase list — but "one attempt"
+    is not "nothing worth recording": without this there is no way to tell a verdict
+    reached on 12 references from one reached on an empty response, which is exactly
+    what you need when judging the prompt.
 
     Newline-joined, matching EntityResult.attempt_log_csv: each line renders on its own
     row INSIDE one quoted CSV cell.

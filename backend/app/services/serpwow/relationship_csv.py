@@ -1,11 +1,9 @@
-"""CSV parsing for the relationship pipeline (spec §2).
+"""CSV parsing for the relationship pipeline.
 
-Input: OCR-results CSV with required Input_URL, Company_Name_X, and
-Company_Name_Y values on every row, optional city/country, and arbitrary
-passthrough columns. Every row is processed independently — one row in, one row
-out (no (X, Y) deduplication). Each row is still represented as a "pair" carrying
-its single source row index so the downstream engine/reporting machinery is
-unchanged (source_row_indices is always a 1-element list).
+Input: OCR-results CSV with required Input_URL, Company_Name_X and Company_Name_Y
+values on every row, plus arbitrary passthrough columns. Those three are the ONLY
+fields this pipeline gets — there is no location, because the OCR'd portfolio page
+does not carry one. Every row is processed independently: one row in, one row out.
 """
 from __future__ import annotations
 
@@ -25,8 +23,6 @@ def _normalize_header(header: str) -> str:
 _Y_ALIASES = ("company_name_y", "company_y")
 _X_ALIASES = ("company_name_x", "company_x")
 _URL_ALIASES = ("input_url",)
-_CITY_ALIASES = ("city", "town")
-_COUNTRY_ALIASES = ("country", "country_name", "nation")
 
 
 def _find_column(normalized: dict[str, str], aliases: tuple[str, ...]) -> str | None:
@@ -62,14 +58,9 @@ def parse_relationship_csv(raw: bytes) -> dict:
             "Missing required column Input_URL. "
             f"Found: {header}"
         )
-    city_col = _find_column(normalized, _CITY_ALIASES)
-    country_col = _find_column(normalized, _COUNTRY_ALIASES)
-
     original_rows: list[dict[str, str]] = []
-    pairs: list[dict] = []
+    rows: list[dict] = []
 
-    # One row in → one row out: no (X, Y) dedup. Each row becomes its own "pair"
-    # carrying its single source row index (source_row_indices == [idx]).
     for idx, row in enumerate(reader):
         clean = {h: (row.get(h) or "").strip() for h in header}
         original_rows.append(clean)
@@ -85,14 +76,11 @@ def parse_relationship_csv(raw: bytes) -> dict:
             raise InvalidRelationshipCSV(
                 f"CSV row {idx + 2} missing required value(s): {', '.join(missing)}"
             )
-        pairs.append({
-            "pair_index": len(pairs) + 1,
+        rows.append({
+            "row_index": idx,
             "x_name": x_name,
             "y_name": y_name,
             "input_url": input_url,
-            "city": clean.get(city_col, "") if city_col else "",
-            "country": clean.get(country_col, "") if country_col else "",
-            "source_row_indices": [idx],
         })
 
     if not original_rows:
@@ -101,17 +89,15 @@ def parse_relationship_csv(raw: bytes) -> dict:
     return {
         "header": header,
         "original_rows": original_rows,
-        # NOTE there is no "blank rows" list and no empty-pairs case: a blank required
-        # value raises above, and a header-only CSV raises too, so `pairs` is non-empty
+        # NOTE there is no "blank rows" list and no empty case: a blank required value
+        # raises above, and a header-only CSV raises too, so `rows` is non-empty
         # whenever this returns. Callers need no guard for it.
-        "pairs": pairs,
-        # Which actual CSV headers matched each logical field (None when the
-        # optional column is absent) — surfaced by the upload-preview endpoint.
+        "rows": rows,
+        # Which actual CSV header matched each logical field — surfaced by the
+        # upload-preview endpoint.
         "columns_detected": {
             "company_name_y": y_col,
             "company_name_x": x_col,
             "input_url": url_col,
-            "city": city_col,
-            "country": country_col,
         },
     }

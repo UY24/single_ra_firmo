@@ -15,28 +15,28 @@ CSV_OK = (
 
 
 class TestParseRelationshipCSV(unittest.TestCase):
-    def test_every_row_becomes_its_own_pair_no_dedup(self):
+    def test_every_row_becomes_its_own_row_no_dedup(self):
         parsed = parse_relationship_csv(CSV_OK)
         self.assertEqual(parsed["header"][0], "Input_URL")
         self.assertEqual(len(parsed["original_rows"]), 4)
-        # No (X, Y) dedup: 4 rows in → 4 pairs out, each with its own single index.
-        self.assertEqual(len(parsed["pairs"]), 4)
-        for i, p in enumerate(parsed["pairs"]):
-            self.assertEqual(p["source_row_indices"], [i])
-            self.assertEqual(p["pair_index"], i + 1)
+        # No (X, Y) dedup: 4 rows in -> 4 rows out, each with its own index.
+        self.assertEqual(len(parsed["rows"]), 4)
+        for i, r in enumerate(parsed["rows"]):
+            self.assertEqual(r["row_index"], i)
         # Per-row whitespace is trimmed (row 1's Y was "  Modal ").
-        self.assertEqual(parsed["pairs"][1]["y_name"], "Modal")
-        self.assertEqual(parsed["pairs"][0]["input_url"],
+        self.assertEqual(parsed["rows"][1]["y_name"], "Modal")
+        self.assertEqual(parsed["rows"][0]["input_url"],
                          "https://www.eastlinkcap.com/portfolio/")
 
-    def test_optional_city_country_columns(self):
+    def test_a_row_carries_only_x_y_and_url(self):
+        """No location: the OCR'd portfolio page supplies none, so City/Country columns
+        are ignored rather than silently plumbed into the prompt."""
         raw = (
             "Input_URL,Company_Name_X,Company_Name_Y,City,Country\n"
             "https://m25vc.com/portfolio,m25vc,Sanzo,New York,United States\n"
         ).encode()
-        parsed = parse_relationship_csv(raw)
-        self.assertEqual(parsed["pairs"][0]["city"], "New York")
-        self.assertEqual(parsed["pairs"][0]["country"], "United States")
+        row = parse_relationship_csv(raw)["rows"][0]
+        self.assertEqual(set(row), {"row_index", "x_name", "y_name", "input_url"})
 
     def test_blank_required_values_report_csv_row_number(self):
         raw = (
@@ -79,7 +79,7 @@ class TestParseRelationshipCSV(unittest.TestCase):
             "https://m25vc.com/p,m25vc,Sanzo\n"
         ).encode("utf-8")
         parsed = parse_relationship_csv(raw)
-        self.assertEqual(parsed["pairs"][0]["y_name"], "Sanzo")
+        self.assertEqual(parsed["rows"][0]["y_name"], "Sanzo")
 
     def test_preserves_error_marker_text_as_company_y(self):
         raw = (
@@ -89,7 +89,7 @@ class TestParseRelationshipCSV(unittest.TestCase):
         ).encode()
         parsed = parse_relationship_csv(raw)
         self.assertEqual(
-            [pair["y_name"] for pair in parsed["pairs"]],
+            [r["y_name"] for r in parsed["rows"]],
             ["FETCH_ERROR: 403 Forbidden", "error: 503 unavailable"],
         )
 
@@ -99,7 +99,7 @@ class TestParseRelationshipCSV(unittest.TestCase):
             "https://a.example,a,Error Coffee Company\n"
         ).encode()
         self.assertEqual(
-            parse_relationship_csv(raw)["pairs"][0]["y_name"],
+            parse_relationship_csv(raw)["rows"][0]["y_name"],
             "Error Coffee Company",
         )
 

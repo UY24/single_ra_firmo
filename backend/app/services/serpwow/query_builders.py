@@ -578,10 +578,12 @@ def build_relationship_search_query(
     y_name: str,
     x_domain: str,
     input_url: str,
-    city: str,
-    country: str,
 ) -> str:
-    """Fill the prompt for ONE row. Replaces the three phase queries.
+    """Fill the prompt for ONE row.
+
+    The prompt file may use exactly these four placeholders: {x_name}, {y_name},
+    {x_domain} (derived from input_url) and {input_url}. There is no location — the
+    CSV carries only Company X, Company Y and the portfolio-page URL.
 
     Company Y is passed VERBATIM including OCR noise — that noise is meaningful input
     the model is explicitly asked to resolve, not something to clean up.
@@ -591,6 +593,4 @@ def build_relationship_search_query(
         y_name=(y_name or "").strip(),
         x_domain=(x_domain or "").strip() or "an unknown domain",
         input_url=(input_url or "").strip() or "not provided",
-        city=(city or "").strip() or "an unspecified city",
-        country=(country or "").strip() or "an unspecified country",
     )

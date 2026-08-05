@@ -1,4 +1,4 @@
-What is the financial relationship, if any, between {x_name} (whose official website is {x_domain}, portfolio page {input_url}) and the company "{y_name}" located in {city}, {country}?
+What is the financial relationship, if any, between {x_name} (whose official website is {x_domain}, portfolio page {input_url}) and the company "{y_name}"?
 
 The name "{y_name}" was read by OCR from a logo on {x_name}'s own portfolio page, so it may be garbled, truncated, or padded with noise around the real company name. Work out which real company it refers to.
 

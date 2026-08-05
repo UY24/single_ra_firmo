@@ -114,9 +114,11 @@ async def _scrape_one(prefix: str, row: dict[str, Any], counters: store.Counters
     x_domain = x_domain_from_input_url(fields["input_url"])
     query = build_relationship_search_query(
         x_name=fields["x_name"], y_name=fields["y_name"], x_domain=x_domain,
-        input_url=fields["input_url"], city=fields["city"], country=fields["country"])
+        input_url=fields["input_url"])
 
-    envelope = await search_ai_mode(query, gl=(fields["country"] or "us").lower()[:2])
+    # gl stays at the client default ("us"): the CSV carries no location to derive it
+    # from, and AI Mode answers a company question the same way from any locale.
+    envelope = await search_ai_mode(query)
     envelope["row_index"] = idx
     envelope["fields"] = fields
     envelope["x_domain"] = x_domain
@@ -315,11 +317,7 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
 
 
 def _build_batch_item(envelope: dict[str, Any]) -> tuple[str, dict, list[str], str]:
-    """(key, request_body, candidates, x_domain) for one scraped row.
-
-    The prompt itself is UNCHANGED — build_relationship_prompt keeps its rules; only the
-    evidence handed to it now comes from AI Mode.
-    """
+    """(key, request_body, candidates, x_domain) for one scraped row."""
     from app.services.ai_mode import gemini_batch as gb
     from app.services.serpwow.gemini_llm import build_relationship_prompt
 
@@ -330,8 +328,6 @@ def _build_batch_item(envelope: dict[str, Any]) -> tuple[str, dict, list[str], s
         x_name=fields.get("x_name") or "",
         y_name=fields.get("y_name") or "",
         input_url=fields.get("input_url") or "",
-        city=fields.get("city") or "",
-        country=fields.get("country") or "",
         candidates=evidence["candidates"],
         ai_overview_evidence=evidence["ai_overview_evidence"],
         search_attempts=evidence["search_attempts"],

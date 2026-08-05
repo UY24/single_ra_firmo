@@ -346,6 +346,13 @@ async function counterDrivenRelationshipTerminal() {
   assert(root.textContent.includes("Relationship verdict"), "verdict section missing");
   assert(root.textContent.includes("Scrape.do"), "scrape.do cost card missing");
   assert(root.textContent.includes("50"), "scrape.do credits missing");
+  // One AI Mode call per row means one empty-response number. The SerpWow-era
+  // per-phase split (Both phases / Phase 1 only / Phase 2 only) rendered three
+  // permanent zeroes here and never showed the actual count.
+  assert(root.textContent.includes("Empty responses (HTTP 200)"),
+    "empty-responses section missing");
+  assert(!root.textContent.includes("Phase 1 only"),
+    "relationship still renders the SerpWow per-phase empty split");
   assert(!byText(root, "button", "Stop run"), "terminal run still offered Stop");
   const files = byClass(root, "files-section")[0];
   assert(files, "counter-driven terminal run rendered no Files card");

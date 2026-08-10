@@ -94,19 +94,29 @@ def _redact(value: Any) -> str:
     return re.sub(r"([?&]token=)[^&'\"\s]+", r"\1[REDACTED]", str(value or ""))
 
 
-def _safe_error(exc: Exception, response: Any = None) -> str:
+def _safe_error(exc: Exception, response: Any = None, label: str = "maps") -> str:
+    """A durable, token-free error string for one failed scrape.do call.
+
+    ``label`` names the ENDPOINT ("maps", "ai-mode"): this string is persisted as the
+    row's error object and shown in "View failed rows", so a shared default would report
+    every relationship-pipeline transport error as a Google Maps failure. Defaulting to
+    "maps" keeps gmaps (and its tests) byte-identical.
+    """
     status = getattr(response, "status_code", None)
     if status is not None:
         body = ""
         try:
             payload = response.json()
             if isinstance(payload, dict):
-                body = str(payload.get("error") or payload.get("message") or "").strip()
+                # _redact, exactly like the non-JSON fallback below: the provider echoes
+                # the request URL (token and all) in some error bodies, and this string
+                # is written to a durable per-row S3 object.
+                body = _redact(payload.get("error") or payload.get("message") or "").strip()
         except Exception:
             body = _redact(response.text)[:200]
         if body:
-            return f"scrape.do maps search failed (HTTP {status}): {body.rstrip('.')}."
-        return f"scrape.do maps search failed (HTTP {status})."
+            return f"scrape.do {label} search failed (HTTP {status}): {body.rstrip('.')}."
+        return f"scrape.do {label} search failed (HTTP {status})."
     return _redact(exc) or type(exc).__name__
 
 

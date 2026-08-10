@@ -119,5 +119,6 @@ rows"** button that carries resolved rows over.
 
 ## More docs
 
-- `HANDOFF.md` — architecture and current state (start at the top)
+- `CLAUDE.md` — architecture (durable)
+- `HANDOFF.md` — current state: what's done, what's owed, what's blocking 500k
 - `docs/` — SerpWow pipeline internals, configuration reference, API endpoints

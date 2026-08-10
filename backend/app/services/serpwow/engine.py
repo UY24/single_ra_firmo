@@ -137,8 +137,6 @@ from app.services.serpwow.constants import (
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
     REPORTING_PIPELINES,
-    REL_ERROR_CONFIRMED_URL_INVALID,
-    REL_ERROR_NOT_CONFIRMED,
 )
 from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
@@ -152,9 +150,6 @@ from app.services.serpwow.modes.common import (
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
-from app.services.serpwow.modes.relationship import (
-    execute_relationship_lookup_for_worker,
-)
 from app.services.serpwow.modes.gmaps import execute_gmaps_lookup
 from app.services.serpwow.modes.firmographics import execute_firmographic_extraction
 
@@ -294,6 +289,9 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
 
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
     gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
+
+    relationship is absent: it owns its own Gemini Batch driver in
+    relationship_runner and never routes through this shared row-batch engine.
     """
     pipe = str(pipeline or "")
     if pipe == PIPELINE_GSEARCH:
@@ -301,8 +299,6 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     if pipe == PIPELINE_GMAPS:
         mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
         return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
-    if pipe == PIPELINE_RELATIONSHIP:
-        return _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
     return False
 
 
@@ -315,7 +311,7 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     pipeline is intentionally left unchanged.
     """
     pipe = str(state.get("pipeline") or "")
-    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}:
+    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
         return False
     if not _batch_postprocess_enabled_for(pipe):
         return False
@@ -1302,21 +1298,6 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        from app.services.serpwow.gemini_llm import build_relationship_prompt
-        return build_relationship_prompt(
-            x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
-            y_name=str(row.get("company_name") or ""),
-            input_url=str(row.get("input_url") or ""),
-            city=str(row.get("city") or ""),
-            country=str(row.get("country") or ""),
-            candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_evidence=list(_ctx_probe.get("ai_overview_evidence") or []),
-            search_attempts=list(_ctx_probe.get("search_attempts") or []),
-            x_domain=str(_ctx_probe.get("x_domain") or ""),
-        )
     input_obj = {
         "company_name": row.get("company_name"),
         "country": row.get("country"),
@@ -1772,10 +1753,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
     a batch-decided no-website row is a business not_found (outcome=not_found), not
     an error. Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        return _apply_relationship_batch_parsed_to_row(row, parsed, row_usage, batch_model)
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
     row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
@@ -1819,65 +1796,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
         return "completed"
     row["status"] = "completed"
     row["error"] = _outcomes.BATCH_NOT_FOUND
-    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
-    row["error_source"] = None
-    row["error_category"] = None
-    return "completed"
-
-
-def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
-                                            row_usage: dict[str, Any], batch_model: str) -> str:
-    """Relationship variant of _apply_batch_parsed_to_row: the LLM's
-    relationship_status GATES the URL (spec §4). Always returns 'completed' now:
-    a not-confirmed / confirmed-but-invalid gate is a business not_found
-    (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import (
-        apply_relationship_gate,
-        update_relationship_block,
-    )
-
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    context = result.get("context") if isinstance(result.get("context"), dict) else {}
-    row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
-    updated_gemini = round(_as_float(result.get("gemini_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    updated_total = round(_as_float(result.get("total_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-
-    candidates = [c for c in (context.get("candidates") or []) if isinstance(c, str)]
-    x_domain = str(context.get("x_domain") or "")
-    gated_url, status, gate_flags = apply_relationship_gate(
-        parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
-
-    relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
-        "status": "pending", "summary": "", "flags": []}
-    context["relationship"] = update_relationship_block(
-        relationship, parsed if isinstance(parsed, dict) else {}, status, gate_flags)
-
-    result["official_website"] = gated_url
-    result["gemini_cost_usd"] = updated_gemini
-    result["total_cost_usd"] = updated_total
-    cb = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
-    cb["gemini_batch_cost_usd"] = round(_as_float(cb.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    cb["gemini_cost_usd"] = updated_gemini
-    cb["total_cost_usd"] = updated_total
-    context["cost_breakdown"] = cb
-    context["gemini_batch_ai"] = {"provider": "google-gemini-batch", "model": batch_model,
-                                  "used": True, "usage": row_usage,
-                                  "cost_usd": row_batch_cost_usd,
-                                  "raw": parsed, "error": None}
-    context["success"] = bool(gated_url)
-    result["context"] = context
-    row["result"] = result
-
-    if gated_url:
-        row["status"] = "completed"
-        row["error"] = None
-        row["outcome"] = _outcomes.OUTCOME_FOUND
-        row["error_source"] = None
-        row["error_category"] = None
-        return "completed"
-    row["status"] = "completed"
-    row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
-                    else REL_ERROR_CONFIRMED_URL_INVALID)
     row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
     row["error_source"] = None
     row["error_category"] = None
@@ -2542,12 +2460,16 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
-    names = ["state.json", "output.json"]
     if pipe == PIPELINE_RELATIONSHIP:
-        names += ["confirmed_relation.csv", "notconfirmed_relation.csv",
-                  "report.json", "run.log"]
-    elif pipe in REPORTING_PIPELINES:
-        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
+        # No state.json / output.json: this pipeline keeps no state dict and no local
+        # disk — S3 object presence IS its state. Advertising them produced two links
+        # to objects that never exist.
+        names = ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                 "report.json", "run.log"]
+    else:
+        names = ["state.json", "output.json"]
+        if pipe in REPORTING_PIPELINES:
+            names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -2695,10 +2617,6 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             ob = summ.get("outcome_breakdown") or {}
             success_count = ob.get("found", summ["websites_found"])
             failed_count = ob.get("errored", 0)
-            if state.get("relationship"):
-                # Relationship canonical outcomes are already fanned to original
-                # searchable rows; only the original total needs an explicit field.
-                extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -3390,6 +3308,44 @@ async def publish_job(job: dict[str, Any]) -> None:
     )
 
 
+async def publish_relationship_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole relationship run.
+
+    Goes to the shared named exchange under RELATIONSHIP_ROUTING_KEY — the same
+    exchange consume_relationship_runs binds its queue to, and the one AI Mode and
+    SerpWow already use, so every binding is visible in one place in the management UI.
+
+    Failure is tolerated — and that tolerance lives HERE, not at the call sites, so every
+    caller (upload, retry-failed-rows, anything added later) gets it. Both callers reach
+    this only AFTER the run is fully created in S3, so letting a wait_for timeout or any
+    AMQP error propagate 500s the request with no upload_id while the run exists and the
+    re-drive scan starts spending money on it 300s later. Never raises: the worker's
+    stale-run scan picks the run up within RELATIONSHIP_REDRIVE_SCAN_SEC, so a broker
+    hiccup delays a run, never loses it.
+    """
+    from app.services.serpwow.relationship_runner import RELATIONSHIP_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[relationship] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=RELATIONSHIP_ROUTING_KEY,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[relationship] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
+
+
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
     """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
     legacy binary: found->completed, everything-else->failed (no not_found remap)."""
@@ -3485,17 +3441,10 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 debug_row_index=row_index,
                 phase=phase_value,
             )
-        elif pipeline == PIPELINE_RELATIONSHIP:
-            crawl_response, serpwow_raw_json = await execute_relationship_lookup_for_worker(
-                y_name=company_name,
-                x_name=str(job.get("x_name") or ""),
-                input_url=str(job.get("input_url") or ""),
-                city=str(job.get("city") or ""),
-                country=country,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-            )
         else:
+            # relationship is deliberately absent: it is run-driven (one message per
+            # RUN, see relationship_runner), never row-driven, so a relationship job
+            # arriving here is a bug this correctly rejects.
             raise ValueError(f"unknown pipeline {pipeline!r}")
 
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
@@ -3813,7 +3762,9 @@ async def reconcile_stuck_gsearch_rows() -> None:
             # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
             # only in batch mode, where a stuck row blocks the finalization batch from
             # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
-            if not (_rec_pipe in {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}
+            # relationship is not here: it has no per-row messages to re-publish and
+            # runs its own stale-run scan (relationship_runner.redrive_stale_runs).
+            if not (_rec_pipe == PIPELINE_GSEARCH
                     or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
@@ -4067,7 +4018,6 @@ async def _create_upload_with_rows(
     extra_state: Optional[dict[str, Any]] = None,
     run_total_rows: Optional[int] = None,
 ) -> dict[str, Any]:
-    _PAIR_EXTRA_KEYS = ("x_name", "input_url", "city", "source_row_indices")
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
 
@@ -4155,7 +4105,6 @@ async def _create_upload_with_rows(
                 "s3_html_key": None,
                 "s3_serpwow_json_key": None,
                 "result": None,
-                **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row},
             }
             for row in parsed_rows
         ],
@@ -4189,7 +4138,6 @@ async def _create_upload_with_rows(
             "phase": phase,
             "uploaded_at": _now_iso(),
             "upload_company_name": company_name,
-            **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row and k != "source_row_indices"},
         }
         try:
             await publish_job(job)
@@ -4302,8 +4250,8 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    rows = parsed["pairs"]  # one entry per CSV data row (no dedup)
-    total = len(parsed["original_rows"])
+    rows = parsed["rows"]          # first SAMPLE_LIMIT only, never the whole file
+    total = parsed["total_rows"]
     warnings: list[str] = []
     if not rows:
         warnings.append("No searchable rows — the CSV contains no data rows.")
@@ -4313,16 +4261,14 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
         "relationship": True,
         "warnings": warnings,
         "columns_detected": parsed["columns_detected"],
-        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url"],
         "sample_rows": [
             {
-                "company_name_x": p["x_name"],
-                "company_name_y": p["y_name"],
-                "input_url": p["input_url"],
-                "city": p["city"],
-                "country": p["country"],
+                "company_name_x": r["x_name"],
+                "company_name_y": r["y_name"],
+                "input_url": r["input_url"],
             }
-            for p in rows[:5]
+            for r in rows
         ],
     }
 
@@ -4333,57 +4279,66 @@ async def create_relationship_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    import uuid
+
+    from app.core import s3 as core_s3
+    from app.services.serpwow import relationship_store as rel_store
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
         parse_relationship_csv,
     )
 
-    # The relationship gate REQUIRES the LLM (no heuristic mode) and SerpWow —
-    # fail fast at upload time like AI Mode does, instead of failing every row.
-    for env_key in ("GEMINI_API_KEY", "SERPWOW_API_KEY"):
-        if not os.getenv(env_key, "").strip():
-            raise HTTPException(status_code=400,
-                                detail=f"{env_key} is not configured — required for the relationship pipeline.")
-
     raw = await file.read()
+    # CSV first: a bad CSV must report the CSV problem, not a config problem.
     try:
-        parsed = parse_relationship_csv(raw)
+        # sample_limit=0: the upload path needs the row COUNT and the raw bytes, which
+        # go straight to S3 for the worker to stream. It never looks at parsed rows.
+        parsed = parse_relationship_csv(raw, sample_limit=0)
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not parsed["pairs"]:
-        raise HTTPException(status_code=400,
-                            detail="No searchable rows — every Company_Name_Y is blank.")
 
-    parsed_rows = [
-        {
-            "row_index": p["pair_index"],
-            "company_name": p["y_name"],
-            "country": p["country"],
-            "firm_id": "", "industry": "", "full_address": "", "official_website": "",
-            "x_name": p["x_name"],
-            "input_url": p["input_url"],
-            "city": p["city"],
-            "source_row_indices": p["source_row_indices"],
-        }
-        for p in parsed["pairs"]
-    ]
-    response = await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_RELATIONSHIP,
-        company_id=company_id, company_name=company_name,
-        run_total_rows=len(parsed["original_rows"]),
-        extra_state={
-            "relationship": {
-                "header": parsed["header"],
-                "original_rows": parsed["original_rows"],
-                "blank_row_indices": parsed["blank_row_indices"],
-                "blank_rows": len(parsed["blank_row_indices"]),
-                "row_count_original": len(parsed["original_rows"]),
-            }
-        },
-    )
-    response["blank_rows"] = len(parsed["blank_row_indices"])
-    response["unique_pairs"] = len(parsed["pairs"])
-    return response
+    # No empty-rows guard: parse_relationship_csv raises on a blank required value and
+    # on a header-only CSV, so total_rows is never 0 when it returns.
+    for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
+        if not os.getenv(env_key, "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_key} is not configured — required for the relationship pipeline.")
+    # S3 is not optional here the way it is for the state-driven pipelines: this run has
+    # no local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the relationship pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = rel_store.run_prefix(company_name or company_id, run_id)
+    total = parsed["total_rows"]
+
+    # Best-effort Supabase run row; create_run never raises (returns None untracked).
+    # get_company_service() itself is None when Supabase is unconfigured.
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_RELATIONSHIP,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(rel_store.put_bytes, rel_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: phase 3 has no state dict to read it from.
+    await asyncio.to_thread(rel_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id)
+    # The API writes status.json exactly once, before publishing. From the first scrape
+    # on, the worker is the only writer.
+    # created_at is stamped ONCE here and carried by every later drive, so total wall
+    # clock survives a worker restart mid-run.
+    counters = rel_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_relationship_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_RELATIONSHIP,
+            "total_rows": total, "company_id": company_id}
 
 
 @app.post("/uploads/{upload_id}/retry-failed-rows")
@@ -4391,6 +4346,32 @@ async def retry_failed_rows(
     upload_id: str,
     limit: int = Query(0, ge=0, le=5000),
 ) -> dict[str, Any]:
+    from app.services.serpwow import relationship_store as rel_store
+
+    # Rerun failed (relationship): drop the error markers so a re-drive rescrapes
+    # exactly those rows. Checked before the broker guard on purpose — the re-drive
+    # scan starts the run even if the publish below is skipped.
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        prefix = pointer["prefix"]
+
+        def _dead_markers() -> list[str]:
+            keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
+            # `limit` used to be accepted and then ignored, so a cautious "retry 100 of
+            # them" silently tried all 50k.
+            return keys[:limit] if limit else keys
+
+        # Bulk delete: 1000 keys per call instead of one call per row, which is what made
+        # this time out on any run with a lot of dead rows.
+        removed = await asyncio.to_thread(
+            lambda: rel_store.delete_objects(_dead_markers()))
+        await asyncio.to_thread(rel_store.clear_stop, prefix)
+        await publish_relationship_run(upload_id)
+        return {"upload_id": upload_id, "retried_rows": removed,
+                # operations.js reads enqueued_rows for its status line.
+                "enqueued_rows": removed,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     if rabbitmq_exchange is None:
         detail = "RabbitMQ not connected. Try again shortly."
         if rabbitmq_last_error:
@@ -4541,6 +4522,20 @@ async def stop_upload(upload_id: str) -> dict[str, Any]:
     RabbitMQ messages are then dropped by the worker's idempotency guard) and
     best-effort cancel a pending/running Gemini batch. The upload terminalizes
     on this persist, so outputs/Supabase/Slack fire with whatever was done."""
+    from app.services.serpwow import relationship_store as rel_store
+
+    # Relationship runs have no rows and no engine-side Gemini batch to cancel — the
+    # stop is an S3 marker the runner polls between rows.
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        await asyncio.to_thread(rel_store.request_stop, pointer["prefix"])
+        # run_detail.js reports stopped_rows/batch_cancelled in its confirmation
+        # message; neither is knowable here (rows are not tracked individually), so
+        # send honest zeros rather than leave the UI rendering "undefined".
+        return {"upload_id": upload_id, "stop_requested": True,
+                "stopped_rows": 0, "batch_cancelled": False,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     _pending_sentinel = "Pending Gemini batch post-processing decision."
     async with get_upload_lock(upload_id):
         try:
@@ -5061,8 +5056,147 @@ async def batch_job_delete_by_name(
     }
 
 
+_RELATIONSHIP_FILES = ("confirmed_relation.csv", "notconfirmed_relation.csv",
+                       "report.json", "run.log")
+
+# Keyed by BOTH status.json phases and report.json summary statuses (the two vocabularies
+# do not collide). "stopped" maps to "completed" deliberately: run_detail.js's terminal
+# set has no rule for it, so passing it through would poll forever and never render the
+# Files card — and a stopped run IS terminal, with its outputs written.
+_RELATIONSHIP_RUN_STATUS = {
+    "queued": "queued", "scraping": "processing", "cleaning": "processing",
+    "reporting": "processing", "completed": "completed",
+    "completed_with_errors": "completed_with_errors",
+    "stopped": "completed", "failed": "failed",
+}
+# Mirrors run_detail.js's ROW_TERMINAL_STATUSES.
+_RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
+
+
+def _relationship_available_files(prefix: str) -> list[str]:
+    """Which of the run's four output files actually exist.
+
+    One scoped LIST per name (each returns 0 or 1 keys) rather than a single LIST of the
+    run prefix: at 500k rows that prefix holds a million raw/ and cleaned/ objects.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    return [name for name in _RELATIONSHIP_FILES
+            if next(rel_store.iter_keys(f"{prefix}/{name}"), None) is not None]
+
+
+def _relationship_elapsed(counters: dict[str, Any]) -> Optional[int]:
+    """Wall clock from a relationship run's created_at to now, for mid-run display.
+
+    report.json only exists once the run is terminal, so without this the Processing-time
+    tile stayed blank for the whole run.
+    """
+    import calendar
+    import time as _time
+
+    try:
+        started = calendar.timegm(
+            _time.strptime(str(counters.get("created_at")), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(_time.time() - started))
+
+
+async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a relationship run from status.json counters.
+
+    Same JSON shape as the state-driven pipelines, so run_detail.js is unchanged.
+    Returns None when this id is not a relationship run.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    phase = str(counters.get("phase") or "queued")
+    total = int(counters.get("rows_total") or 0)
+    scraped = int(counters.get("rows_scraped") or 0)
+    failed = int(counters.get("rows_failed") or 0)
+
+    report = await asyncio.to_thread(
+        rel_store.get_object, f"{prefix}/report.json") or {}
+    summary = report.get("summary") or {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "llm",
+        # Always true for this pipeline — phase 2 is always the Gemini Batch verdict pass,
+        # there is no per-row LLM path. Must match relationship_outputs' summary so the
+        # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
+        "is_batch": True,
+        # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
+        # these are honest zeros rather than absent keys — the tiles render 0, not blank,
+        # and fill in for real once report.json exists.
+        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _relationship_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
+                          "cleaning": int(counters.get("llm_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0, "scrapedo_billed_empty":
+                     int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+    # Prefer the status write_outputs computed — it is what _notify_terminal sent to
+    # Supabase, so taking it here is what stops the detail page and the Runs list
+    # disagreeing (phase only ever reaches "completed", never "completed_with_errors").
+    #
+    # But ONLY when phase == "completed", because report.json OUTLIVES its run:
+    # retry_failed_rows deletes the error markers, not the outputs, so a re-driven run
+    # sits at phase "scraping" with the PREVIOUS run's terminal report.json still in
+    # place. write_outputs rewrites report.json immediately before setting the phase to
+    # "completed", so that phase — and only that one — proves the report is this drive's.
+    # ("stopped" needs no special case: write_outputs makes summary["status"] "stopped"
+    # exactly when it sets that phase, and both map to "completed" below.)
+    reported = str(summary.get("status") or "") if phase == "completed" else ""
+    status = _RELATIONSHIP_RUN_STATUS.get(reported or phase, "processing")
+
+    # Only advertise files that exist. A run that failed mid-scrape is terminal — so the
+    # UI renders the Files card — but wrote none of the four; gsearch guards exactly this
+    # case with available_files, and without it every link is an enabled 404. Gated on the
+    # derived status, so a re-driven run (non-terminal again) advertises nothing either.
+    available: list[str] = []
+    if status in _RELATIONSHIP_TERMINAL_STATUSES:
+        available = await asyncio.to_thread(_relationship_available_files, prefix)
+
+    return {
+        "upload_id": run_id,
+        "pipeline": PIPELINE_RELATIONSHIP,
+        # Mid-run the report doesn't exist yet, so serve timings from the counters. The UI
+        # reads processing_seconds_total/avg at the top level, not inside the summary.
+        "created_at": counters.get("created_at"),
+        "processing_seconds_total": summary.get("processing_seconds_total"),
+        "processing_seconds_avg": summary.get("processing_seconds_avg"),
+        "company_name": pointer.get("company_name"),
+        "status": status,
+        "total_rows": total,
+        "processed_rows": scraped + failed,
+        "failed_rows": failed,
+        "phase": phase,
+        "updated_at": counters.get("updated_at"),
+        "serpwow_summary": {**summary, "available_files": available},
+        "files": list(_RELATIONSHIP_FILES),
+    }
+
+
 @app.get("/uploads/{upload_id}/status")
 async def upload_status(upload_id: str) -> dict[str, Any]:
+    # relationship runs have no state.json — they are counter-driven. Check the pointer
+    # first; the response shape is identical so the UI needs no change.
+    relationship_status = await _relationship_status(upload_id)
+    if relationship_status is not None:
+        return relationship_status
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:
@@ -5111,9 +5245,11 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "is_batch": gs["is_batch"],
                 "cost": gs["cost"],
                 "token_usage": gs["token_usage"],
-                **{k: gs[k] for k in ("blank_rows", "searchable_rows", "unique_pairs",
-                                      "relationship_breakdown", "empty_response_breakdown") if k in gs},
-                **({"total_rows_original": gs["total_rows"]} if "unique_pairs" in gs else {}),
+                # blank_rows / searchable_rows / unique_pairs / total_rows_original were
+                # dropped with relationship's (X, Y) dedup — nothing produces them and
+                # nothing in the UI reads them.
+                **{k: gs[k] for k in ("relationship_breakdown",
+                                      "empty_response_breakdown") if k in gs},
             }
         except Exception:
             serpwow_summary = None
@@ -5153,11 +5289,97 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     }
 
 
+async def _relationship_failure_analysis(
+    run_id: str, sample_limit: int,
+) -> Optional[dict[str, Any]]:
+    """build_failure_analysis's shape, sourced from errors/ objects instead of rows[].
+
+    The "View failed rows" control run_detail.js offers whenever outcome_breakdown.errored
+    is non-zero calls this; without a branch here a relationship run answered 404 and the
+    page showed a red error under its own button.
+
+    ``failed_rows`` is exact (one LIST of errors/, the same scan list_done_rows does). The
+    aggregate buckets are computed over the SAMPLE only — the alternative is GETting up to
+    500k error objects to answer a debug panel that reads neither.
+    """
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    limit = max(1, int(sample_limit))
+
+    def _by_row_index(key: str) -> tuple[int, int, str]:
+        # NOT plain sorted(): shard directories are numeric but unpadded, so errors/10/
+        # sorts before errors/2/ and the "first N" sample becomes a lexicographic slice
+        # once a run exceeds ten shards.
+        idx = rel_store._idx_from_key(key)
+        return (1, 0, key) if idx is None else (0, idx, "")
+
+    def _collect() -> tuple[int, list[dict[str, Any]]]:
+        keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
+        rows: list[dict[str, Any]] = []
+        for key in sorted(keys, key=_by_row_index)[:limit]:
+            envelope = rel_store.get_object(key) or {}
+            fields = envelope.get("fields") or {}
+            rows.append({
+                "row_index": envelope.get("row_index"),
+                "company_name": fields.get("y_name"),
+                # How many scrape.do calls this row actually cost before it died. Without
+                # it a row that burned all SCRAPEDO_MAX_RETRIES reads exactly like a row
+                # that was tried once, and the retries look like they were never there.
+                "attempts": envelope.get("request_count"),
+                # Only scrape.do can produce an error object — the verdict and reporting
+                # phases never write one (see relationship_runner._scrape_one).
+                "error_source": "scrapedo",
+                "error_category": envelope.get("error_category"),
+                "error": envelope.get("error"),
+                "official_website": None,
+                "status_updated_at": None,
+            })
+        rows.sort(key=lambda row: (row["row_index"] is None, row["row_index"]))
+        return len(keys), rows
+
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    failed_count, sample = await asyncio.to_thread(_collect)
+    total_rows = int(counters.get("rows_total") or 0)
+
+    def _buckets(field: str, name: str) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for row in sample:
+            value = str(row.get(field) or "").strip()
+            if value:
+                counts[value] = counts.get(value, 0) + 1
+        return [{name: k, "count": v} for k, v in
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]]
+
+    return {
+        "upload_id": run_id,
+        "status": str(counters.get("phase") or ""),
+        "gemini_batch": None,
+        "total_rows": total_rows,
+        "failed_rows": failed_count,
+        "failed_rate_pct": (round((failed_count / total_rows) * 100, 2)
+                            if total_rows else 0.0),
+        "failed_missing_official_website": failed_count,
+        "error_buckets": _buckets("error", "reason"),
+        "search_attempt_error_buckets": [],
+        "by_source": _buckets("error_source", "source"),
+        "by_category": _buckets("error_category", "category"),
+        "sample_failed_rows": sample,
+    }
+
+
 @app.get("/uploads/{upload_id}/failure-analysis")
 async def upload_failure_analysis(
     upload_id: str,
     sample_limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
+    relationship_analysis = await _relationship_failure_analysis(upload_id, sample_limit)
+    if relationship_analysis is not None:
+        return relationship_analysis
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:
@@ -5227,6 +5449,21 @@ async def upload_result_file(
     file: str = Query(...),
     download: bool = Query(False),
 ) -> Response:
+    from app.services.serpwow import relationship_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    if pointer:
+        allowed = {"confirmed_relation.csv", "notconfirmed_relation.csv",
+                   "report.json", "run.log", "input.csv", "status.json"}
+        if file not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unknown file {file!r}")
+        data = await asyncio.to_thread(
+            rel_store.get_bytes, f"{pointer['prefix']}/{file}")
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"{file} not available yet")
+        media = "application/json" if file.endswith(".json") else "text/plain"
+        return Response(content=data, media_type=media)
+
     if file not in _GSEARCH_RESULT_FILES:
         raise HTTPException(status_code=400, detail="file not allowed")
     upload_dir = _find_upload_dir(upload_id)

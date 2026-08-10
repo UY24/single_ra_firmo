@@ -16,22 +16,6 @@ def _row(phases, source_row_indices=None):
 
 
 class TestEmptyResponseBreakdown(unittest.TestCase):
-    def test_relationship_position_buckets(self):
-        state = {"pipeline": "relationship", "rows": [
-            _row([_phase(), _phase()], [0]),                       # both empty
-            _row([_phase(), _phase(overview=True)], [1]),          # phase1 only
-            _row([_phase(cands=2), _phase()], [2]),                # phase2 only
-            _row([_phase(overview=True), _phase(cands=1)], [3]),   # neither -> uncounted
-        ]}
-        self.assertEqual(empty_response_breakdown(state),
-                         {"both_phases": 1, "phase1_only": 1, "phase2_only": 1})
-
-    def test_relationship_weights_by_source_rows(self):
-        state = {"pipeline": "relationship", "rows": [
-            _row([_phase(), _phase()], [0, 1, 2]),  # both empty, fans out to 3 CSV rows
-        ]}
-        self.assertEqual(empty_response_breakdown(state)["both_phases"], 3)
-
     def test_gsearch_all_vs_some(self):
         state = {"pipeline": "gsearch", "rows": [
             _row([_phase(), _phase(), _phase()]),               # all empty

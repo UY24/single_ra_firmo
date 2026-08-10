@@ -718,21 +718,20 @@ def build_relationship_prompt(
     x_name: str,
     y_name: str,
     input_url: str,
-    city: str,
-    country: str,
     candidates: list[str],
     ai_overview_evidence: list[dict[str, Any]],
     search_attempts: list[dict[str, Any]],
     x_domain: str = "",
 ) -> str:
-    """Prompt for the relationship pipeline (spec §4). Shared by the per-row
-    call (choose_relationship_and_website) and the Gemini-batch item builder so
-    both modes judge with identical instructions."""
+    """Verdict prompt for the relationship pipeline's Gemini Batch phase.
+
+    The row has three inputs and no location: Company X, Company Y and X's portfolio
+    page (x_domain is derived from that URL).
+    """
     input_obj = {
         "company_x": x_name, "company_x_domain": x_domain or None,
         "company_x_official_portfolio_page": input_url,
         "company_y": y_name,
-        "city": city or None, "country": country or None,
     }
     evidence_sections: list[str] = []
     for item in ai_overview_evidence or []:
@@ -758,7 +757,6 @@ def build_relationship_prompt(
         "the real company name (e.g. 'YUZU SPARKLINGWE SANZO POMELO' contains 'SANZO').\n"
         "Return strict JSON only with this schema:\n"
         "{\n"
-        '  "resolved_company_y_name": string|null,\n'
         '  "relationship_status": "confirmed"|"not_confirmed"|"unclear",\n'
         '  "relationship_summary": string,\n'
         '  "relationship_evidence": [string],\n'
@@ -769,6 +767,16 @@ def build_relationship_prompt(
         '  "extra_flags": [string]\n'
         "}\n"
         "Rules:\n"
+        "- GROUND EVERYTHING IN THE SUPPLIED MATERIAL. Your job is to READ the evidence\n"
+        "  below and report what it says — not to answer from your own knowledge of these\n"
+        "  companies. Do not use anything you know that is not in the supplied evidence, do\n"
+        "  not infer, do not assume, and do not fill gaps. If the evidence does not settle a\n"
+        "  field, say so through the schema (null, or not_confirmed/unclear with a low\n"
+        "  score) rather than producing a plausible answer. Two runs given the same evidence\n"
+        "  must reach the same verdict.\n"
+        "- Every claim in relationship_summary and relationship_evidence must be traceable\n"
+        "  to a specific statement in the evidence below. Do not paraphrase into something\n"
+        "  stronger than the source, and do not add facts the source does not state.\n"
         "- relationship_status is about a FINANCIAL relationship only (investment, portfolio\n"
         "  company, funding round, acquisition, fund backing). Mere similarity or co-mention\n"
         "  without financial context is NOT a relationship.\n"
@@ -779,58 +787,26 @@ def build_relationship_prompt(
         "- Set official_website to null unless relationship_status is 'confirmed'.\n"
         "- Never return directory/listing/social/wiki/news/search/file URLs.\n"
         "- relationship_confidence_score is 0-100 = how strongly the provided evidence\n"
-        "  (AI Overview text/sources) shows a FINANCIAL relationship EXISTS between company_x\n"
+        "  (AI Mode text/sources) shows a FINANCIAL relationship EXISTS between company_x\n"
         "  and company_y: 0 = no relationship or no evidence, 100 = clearly evidenced. This is\n"
         "  confidence that the relationship is real, NOT confidence in your verdict — so a\n"
         "  not_confirmed verdict must carry a LOW score.\n"
         "- website_confidence_score is 0-100 for the Company Y URL; use 0 when no URL is found.\n"
-        "- resolved_company_y_name must be evidence-backed; otherwise return null.\n"
         "- relationship_summary: 1-2 sentences quoting what the evidence says.\n"
         "- relationship_evidence: at most 3 concise statements from the supplied evidence.\n"
         "- extra_flags: optional short slugs like \"company_closed\" (evidence says company\n"
         "  shut down) or \"ocr_name_suspicious\" (the OCR text may name a different company).\n\n"
         f"Input: {json.dumps(input_obj, ensure_ascii=True)}\n\n"
         f"Candidate URLs: {json.dumps(list(candidates or []), ensure_ascii=True)}\n\n"
-        f"Normalized AI Overview evidence:\n{evidence_text}\n\n"
+        # Every string the provider's response contained, in order — not a rendering of the
+        # keys we happen to know about. AI Mode structures the same question differently from
+        # call to call (sometimes headings, sometimes one ordered_list, sometimes a single
+        # paragraph), so the answer's own sections are the only structure there is.
+        "AI Mode evidence — every line Google's answer contained, in order. Section\n"
+        "labels, prose, evidence bullets and any URL it cited all appear as plain lines:\n"
+        f"{evidence_text}\n\n"
         f"Search attempts: {json.dumps(list(search_attempts or []), ensure_ascii=True)[:6000]}"
     )
-
-
-def choose_relationship_and_website(
-    x_name: str,
-    y_name: str,
-    input_url: str,
-    city: str,
-    country: str,
-    candidates: list[str],
-    ai_overview_evidence: list[dict[str, Any]],
-    search_attempts: list[dict[str, Any]],
-    x_domain: str = "",
-) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
-    """Per-pair relationship verdict + URL pick. Returns (parsed, error, model, usage)
-    following choose_final_website_with_gemini's convention. Validation of the parsed
-    output (candidate-set, X-domain, the confirmed-gate) lives in
-    apply_relationship_gate — callers MUST run it; this function only calls the model."""
-    configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    ordered_models: list[str] = []
-    for model_name in (configured_model, "gemini-2.5-flash-lite"):
-        if model_name and model_name not in ordered_models:
-            ordered_models.append(model_name)
-    prompt = build_relationship_prompt(
-        x_name, y_name, input_url, city, country, candidates,
-        ai_overview_evidence, search_attempts, x_domain)
-    last_error: Optional[str] = None
-    for model in ordered_models:
-        text, usage, error = _gemini_generate_content_json(model, prompt)
-        if error:
-            last_error = error
-            continue
-        parsed = _parse_json_from_text(text or "")
-        if parsed is None:
-            last_error = "Gemini returned non-JSON output for relationship prompt."
-            continue
-        return parsed, None, model, usage
-    return None, last_error or "Gemini relationship call failed.", None, None
 
 
 _VALID_REL_STATUSES = {"confirmed", "not_confirmed", "unclear"}
@@ -844,8 +820,6 @@ def update_relationship_block(
 ) -> dict[str, Any]:
     relationship["status"] = status
     relationship["summary"] = str(parsed.get("relationship_summary") or "")
-    relationship["resolved_company_y_name"] = str(
-        parsed.get("resolved_company_y_name") or "")
     evidence = parsed.get("relationship_evidence") or []
     if isinstance(evidence, str):
         evidence = [evidence]

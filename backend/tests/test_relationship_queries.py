@@ -1,59 +1,59 @@
+"""The single relationship AI Mode search query."""
 import unittest
 
-from app.services.serpwow.query_builders import build_relationship_phase_queries
-from app.services.serpwow.url_utils import url_matches_domain, x_domain_from_input_url
+from app.services.serpwow.query_builders import (
+    build_relationship_search_query,
+    load_relationship_prompt,
+)
 
 
-class TestXDomainHelpers(unittest.TestCase):
-    def test_x_domain_from_input_url(self):
+class PromptLoadingTests(unittest.TestCase):
+    def test_prompt_file_loads_and_is_url_safe_length(self) -> None:
+        prompt = load_relationship_prompt()
+        self.assertIn("{y_name}", prompt)
+        self.assertIn("{x_name}", prompt)
+        # It ships as a q= URL parameter. ai_bulk_search.txt is ~3.5k and works.
+        self.assertLess(len(prompt), 4000)
+
+    def test_prompt_is_cached_not_reread(self) -> None:
+        self.assertIs(load_relationship_prompt(), load_relationship_prompt())
+
+    def test_prompt_uses_only_the_four_supported_placeholders(self) -> None:
+        """The prompt file is operator-editable and goes through .format(), so an
+        unsupported placeholder (e.g. the removed {city}) raises KeyError on EVERY row
+        of a run. Fail here instead."""
+        import re
+
+        used = set(re.findall(r"\{(\w+)\}", load_relationship_prompt()))
         self.assertEqual(
-            x_domain_from_input_url("https://www.m25vc.com/portfolio"), "m25vc.com")
-        self.assertEqual(x_domain_from_input_url("http://eastlinkcap.com"), "eastlinkcap.com")
-        self.assertEqual(x_domain_from_input_url(""), "")
-        self.assertEqual(x_domain_from_input_url("not a url"), "")
-
-    def test_url_matches_domain(self):
-        self.assertTrue(url_matches_domain("https://m25vc.com/about", "m25vc.com"))
-        self.assertTrue(url_matches_domain("https://www.m25vc.com/x", "m25vc.com"))
-        self.assertTrue(url_matches_domain("https://blog.m25vc.com/", "m25vc.com"))
-        self.assertFalse(url_matches_domain("https://notm25vc.com/", "m25vc.com"))
-        self.assertFalse(url_matches_domain("https://modal.com/", "m25vc.com"))
-        self.assertFalse(url_matches_domain("https://modal.com/", ""))
+            used - {"x_name", "y_name", "x_domain", "input_url"}, set())
 
 
-class TestBuildRelationshipPhaseQueries(unittest.TestCase):
-    def test_two_prose_phases_with_full_inputs(self):
-        qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "m25vc.com")
-        labels = [label for label, _ in qs]
-        self.assertEqual(labels, [
-            "phase1_relationship_and_url",
-            "phase2_identity_and_relationship",
-        ])
-        for _label, query in qs:
-            # Prose AI-Overview questions: mention Y, X (name + domain), ask for a
-            # typed-out plain-text https URL (no hyperlink).
-            self.assertIn('"Sanzo"', query)
-            self.assertIn("M25 Ventures (m25vc.com)", query)
-            self.assertIn("?", query)
-            self.assertIn("https://", query)
-            self.assertIn("plain-text", query)
-            self.assertIn("hyperlink", query)
+class QueryBuildingTests(unittest.TestCase):
+    def test_every_placeholder_is_substituted(self) -> None:
+        q = build_relationship_search_query(
+            x_name="Acme Capital", y_name="SANZO POMELO", x_domain="acme.com",
+            input_url="https://acme.com/portfolio")
+        self.assertIn("Acme Capital", q)
+        self.assertIn("SANZO POMELO", q)
+        self.assertIn("acme.com", q)
+        self.assertIn("https://acme.com/portfolio", q)
+        # No unsubstituted braces left behind.
+        self.assertNotIn("{", q)
 
-        by = dict(qs)
-        self.assertIn("business or financial relationship", by["phase1_relationship_and_url"])
-        self.assertIn('Who is "Sanzo"?', by["phase2_identity_and_relationship"])
+    def test_blank_optional_fields_do_not_leave_none_in_the_query(self) -> None:
+        q = build_relationship_search_query(
+            x_name="Acme", y_name="Y Co", x_domain="", input_url="")
+        self.assertNotIn("None", q)
+        self.assertNotIn("{", q)
 
-    def test_x_identity_falls_back_to_name_without_domain(self):
-        # No parseable domain → X is identified by name alone, both phases still run.
-        qs = build_relationship_phase_queries("M25 Ventures", "Sanzo", "")
-        self.assertEqual(len(qs), 2)
-        for _label, query in qs:
-            self.assertIn("M25 Ventures", query)
-            self.assertNotIn("()", query)  # no empty "(domain)"
-
-    def test_both_x_and_y_required(self):
-        self.assertEqual(build_relationship_phase_queries("", "Sanzo", "m25vc.com"), [])
-        self.assertEqual(build_relationship_phase_queries("m25vc", "", "m25vc.com"), [])
+    def test_y_name_is_passed_verbatim_including_ocr_noise(self) -> None:
+        # OCR noise is meaningful input, never sanitised — see HANDOFF 2026-07-23.
+        noisy = "ERROR: 503 YUZU SPARKLINGWE SANZO"
+        q = build_relationship_search_query(
+            x_name="Acme", y_name=noisy, x_domain="acme.com",
+            input_url="https://acme.com/p")
+        self.assertIn(noisy, q)
 
 
 if __name__ == "__main__":

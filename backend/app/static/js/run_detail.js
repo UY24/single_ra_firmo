@@ -391,23 +391,25 @@ function verdictSection(rb) {
   );
 }
 
-// Empty 200-OK SerpWow responses (no AI overview + 0 candidates). relationship
-// splits by phase (both / phase 1 only / phase 2 only); gsearch by all / some.
+// Rows the provider answered with nothing usable. Branch on the DATA, not the pipeline:
+// relationship makes ONE scrape.do AI Mode call per row, so it reports a single
+// {no_ai_text: N} — there are no phases to split by. gsearch runs several SerpWow
+// phases per row and splits them all / some.
 // `eb` is serpwow_summary.empty_response_breakdown.
-function emptyResponsesSection(eb, isRel) {
-  const chips = isRel
-    ? [
-        chip("Both phases", fmtNum(eb.both_phases ?? 0), (eb.both_phases ?? 0) ? "danger" : "muted"),
-        chip("Phase 1 only", fmtNum(eb.phase1_only ?? 0), (eb.phase1_only ?? 0) ? "warn" : "muted"),
-        chip("Phase 2 only", fmtNum(eb.phase2_only ?? 0), (eb.phase2_only ?? 0) ? "warn" : "muted"),
-      ]
+function emptyResponsesSection(eb) {
+  const aiMode = eb.no_ai_text != null;
+  const chips = aiMode
+    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
       ];
   return el("section", { class: "detail-section" },
-    sectionHeading("Empty responses (HTTP 200)",
-      "Rows where SerpWow returned 200 but no AI overview and no candidates."),
+    sectionHeading(
+      aiMode ? "Empty AI Mode answers (HTTP 200)" : "Empty responses (HTTP 200)",
+      aiMode
+        ? "Rows scrape.do billed and answered, but where AI Mode wrote no text_blocks"
+        : "Rows where the provider returned 200 but no AI overview and no candidates"),
     el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
   );
 }
@@ -438,11 +440,14 @@ function failedRowsSection(ref, count, companyLabel) {
         const rows = data.sample_failed_rows ?? [];
         const table = el("table", { class: "data-table w-full text-xs" },
           el("thead", {}, el("tr", { class: "data-row" },
-            ...["CSV row", companyLabel, "Error source", "Category", "Error"]
+            ...["CSV row", companyLabel, "Attempts", "Error source", "Category", "Error"]
               .map((heading) => el("th", {}, heading)))),
           el("tbody", {}, ...rows.map((row) => el("tr", { class: "data-row" },
             el("td", {}, row.row_index ?? "—"),
             el("td", {}, row.company_name ?? "—"),
+            // Calls this row cost before it died. A "4" here is the retries working:
+            // the row was tried the full SCRAPEDO_MAX_RETRIES + 1 times.
+            el("td", {}, row.attempts != null ? fmtNum(row.attempts) : "—"),
             el("td", {}, row.error_source ?? "—"),
             el("td", {}, row.error_category ?? "—"),
             el("td", {}, row.error ?? "—"),
@@ -682,6 +687,27 @@ function renderLegacyStatus(root, ref, s) {
       if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
   }
+  // Which provider is actually working right now. `phase` is served by the
+  // counter-driven status endpoint; without this the run looked identical whether
+  // scrape.do was mid-flight, Gemini was chewing a batch, or nothing was running at all.
+  const PHASE_LABELS = {
+    queued: ["Queued", "muted"],
+    scraping: ["Scraping (scrape.do)", "info"],
+    cleaning: ["LLM (Gemini batch)", "info"],
+    reporting: ["Writing outputs", "info"],
+    completed: ["Done", "good"],
+    stopped: ["Stopped", "warning"],
+    failed: ["Failed", "danger"],
+  };
+  if (s.phase && PHASE_LABELS[s.phase]) {
+    const [label, tone] = PHASE_LABELS[s.phase];
+    chips.push(chip("Phase", label, tone));
+  }
+  const phaseSecs = g?.phase_seconds;
+  if (phaseSecs && (phaseSecs.scraping || phaseSecs.cleaning)) {
+    chips.push(chip("scrape.do", fmtDuration(phaseSecs.scraping ?? 0), "muted"));
+    chips.push(chip("LLM", fmtDuration(phaseSecs.cleaning ?? 0), "muted"));
+  }
 
   const isRel = s.pipeline === "relationship";
   const total = s.total_rows;
@@ -763,7 +789,7 @@ function renderLegacyStatus(root, ref, s) {
       : costSection(g));
   }
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
-  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
   }
@@ -812,7 +838,10 @@ function renderLegacyStatus(root, ref, s) {
           ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
       : [];
-    const extras = [
+    // Relationship runs are counter-driven: there is no state.json to build output.json
+    // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two
+    // relationship CSVs above — don't advertise two links that cannot work.
+    const extras = s.pipeline === "relationship" ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
     ];

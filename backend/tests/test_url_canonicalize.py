@@ -1,6 +1,7 @@
 import unittest
 
 from app.services.serpwow.engine import canonicalize_official_url, dedupe_candidate_urls
+from app.services.serpwow.url_utils import url_matches_domain, x_domain_from_input_url
 
 
 class TestCanonicalize(unittest.TestCase):
@@ -31,6 +32,23 @@ class TestCanonicalize(unittest.TestCase):
             "https://example.com/contact", "https://other.com",
         ])
         self.assertEqual(out, ["http://www.example.com/", "https://example.com/contact", "https://other.com"])
+
+
+class TestXDomainHelpers(unittest.TestCase):
+    def test_x_domain_from_input_url(self):
+        self.assertEqual(
+            x_domain_from_input_url("https://www.m25vc.com/portfolio"), "m25vc.com")
+        self.assertEqual(x_domain_from_input_url("http://eastlinkcap.com"), "eastlinkcap.com")
+        self.assertEqual(x_domain_from_input_url(""), "")
+        self.assertEqual(x_domain_from_input_url("not a url"), "")
+
+    def test_url_matches_domain(self):
+        self.assertTrue(url_matches_domain("https://m25vc.com/about", "m25vc.com"))
+        self.assertTrue(url_matches_domain("https://www.m25vc.com/x", "m25vc.com"))
+        self.assertTrue(url_matches_domain("https://blog.m25vc.com/", "m25vc.com"))
+        self.assertFalse(url_matches_domain("https://notm25vc.com/", "m25vc.com"))
+        self.assertFalse(url_matches_domain("https://modal.com/", "m25vc.com"))
+        self.assertFalse(url_matches_domain("https://modal.com/", ""))
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from app.services.serpwow import relationship_store as store
+from app.services.serpwow import s3_run_store as store
 from app.services.serpwow.engine import app
-from tests.test_relationship_store import FakeS3, _patched
+from tests.test_s3_run_store import FakeS3, _patched
 
 GOOD_CSV = (b"Input_URL,Company_Name_X,Company_Name_Y\n"
             b"https://acme.com/p,Acme,Sanzo\n")

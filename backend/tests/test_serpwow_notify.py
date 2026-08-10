@@ -10,11 +10,11 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
     """_notify_slack_terminal maps upload state -> the right notify call."""
 
     def test_completed_with_errors_routes_to_complete(self):
-        # gmaps is a REPORTING_PIPELINES member, so the ping now carries the
+        # gsearch is a REPORTING_PIPELINES member, so the ping carries the
         # found/not_found/errored trio (off outcome_breakdown) instead of the
         # old binary success/failed — and success/failed are no longer passed
         # at all for in-scope pipelines.
-        state = {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gmaps",
+        state = {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gsearch",
                  "status": "completed_with_errors", "total_rows": 3,
                  "rows": [
                      {"company_name": "A", "country": "us", "status": "completed",
@@ -33,7 +33,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
             la._notify_slack_terminal(state)
         failed.assert_not_called()
         kw = done.call_args.kwargs
-        self.assertEqual(kw["pipeline"], "Google Maps")     # raw key -> UI label
+        self.assertEqual(kw["pipeline"], "Google Search")   # raw key -> UI label
         self.assertEqual(kw["company"], "Acme Inc")
         self.assertEqual(kw["run_ref"], "UP1")
         self.assertEqual(kw["status"], "completed_with_errors")
@@ -110,11 +110,11 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertNotIn("found", kw)
         self.assertNotIn("errored", kw)
 
-    def test_gmaps_includes_searches_tokens_cost(self):
-        # gmaps now has real serpwow_searches/tokens/cost (LLM batch/per-row
+    def test_gsearch_includes_searches_tokens_cost(self):
+        # gsearch has real serpwow_searches/tokens/cost (LLM batch/per-row
         # confidence mode) -> the Slack ping must surface them like gsearch does.
         state = {
-            "upload_id": "UP5", "company_name": "Acme Inc", "pipeline": "gmaps",
+            "upload_id": "UP5", "company_name": "Acme Inc", "pipeline": "gsearch",
             "status": "completed", "total_rows": 1, "success_rows": 1, "failed_rows": 0,
             "processing_seconds_total": 5.0,
             "rows": [{"row_index": 0, "company_name": "Acme", "country": "us",
@@ -140,7 +140,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertAlmostEqual(kw["cost_usd"], 0.0008, places=6)
         self.assertAlmostEqual(kw["llm_cost_usd"], 0.0001, places=6)
         self.assertAlmostEqual(kw["serpwow_cost_usd"], 0.0007, places=6)
-        # gmaps is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
+        # gsearch is a REPORTING_PIPELINES member -> outcome trio, no old success/failed.
         self.assertEqual(kw["found"], 1)
         self.assertEqual(kw["not_found"], 0)
         self.assertEqual(kw["errored"], 0)
@@ -151,7 +151,7 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         with mock.patch("app.core.notify.notify_run_complete",
                         side_effect=RuntimeError("boom")):
             la._notify_slack_terminal({"upload_id": "x", "status": "completed",
-                                       "pipeline": "gmaps"})  # must not raise
+                                       "pipeline": "gsearch"})  # must not raise
 
 
 class NotifyRenderTests(unittest.TestCase):
@@ -261,7 +261,7 @@ class PersistDedupTests(unittest.TestCase):
     multiple persist_upload_state calls (which happen on every row update)."""
 
     def _state(self, statuses):
-        return {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gmaps",
+        return {"upload_id": "UP1", "company_name": "Acme Inc", "pipeline": "gsearch",
                 "rows": [{"status": s} for s in statuses]}
 
     def _persist(self, state):

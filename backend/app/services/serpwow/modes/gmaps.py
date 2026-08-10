@@ -10,37 +10,57 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
+import re
 from typing import Any, Optional
 
-from app.services.serpwow.schemas import CrawlResponse
-from app.services.common.env import (
-    get_bool_env as _get_bool_env,
-    get_int_env as _get_int_env,
-    get_float_env as _get_float_env,
+from app.models.entities import (
+    ADDRESS_ALIASES,
+    COMPANY_ALIASES,
+    COUNTRY_ALIASES,
+    FIRM_ID_ALIASES,
+    INDUSTRY_ALIASES,
 )
-
+from app.services.serpwow.schemas import CrawlResponse
 from app.services.serpwow.constants import (
     PIPELINE_GMAPS,
 )
 from app.services.serpwow import outcomes as _outcomes
-from app.services.serpwow.cost import (
-    calculate_gemini_cost_usd,
-)
-from app.services.serpwow.gemini_llm import (
-    choose_final_website_with_gemini,
-)
 from app.services.serpwow.gmaps_scoring import (
     _gmaps_confidence_block,
     _score_gmaps_candidates,
 )
-from app.services.serpwow.url_utils import (
-    dedupe_candidate_urls,
-    is_disallowed_official_url,
-)
+from app.services.serpwow.url_utils import dedupe_candidate_urls
 from app.services.serpwow.modes.common import (
     run_gmaps_from_module,
 )
+
+def row_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """The five inputs a gmaps row needs, out of an arbitrary canonical CSV row.
+
+    Header matching reuses models.entities' alias SETS — the same ones parse_entities_csv
+    validates the upload against — so a header accepted at upload can never be one this
+    fails to find. The row index is the CSV position (0-based, injected by
+    s3_run_store.iter_input_rows), NOT a sequence number that skips blank rows: it is the
+    row's identity in raw/ and rows/, so it has to survive a row with no company name.
+    """
+    lowered = {re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_"): v
+               for k, v in row.items() if isinstance(k, str)}
+
+    def pick(aliases: set[str]) -> str:
+        for key, value in lowered.items():
+            if key in aliases and str(value or "").strip():
+                return str(value).strip()
+        return ""
+
+    return {
+        "row_index": row.get("row_index"),
+        "company_name": pick(COMPANY_ALIASES),
+        "country": pick(COUNTRY_ALIASES),
+        "firm_id": pick(FIRM_ID_ALIASES),
+        "industry": pick(INDUSTRY_ALIASES),
+        "full_address": pick(ADDRESS_ALIASES),
+    }
+
 
 async def execute_gmaps_lookup(
     company_name: str,
@@ -107,56 +127,18 @@ async def execute_gmaps_lookup(
         if (not gmaps_requests_ok and not gmaps_no_results) else 0
     )
 
-    # Confidence: heuristic by default; LLM when GMAPS_CONFIDENCE_MODE=llm. The LLM
-    # path reuses gsearch's selector + context keys so serpwow_reporting/build_summary
-    # surface confidence/model/tokens/cost with no reporting changes.
+    # Confidence is HEURISTIC, full stop. The LLM modes (GMAPS_CONFIDENCE_MODE=llm and
+    # GMAPS_LLM_BATCH) were removed when this pipeline moved to the S3-only runner: the
+    # batch one routed through the shared gsearch chunk engine, whose chunk state lives in
+    # state.json — the very thing that capped this pipeline at ~2.7k rows. The scoring
+    # below costs nothing and is what every verified run actually used.
     official_website = gmaps_website
-    gemini_cost_usd = 0.0
-    mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
-    llm_batch = _get_bool_env("GMAPS_LLM_BATCH", False)
-    # Candidate set the LLM selects from (also feeds _build_batch_prompt_for_row).
     scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
     candidates = dedupe_candidate_urls([e["url"] for e in scored])
-    confidence_ctx: dict[str, Any] = {}
-
-    if mode == "llm" and candidates and not llm_batch:
-        final_output, final_error, final_model, final_usage = await asyncio.to_thread(
-            choose_final_website_with_gemini,
-            company_name, country, input_industry, input_full_address,
-            candidates, [], None, gmaps_context,
-        )
-        if final_output is not None:
-            confidence_ctx["candidates"] = candidates
-            confidence_ctx["final_url_selection_ai"] = {
-                "provider": "google-gemini", "model": final_model,
-                "used": True, "error": final_error,
-                "usage": final_usage or {}, "raw": final_output,
-            }
-            gemini_cost_usd = calculate_gemini_cost_usd(final_usage)
-            ai_website = final_output.get("official_website")
-            # Accept the LLM's validated in-candidate pick; otherwise keep the Python
-            # best pick (parity with the gsearch worker).
-            if (isinstance(ai_website, str) and ai_website.strip()
-                    and not is_disallowed_official_url(ai_website)):
-                official_website = ai_website.strip()
-        else:
-            # LLM error -> heuristic fallback so the row still has a confidence.
-            confidence_ctx["candidates"] = candidates
-            block = _gmaps_confidence_block(
-                gmaps_result, company_name, input_full_address, gmaps_website)
-            block["mode"] = f"llm (fallback->heuristic: {final_error})"
-            confidence_ctx["gmaps_confidence"] = block
-    elif mode == "llm" and llm_batch:
-        # Batch mode: the finalization Gemini batch decides. Expose candidates for the
-        # batch prompt builder; keep the Python pick + a heuristic placeholder for
-        # pre-batch display (serpwow_reporting prefers gemini_batch_ai once it lands).
-        confidence_ctx["candidates"] = candidates
-        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
-            gmaps_result, company_name, input_full_address, gmaps_website)
-    else:
-        # Heuristic mode (default) — unchanged behavior.
-        confidence_ctx["gmaps_confidence"] = _gmaps_confidence_block(
-            gmaps_result, company_name, input_full_address, gmaps_website)
+    confidence_ctx: dict[str, Any] = {
+        "gmaps_confidence": _gmaps_confidence_block(
+            gmaps_result, company_name, input_full_address, gmaps_website),
+    }
 
     context: dict[str, Any] = {
         "pipeline": PIPELINE_GMAPS,
@@ -191,8 +173,8 @@ async def execute_gmaps_lookup(
         # scrape.do bills credits, not per-search USD, so there are no serpwow_* keys
         # here — and their ABSENCE is load-bearing: build_summary routes on the
         # scrapedo_* keys and would otherwise price this row's single call at
-        # SERPWOW_USD_PER_SEARCH. total/gemini stay because GMAPS_CONFIDENCE_MODE=llm
-        # is a real USD cost.
+        # SERPWOW_USD_PER_SEARCH. gemini/total stay as zeros so the
+        # report keeps one shape across pipelines.
         "cost_breakdown": {
             # requests == successful + failed, so a run reconciles as
             # "N calls = X succeeded + Y failed"; only the successful ones are billed.
@@ -204,8 +186,8 @@ async def execute_gmaps_lookup(
             "scrapedo_no_results": 1 if gmaps_no_results else 0,
             "scrapedo_billed_empty": 1 if gmaps_billed_empty else 0,
             "scrapedo_credits": gmaps_credits_used,
-            "gemini_cost_usd": gemini_cost_usd,
-            "total_cost_usd": gemini_cost_usd,
+            "gemini_cost_usd": 0.0,
+            "total_cost_usd": 0.0,
         },
     }
     context.update(confidence_ctx)
@@ -232,8 +214,8 @@ async def execute_gmaps_lookup(
         # massive_proxy_cost_usd / serpwow_cost_usd left unset (None): neither provider
         # is involved in a gmaps row, so "not applicable" beats a meaningless $0.00.
         # They stay on the shared CrawlResponse for gsearch/firmographics.
-        gemini_cost_usd=gemini_cost_usd,
-        total_cost_usd=gemini_cost_usd,
+        gemini_cost_usd=0.0,
+        total_cost_usd=0.0,
         context=context,
     )
 

@@ -53,6 +53,10 @@ class ParsedCSV:
     columns_detected: dict[str, str]   # canonical field -> original header
     warnings: list[str] = field(default_factory=list)
     positional: bool = False
+    # Rows that PASSED validation, which is not len(entities) once sample_limit caps what
+    # is retained. The S3-only pipelines need the count and nothing else: the rows
+    # themselves go straight to S3 for the worker to stream back.
+    total_rows: int = 0
 
 
 def _norm(header: str) -> str:
@@ -82,19 +86,34 @@ def _looks_like_header_row(row: list[str]) -> bool:
     return False
 
 
-def parse_entities_csv(raw: str | bytes) -> ParsedCSV:
+def parse_entities_csv(raw: str | bytes,
+                       sample_limit: int | None = None) -> ParsedCSV:
+    """Validate every row; keep at most ``sample_limit`` of them as Entity objects.
+
+    ``sample_limit=None`` (the default) keeps them all, which is what the AI Mode engine
+    wants — it works from the entity list. The S3-only pipelines pass a small limit (or 0)
+    because they need only the COUNT plus the raw bytes, which go straight to S3 for the
+    worker to stream: materialising 500k Entity objects in the API process was ~150MB per
+    upload of data no caller reads. ``total_rows`` always reflects every valid row.
+    """
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8-sig", errors="replace")
-    rows = list(csv.reader(io.StringIO(raw)))
-    rows = [r for r in rows if any((c or "").strip() for c in r)]
-    if not rows:
+    header_row = next((r for r in csv.reader(io.StringIO(raw))
+                       if any((c or "").strip() for c in r)), None)
+    if header_row is None:
         raise InvalidCSVError("CSV is empty. " + REQUIRED_MESSAGE)
 
-    mapping = _resolve_columns(rows[0])
+    mapping = _resolve_columns(header_row)
     warnings: list[str] = []
     entities: list[Entity] = []
+    total = 0
+
+    def _keep(entity: Entity) -> None:
+        if sample_limit is None or len(entities) < sample_limit:
+            entities.append(entity)
 
     if "company_name" in mapping and "country" in mapping:
+        # Streamed, never materialised: DictReader over the text, one record at a time.
         reader = csv.DictReader(io.StringIO(raw))
         sno = 0
         for record in reader:
@@ -103,40 +122,49 @@ def parse_entities_csv(raw: str | bytes) -> ParsedCSV:
             if not name:
                 continue
             sno += 1
+            total += 1
 
             def opt(canon: str) -> str | None:
                 header = mapping.get(canon)
                 value = (record.get(header) or "").strip() if header else ""
                 return value or None
 
-            entities.append(Entity(
+            _keep(Entity(
                 company_name=name, country=country, sno=sno,
                 company_local_name=opt("company_local_name"), address=opt("address"),
                 firm_id=opt("firm_id"), industry=opt("industry"),
             ))
         positional = False
     else:
-        if _looks_like_header_row(rows[0]):
+        if _looks_like_header_row(header_row):
             # The file has a header row, but it is missing the required
             # company/country columns (e.g. legacy Company Mode exports).
             # Do NOT fall back to positional parsing, which would silently
             # treat header text as data.
             raise InvalidCSVError(
                 "CSV header row is missing required columns. " + REQUIRED_MESSAGE)
-        if max(len(r) for r in rows) < 2:
-            raise InvalidCSVError("Unrecognized CSV format. " + REQUIRED_MESSAGE)
         warnings.append("No recognized headers found; positional parsing used "
                         "(column 1 = company name, column 2 = country).")
         mapping = {"company_name": "<col 1>", "country": "<col 2>"}
-        entities = [
-            Entity(company_name=r[0].strip(), country=(r[1].strip() if len(r) > 1 else ""), sno=i)
-            for i, r in enumerate(rows, start=1) if (r and r[0].strip())
-        ]
+        widest = 0
+        sno = 0
+        for row in csv.reader(io.StringIO(raw)):
+            if not any((c or "").strip() for c in row):
+                continue
+            widest = max(widest, len(row))
+            sno += 1
+            if not (row and row[0].strip()):
+                continue
+            total += 1
+            _keep(Entity(company_name=row[0].strip(),
+                         country=(row[1].strip() if len(row) > 1 else ""), sno=sno))
+        if widest < 2:
+            raise InvalidCSVError("Unrecognized CSV format. " + REQUIRED_MESSAGE)
         positional = True
 
-    if not entities:
+    if not total:
         raise InvalidCSVError("No valid rows found. " + REQUIRED_MESSAGE)
-    return ParsedCSV(entities=entities, columns_detected=mapping,
+    return ParsedCSV(entities=entities, total_rows=total, columns_detected=mapping,
                      warnings=warnings, positional=positional)
 
 

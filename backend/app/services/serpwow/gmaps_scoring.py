@@ -153,10 +153,10 @@ def _gmaps_confidence_block(
     input_full_address: Optional[str],
     chosen_url: Optional[str],
 ) -> dict[str, Any]:
-    """Heuristic confidence block for the chosen gmaps URL. Used for
-    GMAPS_CONFIDENCE_MODE=heuristic and as the per-row LLM-error fallback (the
-    caller overrides ``mode`` in that case). The LLM path lives in
-    execute_gmaps_lookup, which owns the GMAPS_CONFIDENCE_MODE branching."""
+    """Heuristic confidence block for the chosen gmaps URL.
+
+    Computed for every gmaps row inside execute_gmaps_lookup, and the pipeline's ONLY
+    confidence source since the LLM modes were removed in 2026-08."""
     scored = _score_gmaps_candidates(gmaps_result, company_name, input_full_address)
     entry: Optional[dict[str, Any]] = None
     if chosen_url:

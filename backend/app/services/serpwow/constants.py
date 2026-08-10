@@ -7,9 +7,11 @@ PIPELINE_GMAPS = "gmaps"
 PIPELINE_GSEARCH = "gsearch"
 PIPELINE_RELATIONSHIP = "relationship"
 
-# Pipelines that produce found/notFound/report/run.log via serpwow_reporting
-# and surface a serpwow_summary block (gsearch parity).
-REPORTING_PIPELINES = {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}
+# Pipelines whose STATE-DRIVEN runs produce found/notFound/report/run.log via
+# serpwow_reporting. gmaps is deliberately absent since 2026-08: it has no state.json at
+# all any more, so it writes those same four files from gmaps_outputs instead, streaming
+# rather than materialising every row.
+REPORTING_PIPELINES = {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}
 
 # Relationship-mode row-error strings (user-visible in notFound.csv / UI).
 REL_ERROR_NO_EVIDENCE = "No search evidence found for this company pair."

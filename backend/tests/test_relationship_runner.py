@@ -11,8 +11,9 @@ from app.services import ai_mode as ai_mode_pkg
 # needs the submodule attribute to exist, and only an import sets it.
 from app.services.ai_mode import gemini_batch as _gemini_batch  # noqa: F401
 from app.services.serpwow import relationship_runner as runner
-from app.services.serpwow import relationship_store as store
-from tests.test_relationship_store import FakeS3, _patched
+from app.services.serpwow import s3_run_driver as driver
+from app.services.serpwow import s3_run_store as store
+from tests.test_s3_run_store import FakeS3, _patched
 
 CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
        b"https://acme.com/p,Acme,Sanzo,US\n"
@@ -309,7 +310,7 @@ class StopCheckFrequencyTests(unittest.TestCase):
 
         with _patched(fake), mock.patch.object(runner, "search_ai_mode", fake_search), \
                 mock.patch.object(store, "stop_requested", counting_stop), \
-                mock.patch.object(runner, "_STOP_CHECK_INTERVAL_SEC", 0.02), \
+                mock.patch.object(driver, "_STOP_CHECK_INTERVAL_SEC", 0.02), \
                 mock.patch.dict(os.environ, {"SCRAPEDO_CONCURRENCY": "20"},
                                 clear=False):
             counters = store.Counters(PREFIX, rows_total=rows)
@@ -560,7 +561,7 @@ class DriveTests(unittest.TestCase):
                                   lambda p, c: phase("verdict")), \
                 mock.patch.object(runner, "write_outputs",
                                   lambda p, c: order.append("outputs") or {}), \
-                mock.patch.object(runner, "_notify_terminal"):
+                mock.patch.object(driver, "notify_terminal"):
             store.write_run_pointer("run1", PREFIX, "Acme")
             asyncio.run(runner.drive_run("run1"))
 
@@ -582,8 +583,8 @@ class DriveTests(unittest.TestCase):
                                   lambda p, c: asyncio.sleep(0)), \
                 mock.patch.object(runner, "write_outputs",
                                   lambda p, c: {"status": "completed"}), \
-                mock.patch.object(runner, "_notify_terminal",
-                                  lambda rid, ptr, summary: notified.append(
+                mock.patch.object(driver, "notify_terminal",
+                                  lambda rid, ptr, summary, **kw: notified.append(
                                       (rid, summary))):
             store.write_run_pointer("run1", PREFIX, "Acme")
             asyncio.run(runner.drive_run("run1"))
@@ -613,8 +614,8 @@ class DriveTests(unittest.TestCase):
                 mock.patch.object(runner, "write_outputs",
                                   lambda p, c: called.append("outputs")
                                   or {"status": "stopped"}), \
-                mock.patch.object(runner, "_notify_terminal",
-                                  lambda *a: called.append("notify")):
+                mock.patch.object(driver, "notify_terminal",
+                                  lambda *a, **kw: called.append("notify")):
             asyncio.run(runner.drive_run("run1"))
         # Outputs and terminalization happen; only the money-spending phase is skipped.
         self.assertEqual(called, ["outputs", "notify"])
@@ -714,7 +715,9 @@ class NotifyTerminalTests(unittest.TestCase):
                         return_value=fake_svc), \
                 mock.patch("app.core.notify.notify_run_complete",
                           side_effect=RuntimeError("slack down")):
-            runner._notify_terminal("run1", pointer, summary)   # must not raise
+            driver.notify_terminal("run1", pointer, summary,
+                                   pipeline="relationship",
+                                   search_label="Scrape.do searches")   # must not raise
 
     def test_both_channels_are_attempted_with_a_run_db_id(self) -> None:
         summary = {"status": "completed_with_errors",
@@ -726,7 +729,9 @@ class NotifyTerminalTests(unittest.TestCase):
         with mock.patch("app.services.companies.get_company_service",
                         return_value=fake_svc), \
                 mock.patch("app.core.notify.notify_run_complete") as slack:
-            runner._notify_terminal("run1", pointer, summary)
+            driver.notify_terminal("run1", pointer, summary,
+                                   pipeline="relationship",
+                                   search_label="Scrape.do searches")
 
         fake_svc.update_run.assert_called_once()
         args, kwargs = fake_svc.update_run.call_args
@@ -751,7 +756,9 @@ class NotifyTerminalTests(unittest.TestCase):
         pointer = {"company_name": "Acme"}
         with mock.patch("app.services.companies.get_company_service") as get_svc, \
                 mock.patch("app.core.notify.notify_run_complete") as slack:
-            runner._notify_terminal("run1", pointer, summary)
+            driver.notify_terminal("run1", pointer, summary,
+                                   pipeline="relationship",
+                                   search_label="Scrape.do searches")
         get_svc.assert_not_called()
         slack.assert_called_once()
 
@@ -764,7 +771,9 @@ class NotifyTerminalTests(unittest.TestCase):
         with mock.patch("app.services.companies.get_company_service",
                         return_value=None), \
                 mock.patch("app.core.notify.notify_run_complete") as slack:
-            runner._notify_terminal("run1", pointer, summary)   # must not raise
+            driver.notify_terminal("run1", pointer, summary,
+                                   pipeline="relationship",
+                                   search_label="Scrape.do searches")   # must not raise
         slack.assert_called_once()
 
 
@@ -1048,7 +1057,7 @@ class SingleFlightTests(unittest.TestCase):
                                       lambda p, c: asyncio.sleep(0)), \
                     mock.patch.object(runner, "write_outputs",
                                       lambda p, c: {"status": "completed"}), \
-                    mock.patch.object(runner, "_notify_terminal"):
+                    mock.patch.object(driver, "notify_terminal"):
                 first = asyncio.create_task(runner.drive_run("run1"))
                 await started.wait()
                 # The first drive is still inside run_scrape_phase (blocked on
@@ -1083,12 +1092,12 @@ class SingleFlightTests(unittest.TestCase):
                                   lambda p, c: phase("verdict", p, c)), \
                 mock.patch.object(runner, "write_outputs",
                                   lambda p, c: order.append("outputs") or {}), \
-                mock.patch.object(runner, "_notify_terminal"):
+                mock.patch.object(driver, "notify_terminal"):
             asyncio.run(runner.drive_run("run1"))
             asyncio.run(runner.drive_run("run1"))   # must run again, not be skipped
 
         self.assertEqual(order, ["scrape", "verdict", "outputs"] * 2)
-        self.assertNotIn("run1", runner._driving)
+        self.assertNotIn("run1", driver._driving)
 
 
 class BatchReattachTests(unittest.TestCase):

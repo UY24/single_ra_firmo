@@ -52,7 +52,7 @@ def _envelope(
     the response body EXACTLY as it came off the wire — that string, not a re-serialised
     copy of it, is what gets written to ``raw/``, so the object in the bucket is
     byte-for-byte what scrape.do sent. Everything else here is call bookkeeping the
-    provider does not report, and it is stored separately (see relationship_store).
+    provider does not report, and it is stored separately (see s3_run_store).
 
     ``credits`` is DERIVED from the HTTP-200 count, never counted by hand, so a run
     always reconciles as ``request_count == successful_requests + failed_requests``.

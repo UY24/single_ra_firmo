@@ -1,11 +1,16 @@
-# backend/app/services/serpwow/relationship_store.py
-"""S3-only run store for the relationship pipeline.
+# backend/app/services/serpwow/s3_run_store.py
+"""S3-only run store, shared by the relationship and gmaps pipelines.
 
 There is NO local disk and NO state.json. Object presence IS the state:
   raw/<shard>/row_NNNNNN.json      -> scrape.do's response body, EXACTLY as sent
+  rows/<shard>/row_NNNNNN.json     -> the row's computed result (gmaps)
   errors/<shard>/row_NNNNNN.json   -> the row died after every retry, and why
-  cleaned/<shard>/row_NNNNNN.json  -> the row has a Gemini verdict
+  cleaned/<shard>/row_NNNNNN.json  -> the row has a Gemini verdict (relationship)
   batches/<first>-<last>.json      -> a Gemini shard is IN FLIGHT for those rows
+
+Every function takes an explicit run ``prefix``, so nothing here is pipeline-specific
+except which SEGMENT a new run's prefix is built under and which pointer namespace it is
+indexed in — both passed in, both defaulting to nothing.
 
 ``raw/`` holds NOTHING but the provider's own bytes — no wrapper, no fields of ours, not
 even re-serialised JSON. There is no sidecar object either: everything a sidecar would
@@ -45,7 +50,6 @@ PIPELINE_SEGMENT = "relationship"
 # One prefix per 1000 rows: 500 prefixes at 500k, so no LIST page is huge and writes
 # spread across prefixes instead of hot-keying one.
 SHARD_SIZE = 1000
-_POINTER_PREFIX = "_relationship_runs"
 
 
 def _client():
@@ -58,8 +62,9 @@ def _bucket() -> str:
 
 # ---------------------------------------------------------------- key layout
 
-def run_prefix(company_name: str, run_id: str) -> str:
-    return f"{slugify_company(company_name)}/{PIPELINE_SEGMENT}/{run_id}"
+def run_prefix(company_name: str, run_id: str,
+               segment: str = PIPELINE_SEGMENT) -> str:
+    return f"{slugify_company(company_name)}/{segment}/{run_id}"
 
 
 def _shard(idx: int) -> int:
@@ -79,6 +84,18 @@ def _row_name(idx: int) -> str:
 def raw_key(prefix: str, idx: int) -> str:
     """The provider's response body, verbatim. Nothing of ours goes in here."""
     return f"{prefix}/raw/{_shard(idx)}/{_row_name(idx)}.json"
+
+
+def row_key(prefix: str, idx: int) -> str:
+    """A row's COMPUTED result, beside the provider bytes it was derived from.
+
+    gmaps needs this and relationship does not: a gmaps row's attempt accounting
+    (which of its retries recovered, which were real errors, whether Google simply has
+    no listing) cannot be recovered from the response body, and the UI's error breakdown
+    is built from exactly those numbers. relationship re-derives its row result from
+    raw/ + input.csv instead, so it writes no object here.
+    """
+    return f"{prefix}/rows/{_shard(idx)}/{_row_name(idx)}.json"
 
 
 def error_key(prefix: str, idx: int) -> str:
@@ -285,15 +302,19 @@ def _idx_from_key(key: str) -> Optional[int]:
     return max(0, int(digits) - 1)
 
 
-def list_done_rows(prefix: str) -> set[int]:
-    """Row indices that have a provider response, or a terminal error marker.
+def list_done_rows(prefix: str, done_prefix: str = "raw") -> set[int]:
+    """Row indices that are finished: they have a ``done_prefix`` object, or an error marker.
 
     Paginated LISTs — a few seconds for 500k rows — instead of 500k HEADs. Every later
     skip check is an in-memory set lookup.
 
+    ``done_prefix`` is what "finished" MEANS for the pipeline: relationship's raw/ object
+    is written last so it is the completion marker, while gmaps writes raw/ first and its
+    rows/ result second — so a gmaps row is only done once rows/ exists, and a crash
+    between the two writes just re-scrapes it.
     """
     done: set[int] = set()
-    for key in iter_keys(f"{prefix}/raw/"):
+    for key in iter_keys(f"{prefix}/{done_prefix}/"):
         idx = _idx_from_key(key)
         if idx is not None:
             done.add(idx)
@@ -315,29 +336,37 @@ def list_cleaned_rows(prefix: str) -> set[int]:
 
 # ---------------------------------------------------------------- run pointer
 
-def _pointer_key(run_id: str) -> str:
-    return f"{_POINTER_PREFIX}/{run_id}.json"
+def _pointer_key(run_id: str, segment: str = PIPELINE_SEGMENT) -> str:
+    """One index object per run, namespaced per pipeline.
+
+    ``_relationship_runs/`` is what the existing relationship runs already use, so
+    deriving the namespace from the segment keeps them findable with no migration and
+    gives gmaps ``_gmaps_runs/`` for free.
+    """
+    return f"_{segment}_runs/{run_id}.json"
 
 
 def write_run_pointer(run_id: str, prefix: str, company_name: str,
-                      run_db_id: Optional[str] = None) -> None:
+                      run_db_id: Optional[str] = None,
+                      segment: str = PIPELINE_SEGMENT) -> None:
     """run_id -> prefix, so the API can find a run without scanning the bucket.
 
     Also carries the Supabase ``run_db_id``: a relationship run has no state dict, so
     this pointer is where phase 3 finds the row it must update at terminal status.
     """
-    put_object(_pointer_key(run_id),
+    put_object(_pointer_key(run_id, segment),
                {"run_id": run_id, "prefix": prefix, "company_name": company_name,
                 "run_db_id": run_db_id})
 
 
-def read_run_pointer(run_id: str) -> Optional[dict[str, Any]]:
-    return get_object(_pointer_key(run_id))
+def read_run_pointer(run_id: str,
+                     segment: str = PIPELINE_SEGMENT) -> Optional[dict[str, Any]]:
+    return get_object(_pointer_key(run_id, segment))
 
 
-def list_run_pointers() -> list[dict[str, Any]]:
+def list_run_pointers(segment: str = PIPELINE_SEGMENT) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for key in iter_keys(f"{_POINTER_PREFIX}/"):
+    for key in iter_keys(f"_{segment}_runs/"):
         ptr = get_object(key)
         if ptr:
             out.append(ptr)

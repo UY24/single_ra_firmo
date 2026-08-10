@@ -288,22 +288,19 @@ def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     """True when Gemini batch confidence scoring applies to this pipeline.
 
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
-    gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
 
-    relationship is absent: it owns its own Gemini Batch driver in
-    relationship_runner and never routes through this shared row-batch engine.
+    gsearch is the ONLY pipeline here. relationship owns its own Gemini Batch driver in
+    relationship_runner, and gmaps has no LLM mode at all since it moved to the S3-only
+    runner — its confidence is heuristic and computed inside the row task.
     """
     pipe = str(pipeline or "")
     if pipe == PIPELINE_GSEARCH:
         return _get_bool_env("GSEARCH_LLM_BATCH", False)
-    if pipe == PIPELINE_GMAPS:
-        mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
-        return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
     return False
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
-    """gsearch/gmaps: True while the Gemini batch hasn't reached a terminal status.
+    """gsearch: True while the Gemini batch hasn't reached a terminal status.
 
     Used to DEFER the terminal completion side-effects (Supabase 'completed' sync,
     Slack ping, output-file finalize) until the batch is done, so a batch run
@@ -311,7 +308,7 @@ def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
     pipeline is intentionally left unchanged.
     """
     pipe = str(state.get("pipeline") or "")
-    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS}:
+    if pipe != PIPELINE_GSEARCH:
         return False
     if not _batch_postprocess_enabled_for(pipe):
         return False
@@ -2778,9 +2775,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
 
 
 async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> None:
-    """Write found/notFound/report/run.log for a terminal SerpWow upload
-    (gsearch or gmaps) and mirror them to S3. Best-effort: logs + swallows
-    everything, never raises."""
+    """Write found/notFound/report/run.log for a terminal gsearch upload and mirror them
+    to S3. Best-effort: logs + swallows everything, never raises."""
     try:
         upload_dir = _find_upload_dir(upload_id)
         paths = await asyncio.to_thread(serpwow_reporting.write_outputs, upload_dir, state)
@@ -2995,7 +2991,6 @@ async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any])
         return state
     if str(state.get("pipeline") or "") not in {
         PIPELINE_FIRMOGRAPHICS,
-        PIPELINE_GMAPS,
         PIPELINE_GSEARCH,
     }:
         return state
@@ -3346,6 +3341,38 @@ async def publish_relationship_run(run_id: str) -> None:
               f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
 
 
+async def publish_gmaps_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole gmaps run.
+
+    Same contract as publish_relationship_run, including that failure is tolerated HERE
+    rather than at the call sites: the run already exists in S3 by this point, so letting
+    an AMQP error propagate would 500 the request with no upload_id while the run exists.
+    The worker's stale-run scan picks it up, so a broker hiccup delays a run, never loses
+    one.
+    """
+    from app.services.serpwow.gmaps_runner import GMAPS_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[gmaps] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=GMAPS_ROUTING_KEY,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[gmaps] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
+
+
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
     """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
     legacy binary: found->completed, everything-else->failed (no not_found remap)."""
@@ -3418,16 +3445,6 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 firm_id=firm_id,
                 input_industry=input_industry,
                 input_full_address=input_full_address,
-            )
-        elif pipeline == PIPELINE_GMAPS:
-            crawl_response, serpwow_raw_json = await execute_gmaps_lookup(
-                company_name=company_name,
-                country=country,
-                firm_id=firm_id,
-                input_industry=input_industry,
-                input_full_address=input_full_address,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
             )
         elif pipeline == PIPELINE_GSEARCH:
             phase_value = str(job.get("phase") or "all").strip() or "all"
@@ -3736,10 +3753,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
     GSEARCH_ROW_STALE_TIMEOUT_SEC is re-published up to GSEARCH_ROW_MAX_REQUEUE times,
     then FORCE-FAILED so the completion barrier can always resolve. Best-effort.
 
-    Also covers gmaps uploads, but ONLY when gmaps batch mode is enabled
-    (GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH) — a stuck row there blocks
-    maybe_start_gemini_batch_for_upload from ever starting since it waits for all
-    rows to be terminal. Per-row/heuristic gmaps has no such barrier and is skipped.
+    gsearch only: it is the last pipeline with per-row messages and a Phase 1->2 barrier.
     """
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return
@@ -3759,13 +3773,10 @@ async def reconcile_stuck_gsearch_rows() -> None:
             if not isinstance(state, dict):
                 continue
             _rec_pipe = str(state.get("pipeline") or "")
-            # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
-            # only in batch mode, where a stuck row blocks the finalization batch from
-            # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
-            # relationship is not here: it has no per-row messages to re-publish and
-            # runs its own stale-run scan (relationship_runner.redrive_stale_runs).
-            if not (_rec_pipe == PIPELINE_GSEARCH
-                    or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
+            # gsearch alone needs terminalization (its Phase 1->2 barrier). The S3-only
+            # pipelines are not here: they have no per-row messages to re-publish and run
+            # their own stale-run scans (relationship_runner / gmaps_runner).
+            if _rec_pipe != PIPELINE_GSEARCH:
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
                 continue
@@ -4198,12 +4209,27 @@ async def create_gmaps_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    """Create an S3-only gmaps run: validate, park input.csv in S3, publish ONE message.
+
+    No state.json and no local disk (2026-08). The rows are never materialised here — the
+    worker streams input.csv back out of S3 — which is what makes a 500k-row upload cost
+    the API process a fixed amount of memory instead of ~150MB of Entity objects.
+    """
+    import uuid
+
+    from app.core import s3 as core_s3
+    from app.models.entities import InvalidCSVError, parse_entities_csv
+    from app.services.serpwow import s3_run_store as run_store
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
     raw = await file.read()
-    _validate_canonical_upload_csv(raw)
+    # CSV first: a bad CSV must report the CSV problem, not a config problem.
+    # sample_limit=0 validates every row but retains none — only the count is used.
     try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
+        parsed = parse_entities_csv(raw, sample_limit=0)
+    except InvalidCSVError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # gmaps runs on scrape.do's Google Maps API — fail fast instead of burning a whole
     # run's rows on a missing token. Checked AFTER CSV validation so a user with a bad
     # CSV hears about their CSV, not about our server config.
@@ -4211,9 +4237,38 @@ async def create_gmaps_upload(
         raise HTTPException(
             status_code=400,
             detail="SCRAPEDO_TOKEN is not configured — required for the gmaps pipeline.")
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_GMAPS, company_id=company_id, company_name=company_name
-    )
+    # S3 is not optional the way it is for the state-driven pipelines: this run has no
+    # local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the gmaps pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = run_store.run_prefix(company_name or company_id, run_id, GMAPS_SEGMENT)
+    total = parsed.total_rows
+
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_GMAPS,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(run_store.put_bytes, run_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: there is no state dict to read it from later.
+    await asyncio.to_thread(run_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id, GMAPS_SEGMENT)
+    # The API writes status.json exactly once, before publishing; from the first scrape on
+    # the worker is the only writer. created_at is stamped ONCE here and carried by every
+    # later drive, so total wall clock survives a worker restart mid-run.
+    counters = run_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_gmaps_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_GMAPS,
+            "total_rows": total, "company_id": company_id}
 
 
 @app.post("/uploads/gsearch")
@@ -4282,7 +4337,7 @@ async def create_relationship_upload(
     import uuid
 
     from app.core import s3 as core_s3
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
         parse_relationship_csv,
@@ -4341,17 +4396,36 @@ async def create_relationship_upload(
             "total_rows": total, "company_id": company_id}
 
 
+def _find_s3_run(run_id: str) -> tuple[Optional[dict[str, Any]], str]:
+    """(pointer, segment) for an S3-only run, or (None, "") if this id is not one.
+
+    Two pipelines now keep their runs entirely in S3 with no state.json, each in its own
+    pointer namespace. Endpoints that serve both — status, stop, retry, failure-analysis,
+    result files — resolve the id here rather than each guessing a namespace. Two small
+    GETs at most, and the miss is what tells the caller to fall through to the
+    state-driven path.
+    """
+    from app.services.serpwow import s3_run_store as run_store
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
+    for segment in (run_store.PIPELINE_SEGMENT, GMAPS_SEGMENT):
+        pointer = run_store.read_run_pointer(run_id, segment)
+        if pointer:
+            return pointer, segment
+    return None, ""
+
+
 @app.post("/uploads/{upload_id}/retry-failed-rows")
 async def retry_failed_rows(
     upload_id: str,
     limit: int = Query(0, ge=0, le=5000),
 ) -> dict[str, Any]:
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
 
-    # Rerun failed (relationship): drop the error markers so a re-drive rescrapes
+    # Rerun failed (S3-only pipelines): drop the error markers so a re-drive rescrapes
     # exactly those rows. Checked before the broker guard on purpose — the re-drive
     # scan starts the run even if the publish below is skipped.
-    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    pointer, segment = await asyncio.to_thread(_find_s3_run, upload_id)
     if pointer:
         prefix = pointer["prefix"]
 
@@ -4366,7 +4440,8 @@ async def retry_failed_rows(
         removed = await asyncio.to_thread(
             lambda: rel_store.delete_objects(_dead_markers()))
         await asyncio.to_thread(rel_store.clear_stop, prefix)
-        await publish_relationship_run(upload_id)
+        await (publish_gmaps_run(upload_id) if segment == "gmaps"
+               else publish_relationship_run(upload_id))
         return {"upload_id": upload_id, "retried_rows": removed,
                 # operations.js reads enqueued_rows for its status line.
                 "enqueued_rows": removed,
@@ -4522,11 +4597,11 @@ async def stop_upload(upload_id: str) -> dict[str, Any]:
     RabbitMQ messages are then dropped by the worker's idempotency guard) and
     best-effort cancel a pending/running Gemini batch. The upload terminalizes
     on this persist, so outputs/Supabase/Slack fire with whatever was done."""
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
 
-    # Relationship runs have no rows and no engine-side Gemini batch to cancel — the
-    # stop is an S3 marker the runner polls between rows.
-    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    # S3-only runs have no rows and no engine-side Gemini batch to cancel — the stop is
+    # an S3 marker the runner polls between rows.
+    pointer, _segment = await asyncio.to_thread(_find_s3_run, upload_id)
     if pointer:
         await asyncio.to_thread(rel_store.request_stop, pointer["prefix"])
         # run_detail.js reports stopped_rows/batch_cancelled in its confirmation
@@ -5073,20 +5148,23 @@ _RELATIONSHIP_RUN_STATUS = {
 _RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
 
 
-def _relationship_available_files(prefix: str) -> list[str]:
-    """Which of the run's four output files actually exist.
+_GMAPS_FILES = ("found.csv", "notFound.csv", "report.json", "run.log")
+
+
+def _s3_run_available_files(prefix: str, names: tuple[str, ...]) -> list[str]:
+    """Which of the run's output files actually exist.
 
     One scoped LIST per name (each returns 0 or 1 keys) rather than a single LIST of the
-    run prefix: at 500k rows that prefix holds a million raw/ and cleaned/ objects.
+    run prefix: at 500k rows that prefix holds a million per-row objects.
     """
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as run_store
 
-    return [name for name in _RELATIONSHIP_FILES
-            if next(rel_store.iter_keys(f"{prefix}/{name}"), None) is not None]
+    return [name for name in names
+            if next(run_store.iter_keys(f"{prefix}/{name}"), None) is not None]
 
 
-def _relationship_elapsed(counters: dict[str, Any]) -> Optional[int]:
-    """Wall clock from a relationship run's created_at to now, for mid-run display.
+def _s3_run_elapsed(counters: dict[str, Any]) -> Optional[int]:
+    """Wall clock from an S3-only run's created_at to now, for mid-run display.
 
     report.json only exists once the run is terminal, so without this the Processing-time
     tile stayed blank for the whole run.
@@ -5102,15 +5180,18 @@ def _relationship_elapsed(counters: dict[str, Any]) -> Optional[int]:
     return max(0, int(_time.time() - started))
 
 
-async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
-    """Build the /status response for a relationship run from status.json counters.
+async def _s3_run_status(run_id: str, *, segment: str, pipeline: str,
+                         files: tuple[str, ...],
+                         fallback: Any) -> Optional[dict[str, Any]]:
+    """Build the /status response for an S3-only run from its status.json counters.
 
-    Same JSON shape as the state-driven pipelines, so run_detail.js is unchanged.
-    Returns None when this id is not a relationship run.
+    Same JSON shape as the state-driven pipelines, so run_detail.js is unchanged. Returns
+    None when this id is not a run of this pipeline. `fallback` builds the mid-run summary
+    for the window before report.json exists — the one part that differs per pipeline.
     """
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
 
-    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id, segment)
     if not pointer:
         return None
     prefix = str(pointer.get("prefix") or "")
@@ -5122,31 +5203,7 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
 
     report = await asyncio.to_thread(
         rel_store.get_object, f"{prefix}/report.json") or {}
-    summary = report.get("summary") or {
-        "total_rows": total, "websites_found": 0,
-        "websites_not_found": max(0, total - scraped),
-        "confidence_mode": "llm",
-        # Always true for this pipeline — phase 2 is always the Gemini Batch verdict pass,
-        # there is no per-row LLM path. Must match relationship_outputs' summary so the
-        # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
-        "is_batch": True,
-        # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
-        # these are honest zeros rather than absent keys — the tiles render 0, not blank,
-        # and fill in for real once report.json exists.
-        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
-        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "processing_seconds_total": _relationship_elapsed(counters),
-        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
-                          "cleaning": int(counters.get("llm_seconds") or 0)},
-        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
-        "empty_response_breakdown": {
-            "empty": int(counters.get("rows_billed_empty") or 0)},
-        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
-                 "scrapedo_credits": int(counters.get("credits") or 0),
-                 "scrapedo_error_requests": 0, "scrapedo_billed_empty":
-                     int(counters.get("rows_billed_empty") or 0),
-                 "llm_usd": 0.0, "total_usd": 0.0},
-    }
+    summary = report.get("summary") or fallback(counters, total, scraped, failed)
     # Prefer the status write_outputs computed — it is what _notify_terminal sent to
     # Supabase, so taking it here is what stops the detail page and the Runs list
     # disagreeing (phase only ever reaches "completed", never "completed_with_errors").
@@ -5167,11 +5224,11 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     # derived status, so a re-driven run (non-terminal again) advertises nothing either.
     available: list[str] = []
     if status in _RELATIONSHIP_TERMINAL_STATUSES:
-        available = await asyncio.to_thread(_relationship_available_files, prefix)
+        available = await asyncio.to_thread(_s3_run_available_files, prefix, files)
 
     return {
         "upload_id": run_id,
-        "pipeline": PIPELINE_RELATIONSHIP,
+        "pipeline": pipeline,
         # Mid-run the report doesn't exist yet, so serve timings from the counters. The UI
         # reads processing_seconds_total/avg at the top level, not inside the summary.
         "created_at": counters.get("created_at"),
@@ -5185,17 +5242,94 @@ async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
         "phase": phase,
         "updated_at": counters.get("updated_at"),
         "serpwow_summary": {**summary, "available_files": available},
-        "files": list(_RELATIONSHIP_FILES),
+        "files": list(files),
     }
+
+
+def _relationship_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
+                                   failed: int) -> dict[str, Any]:
+    """The summary shown while a relationship run is still in flight."""
+    return {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "llm",
+        # Always true for this pipeline — phase 2 is always the Gemini Batch verdict pass,
+        # there is no per-row LLM path. Must match relationship_outputs' summary so the
+        # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
+        "is_batch": True,
+        # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
+        # these are honest zeros rather than absent keys — the tiles render 0, not blank,
+        # and fill in for real once report.json exists.
+        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _s3_run_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
+                          "cleaning": int(counters.get("llm_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0, "scrapedo_billed_empty":
+                     int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+
+
+def _gmaps_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
+                            failed: int) -> dict[str, Any]:
+    """The summary shown while a gmaps run is still in flight.
+
+    No model, no tokens, no batch: heuristic confidence is computed inside the row task,
+    so there is nothing deferred to report on.
+    """
+    return {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "heuristic",
+        "is_batch": False,
+        "model": None,
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _s3_run_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "no_listing": int(counters.get("rows_no_listing") or 0),
+            "billed_empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0,
+                 "scrapedo_billed_empty": int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+
+
+async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a relationship run. None if it is not one."""
+    from app.services.serpwow import s3_run_store as rel_store
+
+    return await _s3_run_status(
+        run_id, segment=rel_store.PIPELINE_SEGMENT, pipeline=PIPELINE_RELATIONSHIP,
+        files=_RELATIONSHIP_FILES, fallback=_relationship_fallback_summary)
+
+
+async def _gmaps_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a gmaps run. None if it is not one."""
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
+    return await _s3_run_status(
+        run_id, segment=GMAPS_SEGMENT, pipeline=PIPELINE_GMAPS,
+        files=_GMAPS_FILES, fallback=_gmaps_fallback_summary)
 
 
 @app.get("/uploads/{upload_id}/status")
 async def upload_status(upload_id: str) -> dict[str, Any]:
-    # relationship runs have no state.json — they are counter-driven. Check the pointer
-    # first; the response shape is identical so the UI needs no change.
-    relationship_status = await _relationship_status(upload_id)
-    if relationship_status is not None:
-        return relationship_status
+    # The S3-only pipelines have no state.json — they are counter-driven. Check their
+    # pointers first; the response shape is identical so the UI needs no change.
+    for build in (_relationship_status, _gmaps_status):
+        s3_status = await build(upload_id)
+        if s3_status is not None:
+            return s3_status
 
     try:
         state = await get_upload_state(upload_id)
@@ -5302,9 +5436,9 @@ async def _relationship_failure_analysis(
     aggregate buckets are computed over the SAMPLE only — the alternative is GETting up to
     500k error objects to answer a debug panel that reads neither.
     """
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
 
-    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id)
+    pointer, _segment = await asyncio.to_thread(_find_s3_run, run_id)
     if not pointer:
         return None
     prefix = str(pointer.get("prefix") or "")
@@ -5449,12 +5583,13 @@ async def upload_result_file(
     file: str = Query(...),
     download: bool = Query(False),
 ) -> Response:
-    from app.services.serpwow import relationship_store as rel_store
+    from app.services.serpwow import s3_run_store as rel_store
 
-    pointer = await asyncio.to_thread(rel_store.read_run_pointer, upload_id)
+    pointer, segment = await asyncio.to_thread(_find_s3_run, upload_id)
     if pointer:
-        allowed = {"confirmed_relation.csv", "notconfirmed_relation.csv",
-                   "report.json", "run.log", "input.csv", "status.json"}
+        allowed = ({"found.csv", "notFound.csv"} if segment == "gmaps"
+                   else {"confirmed_relation.csv", "notconfirmed_relation.csv"}) | {
+            "report.json", "run.log", "input.csv", "status.json"}
         if file not in allowed:
             raise HTTPException(status_code=400, detail=f"Unknown file {file!r}")
         data = await asyncio.to_thread(

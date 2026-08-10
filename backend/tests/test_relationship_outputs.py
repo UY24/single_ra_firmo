@@ -6,8 +6,8 @@ import unittest
 from unittest import mock
 
 from app.services.serpwow import relationship_outputs as outputs
-from app.services.serpwow import relationship_store as store
-from tests.test_relationship_store import FakeS3, _patched
+from app.services.serpwow import s3_run_store as store
+from tests.test_s3_run_store import FakeS3, _patched
 
 PREFIX = "acme/relationship/run1"
 CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country,Notes\n"
@@ -359,8 +359,8 @@ class CostAccountingTests(unittest.TestCase):
 
         self.assertEqual(summary["status"], "stopped")
         self.assertEqual(status["phase"], "stopped")
-        from app.services.serpwow import relationship_runner as runner
-        self.assertIn("stopped", runner._TERMINAL_PHASES)
+        from app.services.serpwow import s3_run_driver as driver
+        self.assertIn("stopped", driver.TERMINAL_PHASES)
 
     def test_task_errors_label_the_run_completed_with_errors(self) -> None:
         """A row/shard task that RAISED leaves no per-row error marker: its rows read as

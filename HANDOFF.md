@@ -36,7 +36,7 @@ any `static/js` file.
    keep no `cleaned/` object. Either give relationship its own key or raise the shared one.
 2. **`retry-failed-rows` can't complete at scale.** LISTs all of `raw/` then issues one *serial*
    `to_thread` DELETE per dead row in a single HTTP request — 50k dead rows is 20+ minutes and a
-   client timeout. It also ignores its `limit` param, and `relationship_store.delete_object`
+   client timeout. It also ignores its `limit` param, and `s3_run_store.delete_object`
    swallows failures, so a row can count as retried and never be rescraped. Fix: `delete_objects`
    in 1000-key batches + honour `limit`.
 3. **`phase="failed"` is terminal for the re-drive scan.** Any transient error over a multi-day
@@ -46,14 +46,16 @@ any `static/js` file.
 4. **`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.** Each shard holds a thread for its whole
    multi-hour poll, so raising it past the default `ThreadPoolExecutor`'s `min(32, cpu+4)`
    (**6 on a 2-vCPU box**) creates nothing. Needs a sized executor.
-5. **gmaps state store.** `update_row_state` rewrites the whole `state.json` per row (ceiling
-   ~2.7k rows) and `report.json` embeds every row. Agreed direction: a small gmaps runner reusing
-   AI Mode's *primitives* (`s3_sync`, `StreamingRunReport`, own queue, O(1) counters,
-   file-presence-as-state) — not its `ModeConfig`/LLM flow. Message carries a batch of ~20 rows,
-   files stay per row. Needs sharded row dirs.
-6. **API-process memory.** `parse_relationship_csv` builds two full dict copies of every row for
-   preview and upload (>1GB twice at 500k); `/uploads/{id}/result` reads a whole several-hundred-MB
-   CSV into memory instead of streaming the boto3 body.
+5. ~~**gmaps state store.**~~ **DONE 2026-08-10.** gmaps is S3-only: no `state.json`, object
+   presence as row state, O(1) counters, streaming outputs, one message per run on `gmaps_runs`.
+   It reuses *relationship's* primitives (`s3_run_store` + the new `s3_run_driver`), not AI Mode's,
+   and is two phases rather than three — its LLM confidence modes were deleted, so there is no
+   batch pass. Old state-driven gmaps runs are not migrated (hard cutover; their S3 data remains).
+6. **API-process memory — partly fixed.** `parse_relationship_csv` (2026-08-05) and
+   `parse_entities_csv` (2026-08-10, via `sample_limit`) now validate every row while retaining
+   none, so a 500k-row upload no longer materialises its rows in the API process. Still open:
+   `/uploads/{id}/result` reads a whole several-hundred-MB CSV into memory instead of streaming
+   the boto3 body.
 
 ## Settled by live probes (2026-08-05, 16 calls / 160 credits)
 

@@ -1,3 +1,8 @@
+"""Supabase + file links for the STATE-DRIVEN reporting path.
+
+Fixtures say gsearch, not gmaps: gmaps left this path in 2026-08 for the S3-only runner,
+whose terminal write is s3_run_driver.notify_terminal (see test_gmaps_runner).
+"""
 import unittest
 from unittest import mock
 
@@ -13,7 +18,7 @@ class _FakeSvc:
 
 
 def _state():
-    return {"upload_id": "gm1", "company_name": "Acme", "pipeline": "gmaps",
+    return {"upload_id": "gm1", "company_name": "Acme", "pipeline": "gsearch",
             "status": "completed_with_errors", "run_db_id": "abc",
             "success_rows": 1, "failed_rows": 1, "processing_seconds_total": 2.0,
             "rows": [
@@ -28,7 +33,7 @@ def _state():
                             "context": {"cost_breakdown": {"serpwow_request_count": 2}}}}]}
 
 
-class TestGmapsSupabaseAndLinks(unittest.TestCase):
+class TestSerpwowSupabaseAndLinks(unittest.TestCase):
     def test_terminal_update_includes_counts_and_zero_llm_cost(self):
         svc = _FakeSvc()
         with mock.patch("app.services.companies.get_company_service", return_value=svc), \
@@ -43,6 +48,6 @@ class TestGmapsSupabaseAndLinks(unittest.TestCase):
 
     def test_file_links_advertise_result_files(self):
         with mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}):
-            links = legacy_app._upload_file_links("gm1", "Acme", "gmaps")
+            links = legacy_app._upload_file_links("gm1", "Acme", "gsearch")
         for name in ("found.csv", "notFound.csv", "report.json", "run.log"):
             self.assertIn(name, links)

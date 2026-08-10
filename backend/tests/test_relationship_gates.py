@@ -14,10 +14,10 @@ from app.services.serpwow.constants import (
 class TestRelationshipGates(unittest.TestCase):
     def test_pipeline_constant(self):
         self.assertEqual(PIPELINE_RELATIONSHIP, "relationship")
-        self.assertEqual(
-            REPORTING_PIPELINES,
-            {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP},
-        )
+        # gmaps left this set when it moved to the S3-only runner: it has no state.json,
+        # so it writes the same four files from gmaps_outputs by streaming instead.
+        self.assertEqual(REPORTING_PIPELINES, {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP})
+        self.assertNotIn(PIPELINE_GMAPS, REPORTING_PIPELINES)
 
     def test_result_file_allowlist_has_skipped_csv(self):
         self.assertIn("skipped.csv", engine._GSEARCH_RESULT_FILES)

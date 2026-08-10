@@ -24,7 +24,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from app.services.serpwow import relationship_store as store
+from app.services.serpwow import s3_run_store as store
 from app.services.serpwow.cost import calculate_gemini_cost_usd
 from app.services.serpwow.modes.relationship import (
     ai_mode_arrays,
@@ -40,7 +40,7 @@ EXTRA_COLUMNS = [
 ]
 
 # Column names this module writes itself, plus the "row_index" bookkeeping key every
-# row carries internally (injected in relationship_store.iter_input_rows). An input
+# row carries internally (injected in s3_run_store.iter_input_rows). An input
 # CSV column that happens to share one of these names must not collide with it.
 _RESERVED_COLUMNS = frozenset(EXTRA_COLUMNS) | {"row_index"}
 

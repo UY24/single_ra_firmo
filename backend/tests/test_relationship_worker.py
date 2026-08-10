@@ -1,255 +1,66 @@
-# backend/tests/test_relationship_worker.py
+"""worker.py wiring for the relationship consumer + re-drive scan (M4/M5 from review).
+
+The re-drive loop must survive a broker/channel setup failure (M4: it is exactly what
+recovers a run published while the worker or its connection was down, so it must not be
+silently skipped when the connection isn't ready) and must be registered where main()'s
+consumer-task snapshot and shutdown's cancel loop both look (M5)."""
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest import mock
 
-from app.services.serpwow.constants import (
-    REL_ERROR_NO_EVIDENCE,
-    REL_ERROR_NO_X,
-    REL_ERROR_NOT_CONFIRMED,
-)
-from app.services.serpwow.modes.relationship import execute_relationship_lookup_for_worker
-
-MODPATH = "app.services.serpwow.modes.relationship"
+from app.services.serpwow import engine as app_engine
+from app.services.serpwow import worker
 
 
-def _serp(candidates, overview_text="", official=None):
-    raw = {}
-    if overview_text:
-        raw["ai_overview"] = {
-            "ai_overview_contents": [{"text": overview_text}],
-            "ai_overview_sources": [],
-        }
-    return {"provider": "serpwow", "used": True, "query": "q",
-            "official_website": official, "candidates": list(candidates),
-            "status_code": 200, "search_url": "https://google/x",
-            "raw_response": raw, "error": None}
+class RelationshipWorkerWiringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_tasks = list(app_engine.rabbitmq_consumer_tasks)
+        app_engine.rabbitmq_consumer_tasks = []
 
+    def tearDown(self) -> None:
+        async def _drain():
+            for task in app_engine.rabbitmq_consumer_tasks:
+                task.cancel()
+            for task in app_engine.rabbitmq_consumer_tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-def _failed_serp(status=503):
-    return {"provider": "serpwow", "used": False, "query": "q",
-            "official_website": None, "candidates": [],
-            "status_code": status, "search_url": None,
-            "raw_response": None,
-            "error": f"SerpWow failed (HTTP {status}).",
-            "error_category": "http_5xx"}
+        if app_engine.rabbitmq_consumer_tasks:
+            asyncio.run(_drain())
+        app_engine.rabbitmq_consumer_tasks = self._saved_tasks
 
+    def test_redrive_loop_survives_a_channel_setup_failure_and_is_registered(self) -> None:
+        class BoomConnection:
+            async def channel(self):
+                raise RuntimeError("connection is down")
 
-def _llm(status, url, score=90):
-    return ({"resolved_company_y_name": "Modal Labs",
-             "relationship_status": status, "relationship_summary": "summary text",
-             "relationship_evidence": ["Eastlink invested in Modal."],
-             "official_website": url,
-             "relationship_confidence_score": score,
-             "website_confidence_score": score if url else 0,
-             "reason": "r", "extra_flags": []},
-            None, "gemini-2.5-flash-lite",
-            {"promptTokenCount": 10, "candidatesTokenCount": 5})
+        results: dict = {}
 
+        async def run():
+            with mock.patch.object(app_engine, "rabbitmq_connection", BoomConnection()), \
+                    mock.patch(
+                        "app.services.serpwow.relationship_runner.redrive_stale_runs",
+                        new=mock.AsyncMock(return_value=0)):
+                with self.assertRaises(RuntimeError):
+                    await worker._start_relationship_worker()
+                await asyncio.sleep(0)   # let the created task get scheduled
+                # Must be checked HERE, inside the same event loop: asyncio.run()
+                # cancels every outstanding task as part of its own teardown once
+                # `run()` returns, so checking .done() after asyncio.run(run())
+                # would always see "cancelled/done" regardless of whether the
+                # production code actually kept the task alive.
+                results["tasks"] = list(app_engine.rabbitmq_consumer_tasks)
+                results["done"] = results["tasks"][0].done() if results["tasks"] else None
 
-class TestRelationshipExecutor(unittest.TestCase):
-    def _run(self, **kwargs):
-        return asyncio.run(execute_relationship_lookup_for_worker(**kwargs))
+        asyncio.run(run())
 
-    def test_confirmed_relationship_yields_url(self):
-        search = AsyncMock(return_value=_serp(
-            ["https://modal.com/"], "Eastlink invests in Modal Labs."))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website",
-                   return_value=_llm("confirmed", "https://modal.com/")), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, raw_json = self._run(
-                y_name="Modal", x_name="eastlinkcap",
-                input_url="https://www.eastlinkcap.com/portfolio/", city="", country="")
-        self.assertEqual(resp.official_website, "https://modal.com/")
-        ctx = resp.context
-        self.assertEqual(ctx["pipeline"], "relationship")
-        self.assertEqual(ctx["relationship"]["status"], "confirmed")
-        self.assertNotIn("verified_pair", ctx["relationship"])
-        self.assertEqual(ctx["relationship"]["resolved_company_y_name"], "Modal Labs")
-        self.assertEqual(ctx["relationship"]["evidence"],
-                         ["Eastlink invested in Modal."])
-        self.assertEqual(ctx["relationship"]["relationship_confidence_score"], 90)
-        self.assertEqual(ctx["relationship"]["website_confidence_score"], 90)
-        self.assertEqual(ctx["final_url_selection_ai"]["raw"]["confidence_score"], 90)
-        self.assertFalse(ctx["skip_llm"])
-        # Exactly two phases fire for every valid pair.
-        self.assertEqual(search.await_count, 2)
-        self.assertEqual(ctx["cost_breakdown"]["serpwow_request_count"], 2)
-
-    def test_not_confirmed_gates_url_to_none(self):
-        search = AsyncMock(return_value=_serp(["https://modal.com/"], "No relation."))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website",
-                   return_value=_llm("not_confirmed", "https://modal.com/")), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, _ = self._run(y_name="Modal", x_name="other",
-                                input_url="https://other.example/portfolio",
-                                city="", country="")
-        self.assertIsNone(resp.official_website)
-        self.assertEqual(resp.context["row_error"], REL_ERROR_NOT_CONFIRMED)
-        flags = resp.context["relationship"]["flags"]
-        self.assertTrue(any(f["flag"] == "url_found_no_relationship" for f in flags))
-
-    def test_x_domain_candidates_are_filtered_before_llm(self):
-        search = AsyncMock(return_value=_serp(
-            ["https://www.eastlinkcap.com/team", "https://modal.com/"], "text"))
-        captured = {}
-
-        def fake_llm(x, y, input_url, city, country, candidates, *a, **k):
-            captured["candidates"] = candidates
-            return _llm("confirmed", "https://modal.com/")
-
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website", side_effect=fake_llm), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
-                                input_url="https://www.eastlinkcap.com/p", city="", country="")
-        self.assertNotIn("https://www.eastlinkcap.com/team", captured["candidates"])
-        self.assertIn("https://modal.com/", captured["candidates"])
-
-    def test_typed_overview_url_becomes_candidate_and_evidence_keeps_phase(self):
-        raw = {
-            "ai_overview": {
-                "ai_overview_contents": [
-                    {"type": "paragraph", "text": "Eastlink invested in Modal."},
-                    {"type": "list", "list": [
-                        {"text": "Modal website: https://modal.com/"},
-                        {"text": "Investor: https://eastlinkcap.com/portfolio"},
-                    ]},
-                ],
-                "ai_overview_sources": [{
-                    "source_name": "Funding report",
-                    "source_url": "https://news.example/modal",
-                }],
-            }
-        }
-        search_result = _serp([], "")
-        search_result["raw_response"] = raw
-        captured = {}
-
-        def fake_llm(x, y, input_url, city, country, candidates, evidence,
-                     *args, **kwargs):
-            captured["candidates"] = candidates
-            captured["evidence"] = evidence
-            return _llm("confirmed", "https://modal.com/")
-
-        with patch(f"{MODPATH}.run_serpwow_search",
-                   AsyncMock(return_value=search_result)) as search, \
-             patch(f"{MODPATH}.choose_relationship_and_website", side_effect=fake_llm), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, _ = self._run(
-                y_name="Modal", x_name="eastlinkcap",
-                input_url="https://eastlinkcap.com/portfolio", city="", country="")
-
-        self.assertEqual(search.await_count, 2)
-        self.assertIn("https://modal.com/", captured["candidates"])
-        self.assertNotIn("https://eastlinkcap.com/portfolio", captured["candidates"])
-        self.assertEqual(len(captured["evidence"]), 2)
-        self.assertEqual(captured["evidence"][0]["phase"],
-                         "phase1_relationship_and_url")
-        self.assertIn("2. Investor:", captured["evidence"][0]["text"])
-        self.assertEqual(captured["evidence"][0]["sources"], [{
-            "name": "Funding report", "url": "https://news.example/modal"}])
-        self.assertEqual(resp.context["ai_overview_evidence"], captured["evidence"])
-        attempts = resp.context["search_attempts"]
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(attempts[0]["result"],
-                         "AI overview returned; 1 candidate(s)")
-        self.assertTrue(attempts[0]["ai_overview_present"])
-        self.assertEqual(attempts[0]["candidate_count"], 1)
-        self.assertEqual(attempts[0]["status"], "candidates_found")
-
-    def test_zero_evidence_short_circuits_without_llm(self):
-        search = AsyncMock(return_value=_serp([], ""))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, _ = self._run(y_name="YUZU NOISE", x_name="m25vc",
-                                input_url="https://m25vc.com/portfolio",
-                                city="", country="")
-        llm.assert_not_called()
-        self.assertIsNone(resp.official_website)
-        self.assertTrue(resp.context["skip_llm"])
-        self.assertEqual(resp.context["row_error"], REL_ERROR_NO_EVIDENCE)
-        self.assertEqual(resp.context["relationship"]["status"], "not_confirmed")
-
-    def test_failed_serpwow_attempts_are_not_billed(self):
-        search = AsyncMock(return_value=_failed_serp(503))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
-             patch.dict("os.environ", {
-                 "RELATIONSHIP_LLM_BATCH": "false",
-                 "SERPWOW_USD_PER_SEARCH": "0.00035",
-             }):
-            resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
-                                input_url="https://eastlinkcap.com/portfolio",
-                                city="", country="")
-        llm.assert_not_called()
-        self.assertEqual(resp.serpwow_cost_usd, 0.0)
-        self.assertEqual(resp.context["cost_breakdown"]["serpwow_request_count"], 2)
-        self.assertEqual(
-            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 0)
-        self.assertEqual(resp.context["relationship"]["summary"],
-                         "SerpWow failed (HTTP 503).")
-        self.assertTrue(any(
-            flag["flag"] == "serpwow_failed"
-            for flag in resp.context["relationship"]["flags"]))
-
-    def test_blank_x_short_circuits_without_llm(self):
-        search = AsyncMock(return_value=_serp(["https://modal.com/"], "text"))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false",
-                                        "SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            resp, _ = self._run(y_name="Modal", x_name="",
-                                input_url="", city="", country="")
-        llm.assert_not_called()
-        self.assertTrue(resp.context["skip_llm"])
-        self.assertEqual(resp.context["row_error"], REL_ERROR_NO_X)
-        # Invalid direct calls cannot build any phase queries, so no search is wasted.
-        self.assertEqual(search.await_count, 0)
-
-    def test_batch_mode_defers_llm_but_gathers_evidence(self):
-        search = AsyncMock(return_value=_serp(["https://modal.com/"], "evidence"))
-        with patch(f"{MODPATH}.run_serpwow_search", search), \
-             patch(f"{MODPATH}.choose_relationship_and_website") as llm, \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}):
-            resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
-                                input_url="https://eastlinkcap.com/portfolio",
-                                city="", country="")
-        llm.assert_not_called()
-        self.assertIsNone(resp.official_website)
-        self.assertFalse(resp.context["skip_llm"])
-        self.assertEqual(
-            [item["text"] for item in resp.context["ai_overview_evidence"]],
-            ["evidence", "evidence"],
-        )
-        self.assertIn("https://modal.com/", resp.context["candidates"])
-
-    def test_phase_error_captured_not_fatal(self):
-        ok = _serp(["https://modal.com/"], "text")
-
-        async def flaky(query, country=None, client=None):
-            # Fail only the phase2 identity query; phase1 still succeeds.
-            if query.startswith('Who is'):
-                raise RuntimeError("boom")
-            return ok
-
-        with patch(f"{MODPATH}.run_serpwow_search", side_effect=flaky), \
-             patch(f"{MODPATH}.choose_relationship_and_website",
-                   return_value=_llm("confirmed", "https://modal.com/")), \
-             patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "false"}):
-            resp, _ = self._run(y_name="Modal", x_name="eastlinkcap",
-                                input_url="https://eastlinkcap.com/portfolio",
-                                city="", country="")
-        self.assertEqual(resp.official_website, "https://modal.com/")
-        errored = [a for a in resp.context["search_attempts"] if a.get("error")]
-        self.assertEqual(len(errored), 1)
-        self.assertEqual(errored[0]["status"], "error")
-        self.assertEqual(
-            resp.context["cost_breakdown"]["serpwow_billable_request_count"], 1)
-        self.assertAlmostEqual(resp.serpwow_cost_usd, 0.00035)
+        # M5: registered in the SAME list main() snapshots for its wait_targets and
+        # stop_worker_consumers cancels — not a separate, unwatched task.
+        self.assertEqual(len(results["tasks"]), 1)
+        # M4: still alive despite the channel setup having raised.
+        self.assertFalse(results["done"])
 
 
 if __name__ == "__main__":

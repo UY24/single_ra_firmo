@@ -92,13 +92,21 @@ def classify_exception(exc: BaseException, *, default_source: str) -> OutcomeInf
     )
 
 
-def _phase_stats(result: dict[str, Any]) -> tuple[int, int, int, Optional[str], Optional[str]]:
-    """(total, succeeded, errored, dominant_category, first_error_detail)."""
+def _phase_stats(
+    result: dict[str, Any],
+) -> tuple[int, int, int, Optional[str], Optional[str], Optional[str]]:
+    """(total, succeeded, errored, dominant_category, first_error_detail, error_source).
+
+    ``error_source`` is taken from the first errored phase that names one, so a
+    pipeline running on a different provider (gmaps on scrape.do) is attributed to it
+    instead of defaulting to SerpWow. None when no phase declares a source.
+    """
     ctx = result.get("context") if isinstance(result.get("context"), dict) else {}
     fr = ctx.get("formatted_results") if isinstance(ctx.get("formatted_results"), list) else []
     total = succeeded = errored = 0
     cat_counts: dict[str, int] = {}
     first_detail: Optional[str] = None
+    source: Optional[str] = None
     for f in fr:
         if not isinstance(f, dict):
             continue
@@ -109,17 +117,20 @@ def _phase_stats(result: dict[str, Any]) -> tuple[int, int, int, Optional[str], 
             errored += 1
             if first_detail is None and f.get("error"):
                 first_detail = str(f.get("error"))
+            if source is None and f.get("error_source"):
+                source = str(f.get("error_source"))
             cat = f.get("error_category")
             if cat:
                 cat_counts[str(cat)] = cat_counts.get(str(cat), 0) + 1
     dominant = max(cat_counts, key=lambda k: cat_counts[k]) if cat_counts else None
-    return total, succeeded, errored, dominant, first_detail
+    return total, succeeded, errored, dominant, first_detail, source
 
 
 def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
                            ctx_row_error: Optional[str], skip_llm: bool) -> OutcomeInfo:
     official = str((result or {}).get("official_website") or "").strip()
-    total, succeeded, errored, dominant_cat, first_detail = _phase_stats(result or {})
+    total, succeeded, errored, dominant_cat, first_detail, phase_source = _phase_stats(
+        result or {})
     degraded = bool(succeeded and errored)
     if official:
         # gsearch falls back to the raw first candidate as official_website, so a
@@ -128,11 +139,12 @@ def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
         # llm_selection_failed flag + errors/ dump carry the detail.
         degraded_search = degraded or bool(((result or {}).get("context") or {}).get("llm_error"))
         return OutcomeInfo(OUTCOME_FOUND, degraded_search=degraded_search)
-    # "We couldn't look": phases ran and every one errored -> a real SerpWow error.
+    # "We couldn't look": phases ran and every one errored -> a real provider error.
     if total > 0 and succeeded == 0:
-        return OutcomeInfo(OUTCOME_ERROR, SRC_SERPWOW,
+        source = phase_source or SRC_SERPWOW
+        return OutcomeInfo(OUTCOME_ERROR, source,
                            dominant_cat or CAT_INTERNAL,
-                           error_detail=first_detail or "all SerpWow phases errored")
+                           error_detail=first_detail or f"all {source} phases errored")
     # Known business "not found" sentinels (e.g. relationship not-confirmed / no-evidence).
     # Checked after provider failure so "no evidence" cannot mask that we never looked.
     if ctx_row_error and ctx_row_error.strip() in NOT_FOUND_SENTINELS:

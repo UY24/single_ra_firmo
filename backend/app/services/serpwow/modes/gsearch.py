@@ -166,7 +166,10 @@ async def execute_gsearch_lookup_for_worker(
             # with relationship mode. See serpwow_reporting.empty_response_breakdown.
             "ai_overview_present": bool(extract_ai_overview_text(raw_result.get("raw_response"))),
             "candidate_count": phase_candidate_count,
-            "raw_response": raw_result.get("raw_response"),
+            # raw_response deliberately NOT stored: it's already persisted as this
+            # row's serpwow_response/ artifact, nothing reads it back from state, and
+            # inlining it here put one payload PER PHASE (up to 5) into a state file
+            # that gets rewritten in full on every row update.
         })
 
         search_attempts.append({

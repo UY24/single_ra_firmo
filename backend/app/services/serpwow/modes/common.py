@@ -111,16 +111,18 @@ async def run_gmaps_from_module(
     input_full_address: Optional[str] = None,
 ) -> dict[str, Any]:
     try:
-        from app.services.serpwow import gmaps_client as gmaps_module
+        from app.services.serpwow import scrapedo_maps_client as gmaps_module
     except Exception as exc:
         return {
-            "provider": "gmaps",
+            "provider": "scrapedo",
             "used": False,
             "query": None,
             "official_website": None,
             "request_count": 0,
+            "credits": 0,
             "raw_response": None,
-            "error": f"Failed to import gmaps_client.py: {str(exc)}",
+            "error": f"Failed to import scrapedo_maps_client.py: {str(exc)}",
+            "error_category": "internal",
         }
 
     try:
@@ -129,41 +131,68 @@ async def run_gmaps_from_module(
         if not query:
             query = (company_name or "").strip()
 
-        gmaps_result = await gmaps_module.process_gmaps_query(query, country=_country_to_gl(country))
+        gmaps_result = await gmaps_module.process_gmaps_query(
+            query, gl=_country_to_gl(country))
+        counts = {
+            key: max(0, int((gmaps_result or {}).get(key, 0) or 0))
+            for key in ("request_count", "successful_requests", "failed_requests", "credits")
+        }
+
+        # A provider failure must NOT be reported as "no website found" -- the client
+        # returns errors instead of raising, so propagate them here or the row lands as
+        # a business not_found and "Rerun failed" can never reach it.
+        provider_error = (gmaps_result or {}).get("error")
+        if provider_error:
+            return {
+                "provider": "scrapedo",
+                "used": False,
+                "query": query,
+                "official_website": None,
+                **counts,
+                "no_results": False,
+                "billed_empty": False,
+                "raw_response": gmaps_result,
+                "error": str(provider_error),
+                "error_category": (gmaps_result or {}).get("error_category"),
+            }
+
         gmaps_website = _select_best_gmaps_website(
             gmaps_result,
             company_name=company_name,
             input_full_address=input_full_address,
         )
         if not gmaps_website:
-            gmaps_website = (
-                gmaps_module.extract_gmaps_website(gmaps_result)
-                if hasattr(gmaps_module, "extract_gmaps_website")
-                else None
-            )
+            gmaps_website = gmaps_module.extract_gmaps_website(gmaps_result)
         if is_disallowed_official_url(gmaps_website):
             gmaps_website = None
 
-        request_count = int((gmaps_result or {}).get("request_count", 0) or 0)
-        if request_count < 0:
-            request_count = 0
-
         return {
-            "provider": "gmaps",
+            "provider": "scrapedo",
             "used": True,
             "query": query,
             "official_website": gmaps_website,
-            "request_count": request_count,
+            **counts,
+            # Google has no Maps listing for this company: a not-found, not a failure.
+            "no_results": bool((gmaps_result or {}).get("no_results")),
+            # Billed (HTTP 200) but zero results — credits spent for nothing.
+            "billed_empty": bool((gmaps_result or {}).get("billed_empty")),
             "raw_response": gmaps_result,
             "error": None,
+            "error_category": None,
         }
     except Exception as exc:
         return {
-            "provider": "gmaps",
+            "provider": "scrapedo",
             "used": False,
             "query": None,
             "official_website": None,
             "request_count": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "credits": 0,
+            "no_results": False,
+            "billed_empty": False,
             "raw_response": None,
             "error": str(exc),
+            "error_category": "internal",
         }

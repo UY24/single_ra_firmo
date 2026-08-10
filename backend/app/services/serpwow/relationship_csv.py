@@ -1,11 +1,15 @@
-"""CSV parsing for the relationship pipeline (spec §2).
+"""CSV parsing for the relationship pipeline.
 
-Input: OCR-results CSV with required Input_URL, Company_Name_X, and
-Company_Name_Y values on every row, optional city/country, and arbitrary
-passthrough columns. Every row is processed independently — one row in, one row
-out (no (X, Y) deduplication). Each row is still represented as a "pair" carrying
-its single source row index so the downstream engine/reporting machinery is
-unchanged (source_row_indices is always a 1-element list).
+Input: OCR-results CSV with required Input_URL, Company_Name_X and Company_Name_Y
+values on every row, plus arbitrary passthrough columns. Those three are the ONLY
+fields this pipeline gets — there is no location, because the OCR'd portfolio page
+does not carry one. Every row is processed independently: one row in, one row out.
+
+Every row is VALIDATED, but only the first ``sample_limit`` are kept in memory. This
+runs in the API process, so materialising 500k dicts (twice, as it used to — once for
+the originals and once for the parsed rows) meant ~2GB per upload for data neither
+caller wants: the preview shows a handful of rows, and the upload path only needs the
+row COUNT plus the raw bytes, which go straight to S3 for the worker to stream.
 """
 from __future__ import annotations
 
@@ -25,8 +29,6 @@ def _normalize_header(header: str) -> str:
 _Y_ALIASES = ("company_name_y", "company_y")
 _X_ALIASES = ("company_name_x", "company_x")
 _URL_ALIASES = ("input_url",)
-_CITY_ALIASES = ("city", "town")
-_COUNTRY_ALIASES = ("country", "country_name", "nation")
 
 
 def _find_column(normalized: dict[str, str], aliases: tuple[str, ...]) -> str | None:
@@ -36,7 +38,11 @@ def _find_column(normalized: dict[str, str], aliases: tuple[str, ...]) -> str | 
     return None
 
 
-def parse_relationship_csv(raw: bytes) -> dict:
+SAMPLE_LIMIT = 10
+
+
+def parse_relationship_csv(raw: bytes, sample_limit: int = SAMPLE_LIMIT) -> dict:
+    """Validate every row; return the count plus the first ``sample_limit`` rows."""
     text = raw.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
@@ -62,21 +68,14 @@ def parse_relationship_csv(raw: bytes) -> dict:
             "Missing required column Input_URL. "
             f"Found: {header}"
         )
-    city_col = _find_column(normalized, _CITY_ALIASES)
-    country_col = _find_column(normalized, _COUNTRY_ALIASES)
+    rows: list[dict] = []
+    total_rows = 0
 
-    original_rows: list[dict[str, str]] = []
-    blank_row_indices: list[int] = []
-    pairs: list[dict] = []
-
-    # One row in → one row out: no (X, Y) dedup. Each row becomes its own "pair"
-    # carrying its single source row index (source_row_indices == [idx]).
     for idx, row in enumerate(reader):
-        clean = {h: (row.get(h) or "").strip() for h in header}
-        original_rows.append(clean)
-        y_name = clean.get(y_col, "")
-        x_name = clean.get(x_col, "")
-        input_url = clean.get(url_col, "")
+        total_rows += 1
+        y_name = (row.get(y_col) or "").strip()
+        x_name = (row.get(x_col) or "").strip()
+        input_url = (row.get(url_col) or "").strip()
         missing = [name for name, value in (
             ("Input_URL", input_url),
             ("Company_Name_X", x_name),
@@ -86,31 +85,29 @@ def parse_relationship_csv(raw: bytes) -> dict:
             raise InvalidRelationshipCSV(
                 f"CSV row {idx + 2} missing required value(s): {', '.join(missing)}"
             )
-        pairs.append({
-            "pair_index": len(pairs) + 1,
-            "x_name": x_name,
-            "y_name": y_name,
-            "input_url": input_url,
-            "city": clean.get(city_col, "") if city_col else "",
-            "country": clean.get(country_col, "") if country_col else "",
-            "source_row_indices": [idx],
-        })
+        # Validation above runs on EVERY row — only retention is capped.
+        if len(rows) < max(0, sample_limit):
+            rows.append({
+                "row_index": idx,
+                "x_name": x_name,
+                "y_name": y_name,
+                "input_url": input_url,
+            })
 
-    if not original_rows:
+    if not total_rows:
         raise InvalidRelationshipCSV("CSV has a header but no data rows.")
 
     return {
         "header": header,
-        "original_rows": original_rows,
-        "blank_row_indices": blank_row_indices,
-        "pairs": pairs,
-        # Which actual CSV headers matched each logical field (None when the
-        # optional column is absent) — surfaced by the upload-preview endpoint.
+        "total_rows": total_rows,
+        # The first `sample_limit` rows only — never the whole file. Nothing downstream
+        # reads rows from here: the worker streams input.csv from S3.
+        "rows": rows,
+        # Which actual CSV header matched each logical field — surfaced by the
+        # upload-preview endpoint.
         "columns_detected": {
             "company_name_y": y_col,
             "company_name_x": x_col,
             "input_url": url_col,
-            "city": city_col,
-            "country": country_col,
         },
     }

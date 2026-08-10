@@ -1,0 +1,15 @@
+Investigate the relationship between Company X ({x_name}, domain: {x_domain}, source: {input_url}) and Company Y ({y_name}, extracted from logo on X's site).
+
+### SEARCH STEPS
+1. Search `"{x_name}" "{y_name}"` with keywords: `investment`, `portfolio`, `acquired`, `funding`, `backed by`.
+2. Classify relation: Financial (investor/holding) vs non-financial (client/case study/vendor).
+3. Search for {y_name}'s primary corporate domain.
+
+### OUTPUT EXACTLY
+
+1. RELATIONSHIP: State whether a FINANCIAL relationship (investment, funding, acquisition, portfolio holding) is [CONFIRMED], [NOT SUPPORTED], or [UNCLEAR]. State the exact connection type and cite sources.
+
+2. EVIDENCE: Quote specific statements establishing the relationship (dates, amounts, funding rounds, or acquisition notices) with source names.
+
+3. WEBSITE: Type {y_name}'s official homepage as plain text starting with https:// (e.g., https://example.com).
+- Rules: Plain text only (NO hyperlinks). NO social media (LinkedIn, X), NO directories/maps, and NEVER give {x_domain}. If not found, write: "No official website was found for {y_name}".

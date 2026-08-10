@@ -2,7 +2,6 @@
 
 Covers the direct-write sites that don't go through update_row_state:
   - _apply_batch_parsed_to_row (found / no-website)
-  - _apply_relationship_batch_parsed_to_row (gated / not-confirmed)
   - reconcile_stuck_gsearch_rows force-fail (via source inspection, since a full
     integration test needs heavy RabbitMQ/upload-state scaffolding)
 """
@@ -40,31 +39,6 @@ class TestBatchApplyOutcome(unittest.TestCase):
         self.assertIsNone(row["error_category"])
         self.assertIsNone(row["error"])
 
-    def test_relationship_not_confirmed_is_notfound_completed(self):
-        row = {"company_name": "Y", "result": {"context": {"pipeline": "relationship",
-               "candidates": [], "x_domain": ""}}}
-        status = engine._apply_batch_parsed_to_row(
-            row, {"relationship_status": "not_confirmed"}, {}, "gemini-x")
-        self.assertEqual(status, "completed")
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome"], o.OUTCOME_NOT_FOUND)
-        self.assertIsNone(row["error_source"])
-        self.assertIsNone(row["error_category"])
-
-    def test_relationship_confirmed_is_found_completed(self):
-        row = {"company_name": "Y", "result": {"context": {"pipeline": "relationship",
-               "candidates": ["https://y.com"], "x_domain": "x.com"}}}
-        status = engine._apply_batch_parsed_to_row(
-            row,
-            {"relationship_status": "confirmed", "gated_url": "https://y.com",
-             "official_website": "https://y.com"},
-            {},
-            "gemini-x",
-        )
-        self.assertEqual(status, "completed")
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome"], o.OUTCOME_FOUND)
-
 
 class TestReconcilerForceFailSetsErrorFields(unittest.TestCase):
     """The reconciler force-fail sites can't easily be exercised without heavy
@@ -81,35 +55,34 @@ class TestReconcilerForceFailSetsErrorFields(unittest.TestCase):
 
 
 class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase):
-    """Regression (Fix 1): a skip_llm relationship short-circuit row (no-X /
-    no-evidence), already finalized status=completed/outcome=not_found by the worker
-    and deliberately NEVER seeded into the batch, must not be force-failed to
-    error/gemini by the driver's chunk-failure sweep just because some OTHER row in
-    the same upload went through the batch."""
+    """Regression (Fix 1): a skip_llm short-circuit row, already finalized
+    status=completed/outcome=not_found by the worker and deliberately NEVER seeded
+    into the batch, must not be force-failed to error/gemini by the driver's
+    chunk-failure sweep just because some OTHER row in the same upload went through
+    the batch."""
 
     async def test_rows_outside_snapshot_follow_their_existing_state(self):
-        # Row 1: skip_llm no-X short-circuit -> already completed/not_found by worker.
+        # Row 1: skip_llm short-circuit -> already completed/not_found by the worker.
         skip_row = {
-            "row_index": 1, "company_name": "NoXCorp", "country": "",
+            "row_index": 1, "company_name": "NoEvidenceCorp", "country": "",
             "status": "completed", "outcome": o.OUTCOME_NOT_FOUND,
             "error_source": None, "error_category": None,
-            "error": "No X company found for relationship verification.",
+            "error": "No candidate URLs found.",
             "result": {"official_website": None,
-                       "context": {"pipeline": "relationship", "skip_llm": True,
-                                   "candidates": [], "x_domain": ""}},
+                       "context": {"pipeline": "gsearch", "skip_llm": True,
+                                   "candidates": []}},
         }
-        # Row 2: normal relationship row that goes through the batch and gets confirmed.
+        # Row 2: normal row that goes through the batch and gets a URL.
         batch_row = {
             "row_index": 2, "company_name": "Modal", "country": "",
-            "x_name": "eastlinkcap", "status": "completed",
+            "status": "completed",
             "error": "Pending Gemini batch post-processing decision.",
             "result": {"official_website": None, "gemini_cost_usd": 0.0, "total_cost_usd": 0.0,
-                       "context": {"pipeline": "relationship", "skip_llm": False,
-                                   "x_domain": "eastlinkcap.com",
+                       "context": {"pipeline": "gsearch", "skip_llm": False,
                                    "candidates": ["https://modal.com/"],
                                    "cost_breakdown": {"serpwow_request_count": 1}}},
         }
-        state = {"upload_id": "mix-u1", "company_name": "Co", "pipeline": "relationship",
+        state = {"upload_id": "mix-u1", "company_name": "Co", "pipeline": "gsearch",
                  "status": "completed_with_errors", "rows": [skip_row, batch_row],
                  "gemini_batch": {"status": "queued", "chunks": []}}
         persisted = {"state": state}
@@ -118,7 +91,7 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
             "status": "completed",
             "error": "Pending Gemini batch post-processing decision.",
             "result": {"official_website": None, "context": {
-                "pipeline": "relationship", "skip_llm": False,
+                "pipeline": "gsearch", "skip_llm": False,
                 "candidates": ["https://late.example/"],
             }},
         }
@@ -135,12 +108,11 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
         def fake_collect(obj):
             # Row 100 completes SerpWow after the batch input snapshot was built.
             persisted["state"]["rows"].append(late_row)
-            # Confirm the batched row (row-2) with an in-candidate URL.
+            # Resolve the batched row (row-2) to an in-candidate URL.
             out = []
             for k in obj.get("_keys", []):
                 out.append({"key": k, "text": json.dumps(
-                    {"relationship_status": "confirmed", "official_website": "https://modal.com/",
-                     "relationship_summary": "Eastlink invested in Modal.",
+                    {"official_website": "https://modal.com/",
                      "confidence_score": 90}), "usage": {}})
             return out
 

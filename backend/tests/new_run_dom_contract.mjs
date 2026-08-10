@@ -344,7 +344,7 @@ async function uploadContract() {
     assert(uploadRequest.body.get("file") === file, "launch changed the selected file");
     assert(uploadRequest.body.get("company_id") === "co-1", "launch omitted company_id");
     assert(uploadRequest.body.get("mode") === "ai_deep", "launch omitted AI mode");
-    assert(window.location.hash === "#/runs/run%20%2F1", "AI launch redirect changed");
+    assert(window.location.hash === "#/runs/run%20%2F1?engine=ai", "AI launch redirect changed");
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }

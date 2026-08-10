@@ -331,8 +331,11 @@ function chip(label, value, tone = "muted") {
   );
 }
 
-// Cost breakdown card: LLM (LLM pipelines only) · SerpWow (+searches) · Total.
-// `g` is serpwow_summary; reads g.cost {llm_usd, serpwow_usd, serpwow_searches, total_usd}.
+// Cost breakdown card: LLM (LLM pipelines only) · provider · Total. The provider cell is
+// parameterized: SerpWow searches + USD by default (gsearch/relationship/firmographics),
+// or Scrape.do credits for pipelines billed that way (gmaps, AI Mode) — see the call sites.
+// `g` is serpwow_summary; reads g.cost {llm_usd, serpwow_usd, serpwow_searches,
+// scrapedo_credits, total_usd}.
 function costItem(label, value, sub, extraClass = "") {
   return el("div", { class: `cost-item ${extraClass}`.trim() },
     el("span", { class: "cost-label" }, label),
@@ -345,6 +348,7 @@ function costSection(g, {
   providerLabel = "SerpWow",
   providerCostKey = "serpwow_usd",
   searchKey = "serpwow_searches",
+  searchUnit = "searches",
   failedSearchCount = null,
   llmCostKey = "llm_usd",
   totalCostKey = "total_usd",
@@ -356,7 +360,7 @@ function costSection(g, {
       ? Math.max(0, Number(cost[searchKey]) - Number(cost.serpwow_billable_searches))
       : 0);
   const searchSub = cost[searchKey] == null ? null
-    : `${fmtNum(cost[searchKey])} searches`
+    : `${fmtNum(cost[searchKey])} ${searchUnit}`
       + (failed ? ` · ${fmtNum(failed)} failed` : "");
   const items = [];
   if (isLlm && llmCostKey) items.push(costItem("LLM", fmtUsd(cost[llmCostKey])));
@@ -387,23 +391,25 @@ function verdictSection(rb) {
   );
 }
 
-// Empty 200-OK SerpWow responses (no AI overview + 0 candidates). relationship
-// splits by phase (both / phase 1 only / phase 2 only); gsearch by all / some.
+// Rows the provider answered with nothing usable. Branch on the DATA, not the pipeline:
+// relationship makes ONE scrape.do AI Mode call per row, so it reports a single
+// {no_ai_text: N} — there are no phases to split by. gsearch runs several SerpWow
+// phases per row and splits them all / some.
 // `eb` is serpwow_summary.empty_response_breakdown.
-function emptyResponsesSection(eb, isRel) {
-  const chips = isRel
-    ? [
-        chip("Both phases", fmtNum(eb.both_phases ?? 0), (eb.both_phases ?? 0) ? "danger" : "muted"),
-        chip("Phase 1 only", fmtNum(eb.phase1_only ?? 0), (eb.phase1_only ?? 0) ? "warn" : "muted"),
-        chip("Phase 2 only", fmtNum(eb.phase2_only ?? 0), (eb.phase2_only ?? 0) ? "warn" : "muted"),
-      ]
+function emptyResponsesSection(eb) {
+  const aiMode = eb.no_ai_text != null;
+  const chips = aiMode
+    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
       ];
   return el("section", { class: "detail-section" },
-    sectionHeading("Empty responses (HTTP 200)",
-      "Rows where SerpWow returned 200 but no AI overview and no candidates."),
+    sectionHeading(
+      aiMode ? "Empty AI Mode answers (HTTP 200)" : "Empty responses (HTTP 200)",
+      aiMode
+        ? "Rows scrape.do billed and answered, but where AI Mode wrote no text_blocks"
+        : "Rows where the provider returned 200 but no AI overview and no candidates"),
     el("div", { class: "detail-section-body relationship-verdict" }, ...chips),
   );
 }
@@ -434,11 +440,14 @@ function failedRowsSection(ref, count, companyLabel) {
         const rows = data.sample_failed_rows ?? [];
         const table = el("table", { class: "data-table w-full text-xs" },
           el("thead", {}, el("tr", { class: "data-row" },
-            ...["CSV row", companyLabel, "Error source", "Category", "Error"]
+            ...["CSV row", companyLabel, "Attempts", "Error source", "Category", "Error"]
               .map((heading) => el("th", {}, heading)))),
           el("tbody", {}, ...rows.map((row) => el("tr", { class: "data-row" },
             el("td", {}, row.row_index ?? "—"),
             el("td", {}, row.company_name ?? "—"),
+            // Calls this row cost before it died. A "4" here is the retries working:
+            // the row was tried the full SCRAPEDO_MAX_RETRIES + 1 times.
+            el("td", {}, row.attempts != null ? fmtNum(row.attempts) : "—"),
             el("td", {}, row.error_source ?? "—"),
             el("td", {}, row.error_category ?? "—"),
             el("td", {}, row.error ?? "—"),
@@ -513,7 +522,7 @@ function progressSection(done, total, running) {
 // disabled. `baseUrl(name)` builds the per-file result URL (download appends
 // "&download=true"). `extras` (optional) are download-only rows {name, href} for
 // files served by a different endpoint (e.g. the full output.json/xlsx). Used by
-// both AI Mode and the SerpWow gsearch/gmaps detail view.
+// both AI Mode and the gsearch/gmaps detail view.
 function filesSection(allFiles, baseUrl, available, extras) {
   const files = Array.isArray(available) ? available : allFiles;
   const rows = allFiles.map((name) => {
@@ -678,6 +687,27 @@ function renderLegacyStatus(root, ref, s) {
       if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
   }
+  // Which provider is actually working right now. `phase` is served by the
+  // counter-driven status endpoint; without this the run looked identical whether
+  // scrape.do was mid-flight, Gemini was chewing a batch, or nothing was running at all.
+  const PHASE_LABELS = {
+    queued: ["Queued", "muted"],
+    scraping: ["Scraping (scrape.do)", "info"],
+    cleaning: ["LLM (Gemini batch)", "info"],
+    reporting: ["Writing outputs", "info"],
+    completed: ["Done", "good"],
+    stopped: ["Stopped", "warning"],
+    failed: ["Failed", "danger"],
+  };
+  if (s.phase && PHASE_LABELS[s.phase]) {
+    const [label, tone] = PHASE_LABELS[s.phase];
+    chips.push(chip("Phase", label, tone));
+  }
+  const phaseSecs = g?.phase_seconds;
+  if (phaseSecs && (phaseSecs.scraping || phaseSecs.cleaning)) {
+    chips.push(chip("scrape.do", fmtDuration(phaseSecs.scraping ?? 0), "muted"));
+    chips.push(chip("LLM", fmtDuration(phaseSecs.cleaning ?? 0), "muted"));
+  }
 
   const isRel = s.pipeline === "relationship";
   const total = s.total_rows;
@@ -737,9 +767,29 @@ function renderLegacyStatus(root, ref, s) {
     parts.push(el("div", { class: "callout callout-red" },
       el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  if (g) parts.push(costSection(g));
+  // Branch on the DATA, not the pipeline key: a gmaps run predating the scrape.do
+  // migration still carries serpwow_searches/serpwow_usd and keeps its old cost card.
+  if (g) {
+    // Truthy, not != null: the cost block carries these keys as 0 for SerpWow pipelines
+    // too. Checking failed/credits as well keeps an all-failed run on the Scrape.do card.
+    const isScrapedo = !!(g.cost?.scrapedo_requests || g.cost?.scrapedo_credits
+                          || g.cost?.scrapedo_failed_requests);
+    parts.push(isScrapedo
+      ? costSection(g, {
+          providerLabel: "Scrape.do",
+          providerCostKey: null,
+          searchKey: "scrapedo_credits",
+          searchUnit: "credits",
+          // Real errors ONLY — attempts on rows that failed after every retry. A 502
+          // that recovered on retry, or one meaning "Google has no listing", is not a
+          // failure, and counting either here would make a clean run look broken.
+          failedSearchCount: g.cost.scrapedo_error_requests ?? 0,
+          totalCostKey: null,
+        })
+      : costSection(g));
+  }
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
-  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown, isRel));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
   }
@@ -788,7 +838,10 @@ function renderLegacyStatus(root, ref, s) {
           ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
           : ["found.csv", "notFound.csv", "report.json", "run.log"])
       : [];
-    const extras = [
+    // Relationship runs are counter-driven: there is no state.json to build output.json
+    // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two
+    // relationship CSVs above — don't advertise two links that cannot work.
+    const extras = s.pipeline === "relationship" ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
     ];
@@ -802,38 +855,49 @@ export async function render(root, params) {
   root.replaceChildren(loadingCard());
   let stop = null;
 
-  const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
+  // A run id alone doesn't say which engine owns it, so each candidate endpoint is
+  // probed with a raw fetch (a 404 must route to the other one rather than be swallowed
+  // by the poller's retry). Views that know the pipeline pass ?engine= so the right one
+  // is tried FIRST and the wasted 404 disappears — but the hint is only an ordering,
+  // never a requirement: bookmarked or hand-typed URLs carry no hint, and a stale one
+  // still resolves via the second candidate.
+  const candidates = [
+    {
+      engine: "ai",
+      path: `/uploads/ai-mode/${encodeURIComponent(ref)}/status`,
+      start: (p) => pollStatus(p, (s) => renderAiStatus(root, ref, s)),
+    },
+    {
+      engine: "serpwow",
+      path: `/uploads/${encodeURIComponent(ref)}/status`,
+      start: (p) => pollStatus(p, (s) => renderLegacyStatus(root, ref, s), 2000,
+                               (s) => deriveLegacyRunState(s).pollTerminal),
+    },
+  ];
+  if (params.query?.engine === "serpwow") candidates.reverse();
 
-  // Probe with a raw fetch so a 404 (not an AI-mode run) can route to the
-  // legacy SerpWow fallback instead of being swallowed by the poller's retry.
-  let probe;
-  try {
-    probe = await fetch(aiPath);
-  } catch (e) {
-    root.replaceChildren(errorCard(e.message));
-    return () => {};
-  }
-
-  if (probe.ok) {
-    stop = pollStatus(aiPath, (s) => renderAiStatus(root, ref, s));
-  } else if (probe.status === 404) {
-    const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
+  let failure = null;
+  for (const candidate of candidates) {
+    let probe;
     try {
-      await api(legacyPath); // 404 here too → unknown run
-      stop = pollStatus(
-        legacyPath,
-        (s) => renderLegacyStatus(root, ref, s),
-        2000,
-        (s) => deriveLegacyRunState(s).pollTerminal,
-      );
+      probe = await fetch(candidate.path);
     } catch (e) {
-      root.replaceChildren(errorCard(
-        /not found/i.test(e.message) ? `Run "${ref}" was not found.` : e.message));
+      failure = e.message;
+      break;
     }
-  } else {
-    let detail = probe.statusText;
-    try { detail = (await probe.json()).detail ?? detail; } catch {}
-    root.replaceChildren(errorCard(detail));
+    if (probe.ok) {
+      stop = candidate.start(candidate.path);
+      break;
+    }
+    if (probe.status !== 404) {
+      failure = probe.statusText;
+      try { failure = (await probe.json()).detail ?? failure; } catch {}
+      break;
+    }
+    // 404 → not this engine; fall through to the next candidate.
+  }
+  if (!stop) {
+    root.replaceChildren(errorCard(failure ?? `Run "${ref}" was not found.`));
   }
 
   // The router invokes this before the next view renders — stops the poller.

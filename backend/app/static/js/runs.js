@@ -11,6 +11,8 @@ import {
   pageIntro,
   PIPELINE_LABELS,
   PIPELINES,
+  runHref,
+  engineOf,
   shortDate,
   statusBadge,
 } from "./ui.js";
@@ -83,7 +85,7 @@ function runsTable(runs, companiesById) {
       cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
       cell(el("a", {
         class: "table-link",
-        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        href: runHref(r.run_ref, engineOf(r.pipeline)),
         "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
       }, companyName), "font-semibold text-slate-50"),
       cell(PIPELINE_LABELS[r.pipeline] ?? r.pipeline ?? "-"),

@@ -1,6 +1,6 @@
 // backend/app/static/js/new_run.js - full-width "start a new run" workflow.
 import { api, el, fmtNum } from "./api.js";
-import { errorCard, head, cell } from "./ui.js";
+import { errorCard, head, cell, runHref } from "./ui.js";
 
 const _AI_COLS = [
   { name: "company_name", req: true,  hint: "company, name, entity_name, entity, organization" },
@@ -37,7 +37,7 @@ const PIPELINES = [
   { key: "ai_deep", label: "AI Mode 2 - Deep Search", endpoint: "/uploads/ai-mode", ai: true,
     desc: "Small batches, deeper investigation, better for hard targets.", csvCols: _AI_COLS },
   { key: "gmaps", label: "Google Maps", endpoint: "/uploads/gmaps",
-    desc: "Fast SerpWow Maps discovery for local business signals.", csvCols: _SW_COLS },
+    desc: "Fast Scrape.do Maps discovery for local business signals.", csvCols: _SW_COLS },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",
@@ -141,7 +141,7 @@ function previewTables(preview) {
   // Relationship preview: surface the search plan up front.
   if (preview.relationship) {
     parts.push(el("p", { class: "section-copy" },
-      "Each row is searched across 3 AI-Overview phases (relationship + website)."));
+      "Each row is verified with one Google AI Mode search (relationship + website)."));
   }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));
@@ -397,7 +397,7 @@ export async function render(root) {
         el("p", { class: "text-sm font-semibold text-emerald-600" },
           `Run started (${info.run_id ?? info.upload_id ?? "ok"}). Redirecting...`));
       const target = state.pipeline.ai
-        ? `#/runs/${encodeURIComponent(info.run_id)}`
+        ? runHref(info.run_id, "ai")
         : "#/runs";
       setTimeout(() => { window.location.hash = target; }, 700);
     } catch (e) {

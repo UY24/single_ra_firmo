@@ -11,6 +11,8 @@ import {
   sectionHeading,
   shortDate,
   statusBadge,
+  runHref,
+  engineOf,
 } from "./ui.js";
 
 const runCost = (r) => (r.cost && typeof r.cost === "object") ? r.cost.total_usd : r.cost;
@@ -59,7 +61,7 @@ function recentRunsTable(runs, companiesById) {
     return el("tr", { class: "data-row" },
       cell(el("a", {
         class: "table-link",
-        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        href: runHref(r.run_ref, engineOf(r.pipeline)),
         "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
       }, companyName), "font-semibold text-slate-50"),
       cell(r.pipeline ?? "-"),

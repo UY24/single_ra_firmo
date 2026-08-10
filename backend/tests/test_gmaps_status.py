@@ -121,7 +121,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
                                new=mock.AsyncMock(side_effect=lambda _id, s: s)), \
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             resp = asyncio.run(legacy_app.upload_status("gm1"))
         self.assertEqual(resp["serpwow_summary"]["available_files"], ["run.log"])
         self.assertEqual(len(s3.calls), 1)
@@ -145,7 +146,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
                  mock.patch.object(legacy_app, "_find_upload_dir", return_value=run_dir), \
                  mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
                  mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
-                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
                 resp = asyncio.run(legacy_app.upload_status("gm1"))
         self.assertEqual(resp["serpwow_summary"]["available_files"],
                          ["found.csv", "notFound.csv", "report.json", "run.log"])
@@ -169,7 +171,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
              mock.patch.object(legacy_app.asyncio, "create_task",
                                side_effect=capture_task), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             asyncio.run(legacy_app.write_upload_artifact("up-1", "state", state))
             asyncio.run(scheduled.pop())
 
@@ -196,7 +199,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
              mock.patch.object(legacy_app.asyncio, "create_task",
                                side_effect=capture_task), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             asyncio.run(legacy_app.write_upload_artifact("gm1", "output", state))
             asyncio.run(scheduled.pop())
 
@@ -207,7 +211,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
 
     def test_s3_file_links_use_resolved_legacy_run_prefix(self):
         legacy_app._s3_run_prefix_cache["gm1"] = "ISI_Market_Test/gmaps/gm1"
-        with mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+        with mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             links = legacy_app._upload_file_links(
                 "gm1", "ISI Market Test", "gmaps")
 
@@ -239,7 +244,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
                  mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
                  mock.patch.object(legacy_app.asyncio, "create_task",
                                    side_effect=capture_task), \
-                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
                 restored = asyncio.run(
                     legacy_app.read_upload_artifact("gm1", "state"))
                 asyncio.run(
@@ -276,7 +282,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
                  mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
                  mock.patch.object(legacy_app.asyncio, "create_task",
                                    side_effect=capture_task), \
-                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
                 restored = asyncio.run(
                     legacy_app.read_upload_artifact("gm1", "state"))
                 self.assertTrue(sidecar.exists())
@@ -314,7 +321,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
                  mock.patch.object(legacy_app, "_write_json_to_s3_sync", write_s3), \
                  mock.patch.object(legacy_app.asyncio, "create_task",
                                    side_effect=capture_task), \
-                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+                 mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
                 asyncio.run(
                     legacy_app.write_upload_artifact("new1", "state", state))
                 asyncio.run(scheduled.pop())
@@ -343,7 +351,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
              mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             available = asyncio.run(legacy_app._available_reporting_files(
                 "gm1", "Acme", "gmaps"))
 
@@ -359,7 +368,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "_find_s3_upload_key_sync", return_value=legacy_key), \
              mock.patch.object(legacy_app, "_read_json_from_s3_sync", return_value={"upload_id": "gm1"}), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             asyncio.run(legacy_app.read_upload_artifact("gm1", "state"))
         self.assertEqual(legacy_app._s3_run_prefix_cache["gm1"],
                          "ISI_Market_Test/gmaps/gm1")
@@ -384,7 +394,8 @@ class TestGmapsStatusBlock(unittest.TestCase):
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path(td)), \
              mock.patch.object(legacy_app, "get_s3_client", return_value=s3), \
              mock.patch.object(legacy_app, "_find_s3_upload_key_sync", resolve), \
-             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket"}):
+             mock.patch.dict("os.environ", {"S3_BUCKET": "bucket",
+                                            "SERPWOW_S3_STATE_FLUSH_SEC": "0"}):
             first = asyncio.run(legacy_app._available_reporting_files(
                 "gm1", "ISI Market Test", "gmaps"))
             first_calls = list(s3.calls)

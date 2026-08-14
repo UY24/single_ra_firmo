@@ -22,6 +22,58 @@ from app.services.serpwow.serpwow_client import sanitize_serpwow_error_text
 CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
                "confidence", "flags", "attempt_log"]
 
+# retry.csv's own column, added after the input header. Deduped by retry_column() when an
+# input CSV already has one by that name.
+RETRY_REASON_COLUMN = "retry_reason"
+
+# iter_input_rows overwrites a real "row_index" input column with its own int index and
+# parks the original value here — so passing an input row back out has to read from here.
+_INPUT_SOURCE_OVERRIDES = {"row_index": "row_index__input"}
+
+
+def retry_column(header: list[str]) -> str:
+    """The reason column's name, suffixed until it cannot collide with an input column."""
+    name = RETRY_REASON_COLUMN
+    while name in header:
+        name += "_"
+    return name
+
+
+def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *,
+              attempts: int, credits: int, error: str = "",
+              billed_empty: bool = False, no_listing: bool = False
+              ) -> Optional[dict[str, str]]:
+    """One retry.csv row, or None when the row got a real answer.
+
+    retry.csv exists to be RE-UPLOADED, so it carries the original input cells verbatim
+    under the original header and adds exactly one column. Only rows with nothing to show
+    for themselves belong in it — a row the provider answered is finished, and running it
+    again just buys the same answer twice:
+
+    - ``billed_empty`` — HTTP 200 that carried no data. The only case where credits were
+      charged for nothing, i.e. the scrape.do refund claim. Listed first because it is the
+      only reason that costs money.
+    - ``no_listing`` — every attempt came back 502 "no results" (gmaps). Not billed.
+    - ``error``      — died after every retry, or never ran at all.
+
+    Shared by gmaps and relationship so one vocabulary describes both runs' rerun lists.
+    """
+    if billed_empty:
+        reason = "billed_empty: HTTP 200 returned no data — refundable"
+    elif no_listing:
+        reason = 'no_listing: 502 "no results" after every retry — not billed'
+    elif error:
+        # Credits on an errored row mean the call returned HTTP 200 and the BODY carried
+        # the error — charged for nothing, exactly like billed_empty. A row that died
+        # before any 200 cost nothing, so it must not claim to be refundable.
+        reason = f"error: {error}" + (" — billed, refundable" if credits else "")
+    else:
+        return None
+    row = {name: str(original.get(_INPUT_SOURCE_OVERRIDES.get(name, name), "") or "")
+           for name in header}
+    row[reason_column] = f"{reason} | attempts={attempts} credits={credits}"
+    return row
+
 
 def _confidence_raw(result: dict[str, Any]) -> dict[str, Any]:
     ctx = result.get("context") or {}
@@ -111,7 +163,8 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
                 scrapedo_billed_empty: int = 0,
                 scrapedo_no_results: int = 0,
                 scrapedo_recovered_requests: int = 0,
-                scrapedo_error_requests: int = 0) -> dict[str, Any]:
+                scrapedo_error_requests: int = 0,
+                scrapedo_billed_errors: int = 0) -> dict[str, Any]:
     """SerpWow is per-search USD; scrape.do is credits (10 per successful call) with no
     USD figure. Both key sets are always present so a run whose pipeline has migrated
     and a pre-migration run of the same pipeline each render from their own fields.
@@ -144,6 +197,9 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
         "scrapedo_recovered_requests": scrapedo_recovered_requests,
         "scrapedo_error_requests": scrapedo_error_requests,
         "scrapedo_billed_empty": scrapedo_billed_empty,
+        # Rows whose HTTP 200 came back with an ERROR body. Billed all the same, so they
+        # sit with billed_empty as "credits spent for nothing", not with the free 502s.
+        "scrapedo_billed_errors": scrapedo_billed_errors,
         "scrapedo_credits": scrapedo_credits,
         "total_usd": round(llm_usd + serpwow_usd, 6),
     }
@@ -169,6 +225,8 @@ def _cost_log_line(summary: dict[str, Any]) -> str:
                  f" rows_no_listing={cost.get('scrapedo_no_results')}")
         if cost.get("scrapedo_billed_empty"):
             line += f" scrapedo_billed_empty={cost.get('scrapedo_billed_empty')}"
+        if cost.get("scrapedo_billed_errors"):
+            line += f" scrapedo_billed_errors={cost.get('scrapedo_billed_errors')}"
 
     return line
 

@@ -261,6 +261,48 @@ async function completedGmapsHeuristic() {
   assert(!root.textContent.includes("Input tokens"), "heuristic run exposed token metrics");
 }
 
+async function gmapsBillingBreakdown() {
+  // Based on the real 100-row run 8ffe96d9 (139 attempts, 87 billed 200s = 870 credits,
+  // 13 rows Google has no listing for at 4 free attempts each), plus a billed-empty row
+  // and two 200s whose BODY carried an error — both are credits spent for nothing.
+  // The card explains the 1000-vs-870 gap; it used to render "All phases 0 / Some 0".
+  const { root } = await renderStatus("gmaps-billing", {
+    pipeline: "gmaps", status: "completed_with_errors", total_rows: 100,
+    processed_rows: 100, failed_rows: 3,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 100,
+      websites_found: 68, websites_not_found: 32,
+      // 3 dead rows: 2 were billed (HTTP 200 + error body), 1 never got a 200.
+      outcome_breakdown: { found: 68, not_found: 29, errored: 3 },
+      empty_response_breakdown: { no_listing: 13, billed_empty: 1 },
+      available_files: [],
+      cost: {
+        scrapedo_requests: 139, scrapedo_successful_requests: 87,
+        scrapedo_failed_requests: 52, scrapedo_error_requests: 4,
+        scrapedo_no_results: 13, scrapedo_billed_empty: 1,
+        scrapedo_billed_errors: 2, scrapedo_credits: 870,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+  });
+  assert(root.textContent.includes("Scrape.do billing (10 credits per HTTP 200)"),
+    "gmaps billing heading missing");
+  assert(!root.textContent.includes("All phases"),
+    "gmaps still renders gsearch's per-phase empty-response split");
+  const pillValue = (label) => byClass(root, "pill")
+    .find((pill) => pill.children[0]?.textContent === label)?.children[1]?.textContent;
+  assert(pillValue("Billed calls") === "87 of 100 rows", "billed calls wrong");
+  // Charged and got nothing usable: the empty 200 plus both error-body 200s.
+  assert(pillValue("Billed but no result") === "3", "billed-for-nothing count wrong");
+  // Every attempt failed, so nothing was charged: 13 no-listing rows + the one dead row
+  // that never got a 200. The two BILLED error rows must not be counted here.
+  assert(pillValue("Failed after retries") === "14", "unbilled dead rows wrong");
+  assert(pillValue("Unbilled attempts") === "52", "retry attempts not shown");
+  assert(!root.textContent.includes("No Maps listing"),
+    "no-listing chip should be folded into the unbilled-failure count");
+  assert(root.textContent.includes("870"), "credits missing from the cost card");
+}
+
 async function failedRowsViewer() {
   const ref = "failed rows/&";
   const { root } = await renderStatus(ref, {
@@ -303,7 +345,8 @@ async function completedRelationship() {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
       websites_found: 3, websites_not_found: 2,
       outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
-      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
+        "retry.csv", "report.json", "run.log"],
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
@@ -332,7 +375,7 @@ async function counterDrivenRelationshipTerminal() {
       empty_response_breakdown: { no_ai_text: 1 },
       confidence_mode: "llm",
       available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
-        "report.json", "run.log"],
+        "retry.csv", "report.json", "run.log"],
       cost: {
         scrapedo_requests: 5, scrapedo_successful_requests: 5,
         scrapedo_failed_requests: 0, scrapedo_error_requests: 0,
@@ -358,8 +401,9 @@ async function counterDrivenRelationshipTerminal() {
   assert(!byText(root, "button", "Stop run"), "terminal run still offered Stop");
   const files = byClass(root, "files-section")[0];
   assert(files, "counter-driven terminal run rendered no Files card");
+  // retry.csv is the rerun/refund list — the rows that got no answer, ready to upload back.
   for (const name of ["confirmed_relation.csv", "notconfirmed_relation.csv",
-    "report.json", "run.log"]) {
+    "retry.csv", "report.json", "run.log"]) {
     assert(files.textContent.includes(name), `Files card missing ${name}`);
   }
   assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
@@ -390,12 +434,13 @@ async function counterDrivenRelationshipFailedMidScrape() {
         llm_usd: 0.0, total_usd: 0.0,
       },
     },
-    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "retry.csv",
+      "report.json", "run.log"],
   });
   const files = byClass(root, "files-section")[0];
   assert(files, "failed relationship run hid the Files surface");
   const buttons = byTag(files, "button");
-  assert(buttons.length === 4, `expected 4 file buttons, got ${buttons.length}`);
+  assert(buttons.length === 5, `expected 5 file buttons, got ${buttons.length}`);
   assert(buttons.every((button) => button.disabled),
     "failed mid-scrape run offered enabled links to files it never wrote");
   // The failed-rows viewer is offered, so its endpoint must answer (see
@@ -787,6 +832,7 @@ async function accessibleModalLifecycleAndRace() {
 await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
+await gmapsBillingBreakdown();
 await failedRowsViewer();
 await completedRelationship();
 await counterDrivenRelationshipTerminal();

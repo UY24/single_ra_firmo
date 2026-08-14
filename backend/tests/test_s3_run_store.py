@@ -185,6 +185,11 @@ class CountersTests(unittest.TestCase):
             c.flush(force=True)            # terminal snapshot always writes
             self.assertEqual(fake.put_calls, first + 1)
 
+    def test_bump_rejects_an_unknown_counter(self) -> None:
+        """It used to drop them silently, which cost gmaps a whole counter."""
+        with self.assertRaises(KeyError):
+            store.Counters("acme/relationship/run1").bump(rows_no_listings=1)
+
     def test_status_json_holds_counters_only_never_rows(self) -> None:
         fake = FakeS3()
         with _patched(fake):

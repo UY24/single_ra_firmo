@@ -28,6 +28,8 @@ from app.services.serpwow.serpwow_reporting import (
     _cost_log_line,
     _csv_row,
     _derive_outcome,
+    retry_column,
+    retry_row,
     row_to_entity_result,
 )
 
@@ -108,12 +110,22 @@ def _write_outputs(prefix: str, counters: store.Counters,
 
     log_tmp, log_text = _temp_file()
 
+    # retry.csv keeps the INPUT's own header so it can be uploaded straight back to
+    # /uploads/gmaps — which is why it is built here rather than from CSV_COLUMNS.
+    header = store.read_input_header(prefix)
+    reason_column = retry_column(header)
+    retry_tmp, retry_text = _temp_file()
+    retry_text.write("﻿")
+    retry_writer = csv.DictWriter(retry_text, fieldnames=header + [reason_column],
+                                  extrasaction="ignore")
+    retry_writer.writeheader()
+
     total_rows = found = 0
     outcomes = {"found": 0, "not_found": 0, "errored": 0}
     by_source: dict[str, int] = {}
     by_category: dict[str, int] = {}
     requests = successes = failed = credits = 0
-    billed_empty = no_results = recovered = error_requests = 0
+    billed_empty = no_results = recovered = error_requests = billed_errors = 0
 
     for original in store.iter_input_rows(prefix):
         total_rows += 1
@@ -143,8 +155,24 @@ def _write_outputs(prefix: str, counters: store.Counters,
 
         entity = row_to_entity_result(row, total_rows)
         outcome = _derive_outcome(row)
+        # `error` only when the row actually errored: a no-listing row and a
+        # "Row has no company name." row both carry row["error"] as their display text,
+        # and neither is a provider failure. The nameless one is not rerunnable at all.
+        retry = retry_row(
+            original, header, reason_column,
+            attempts=int(cost.get("scrapedo_requests") or 0),
+            credits=int(cost.get("scrapedo_credits") or 0),
+            error=str(row.get("error") or "") if outcome == "error" else "",
+            billed_empty=bool(cost.get("scrapedo_billed_empty")),
+            no_listing=bool(cost.get("scrapedo_no_results")))
+        if retry:
+            retry_writer.writerow(retry)
         if outcome == "error":
             outcomes["errored"] += 1
+            # A row that died WITH a billed 200 (error body) is a paid-for-nothing row,
+            # not one of the free 502s. The UI splits the two on exactly this number.
+            if int(cost.get("scrapedo_successful_requests") or 0):
+                billed_errors += 1
             source = str(row.get("error_source") or "scrapedo")
             by_source[source] = by_source.get(source, 0) + 1
             category = str(row.get("error_category") or "unknown")
@@ -201,10 +229,12 @@ def _write_outputs(prefix: str, counters: store.Counters,
         "empty_response_breakdown": {"no_listing": no_results,
                                      "billed_empty": billed_empty},
         "cost": _build_cost(0.0, 0, 0, requests, credits, successes, failed,
-                            billed_empty, no_results, recovered, error_requests),
+                            billed_empty, no_results, recovered, error_requests,
+                            scrapedo_billed_errors=billed_errors),
     }
 
-    for name, (tmp, text) in files.items():
+    for name, (tmp, text) in list(files.items()) + [("retry.csv",
+                                                     (retry_tmp, retry_text))]:
         text.flush()
         store.put_fileobj(f"{prefix}/{name}", tmp, content_type="text/csv")
     store.put_bytes(

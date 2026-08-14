@@ -243,7 +243,8 @@ class OutputTests(unittest.TestCase):
 
         self.assertEqual(set(seen),
                          {f"{PREFIX}/confirmed_relation.csv",
-                          f"{PREFIX}/notconfirmed_relation.csv", f"{PREFIX}/run.log"})
+                          f"{PREFIX}/notconfirmed_relation.csv",
+                          f"{PREFIX}/retry.csv", f"{PREFIX}/run.log"})
 
 
 COLLISION_PREFIX = "acme/relationship/run-collision"
@@ -402,6 +403,57 @@ class CostAccountingTests(unittest.TestCase):
             outputs.write_outputs(COST_PREFIX, store.Counters(COST_PREFIX, rows_total=1))
             log = store.get_bytes(f"{COST_PREFIX}/run.log").decode()
         self.assertIn("status=completed\n", log)
+
+
+RETRY_PREFIX = "acme/relationship/retry1"
+RETRY_CSV = (b"Input_URL,Company_Name_X,Company_Name_Y,country\n"
+             b"https://acme.com/p,Acme,Confirmed,US\n"
+             b"https://acme.com/p,Acme,Empty,US\n"
+             b"https://acme.com/p,Acme,Dead,US\n"
+             b"https://acme.com/p,Acme,NeverRan,US\n")
+
+
+class RetryCsvTests(unittest.TestCase):
+    def _seed(self, fake) -> None:
+        with _patched(fake):
+            store.put_bytes(store.input_key(RETRY_PREFIX), RETRY_CSV)
+            store.write_row(RETRY_PREFIX, 0, {"response": BODY})
+            store.put_object(store.cleaned_key(RETRY_PREFIX, 0), {
+                "row_index": 0, "candidates": ["https://c.example"],
+                "x_domain": "acme.com",
+                "parsed": {"relationship_status": "confirmed",
+                           "official_website": "https://c.example",
+                           "relationship_summary": "s",
+                           "relationship_confidence_score": 90,
+                           "website_confidence_score": 80}})
+            # A billed 200 that carried neither prose nor citations: 10 credits for
+            # literally nothing — the refund claim.
+            store.write_row(RETRY_PREFIX, 1, {"response": {}})
+            store.put_object(store.error_key(RETRY_PREFIX, 2), {
+                "error": "HTTP 529", "error_category": "http_5xx",
+                "request_count": 4, "successful_requests": 0, "credits": 0})
+            # row 3: no object at all — never processed.
+
+    def test_retry_csv_lists_the_rows_that_got_no_answer(self) -> None:
+        """A verdict — confirmed or not — is an answer; rerunning it re-buys it. Only a
+        row with nothing to show for its credits belongs in the rerun list."""
+        fake = FakeS3()
+        self._seed(fake)
+        with _patched(fake):
+            outputs.write_outputs(RETRY_PREFIX,
+                                  store.Counters(RETRY_PREFIX, rows_total=4))
+        rows = _read_csv(fake, "retry.csv", RETRY_PREFIX)
+        self.assertEqual([r["Company_Name_Y"] for r in rows],
+                         ["Empty", "Dead", "NeverRan"])
+        # The ORIGINAL input columns, so the file re-uploads to /uploads/relationship.
+        self.assertEqual(list(rows[0]),
+                         ["Input_URL", "Company_Name_X", "Company_Name_Y", "country",
+                          "retry_reason"])
+        self.assertIn("billed_empty", rows[0]["retry_reason"])
+        self.assertIn("refundable", rows[0]["retry_reason"])
+        self.assertIn("credits=10", rows[0]["retry_reason"])
+        self.assertIn("HTTP 529", rows[1]["retry_reason"])
+        self.assertIn("never processed", rows[2]["retry_reason"].lower())
 
 
 if __name__ == "__main__":

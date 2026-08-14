@@ -392,11 +392,48 @@ function verdictSection(rb) {
 }
 
 // Rows the provider answered with nothing usable. Branch on the DATA, not the pipeline:
+// gmaps makes ONE Maps call per row and is billed per HTTP 200, so the question there is
+// not "was the 200 empty" (it almost never is) but why the bill is under rows × 10 —
+// answered by the calls that never reached 200: no Maps listing, or dead after every
+// retry. Both are free, and the phase split rendered two permanent zeroes for it.
 // relationship makes ONE scrape.do AI Mode call per row, so it reports a single
 // {no_ai_text: N} — there are no phases to split by. gsearch runs several SerpWow
 // phases per row and splits them all / some.
-// `eb` is serpwow_summary.empty_response_breakdown.
-function emptyResponsesSection(eb) {
+// `g` is serpwow_summary (needs cost + outcome_breakdown, not just the breakdown).
+function emptyResponsesSection(g) {
+  const eb = g.empty_response_breakdown || {};
+  const cost = g.cost || {};
+  if (eb.no_listing != null) {
+    const billed = safeCount(cost.scrapedo_successful_requests);
+    const rows = safeCount(g.total_rows);
+    // Every attempt that did not return 200. This is the retry story: a dead row burns
+    // the full SCRAPEDO_MAX_RETRIES + 1 attempts before it gives up, for free.
+    const unbilled = Math.max(0, safeCount(cost.scrapedo_requests) - billed);
+    // Paid and got nothing usable — an empty results array or an error body. Same
+    // refund claim either way, and the only two ways a credit buys nothing.
+    const billedErrors = safeCount(cost.scrapedo_billed_errors);
+    const paidForNothing = safeCount(eb.billed_empty) + billedErrors;
+    // Never got a 200 at all, so never charged: rows Google has no listing for, plus
+    // dead rows whose every attempt failed. Rows that died WITH a billed 200 are
+    // subtracted — they are counted above, and would otherwise be counted twice.
+    const failed = safeCount(eb.no_listing)
+      + Math.max(0, safeCount(g.outcome_breakdown?.errored) - billedErrors);
+    return el("section", { class: "detail-section" },
+      sectionHeading(
+        "Scrape.do billing (10 credits per HTTP 200)",
+        "A 200 is billed whether or not it carried data. Attempts that never returned "
+        + "200 are free, which is why a run can cost less than 10 credits a row. "
+        + "Download retry.csv for the rows behind these numbers."),
+      el("div", { class: "detail-section-body relationship-verdict" },
+        chip("Billed calls",
+          rows ? `${fmtNum(billed)} of ${fmtNum(rows)} rows` : fmtNum(billed), "good"),
+        chip("Billed but no result", fmtNum(paidForNothing),
+          paidForNothing ? "danger" : "muted"),
+        chip("Failed after retries", fmtNum(failed), failed ? "warn" : "muted"),
+        chip("Unbilled attempts", fmtNum(unbilled), "muted"),
+      ),
+    );
+  }
   const aiMode = eb.no_ai_text != null;
   const chips = aiMode
     ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
@@ -789,7 +826,7 @@ function renderLegacyStatus(root, ref, s) {
       : costSection(g));
   }
   if (isRel && g?.relationship_breakdown) parts.push(verdictSection(g.relationship_breakdown));
-  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g.empty_response_breakdown));
+  if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
   }
@@ -833,10 +870,14 @@ function renderLegacyStatus(root, ref, s) {
   // result files aren't written until then, so View/Download would 404).
   if (runState.filesReady) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
+    // retry.csv is the rerun/refund list, written only by the two S3-only pipelines —
+    // gsearch shares this branch and never produces one, so don't advertise it there.
+    const retryFile = ["gmaps", "relationship"].includes(s.pipeline) ? ["retry.csv"] : [];
     const resultFiles = (runState.reporting && runState.batchTerminal)
       ? (s.pipeline === "relationship"
-          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"]
-          : ["found.csv", "notFound.csv", "report.json", "run.log"])
+          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", ...retryFile,
+             "report.json", "run.log"]
+          : ["found.csv", "notFound.csv", ...retryFile, "report.json", "run.log"])
       : [];
     // Relationship runs are counter-driven: there is no state.json to build output.json
     // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two

@@ -7,6 +7,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from app.services.serpwow import s3_run_store as store
+from app.services.serpwow import engine
 from app.services.serpwow.engine import app
 from tests.test_s3_run_store import FakeS3, _patched
 
@@ -268,7 +269,7 @@ class StatusTests(unittest.TestCase):
             with mock.patch.object(fake, "get_paginator",
                                    wraps=fake.get_paginator) as paginator:
                 TestClient(app).get("/uploads/run6b/status")
-        self.assertEqual(paginator.call_count, 4)
+        self.assertEqual(paginator.call_count, len(engine._RELATIONSHIP_FILES))
 
     def test_a_re_driven_run_reports_the_live_phase_not_the_stale_report(self) -> None:
         """report.json OUTLIVES its run: retry_failed_rows deletes the error markers,

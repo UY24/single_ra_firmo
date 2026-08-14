@@ -31,6 +31,7 @@ from app.services.serpwow.modes.relationship import (
     build_row_result,
     row_fields,
 )
+from app.services.serpwow.serpwow_reporting import retry_column, retry_row
 
 EXTRA_COLUMNS = [
     "website_url", "relationship_status",
@@ -152,6 +153,16 @@ def _write_outputs(prefix: str, counters: store.Counters,
         writers[name] = writer
 
     log_tmp, log_text = _temp_file()
+
+    # retry.csv carries the INPUT header, not the enriched one: it exists to be uploaded
+    # straight back to /uploads/relationship.
+    reason_column = retry_column(header)
+    retry_tmp, retry_text = _temp_file()
+    retry_text.write("﻿")
+    retry_writer = csv.DictWriter(retry_text, fieldnames=header + [reason_column],
+                                  extrasaction="ignore")
+    retry_writer.writeheader()
+
     counts = {"confirmed": 0, "not_confirmed": 0, "unclear": 0}
     outcomes = {"found": 0, "not_found": 0, "errored": 0}
     by_source: dict[str, int] = {}
@@ -199,6 +210,19 @@ def _write_outputs(prefix: str, counters: store.Counters,
             # business-layer failure, not a failed request, and must not inflate this
             # past scrapedo_failed_requests (requests - successes).
             error_requests += max(0, int(envelope.get("request_count") or 0) - row_successes)
+
+        # Same rule as gmaps: only rows with nothing to show for their credits. A verdict
+        # (confirmed or not) is a real answer — rerunning it re-buys it. Rows with
+        # references but no prose (no_ai_text) are deliberately NOT here: the gate had
+        # something to work with and produced a verdict.
+        retry = retry_row(
+            original, header, reason_column,
+            attempts=int(envelope.get("request_count") or 0),
+            credits=int(envelope.get("credits") or 0),
+            error=str(envelope.get("error") or ""),
+            billed_empty=not envelope.get("error") and not blocks and not refs)
+        if retry:
+            retry_writer.writerow(retry)
 
         cleaned = store.get_object(store.cleaned_key(prefix, idx)) or {}
         parsed = cleaned.get("parsed")
@@ -311,7 +335,8 @@ def _write_outputs(prefix: str, counters: store.Counters,
         },
     }
 
-    for name, (tmp, text) in tmp_files.items():
+    for name, (tmp, text) in list(tmp_files.items()) + [("retry.csv",
+                                                         (retry_tmp, retry_text))]:
         text.flush()
         store.put_fileobj(f"{prefix}/{name}", tmp, content_type="text/csv")
     store.put_bytes(

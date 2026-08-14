@@ -219,6 +219,10 @@ s3_client = None
 
 _GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv",
                          "confirmed_relation.csv", "notconfirmed_relation.csv",
+                         # The rerun/refund list (gmaps + relationship): the rows that
+                         # got no answer, with their original input columns so the file
+                         # can be downloaded and uploaded straight back.
+                         "retry.csv",
                          "skipped.csv", "report.json", "run.log",
                          "output.json", "state.json"}
 
@@ -5132,7 +5136,7 @@ async def batch_job_delete_by_name(
 
 
 _RELATIONSHIP_FILES = ("confirmed_relation.csv", "notconfirmed_relation.csv",
-                       "report.json", "run.log")
+                       "retry.csv", "report.json", "run.log")
 
 # Keyed by BOTH status.json phases and report.json summary statuses (the two vocabularies
 # do not collide). "stopped" maps to "completed" deliberately: run_detail.js's terminal
@@ -5148,7 +5152,7 @@ _RELATIONSHIP_RUN_STATUS = {
 _RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
 
 
-_GMAPS_FILES = ("found.csv", "notFound.csv", "report.json", "run.log")
+_GMAPS_FILES = ("found.csv", "notFound.csv", "retry.csv", "report.json", "run.log")
 
 
 def _s3_run_available_files(prefix: str, names: tuple[str, ...]) -> list[str]:
@@ -5283,6 +5287,13 @@ def _gmaps_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
     No model, no tokens, no batch: heuristic confidence is computed inside the row task,
     so there is nothing deferred to report on.
     """
+    from app.services.serpwow.scrapedo_maps_client import CREDITS_PER_CALL
+
+    # Billed 200s aren't a counter of their own — credits ARE 10 per billed 200, so the
+    # split is exact arithmetic, not an estimate. Mid-run the billing card needs it to
+    # say "87 of 100 rows billed"; report.json carries the real per-row sum at the end.
+    requests = int(counters.get("requests") or 0)
+    billed = int(counters.get("credits") or 0) // CREDITS_PER_CALL
     return {
         "total_rows": total, "websites_found": 0,
         "websites_not_found": max(0, total - scraped),
@@ -5296,7 +5307,9 @@ def _gmaps_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
         "empty_response_breakdown": {
             "no_listing": int(counters.get("rows_no_listing") or 0),
             "billed_empty": int(counters.get("rows_billed_empty") or 0)},
-        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+        "cost": {"scrapedo_requests": requests,
+                 "scrapedo_successful_requests": billed,
+                 "scrapedo_failed_requests": max(0, requests - billed),
                  "scrapedo_credits": int(counters.get("credits") or 0),
                  "scrapedo_error_requests": 0,
                  "scrapedo_billed_empty": int(counters.get("rows_billed_empty") or 0),

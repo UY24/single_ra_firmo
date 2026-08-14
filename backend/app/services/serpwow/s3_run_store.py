@@ -452,8 +452,11 @@ class Counters:
     # drive_attempts: how many times drive_run has died on this run. Lets the re-drive
     # scan retry a run whose phase is "failed" a bounded number of times instead of
     # treating one transient error as permanent — see relationship_runner.
+    # rows_no_listing: gmaps rows Google has no Maps listing for. Unbilled and not an
+    # error, but it is what explains a bill under rows x 10 credits, so the live status
+    # has to carry it — write_outputs recomputes it from the rows themselves.
     _FIELDS = ("rows_total", "rows_scraped", "rows_failed", "rows_billed_empty",
-               "rows_cleaned", "requests", "credits", "task_errors",
+               "rows_no_listing", "rows_cleaned", "requests", "credits", "task_errors",
                "scrape_seconds", "llm_seconds", "drive_attempts")
 
     def __init__(self, prefix: str, rows_total: int = 0, phase: str = "queued",
@@ -469,8 +472,12 @@ class Counters:
 
     def bump(self, **deltas: int) -> None:
         for key, delta in deltas.items():
-            if key in self.values:
-                self.values[key] += int(delta)
+            # Loud, not silent: an unlisted key used to be dropped here, which is how
+            # gmaps' rows_no_listing counted nothing for a whole pipeline without anyone
+            # noticing. Every call site passes a literal, so this can only fire on a typo.
+            if key not in self.values:
+                raise KeyError(f"unknown counter {key!r}")
+            self.values[key] += int(delta)
 
     def set_phase(self, phase: str) -> None:
         self.phase = phase

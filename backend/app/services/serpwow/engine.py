@@ -69,6 +69,7 @@ from app.services.serpwow.xlsx_export import (
     _sanitize_excel_text,
     _excel_col_name,
     _xlsx_cell_xml,
+    build_upload_output_csv_bytes,
     build_upload_output_xlsx_bytes,
 )
 from app.services.serpwow.csv_input import (
@@ -2574,6 +2575,7 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
             "file_links": file_links,
             "status_url": f"/uploads/{upload_id}/status",
             "output_url": f"/uploads/{upload_id}/output",
+            "output_csv_url": f"/uploads/{upload_id}/output?format=csv",
             "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
         }
     except Exception:
@@ -4187,6 +4189,7 @@ async def _create_upload_with_rows(
         "enqueue_errors": enqueue_errors,
         "status_url": f"/uploads/{upload_id}/status",
         "output_url": f"/uploads/{upload_id}/output",
+        "output_csv_url": f"/uploads/{upload_id}/output?format=csv",
         "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
     }
 
@@ -5581,7 +5584,7 @@ async def upload_failure_analysis(
 async def upload_output(
     upload_id: str,
     download: bool = Query(False),
-    format: Literal["json", "xlsx"] = Query("json"),
+    format: Literal["json", "csv", "xlsx"] = Query("json"),
 ) -> Response:
     try:
         output_data = await read_upload_artifact(upload_id, "output")
@@ -5603,6 +5606,19 @@ async def upload_output(
 
     if isinstance(output_data, dict):
         output_data.update(build_processing_timing_summary(output_data.get("results") or []))
+
+    if format == "csv":
+        # charset=utf-8 must be declared: the bytes carry a BOM for Excel, but a browser
+        # previewing them inline honours the header, not the BOM.
+        body = build_upload_output_csv_bytes(output_data)
+        headers = {}
+        if download:
+            headers["Content-Disposition"] = f'attachment; filename="{upload_id}.csv"'
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
+        )
 
     if format == "xlsx":
         body = build_upload_output_xlsx_bytes(output_data)

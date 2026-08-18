@@ -9,6 +9,55 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-18 — per-row output: CSV instead of XLSX, and the UTF-8 fix
+
+A 71-row firmographics run was downloaded as XLSX. Two problems: the format is awkward to
+diff/load, and non-ASCII output (`ul. Leśna 10`, Turkish depot addresses, Bengali phone
+lists) needed the encoding pinned down rather than trusted.
+
+### D33. One table builder, two writers
+
+`build_upload_output_table(output_data)` now owns the 38-column header and the per-row
+extraction; `build_upload_output_xlsx_bytes` and the new `build_upload_output_csv_bytes`
+both call it. A second copy of that column list is the obvious alternative and is exactly
+how the two exports would silently drift — a column added for the CSV and missing from the
+XLSX is the kind of bug nobody notices for a month. `test_output_csv.py` asserts the CSV
+header equals the table's, so the drift is caught mechanically, not by review.
+
+### D34. `utf-8-sig`, not plain UTF-8 — the BOM *is* the fix
+
+Excel decodes a BOM-less CSV as the OS legacy codepage, which is what renders `Leśna` as
+`LeÅ›na`. Nothing about the bytes is wrong in that case and no amount of `charset=utf-8` in
+the response header changes it, because a double-clicked file never sees the header. The
+3-byte BOM is what switches Excel to UTF-8, and `csv`/`pandas` strip it automatically via
+`utf-8-sig`, so no downstream reader regresses. CRLF (the `excel` dialect default) for the
+same audience. `Content-Type: text/csv; charset=utf-8` is still set, for the *inline browser
+preview* path where the header is what's honoured.
+
+Rejected: UTF-16LE + tab separator (the other thing Excel opens reliably). It defeats every
+plain-text tool and `grep`, for a file whose main appeal over XLSX is being plain text.
+
+### D35. The CSV does NOT inherit the XLSX cell cap
+
+`_sanitize_excel_text` truncates at 32767 because that is Excel's per-cell limit. A CSV has
+no such limit, and `output_json` is the one column where the tail matters — a silently
+truncated blob looks like valid JSON that won't parse. So `_csv_text` keeps the control-char
+strip (NUL genuinely breaks readers) and drops the cap. Consequence accepted: a >32767-char
+field will annoy Excel in that one cell. Losing data to protect a spreadsheet's feelings is
+the worse trade.
+
+Also `ensure_ascii=False` for `output_json` in the CSV path only, so that column reads as
+`Leśna` rather than `Leśna`. The XLSX path keeps `ensure_ascii=True` — its XML writer
+is ASCII-safe by construction and there was no reason to touch it.
+
+### D36. XLSX kept, just unlinked
+
+`?format=xlsx` still answers; only the UI links changed (`run_detail.js` Files card →
+`output.csv`, `operations.js` history column → CSV). Deleting the format would break
+bookmarks and the two DOM contracts for a saving of one branch, and the ask was about which
+format is *offered*, not about removing one. `output_csv_url` was added next to
+`output_xlsx_url` in both upload/summary payloads rather than replacing it.
+
 ## 2026-08-18 — firmographics: the preview now uses its own parser
 
 Follow-on from the rename below, reported from the UI: uploading a firmographics CSV

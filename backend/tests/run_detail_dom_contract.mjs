@@ -409,10 +409,10 @@ async function counterDrivenRelationshipTerminal() {
   assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
   assert(!byTag(files, "button").some((button) => button.disabled),
     "terminal relationship files rendered disabled");
-  // A relationship run has no state.json, so /output (json and xlsx) 404s — the Files
+  // A relationship run has no state.json, so /output (json and csv) 404s — the Files
   // card must not offer them. gsearch keeps them (see failedReportingRunShowsFiles).
   assert(!files.textContent.includes("output.json")
-    && !files.textContent.includes("output.xlsx"),
+    && !files.textContent.includes("output.csv"),
   "relationship Files card advertised the state-driven output endpoints");
 }
 
@@ -545,7 +545,7 @@ async function failedReportingRunShowsFiles() {
   assert(!log?.children[1]?.children[0]?.disabled, "available failed-run log was disabled");
   const found = byClass(files, "file-row").find((row) => row.textContent.includes("found.csv"));
   assert(found?.children[1]?.children[0]?.disabled, "absent failed-run result was enabled");
-  assert(files.textContent.includes("output.json") && files.textContent.includes("output.xlsx"),
+  assert(files.textContent.includes("output.json") && files.textContent.includes("output.csv"),
     "failed run lost output endpoint fallbacks");
 }
 

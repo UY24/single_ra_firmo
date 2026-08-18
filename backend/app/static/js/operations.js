@@ -147,7 +147,7 @@ function storageCell(fileLinks) {
 function downloadButton(uploadId, label, format) {
   return el("a", {
     class: "btn-ghost min-h-0 px-2.5 py-1 text-xs",
-    href: `/uploads/${encodeURIComponent(uploadId)}/output${format === "xlsx" ? "?format=xlsx&download=true" : "?download=true"}`,
+    href: `/uploads/${encodeURIComponent(uploadId)}/output${format === "json" ? "?download=true" : `?format=${format}&download=true`}`,
     onclick: (ev) => ev.stopPropagation(),
   }, label);
 }
@@ -190,7 +190,7 @@ function uploadHistoryCard(lifecycle) {
         cell(shortDate(item.updated_at), "whitespace-nowrap text-slate-400"),
         cell(storageCell(item.file_links)),
         cell(ready ? downloadButton(uploadId, "JSON", "json") : el("span", { class: "text-xs text-slate-500" }, "Processing")),
-        cell(ready ? downloadButton(uploadId, "XLSX", "xlsx") : el("span", { class: "text-xs text-slate-500" }, "Processing")),
+        cell(ready ? downloadButton(uploadId, "CSV", "csv") : el("span", { class: "text-xs text-slate-500" }, "Processing")),
       );
     }));
   }
@@ -246,7 +246,7 @@ function uploadHistoryCard(lifecycle) {
               head("Total", "text-right"), head("Processed", "text-right"),
               head("Success", "text-right"), head("Failed", "text-right"),
               head("Time Total", "text-right"), head("Avg/row", "text-right"),
-              head("Updated"), head("Storage"), head("Output JSON"), head("Output XLSX"),
+              head("Updated"), head("Storage"), head("Output JSON"), head("Output CSV"),
             ),
           ),
           tbody,

@@ -884,7 +884,10 @@ function renderLegacyStatus(root, ref, s) {
     // relationship CSVs above — don't advertise two links that cannot work.
     const extras = s.pipeline === "relationship" ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
-      { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
+      // CSV, not XLSX: it opens in Excel just the same (the bytes carry a UTF-8 BOM) and
+      // is the format the per-row output is actually loaded from. ?format=xlsx still works
+      // for anyone with the old link, it just isn't advertised.
+      { name: "output.csv", href: `/uploads/${encodeURIComponent(ref)}/output?format=csv&download=true` },
     ];
     parts.push(filesSection(resultFiles, resultUrl, g?.available_files, extras));
   }

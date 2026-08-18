@@ -1,7 +1,12 @@
 # backend/app/services/serpwow/xlsx_export.py
-"""Hand-rolled (dependency-free) XLSX export of an upload's output payload."""
+"""Dependency-free tabular export of an upload's output payload: XLSX and CSV.
+
+Both formats come from ONE table builder (``build_upload_output_table``) so a column
+added for one shows up in the other — the two exports cannot drift.
+"""
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
@@ -40,7 +45,18 @@ def _xlsx_cell_xml(col_idx: int, row_idx: int, value: Any) -> str:
     return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{escaped}</t></is></c>'
 
 
-def build_upload_output_xlsx_bytes(output_data: dict[str, Any]) -> bytes:
+def build_upload_output_table(
+    output_data: dict[str, Any],
+    *,
+    ascii_json: bool = True,
+) -> tuple[list[str], list[list[Any]]]:
+    """(headers, rows) for one upload's output payload — the source for XLSX and CSV.
+
+    ``ascii_json`` controls only the ``output_json`` column: the XLSX path keeps
+    ``\\uXXXX`` escapes (its XML writer is ASCII-safe by construction), while the CSV
+    path passes False so a Polish or Turkish address reads as itself in the file rather
+    than as escape soup.
+    """
     headers = [
         "upload_id",
         "file_status",
@@ -165,10 +181,50 @@ def build_upload_output_xlsx_bytes(output_data: dict[str, Any]) -> bytes:
                 result_obj.get("gemini_cost_usd"),
                 result_obj.get("total_cost_usd"),
                 (context_obj.get("timing") or {}).get("total_seconds"),
-                json.dumps(result_obj, ensure_ascii=True),
+                json.dumps(result_obj, ensure_ascii=ascii_json),
             ]
         )
 
+    return headers, data_rows
+
+
+def build_upload_output_csv_bytes(output_data: dict[str, Any]) -> bytes:
+    """UTF-8 CSV of the same table the XLSX export writes.
+
+    Encoding, because this file is opened in Excel as often as it is parsed:
+    - **utf-8-sig** (BOM). Excel assumes the OS legacy codepage for a BOM-less CSV, which
+      is what turns ``Leśna`` into ``LeÅ›na``; the BOM is what makes it read UTF-8. Python's
+      ``csv``/``pandas`` skip the BOM automatically, so nothing downstream regresses.
+    - **CRLF** line endings (``excel`` dialect default) for the same reason.
+    - Values keep their real characters and their FULL length. The XLSX writer truncates at
+      Excel's 32767-per-cell limit; a CSV has no such limit and silently losing the tail of
+      ``output_json`` would be worse than a long field.
+    - Embedded newlines (products/services joins, multi-line addresses) are quoted by the
+      csv module, so they stay inside one field instead of breaking the row.
+    """
+    headers, data_rows = build_upload_output_table(output_data, ascii_json=False)
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, dialect="excel", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(headers)
+    for row in data_rows:
+        writer.writerow(["" if value is None else _csv_text(value) for value in row])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def _csv_text(value: Any) -> Any:
+    """Numbers pass through unformatted; text loses only chars that corrupt a CSV.
+
+    NUL and the other C0 controls (tab/CR/LF excepted) have no legal place in a CSV field
+    and break some readers outright, so they are dropped exactly as the XLSX path drops
+    them — but without that path's length cap.
+    """
+    if isinstance(value, (int, float, bool)):
+        return value
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", str(value))
+
+
+def build_upload_output_xlsx_bytes(output_data: dict[str, Any]) -> bytes:
+    headers, data_rows = build_upload_output_table(output_data)
     rows = [headers] + data_rows
     sheet_rows_xml: list[str] = []
     for row_idx, row_values in enumerate(rows, start=1):

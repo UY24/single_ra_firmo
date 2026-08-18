@@ -257,6 +257,34 @@ async function invalidRelationshipContract() {
   assert(root.textContent.includes(warning), "relationship preview warning disappeared");
 }
 
+async function firmographicsPreviewEndpointContract() {
+  // A firmographics CSV has no company_name/country, so the shared /uploads/preview
+  // (parse_entities_csv) reported it as headerless and positional — "col 1 = company
+  // name, col 2 = country" about a file whose first column is a URL.
+  const paths = [];
+  const root = await renderWith(async (path) => {
+    if (path === "/companies") return companiesResponse();
+    paths.push(path);
+    if (path === "/uploads/firmographics/preview") {
+      return response({ total_rows: 72, positional: false,
+                        columns_detected: { website_url: "Website" } });
+    }
+    throw new Error(`Unexpected fetch: ${path}`);
+  });
+
+  selectCompany(root);
+  await choosePipeline(root, "firmographics");
+  await upload(root, new File(["Website\nhttps://acme.com"], "firmo.csv",
+                              { type: "text/csv" }));
+
+  assert(paths.includes("/uploads/firmographics/preview"),
+    "firmographics did not use its own preview endpoint");
+  assert(!paths.includes("/uploads/preview"),
+    "firmographics still hit the entity-CSV preview");
+  assert(!root.textContent.includes("positional"),
+    "firmographics preview still claims positional parsing");
+}
+
 async function pipelineInvalidationContract() {
   const nextPreview = deferred();
   const genericRequests = [];
@@ -355,6 +383,7 @@ for (const [name, contract] of [
   ["initial accessibility", initialAccessibilityContract],
   ["labels and placeholder", labelsAndPlaceholderContract],
   ["invalid relationship", invalidRelationshipContract],
+  ["firmographics preview endpoint", firmographicsPreviewEndpointContract],
   ["pipeline invalidation", pipelineInvalidationContract],
   ["stale preview", stalePreviewContract],
   ["upload", uploadContract],

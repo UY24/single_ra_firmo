@@ -7,7 +7,7 @@ archived newest-first in `docs/HISTORY.md`. This file is only current state + wh
 ## Status
 
 - Branch **`relationship-scrapedo`**, **5 commits ahead of `origin/relationship-scrapedo`** (pushed branch exists; these are not on it) — newest `ced718c` (output CSVs carry the input columns). Only the firmographics column rename below is uncommitted.
-- **774/774** offline tests + **6/6** `.mjs` DOM contracts passing.
+- **778/778** offline tests + **6/6** `.mjs` DOM contracts passing.
 - Two pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03) and
   **relationship** (Google AI Mode, 2026-08-04). **gsearch** and **firmographics** still call
   `api.serpwow.com`. AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
@@ -21,7 +21,7 @@ docker compose up -d rabbitmq                     # broker + mgmt UI on 15672
 cd backend && ../.venv/bin/python -m app.main     # API; UI at http://localhost:11500/app
 python worker.py                                  # repo root; exactly ONE process
 
-cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 774; -t . is MANDATORY
+cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 778; -t . is MANDATORY
 cd backend && for f in tests/*.mjs; do node "$f" || echo "FAIL $f"; done
 ```
 
@@ -127,7 +127,7 @@ keeps its name (`FLOW.md` §3).
 `docs/retry_8ffe96d9_gmaps.csv` (read-only against S3; its existing outputs were not
 rewritten). Upload that to re-run them.
 
-## firmographics input column renamed to `website_url` — done 2026-08-18 (uncommitted)
+## firmographics: `website_url` + a preview that detects the real columns — 2026-08-18 (uncommitted)
 
 The firmographics upload demanded `official_website` and **rejected `website_url`** — the
 very name gmaps/AI Mode/relationship write into found.csv, so you could not feed a run's
@@ -137,6 +137,26 @@ chip); `official_website`/`website`/`url`/`domain` still resolve, so no existing
 breaks. The internal dict/state key stays `official_website` — renaming that touches the
 executor, state rows and the XLSX `input_official_website` column for no user benefit.
 First-ever test for this parser: `tests/test_firmographics_csv.py`.
+
+**The preview lied about the columns.** `/uploads/preview` runs `parse_entities_csv`
+(needs company_name + country), so a firmographics CSV fell through to POSITIONAL parsing
+and reported *"col 1 = company name, col 2 = country"* for a file whose first column is a
+URL. Fixed the way relationship already was: its own `/uploads/firmographics/preview`,
+with `new_run.js` picking the endpoint per pipeline. Both the parser and the preview now
+resolve headers through ONE table, `csv_input.firmographics_columns()` (which replaced six
+near-identical alias loops — net line deletion), so the preview cannot advertise a mapping
+the upload disagrees with, and its sample rows come from the real parser output.
+
+**No invented company names.** `company_name` used to fall back to the URL's domain — in
+the parser when the CSV had no company column, and again in the executor when the value
+was blank — so `acme.com` looked like a real company name in the output and was fed to the
+LLM as one. Both fallbacks are gone: no column, empty cell.
+
+**Firmographics now accepts the same company aliases as every other pipeline**
+(`…|entity_name|entity|organization|…`). Found by running the new endpoint against a real
+`found.csv`: its company column is `entity_name`, which firmographics rejected, so a
+round-tripped file silently used the DOMAIN as the company name for every row — which
+would have quietly defeated the point of the rename.
 
 ## Output CSVs carry the input file's columns — done 2026-08-11 (commit `ced718c`)
 

@@ -19,7 +19,7 @@ const _SW_COLS = [
 ];
 const _FIRMO_COLS = [
   { name: "website_url",      req: true,  hint: "official_website, website, url, domain" },
-  { name: "company_name",     req: false, hint: "company, name  (falls back to domain)" },
+  { name: "company_name",     req: false, hint: "company, name, entity_name, entity, organization" },
   { name: "country",          req: false, hint: "country_name, nation" },
   { name: "firm_id",          req: false, hint: "firmid, id" },
   { name: "industry",         req: false, hint: "input_industry" },
@@ -334,11 +334,16 @@ export async function render(root) {
 
     const pipelineKey = pipeline.key;
     previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
-    // Relationship CSVs have their own header shape (Company_Name_Y /
-    // Company_Name_X / Input_URL), so they get their own dry-run preview
-    // endpoint; everything else uses the shared /uploads/preview.
-    const previewEndpoint = (!pipeline.ai && pipelineKey === "relationship")
-      ? "/uploads/relationship/preview" : "/uploads/preview";
+    // Preview with the parser the UPLOAD will use. Relationship (Company_Name_Y /
+    // Company_Name_X / Input_URL) and firmographics (website_url, no company/country
+    // required) have their own header shapes, so they get their own dry-run endpoints;
+    // the shared /uploads/preview runs parse_entities_csv and would report their files
+    // as headerless, positional "col 1 = company, col 2 = country".
+    const previewEndpoint = pipeline.ai
+      ? "/uploads/preview"
+      : ({ relationship: "/uploads/relationship/preview",
+           firmographics: "/uploads/firmographics/preview" }[pipelineKey]
+         ?? "/uploads/preview");
     const requestIsCurrent = () => generation === previewGeneration
       && state.file === file
       && state.pipeline?.key === pipelineKey;

@@ -8,7 +8,7 @@ import re
 
 from fastapi import HTTPException
 
-from app.services.serpwow.url_utils import _domain_from_url, _normalize_website_input
+from app.services.serpwow.url_utils import _normalize_website_input
 
 
 def _normalize_header(header: str) -> str:
@@ -134,6 +134,39 @@ def parse_csv_rows(raw: bytes) -> list[dict[str, str]]:
     return rows
 
 
+# Firmographics input columns, canonical name -> accepted headers, first match wins.
+# website_url leads because that is the name every other pipeline WRITES into found.csv,
+# so an enrichment run can take that file back unchanged.
+_FIRMO_ALIASES = {
+    "website_url": ("website_url", "official_website", "website", "url", "domain"),
+    # Same list parse_entities_csv accepts, so a found.csv round-trips with its
+    # company names intact instead of falling back to the domain.
+    "company_name": ("company_name", "company", "name", "entity_name", "entity",
+                     "organization", "organisation", "legal_name"),
+    "country": ("country", "country_name", "nation"),
+    "firm_id": ("firm_id", "firmid", "id"),
+    "industry": ("industry", "input_industry"),
+    "full_address": ("full_address", "address", "fulladdress", "input_full_address"),
+}
+
+
+def firmographics_columns(fieldnames) -> dict[str, str]:
+    """Canonical field -> the CSV header that supplied it, for the headers present.
+
+    Shared by the parser and the New Run preview, so the preview cannot claim a mapping
+    the upload will not use — the failure that made a firmographics CSV render as
+    "col 1 = company name, col 2 = country".
+    """
+    normalized = {_normalize_header(h): h for h in (fieldnames or []) if h}
+    resolved: dict[str, str] = {}
+    for canonical, aliases in _FIRMO_ALIASES.items():
+        for alias in aliases:
+            if alias in normalized:
+                resolved[canonical] = normalized[alias]
+                break
+    return resolved
+
+
 def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
     text = raw.decode("utf-8-sig", errors="replace")
     stream = io.StringIO(text)
@@ -146,40 +179,13 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
             "Required: website_url (or official_website/website/url/domain)."
         )
 
-    normalized = {_normalize_header(h): h for h in reader.fieldnames if h}
-    website_key = None
-    company_key = None
-    country_key = None
-    firm_id_key = None
-    industry_key = None
-    full_address_key = None
-
-    # website_url first: it is what every other pipeline WRITES into found.csv, so an
-    # enrichment run can take that file back unchanged. The rest are legacy aliases.
-    for key in ("website_url", "official_website", "website", "url", "domain"):
-        if key in normalized:
-            website_key = normalized[key]
-            break
-    for key in ("company_name", "company", "name"):
-        if key in normalized:
-            company_key = normalized[key]
-            break
-    for key in ("country", "country_name", "nation"):
-        if key in normalized:
-            country_key = normalized[key]
-            break
-    for key in ("firm_id", "firmid", "id"):
-        if key in normalized:
-            firm_id_key = normalized[key]
-            break
-    for key in ("industry", "input_industry"):
-        if key in normalized:
-            industry_key = normalized[key]
-            break
-    for key in ("full_address", "address", "fulladdress", "input_full_address"):
-        if key in normalized:
-            full_address_key = normalized[key]
-            break
+    columns = firmographics_columns(reader.fieldnames)
+    website_key = columns.get("website_url")
+    company_key = columns.get("company_name")
+    country_key = columns.get("country")
+    firm_id_key = columns.get("firm_id")
+    industry_key = columns.get("industry")
+    full_address_key = columns.get("full_address")
 
     if not website_key:
         raise ValueError(
@@ -191,10 +197,10 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
         official_website = _normalize_website_input(str(row.get(website_key) or ""))
         if not official_website:
             continue
+        # Whatever the file has, nothing more: a name derived from the domain reads
+        # like real data in the output and isn't.
         company_name = (row.get(company_key) or "").strip() if company_key else ""
         country = (row.get(country_key) or "").strip() if country_key else ""
-        if not company_name:
-            company_name = _domain_from_url(official_website)
         rows.append(
             {
                 "row_index": idx,

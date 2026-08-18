@@ -9,7 +9,55 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
-## 2026-08-18 — firmographics' input column is `website_url`
+## 2026-08-18 — firmographics: the preview now uses its own parser
+
+Follow-on from the rename below, reported from the UI: uploading a firmographics CSV
+previewed as *"No recognized headers found; positional parsing used (column 1 = company
+name, column 2 = country)"* — about a file whose first column is a URL.
+
+### D29. Preview with the parser the UPLOAD uses, not a shared one
+
+`/uploads/preview` runs `parse_entities_csv`, which requires company_name + country. A
+firmographics CSV has neither, so it fell through to the positional branch and reported a
+mapping the upload would never use. Relationship already had its own preview endpoint for
+exactly this reason; firmographics now has `/uploads/firmographics/preview` alongside it,
+and `new_run.js` picks the endpoint per pipeline from a small table.
+
+Rejected: a `pipeline` form field on the shared preview. It would put a per-pipeline
+branch inside a route that currently has none, for the same number of lines, and the
+two-endpoint precedent already exists.
+
+### D30. One alias table, shared by the parser and the preview
+
+`firmographics_columns(fieldnames)` in `csv_input.py` replaces six near-identical
+alias loops (net line **deletion**) and is what both the parser and the preview resolve
+through — so the preview cannot advertise a mapping the upload disagrees with. The
+sample rows come from the real parser output, so what the preview shows is literally
+what will be enriched.
+
+### D32. No invented company names — use the columns the file has
+
+`company_name` fell back to the URL's domain in TWO places (`csv_input` when the CSV had
+no company column, and the executor when the value was blank), so `acme.com` appeared in
+the output looking like a real company name and went into the LLM prompt as one. Both
+fallbacks deleted; an absent column now means an empty cell. `_domain_from_url` drops out
+of both modules with it.
+
+Deletion over addition: the honest empty value is also the smaller diff, and a blank cell
+is unambiguous where a fabricated one is not.
+
+### D31. Firmographics accepts the same company aliases as everything else
+
+Found while eyeballing the endpoint against a real `found.csv`: its company column is
+`entity_name` (the input's own header, passed through), which `parse_entities_csv`
+accepts but firmographics did not — so a round-tripped file silently fell back to the
+DOMAIN as the company name for every row. The alias list is now the canonical one
+(`company_name|company|name|entity_name|entity|organization|organisation|legal_name`).
+That round-trip is the whole point of the `website_url` rename, so it has to work.
+
+---
+
+## 2026-08-18 (a) — firmographics' input column is `website_url`
 
 The firmographics upload required `official_website` (aliases `website`/`url`/`domain`) —
 and did **not** accept `website_url`, which is the exact name every other pipeline WRITES

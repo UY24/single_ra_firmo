@@ -30,3 +30,57 @@ class FirmographicsWebsiteColumnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FirmographicsPreviewTests(unittest.TestCase):
+    """The New Run preview must use the parser the pipeline actually uses. The shared
+    /uploads/preview runs parse_entities_csv, which needs company_name + country — a
+    firmographics CSV has neither, so it fell through to POSITIONAL parsing and reported
+    "col 1 = company name, col 2 = country" for a file whose first column is a URL."""
+
+    CSV = (b"Website,Company,Country,ISIC\n"
+           b"https://acme.com,Acme,us,1234\n"
+           b"https://beta.io,Beta,de,5678\n")
+
+    def _preview(self, body=None):
+        import io
+
+        from fastapi.testclient import TestClient
+
+        from app.services.serpwow.engine import app
+        return TestClient(app).post(
+            "/uploads/firmographics/preview",
+            files={"file": ("firmo.csv", io.BytesIO(body or self.CSV), "text/csv")})
+
+    def test_preview_maps_the_real_headers_and_never_goes_positional(self):
+        resp = self._preview()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["total_rows"], 2)
+        self.assertFalse(body.get("positional"))
+        self.assertEqual(body["columns_detected"]["website_url"], "Website")
+        self.assertEqual(body["columns_detected"]["company_name"], "Company")
+        # A column we don't map isn't invented into the mapping table.
+        self.assertNotIn("ISIC", body["columns_detected"].values())
+        self.assertEqual(body["sample_rows"][0]["website_url"], "https://acme.com")
+
+    def test_a_csv_with_no_website_column_is_a_400_not_a_positional_guess(self):
+        resp = self._preview(b"company_name,country\nAcme,us\n")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("website_url", resp.json()["detail"])
+
+
+class FirmographicsCompanyAliasTests(unittest.TestCase):
+    def test_no_company_column_leaves_the_name_empty(self):
+        """Use the columns the file has, invent nothing. It used to fill company_name
+        with the URL's domain, which reads like real data in the output and is not."""
+        rows = parse_firmographics_csv_rows(b"website_url\nhttps://acme.com\n")
+        self.assertEqual(rows[0]["company_name"], "")
+
+    def test_company_aliases_match_the_canonical_parser(self):
+        """found.csv writes the input's own company header — often entity_name, which
+        parse_entities_csv accepts. Firmographics rejecting it silently fell back to the
+        domain, so a round-tripped file lost every company name."""
+        rows = parse_firmographics_csv_rows(
+            b"entity_name,country,website_url\nBag Polska,Poland,http://bagpolska.pl\n")
+        self.assertEqual(rows[0]["company_name"], "Bag Polska")

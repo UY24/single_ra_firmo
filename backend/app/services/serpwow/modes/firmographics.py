@@ -22,7 +22,6 @@ from app.services.serpwow.gemini_llm import (
     standardize_serpwow_ai_overview_with_gemini,
 )
 from app.services.serpwow.url_utils import (
-    _domain_from_url,
     _normalize_website_input,
     is_disallowed_official_url,
 )
@@ -39,7 +38,8 @@ async def execute_firmographic_extraction(
     input_full_address: Optional[str] = None,
 ) -> tuple[CrawlResponse, str]:
     normalized_official = _normalize_website_input(official_website)
-    clean_company_name = (company_name or "").strip() or _domain_from_url(normalized_official)
+    # Empty when the input CSV had no company column — see csv_input: no invented names.
+    clean_company_name = (company_name or "").strip()
     clean_country = (country or "").strip()
     clean_full_address = (input_full_address or "").strip() or None
     summary = "Firmographic extraction completed from provided official website."

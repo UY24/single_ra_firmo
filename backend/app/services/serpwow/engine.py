@@ -4293,6 +4293,40 @@ async def create_gsearch_upload(
     )
 
 
+@app.post("/uploads/firmographics/preview")
+async def preview_firmographics_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Dry-run parse for the New Run preview, using the parser the UPLOAD uses.
+
+    The shared /uploads/preview runs parse_entities_csv, which requires company_name +
+    country; a firmographics CSV has neither, so it fell through to positional parsing
+    and told the user "col 1 = company name, col 2 = country" about a file whose first
+    column is a URL. Costs nothing — no state, no queue, no Supabase.
+    """
+    from app.services.serpwow.csv_input import firmographics_columns
+
+    raw = await file.read()
+    try:
+        rows = parse_firmographics_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    header = next(csv.reader(io.StringIO(raw.decode("utf-8-sig", errors="replace"))), [])
+    sample_columns = ["website_url", "company_name", "country",
+                      "firm_id", "industry", "full_address"]
+    return {
+        "total_rows": len(rows),
+        "positional": False,
+        "warnings": [] if rows else ["No enrichable rows — every row is missing a website."],
+        "columns_detected": firmographics_columns(header),
+        "sample_columns": sample_columns,
+        # The row dict's key is still official_website (the state/executor field name);
+        # only the user-facing column is website_url.
+        "sample_rows": [{**{c: r.get(c, "") for c in sample_columns},
+                         "website_url": r["official_website"]}
+                        for r in rows[:5]],
+    }
+
+
 @app.post("/uploads/relationship/preview")
 async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     """Dry-run parse for the New Run preview: header mapping, row count, and a

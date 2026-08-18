@@ -6,8 +6,8 @@ archived newest-first in `docs/HISTORY.md`. This file is only current state + wh
 
 ## Status
 
-- Branch **`relationship-scrapedo`**, **12 commits ahead of `origin/relationship-scrapedo`** (pushed branch exists; these are not on it), plus the uncommitted gmaps billing-display change below.
-- **764/764** offline tests + **6/6** `.mjs` DOM contracts passing.
+- Branch **`relationship-scrapedo`**, **4 commits ahead of `origin/relationship-scrapedo`** (pushed branch exists; these are not on it) — the newest is `15167f3` (gmaps billing card + retry.csv). The CSV-passthrough change below is uncommitted.
+- **771/771** offline tests + **6/6** `.mjs` DOM contracts passing.
 - Two pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03) and
   **relationship** (Google AI Mode, 2026-08-04). **gsearch** and **firmographics** still call
   `api.serpwow.com`. AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
@@ -21,7 +21,7 @@ docker compose up -d rabbitmq                     # broker + mgmt UI on 15672
 cd backend && ../.venv/bin/python -m app.main     # API; UI at http://localhost:11500/app
 python worker.py                                  # repo root; exactly ONE process
 
-cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 764; -t . is MANDATORY
+cd backend && ../.venv/bin/python -m unittest discover -s tests -t .   # 771; -t . is MANDATORY
 cd backend && for f in tests/*.mjs; do node "$f" || echo "FAIL $f"; done
 ```
 
@@ -58,7 +58,7 @@ any `static/js` file.
    `/uploads/{id}/result` reads a whole several-hundred-MB CSV into memory instead of streaming
    the boto3 body.
 
-## gmaps billing display — done 2026-08-11 (uncommitted)
+## gmaps billing display — done 2026-08-11 (commit `15167f3`)
 
 Run `8ffe96d90db341ca85147ead3459c05c` (100 rows) billed **870 credits**, and the detail
 page explained none of it — it rendered gsearch's "Empty responses (HTTP 200) / All phases
@@ -94,7 +94,7 @@ Left alone on purpose: the Slack ping still reads `139 requests · 870 credits` 
 next to credits — real but cosmetic; fix it as part of a vocabulary pass across run.log +
 report.json + Slack, not alone).
 
-## `retry.csv` — the rerun / refund list, done 2026-08-11 (uncommitted)
+## `retry.csv` — the rerun / refund list, done 2026-08-11 (commit `15167f3`)
 
 **The 13 no-listing rows were never billed.** Every one reads `successful_requests: 0,
 credits: 0, no_results: true` — four 502 `{"error":"no results"}` in a row (the live
@@ -126,6 +126,43 @@ keeps its name (`FLOW.md` §3).
 **Run 8ffe96d9 predates the file** — its 13 rows are backfilled on disk at
 `docs/retry_8ffe96d9_gmaps.csv` (read-only against S3; its existing outputs were not
 rewritten). Upload that to re-run them.
+
+## Output CSVs carry the input file's columns — done 2026-08-11 (uncommitted)
+
+`found.csv` / `notFound.csv` used to be a fixed seven columns
+(`company_name, company_local_name, country, website_url, confidence, flags, attempt_log`)
+and dropped every input column outside the five `parse_entities_csv` maps. **Not a
+regression** — `CSV_COLUMNS` is unchanged since `9cc4248` (2026-06-26); relationship was
+already passing its input through, which is what made the gap visible.
+
+Now, for **gmaps + AI Mode** (relationship already did this): the input header **verbatim
+and in order**, then `website_url, confidence, flags, attempt_log` (+ `error` on notFound).
+Verified against real run `8ffe96d9` — its 10 columns
+(`entity_name … firm_id`) come out first, in order.
+
+- The rule lives once, in `common/text.passthrough_fieldnames` / `passthrough_row` —
+  **there, not in `serpwow_reporting`**, because `ai_mode/run_reporting.py` is
+  standalone-by-contract and `serpwow_reporting` pulls in `httpx`.
+  `relationship_outputs._passthrough_fieldnames` is now a one-line wrapper over it.
+- `serpwow_reporting.CSV_COLUMNS` is split into `RESULT_COLUMNS` + the three echoed fields
+  and is byte-identical, so the **gsearch** writer is untouched.
+- **AI Mode: the writer owns the input.csv cursor.** `StreamingRunReport(run_dir,
+  company_column)` pulls one input row per `EntityResult`, so alignment is an invariant of
+  the writer, not of a caller with two `add_batch` sites and a `continue` between them.
+  Caller diff is 3 lines. **The trap it must respect:** `parse_entities_csv` skips a row
+  with an empty company name *without spending an sno*, so the cursor replays that rule —
+  otherwise every row after the first blank one gets the previous row's cells, silently.
+  Two tests pin it (writer-level and end-to-end).
+- Falls back to the old columns for headerless/positional input or an unreadable
+  input.csv.
+
+**gsearch is deliberately excluded — user's call, 2026-08-16: it is being removed, so it
+gets no passthrough work.** (For the record, it would not have been a reporting fix:
+`parse_csv_rows` keeps 6 mapped keys, the uploaded bytes are dropped at the end of the
+request, and nothing carries the original record into `state.json`, so it would need an
+`input.csv` write at upload plus a deliberate join.) **firmographics** writes no found.csv
+at all, and **`output.xlsx`** has the same problem via its fixed `input_*` block — both
+follow gsearch out, so neither is worth touching either.
 
 ## Settled by live probes (2026-08-05, 16 calls / 160 credits)
 

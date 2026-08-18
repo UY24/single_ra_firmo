@@ -14,13 +14,18 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from app.models.results import AttemptLogEntry, EntityResult, Flag
+from app.services.common.text import passthrough_fieldnames, passthrough_row
 from app.services.serpwow.serpwow_client import sanitize_serpwow_error_text
 
-CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
-               "confidence", "flags", "attempt_log"]
+# What we WORKED OUT for a row. The pipelines that can reach the uploaded input.csv
+# (gmaps, relationship) put the user's own columns in front of these; gsearch cannot —
+# it never persists the upload — so it keeps echoing the three parsed fields below and
+# CSV_COLUMNS stays exactly what it has always been.
+RESULT_COLUMNS = ["website_url", "confidence", "flags", "attempt_log"]
+CSV_COLUMNS = ["company_name", "company_local_name", "country"] + RESULT_COLUMNS
 
 # retry.csv's own column, added after the input header. Deduped by retry_column() when an
 # input CSV already has one by that name.
@@ -29,6 +34,18 @@ RETRY_REASON_COLUMN = "retry_reason"
 # iter_input_rows overwrites a real "row_index" input column with its own int index and
 # parks the original value here — so passing an input row back out has to read from here.
 _INPUT_SOURCE_OVERRIDES = {"row_index": "row_index__input"}
+
+
+def s3_passthrough(header: list[str], reserved: Iterable[str]) -> list[tuple[str, str]]:
+    """`passthrough_fieldnames` for the S3-only pipelines, whose rows come from
+    `s3_run_store.iter_input_rows` and therefore carry its injected `row_index`."""
+    return passthrough_fieldnames(header, reserved, _INPUT_SOURCE_OVERRIDES)
+
+
+def result_cells(entity: EntityResult) -> dict[str, Any]:
+    """The RESULT_COLUMNS four, for one row."""
+    return {"website_url": entity.website_url or "", "confidence": entity.confidence,
+            "flags": entity.flags_csv(), "attempt_log": entity.attempt_log_csv()}
 
 
 def retry_column(header: list[str]) -> str:
@@ -69,8 +86,7 @@ def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *
         reason = f"error: {error}" + (" — billed, refundable" if credits else "")
     else:
         return None
-    row = {name: str(original.get(_INPUT_SOURCE_OVERRIDES.get(name, name), "") or "")
-           for name in header}
+    row = passthrough_row(original, s3_passthrough(header, ()))
     row[reason_column] = f"{reason} | attempts={attempts} credits={credits}"
     return row
 
@@ -397,10 +413,9 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
 
 
 def _csv_row(r: EntityResult) -> dict[str, Any]:
-    return {"company_name": r.company_name, "company_local_name": r.company_local_name or "",
-            "country": r.country, "website_url": r.website_url or "",
-            "confidence": r.confidence, "flags": r.flags_csv(),
-            "attempt_log": r.attempt_log_csv()}
+    return {"company_name": r.company_name,
+            "company_local_name": r.company_local_name or "",
+            "country": r.country, **result_cells(r)}
 
 
 def write_outputs(upload_dir: Path, state: dict[str, Any]) -> dict[str, Path]:

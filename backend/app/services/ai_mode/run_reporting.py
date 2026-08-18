@@ -12,15 +12,22 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from app.models.results import EntityResult
+from app.services.common.text import passthrough_fieldnames, passthrough_row
 from app.services.serpwow.outcomes import SRC_GEMINI, categorize_http_error
 
-CSV_COLUMNS = ["company_name", "company_local_name", "country", "website_url",
-               "confidence", "flags", "attempt_log"]
+RESULT_COLUMNS = ["website_url", "confidence", "flags", "attempt_log"]
+# Fallback header, used only when the run's input.csv can't be passed through (see
+# StreamingRunReport). Mirrors serpwow_reporting.CSV_COLUMNS.
+CSV_COLUMNS = ["company_name", "company_local_name", "country"] + RESULT_COLUMNS
+# "error" is reserved for BOTH files, not just notFound.csv, so an input column by that
+# name is renamed identically in each and the two headers stay parallel.
+_RESERVED = frozenset(RESULT_COLUMNS) | {"error"}
 
 _ENTITIES_CAP_DEFAULT = 50_000
 
@@ -71,7 +78,7 @@ class StreamingRunReport:
     build the terminal summary without retaining results in memory.
     """
 
-    def __init__(self, run_dir: Path):
+    def __init__(self, run_dir: Path, company_column: str | None = None):
         self.run_dir = run_dir
         self.counts: dict[str, int] = {"found": 0, "not_found": 0, "errored": 0}
         self.by_source: dict[str, int] = {}
@@ -88,14 +95,51 @@ class StreamingRunReport:
         # and serve it (and the S3 mirror would upload it) as if complete.
         self._found_tmp = run_dir / "found.csv.tmp"
         self._notfound_tmp = run_dir / "notFound.csv.tmp"
+        columns = self._open_input(company_column) or CSV_COLUMNS
         # utf-8-sig: the BOM makes Excel/Numbers auto-detect UTF-8 instead of a legacy
         # 8-bit encoding, so em dashes / arrows / accents don't render as mojibake.
+        # extrasaction: in passthrough mode _row()'s company_local_name is not a column.
         self._found_fh = self._found_tmp.open("w", newline="", encoding="utf-8-sig")
-        self._found = csv.DictWriter(self._found_fh, fieldnames=CSV_COLUMNS)
+        self._found = csv.DictWriter(self._found_fh, fieldnames=columns,
+                                     extrasaction="ignore")
         self._found.writeheader()
         self._notfound_fh = self._notfound_tmp.open("w", newline="", encoding="utf-8-sig")
-        self._notfound = csv.DictWriter(self._notfound_fh, fieldnames=CSV_COLUMNS + ["error"])
+        self._notfound = csv.DictWriter(self._notfound_fh, fieldnames=columns + ["error"],
+                                        extrasaction="ignore")
         self._notfound.writeheader()
+
+    def _open_input(self, company_column: str | None) -> list[str] | None:
+        """Open a forward-only cursor over the run's input.csv, and return the output
+        columns (its header, then the computed ones) — or None to keep CSV_COLUMNS.
+
+        The user's own columns are what make the output line up with what they uploaded.
+        Alignment is positional-by-consumption — one input row per EntityResult, which
+        holds because Phase 3 adds results batch by batch in ascending request_index,
+        one per input entity, failed batches included. Deliberately NOT a join on
+        EntityResult.sno: that field takes the LLM's echoed value when present.
+
+        None (headerless/positional input, or no readable input.csv) keeps the classic
+        columns — which is also what makes the plain write_outputs() entry point and
+        every temp-dir unit test work unchanged.
+        """
+        self._input_fh = None
+        self._originals: Iterator[dict] = iter(())
+        self._passthrough: list[tuple[str, str]] = []
+        if not company_column:
+            return None
+        try:
+            self._input_fh = (self.run_dir / "input.csv").open(
+                "r", newline="", encoding="utf-8-sig", errors="replace")
+        except OSError:
+            return None
+        reader = csv.DictReader(self._input_fh)
+        self._passthrough = passthrough_fieldnames(reader.fieldnames or [], _RESERVED)
+        # parse_entities_csv SKIPS a row whose company cell is empty and does NOT spend
+        # an sno on it (models/entities.py) — replay that exact rule here, or every
+        # column shifts down by one from the first blank-name row onwards.
+        self._originals = (row for row in reader
+                           if (row.get(company_column) or "").strip())
+        return [out for out, _src in self._passthrough] + RESULT_COLUMNS
 
     def add_request(self, request_record: dict) -> None:
         self._requests.append(request_record)
@@ -110,12 +154,19 @@ class StreamingRunReport:
                     self.by_category[r.error_category] = (
                         self.by_category.get(r.error_category, 0) + 1
                     )
+            row = _row(r)
+            if self._passthrough:
+                # One input row per result. Exhausted -> blank cells, never an exception
+                # at the last step of an otherwise-successful 1M-row run. Applied AFTER
+                # _row so an input column named company_name wins over the LLM's echo —
+                # "verbatim" means the user's cell.
+                row.update(passthrough_row(next(self._originals, {}),
+                                           self._passthrough))
             if r.website_url:
                 self.websites_found += 1
-                self._found.writerow(_row(r))
+                self._found.writerow(row)
             else:
                 self.websites_not_found += 1
-                row = _row(r)
                 row["error"] = r.error or ""
                 self._notfound.writerow(row)
             if not self._entities_omitted:
@@ -136,6 +187,7 @@ class StreamingRunReport:
         if self._closed:
             return
         self._closed = True
+        self._close_input()
         for fh, tmp in ((self._found_fh, self._found_tmp),
                         (self._notfound_fh, self._notfound_tmp)):
             try:
@@ -147,10 +199,25 @@ class StreamingRunReport:
             except OSError:
                 pass
 
+    def _close_input(self) -> None:
+        if self._input_fh is not None:
+            try:
+                self._input_fh.close()
+            except OSError:
+                pass
+            self._input_fh = None
+
     def close(self, summary: dict) -> dict[str, Path]:
         if self._closed:
             raise RuntimeError("StreamingRunReport already closed")
         self._closed = True
+        # Leftover input rows mean the cursor and the results fell out of step, which
+        # shifts every passthrough cell and has no other symptom. Warn, don't fail: the
+        # CSVs are written and the run is otherwise complete.
+        if self._passthrough and next(self._originals, None) is not None:
+            logging.getLogger(__name__).warning(
+                "input.csv has unconsumed rows — passthrough columns may be misaligned")
+        self._close_input()
         self._found_fh.close()
         self._notfound_fh.close()
         os.replace(self._found_tmp, self.run_dir / "found.csv")

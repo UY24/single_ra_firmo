@@ -864,7 +864,11 @@ def run_ai_mode_finish(
         llm = make_llm_client(cfg)
 
         input_csv = run_dir / "input.csv"
-        entities: list[Entity] = parse_entities_csv(input_csv.read_bytes()).entities
+        # Keep the ParsedCSV, not just its entities: Phase 3 needs columns_detected /
+        # positional to pass the input's own columns through to found/notFound.csv,
+        # and re-parsing a 1M-row CSV to learn its header would be absurd.
+        parsed_input = parse_entities_csv(input_csv.read_bytes())
+        entities: list[Entity] = parsed_input.entities
         groups = list(chunked(entities, batch_size))
         raw_dir = run_dir / RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1151,7 +1155,15 @@ def run_ai_mode_finish(
         # file from disk, classify, and write it straight into the report.
         # Memory stays O(one batch) — no run-wide results list.
         # ------------------------------------------------------------- #
-        report = _report_in_progress = StreamingRunReport(run_dir)
+        report = _report_in_progress = StreamingRunReport(
+            run_dir,
+            # found/notFound carry the uploaded CSV's own columns ahead of ours. The
+            # writer streams input.csv itself; it needs the header that resolved to the
+            # company name so it can replay parse_entities_csv's skip-blank-name rule.
+            # Headerless (positional) input has no header to pass through and a
+            # different skip rule — fall back to the classic columns.
+            None if parsed_input.positional
+            else parsed_input.columns_detected.get("company_name"))
         # Recount authoritatively while streaming (the sync path counted
         # provisionally above for incremental UI persists).
         llm_errors = 0

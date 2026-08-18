@@ -31,7 +31,11 @@ from app.services.serpwow.modes.relationship import (
     build_row_result,
     row_fields,
 )
-from app.services.serpwow.serpwow_reporting import retry_column, retry_row
+from app.services.serpwow.serpwow_reporting import (
+    retry_column,
+    retry_row,
+    s3_passthrough,
+)
 
 EXTRA_COLUMNS = [
     "website_url", "relationship_status",
@@ -52,24 +56,10 @@ _SOURCE_KEY_OVERRIDES = {"row_index": "row_index__input"}
 
 
 def _passthrough_fieldnames(header: list[str]) -> list[tuple[str, str]]:
-    """(output_name, source_name) for each ORIGINAL CSV column, deduped against the
-    reserved/computed names and against repeats within the header itself.
-
-    Without this, an input column literally named e.g. "flags" produces a duplicate
-    "flags" header, and row.update()'s computed "flags" silently overwrites the
-    passthrough value in the row dict with no warning — breaking the "every original
-    column passes through" contract. A collision gets an "__orig" suffix, and a further
-    collision gets another one appended ("flags__orig__orig"), rather than being dropped.
-    """
-    seen = set(_RESERVED_COLUMNS)
-    out: list[tuple[str, str]] = []
-    for name in header:
-        out_name = name
-        while out_name in seen:
-            out_name = f"{out_name}__orig"
-        seen.add(out_name)
-        out.append((out_name, _SOURCE_KEY_OVERRIDES.get(name, name)))
-    return out
+    """(output_name, source_name) for each ORIGINAL CSV column, deduped against this
+    module's reserved/computed names. The rule itself is shared with gmaps and AI Mode —
+    see common.text.passthrough_fieldnames."""
+    return s3_passthrough(header, _RESERVED_COLUMNS)
 
 
 def _flags_csv(relationship: dict[str, Any]) -> str:

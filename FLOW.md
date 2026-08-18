@@ -165,8 +165,13 @@ after every retry — the only real errors), remainder (attempts on a no-listing
   `errors/…`), rebuilds a state-shaped row via `_state_row`, and sums the per-row
   `cost_breakdown` into run totals: `requests / successes / failed / credits /
   billed_empty / no_results / recovered / error_requests`.
-- `serpwow_reporting.row_to_entity_result` + `_csv_row` → `found.csv` / `notFound.csv`
-  (shared with gsearch — identical columns by construction).
+- `serpwow_reporting.row_to_entity_result` → `found.csv` / `notFound.csv`, written as
+  **the input file plus what we worked out** ▲ CHANGED: `common.text.passthrough_row` emits
+  the original cells under the input's own header (via `s3_passthrough`, which is
+  collision-safe and undoes `iter_input_rows`' injected `row_index`), then
+  `serpwow_reporting.result_cells` appends `website_url, confidence, flags, attempt_log`
+  (+ `error` on notFound). gsearch keeps the old fixed `CSV_COLUMNS` — it never persists
+  the upload, so it has no input columns to pass through.
 - `serpwow_reporting.retry_row(...)` → **`retry.csv`** ▲ CHANGED — the rerun / refund list.
   Written in the same pass, from the same `original` input row, so it costs no extra read.
   A row is in it only when it has nothing to show for itself:
@@ -222,6 +227,33 @@ the summary already counts it. Rows with citations but no prose (`no_ai_text`) a
 
 ---
 
+### 4c. AI Mode's equivalent — the one with a cursor
+
+AI Mode's assembly never sees the input CSV: `run_reporting.StreamingRunReport` is fed
+`EntityResult`s, batch by batch. So **the writer opens its own forward-only cursor** over
+`run_dir/input.csv` and pulls exactly one row per result:
+
+```
+ai_mode_service.run_ai_mode_finish
+├─ parsed_input = parse_entities_csv(input.csv)        ← already happened; now KEPT
+├─ StreamingRunReport(run_dir, parsed_input.columns_detected["company_name"])
+│    └─ _open_input(): DictReader over input.csv, filtered by the SAME rule
+│       parse_entities_csv uses — skip a row whose company cell is empty
+│       (it costs no sno, so the Nth result is NOT the Nth data row)
+└─ for rec in ordered:            ← ascending request_index, one result per entity
+     report.add_batch(...) → add_results() → row.update(next(cursor))
+```
+
+Alignment is positional-by-consumption and is an invariant of the **writer**, not the
+caller — which is why the failed-batch `continue` cannot desync it (that path emits one
+`_error_results` row per entity through the same `add_results`). `close()` warns if the
+cursor has rows left over. `company_column=None` (headerless/positional input, unreadable
+input.csv, or the classic `write_outputs()` entry point) keeps the old fixed columns.
+
+Never joins on `EntityResult.sno` — that field takes the LLM's echoed value when present.
+
+---
+
 ## 6. Exactly what this change modified
 
 | File | Function | Change |
@@ -237,6 +269,12 @@ the summary already counts it. Rows with citations but no prose (`no_ai_text`) a
 | `relationship_outputs.py` | `_write_outputs` | Same, with `billed_empty` derived from the stored response (`not blocks and not refs`, only when the row has no error). |
 | `engine.py:220 / 5134 / 5151` | `_GSEARCH_RESULT_FILES`, `_RELATIONSHIP_FILES`, `_GMAPS_FILES` | `retry.csv` added to the `/result` allowlist and to both pipelines' advertised file sets. |
 | `run_detail.js:865` | `renderLegacyStatus` | Files card offers `retry.csv` for gmaps + relationship only (gsearch shares that branch and writes none). |
+| `common/text.py` | `passthrough_fieldnames` / `passthrough_row` | **New.** The input-columns-first rule, shared by all three pipelines. Here and not in `serpwow_reporting` because `ai_mode/run_reporting.py` is standalone-by-contract and `serpwow_reporting` drags in `httpx`. `source_overrides` exists because the S3 readers inject `row_index` and AI Mode's doesn't. |
+| `serpwow_reporting.py` | `CSV_COLUMNS` split | `RESULT_COLUMNS` (the computed four) + the three echoed fields = today's `CSV_COLUMNS`, byte-identical, so the gsearch writer is untouched. Adds `result_cells` and `s3_passthrough`. |
+| `relationship_outputs.py:58` | `_passthrough_fieldnames` | Now a one-line wrapper over the shared helper; its collision test passed unchanged. |
+| `gmaps_outputs.py` | `_write_outputs` | found/notFound built from `input header + RESULT_COLUMNS` instead of `CSV_COLUMNS`. |
+| `ai_mode/run_reporting.py` | `StreamingRunReport` | New optional `company_column`; owns the input.csv cursor (`_open_input` / `_close_input`), `extrasaction="ignore"` on both writers, desync canary in `close()`. |
+| `ai_mode_service.py:867,1154` | `run_ai_mode_finish` | Keeps the `ParsedCSV` it already built and passes the resolved company column to the report. 3 lines. |
 
 Tests added: `tests/test_gmaps_runner.py` (no-listing counter reaches status.json;
 mid-run summary splits billed/unbilled; `retry.csv` membership + the refundable

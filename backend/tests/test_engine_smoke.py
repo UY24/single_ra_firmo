@@ -125,6 +125,38 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(len(FakeScrapeDoClient.queries), 2)
         self.assertIn("OSINT", FakeScrapeDoClient.queries[0])
 
+    def test_outputs_carry_every_input_column_end_to_end(self):
+        """The wiring the writer's own tests can't see: run_ai_mode_finish must hand
+        StreamingRunReport the resolved company column, or the whole passthrough silently
+        reverts to the fixed seven. The blank-name row is here on purpose — it is dropped
+        by parse_entities_csv, so a cursor that doesn't drop it too shifts every row
+        after it onto the wrong company."""
+        csv_text = ("firm_id,company_name,country,notes\n"
+                    "f1,Company 1,Japan,alpha\n"
+                    "f2,Company 2,Japan,beta\n"
+                    ",,Japan,DROPPED — no company name\n"
+                    "f3,Company 3,Japan,gamma\n")
+        info = ai_mode_service.prepare_ai_mode_run(
+            csv_text.encode("utf-8"), "input.csv",
+            mode_key="ai_bulk", company_name="Acme Corp", company_id="acme-id-1")
+        drive_run(info["run_id"])
+        run_dir = self.results_root / "acme-corp" / info["run_id"]
+
+        with (run_dir / "found.csv").open(newline="", encoding="utf-8-sig") as fh:
+            found = list(csv.DictReader(fh))
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
+            not_found = list(csv.DictReader(fh))
+        self.assertEqual(list(found[0]),
+                         ["firm_id", "company_name", "country", "notes",
+                          "website_url", "confidence", "flags", "attempt_log"])
+        self.assertEqual(list(not_found[0]), list(found[0]) + ["error"])
+        # Odd snos are found, even are not — so sno 1 (Company 1) and sno 3 (Company 3,
+        # the row AFTER the dropped one) land in found.csv with their own cells.
+        self.assertEqual([(r["firm_id"], r["company_name"], r["notes"]) for r in found],
+                         [("f1", "Company 1", "alpha"), ("f3", "Company 3", "gamma")])
+        self.assertEqual([(r["firm_id"], r["notes"]) for r in not_found],
+                         [("f2", "beta")])
+
     def test_outputs_layout_and_schema(self):
         info = self._run("ai_bulk")
         run_id = info["run_id"]

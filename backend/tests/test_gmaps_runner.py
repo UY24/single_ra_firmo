@@ -233,6 +233,46 @@ class OutputsTests(unittest.TestCase):
         self.assertEqual(summary["websites_found"], 1)
         self.assertEqual(summary["total_rows"], 3)
 
+    def test_found_and_not_found_carry_every_input_column(self):
+        """The output is the INPUT FILE plus what we worked out. Reporting only the five
+        columns the parser happens to map (company/country/address/firm_id/industry) hands
+        back a file the user cannot line up against their own."""
+        fake = FakeS3()
+        self._seed_rows(fake)
+        self._run_outputs(fake)
+        found = list(csv.DictReader(io.StringIO(
+            fake.objects[f"{PREFIX}/found.csv"].decode("utf-8-sig"))))
+        not_found = list(csv.DictReader(io.StringIO(
+            fake.objects[f"{PREFIX}/notFound.csv"].decode("utf-8-sig"))))
+        self.assertEqual(
+            list(found[0]),
+            ["company_name", "country", "full_address",       # input.csv, verbatim + in order
+             "website_url", "confidence", "flags", "attempt_log"])
+        self.assertEqual(list(not_found[0]), list(found[0]) + ["error"])
+        # full_address is carried straight from the input, not re-derived from the result.
+        self.assertEqual(found[0]["full_address"], "500 Main Street")
+        self.assertEqual(found[0]["company_name"], "Acme Motors")
+        self.assertEqual(found[0]["website_url"], "https://acme.com")
+
+    def test_an_input_column_named_like_a_computed_one_is_not_overwritten(self):
+        """"every original column passes through" has to hold even when the input picks a
+        name we also write — otherwise the user's cell silently becomes our value."""
+        fake = FakeS3()
+        with _patched(fake):
+            store.put_bytes(store.input_key(PREFIX),
+                            b"company_name,country,website_url\n"
+                            b"Acme Motors,us,https://user-supplied.example\n")
+            store.Counters(PREFIX, rows_total=1, phase="queued").flush(True)
+            resp, _raw = _response()
+            store.put_object(store.row_key(PREFIX, 0), {
+                "row_index": 0, "fields": {"company_name": "Acme Motors", "country": "us"},
+                "context": resp.context, "official_website": "https://acme.com"})
+        self._run_outputs(fake)
+        row = list(csv.DictReader(io.StringIO(
+            fake.objects[f"{PREFIX}/found.csv"].decode("utf-8-sig"))))[0]
+        self.assertEqual(row["website_url__orig"], "https://user-supplied.example")
+        self.assertEqual(row["website_url"], "https://acme.com")
+
     def test_a_no_listing_row_is_not_found_not_an_error(self):
         """scrape.do overloads 502 for "Google has no listing"; counting those as errors
         inflates the failed badge and offers a retry that can only fail again."""

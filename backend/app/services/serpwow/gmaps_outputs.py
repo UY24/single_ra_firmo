@@ -22,15 +22,17 @@ from typing import Any
 
 from app.services.serpwow import s3_run_store as store
 from app.services.serpwow.modes.gmaps import row_fields
+from app.services.common.text import passthrough_row
 from app.services.serpwow.serpwow_reporting import (
-    CSV_COLUMNS,
+    RESULT_COLUMNS,
     _build_cost,
     _cost_log_line,
-    _csv_row,
     _derive_outcome,
+    result_cells,
     retry_column,
     retry_row,
     row_to_entity_result,
+    s3_passthrough,
 )
 
 
@@ -98,21 +100,28 @@ def _write_outputs(prefix: str, counters: store.Counters,
 
     elapsed_total = counters.elapsed_seconds()
 
+    # Every output here is the USER'S FILE plus what we worked out: the input header goes
+    # out verbatim and in order, then RESULT_COLUMNS. "error" is reserved for both files
+    # so an input column named "error" is renamed the same way in each.
+    header = store.read_input_header(prefix)
+    passthrough = s3_passthrough(header, set(RESULT_COLUMNS) | {"error"})
+    input_columns = [out for out, _src in passthrough]
+
     files = {name: _temp_file() for name in ("found.csv", "notFound.csv")}
     writers = {}
     for name, (_tmp, text) in files.items():
         text.write("﻿")  # BOM: Excel reads a BOM-less UTF-8 CSV as Mac Roman
         extra = ["error"] if name == "notFound.csv" else []
-        writer = csv.DictWriter(text, fieldnames=CSV_COLUMNS + extra,
+        writer = csv.DictWriter(text,
+                                fieldnames=input_columns + RESULT_COLUMNS + extra,
                                 extrasaction="ignore")
         writer.writeheader()
         writers[name] = writer
 
     log_tmp, log_text = _temp_file()
 
-    # retry.csv keeps the INPUT's own header so it can be uploaded straight back to
-    # /uploads/gmaps — which is why it is built here rather than from CSV_COLUMNS.
-    header = store.read_input_header(prefix)
+    # retry.csv carries the input header ALONE (plus its one reason column): it exists to
+    # be uploaded straight back to /uploads/gmaps, so our columns have no business in it.
     reason_column = retry_column(header)
     retry_tmp, retry_text = _temp_file()
     retry_text.write("﻿")
@@ -183,7 +192,7 @@ def _write_outputs(prefix: str, counters: store.Counters,
             outcomes["not_found"] += 1
 
         name = "found.csv" if entity.website_url else "notFound.csv"
-        csv_row = _csv_row(entity)
+        csv_row = {**passthrough_row(original, passthrough), **result_cells(entity)}
         if name == "notFound.csv":
             csv_row["error"] = entity.error or ""
         writers[name].writerow(csv_row)

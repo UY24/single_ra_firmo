@@ -9,6 +9,104 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-11 (d) — every output CSV is the input file plus the computed columns
+
+*"i want what the input file has thats all."*
+
+`found.csv` / `notFound.csv` carried a fixed seven columns and dropped every input column
+that wasn't one of the five `parse_entities_csv` maps. First finding: **this was not a
+recent regression** — `CSV_COLUMNS` is unchanged since `9cc4248` (2026-06-26). Relationship
+was already doing it right; `retry.csv` (this session) made the contrast visible.
+
+### D20. Passthrough, not passthrough-plus-canonical
+
+The output header is now the **input header verbatim and in order**, then
+`website_url, confidence, flags, attempt_log` (+ `error` on notFound). If the upload says
+`entity_name`, the output says `entity_name` — no synthesised `company_name`.
+
+Rejected: also emitting canonical `company_name`/`country` for backwards compatibility.
+It duplicates columns the input already has, and nothing in the repo reads these files
+back (`grep` over `app/`: found.csv is written and served, never parsed). "Same as the
+input" is the whole request; a second naming convention next to it defeats it.
+
+### D21. `passthrough_fieldnames` lives in `common/text.py`, not `serpwow_reporting.py`
+
+`ai_mode/run_reporting.py` is deliberately standalone (docstring: models + `serpwow.outcomes`
+only), and `serpwow_reporting` pulls in `serpwow_client` → `httpx`. `common/text.py` is
+already the home of the one other AI-Mode↔SerpWow shared helper (`slugify_company`) and
+imports nothing but `re`. Ten pure lines go there; both engines import them.
+
+The optional `source_overrides` param is not speculative: `s3_run_store.iter_input_rows`
+overwrites a real `row_index` column with its own index, so **both** S3 pipelines need the
+remap, and AI Mode's plain `DictReader` must not have it. Two callers each way.
+`relationship_outputs._passthrough_fieldnames` becomes a one-line wrapper — its existing
+collision test passed unchanged, which is the proof the move was behaviour-preserving.
+
+### D22. AI Mode: the writer owns the input cursor
+
+Considered handing the original rows in per batch (`add_results(results, originals)`).
+Rejected: that puts alignment in the **caller**, across two `add_batch` sites with a
+`continue` between them, where a desync is invisible and no unit test of the writer can
+catch it.
+
+Instead `StreamingRunReport(run_dir, company_column)` opens its own forward-only cursor and
+pulls exactly one input row per `EntityResult`. Alignment becomes an invariant of the
+writer; the caller diff is 3 lines and the failed-batch `continue` is structurally safe
+(that path emits one result per entity too, through the same `add_results`).
+
+Memory is unchanged — a cursor, never a `sno → row` map (that would be a second full-run
+structure at 1M rows).
+
+### D23. The join is positional-by-consumption, and the blank-name row is the trap
+
+`parse_entities_csv` **skips a row whose company cell is empty without spending an `sno`**,
+so the Nth result is *not* the Nth data row. The cursor replays that exact rule
+(`if not (row.get(company_column) or "").strip(): continue`). Without it, every row after
+the first blank one is written with the previous row's cells — silently, with no other
+symptom. That is the one test written to fail loudest, at both the writer and end-to-end
+level.
+
+Not joining on `EntityResult.sno` deliberately: `results.py:79` takes the LLM's *echoed*
+sno when present, so it can be hallucinated.
+
+Guards that fall back to today's columns: positional (headerless) input — different skip
+rule, no real header — and an unreadable `input.csv`. The fallback is also what keeps the
+classic `write_outputs()` entry point and every temp-dir unit test working untouched.
+
+A `close()` canary warns when the cursor has unconsumed rows left. Kept despite being
+unreachable-by-design: it is the only symptom a desync would ever produce.
+
+### D24. Collisions: `error` is reserved for BOTH files
+
+An input column named `website_url` becomes `website_url__orig`; the computed value keeps
+the plain name. `error` is reserved for `found.csv` too, even though only `notFound.csv`
+writes it, so the two files' passthrough naming stays parallel.
+
+### D25. gsearch is excluded — settled 2026-08-16: it is being removed
+
+Raised as a scope question and answered by the user: **gsearch is being removed, so it gets
+none of this work.** Recorded because the cost was real either way — it is not a
+reporting-layer fix: `csv_input.parse_csv_rows` keeps 6 mapped keys and discards the rest,
+the uploaded bytes are dropped at the end of the request, and nothing carries the original
+record into `state.json`, so it would need an `input.csv` write at upload plus a deliberate
+join (its row index counts only kept rows).
+
+**firmographics** writes no found.csv at all (not in `REPORTING_PIPELINES`) and
+**`output.xlsx`** has the same problem via its fixed `input_*` block — both belong to the
+pipelines on their way out, so neither is worth touching. Said out loud rather than
+silently skipped.
+
+### D26. Verified against real data, not just fixtures
+
+Re-ran `gmaps_outputs.write_outputs` over the finished S3 run `8ffe96d9` with the S3 writes
+intercepted in-process (nothing sent, existing outputs untouched): the new `found.csv`
+header is that run's own 10 input columns in order, then the 4 computed. 771 tests + 6 DOM
+contracts green, and **no existing test needed editing** — which is the evidence that
+splitting `CSV_COLUMNS` into `RESULT_COLUMNS` + the three echoed fields left the gsearch
+path byte-identical.
+
+---
+
 ## 2026-08-11 (c) — the billing card says what was PAID for, in four numbers
 
 User's spec, verbatim: *"billed / billed but no result like api returned empty result

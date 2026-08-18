@@ -110,6 +110,16 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
     def setUp(self):
         from app.routers.ai_mode import router as ai_mode_router
 
+        # These tests exercise company validation/prepare, not the broker — mock
+        # it ready and stub the background publisher so no RabbitMQ is required.
+        for target, repl in (
+            ("app.services.ai_mode.broker.is_ready", mock.Mock(return_value=True)),
+            ("app.services.ai_mode.worker.publish_run_batches",
+             mock.AsyncMock(return_value=0)),
+        ):
+            patcher = mock.patch(target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         app = FastAPI()
         app.include_router(ai_mode_router)
         self.client = TestClient(app)
@@ -152,8 +162,7 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
         with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
                 mock.patch("app.services.ai_mode.ai_mode_service.prepare_ai_mode_run",
                            return_value=info) as prepare, \
-                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id, \
-                mock.patch("app.services.ai_mode.ai_mode_service.run_ai_mode_sync"):
+                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id:
             res = self.client.post(
                 "/uploads/ai-mode", files={"file": self.csv}, data={"company_id": "u1"}
             )
@@ -174,8 +183,7 @@ class TestAiModeUploadCompanyValidation(unittest.TestCase):
         with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
                 mock.patch("app.services.ai_mode.ai_mode_service.prepare_ai_mode_run",
                            return_value=info), \
-                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id, \
-                mock.patch("app.services.ai_mode.ai_mode_service.run_ai_mode_sync"):
+                mock.patch("app.services.ai_mode.ai_mode_service.set_run_db_id") as set_id:
             res = self.client.post(
                 "/uploads/ai-mode", files={"file": self.csv}, data={"company_id": "u1"}
             )
@@ -349,7 +357,7 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
         return svc
 
     def test_old_company_mode_csv_rejected_400(self):
-        for path in ("/uploads", "/uploads/gmaps"):
+        for path in ("/uploads/gsearch", "/uploads/gmaps"):
             with mock.patch(
                 "app.services.companies.get_company_service", return_value=self._svc()
             ):
@@ -368,7 +376,7 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
             "app.services.companies.get_company_service", return_value=self._svc()
         ), mock.patch.object(self.legacy_app, "rabbitmq_exchange", None):
             res = self.client.post(
-                "/uploads", files={"file": self.CANONICAL_CSV}, data={"company_id": "u1"}
+                "/uploads/gsearch", files={"file": self.CANONICAL_CSV}, data={"company_id": "u1"}
             )
         self.assertEqual(res.status_code, 503)
         self.assertIn("RabbitMQ", res.json()["detail"])

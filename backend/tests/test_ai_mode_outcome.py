@@ -9,6 +9,7 @@ from app.models.results import EntityResult
 from app.services.ai_mode.ai_mode_service import (
     _build_run_update,
     classify_ai_mode_outcomes,
+    classify_one_result,
 )
 from app.services.serpwow.outcomes import (
     CAT_INTERNAL,
@@ -58,6 +59,62 @@ class TestClassifyOutcomes(unittest.TestCase):
         self.assertEqual(errors["by_source"], {SRC_GEMINI: 1})
         self.assertEqual(errors["by_category"], {CAT_INTERNAL: 1})
         self.assertEqual(results[0].error_source, SRC_GEMINI)
+
+
+class TestClassifyOneResult(unittest.TestCase):
+    """Per-result classifier used by the streaming report (PR1)."""
+
+    def test_found(self):
+        r = EntityResult(company_name="A", country="US", sno=1,
+                         website_url="https://a.com")
+        self.assertEqual(classify_one_result(r), "found")
+
+    def test_not_found(self):
+        r = EntityResult(company_name="B", country="US", sno=2)
+        self.assertEqual(classify_one_result(r), "not_found")
+
+    def test_tagged_error_kept(self):
+        r = EntityResult(company_name="C", country="US", sno=3,
+                         error="scrape.do error: HTTP 429",
+                         error_source=SRC_SCRAPEDO, error_category=CAT_RATE_LIMIT)
+        self.assertEqual(classify_one_result(r), "errored")
+        self.assertEqual(r.error_source, SRC_SCRAPEDO)
+        self.assertEqual(r.error_category, CAT_RATE_LIMIT)
+
+    def test_untagged_error_attributed_to_gemini_in_place(self):
+        r = EntityResult(company_name="D", country="US", sno=4,
+                         error="missing from LLM response")
+        self.assertEqual(classify_one_result(r), "errored")
+        self.assertEqual(r.error_source, SRC_GEMINI)
+        self.assertEqual(r.error_category, CAT_INTERNAL)
+
+    def test_parity_with_aggregate_classifier(self):
+        results = [
+            EntityResult(company_name="A", country="US", sno=1,
+                         website_url="https://a.com", confidence=90),
+            EntityResult(company_name="B", country="US", sno=2),
+            EntityResult(company_name="C", country="US", sno=3,
+                         error="scrape.do error: HTTP 429",
+                         error_source=SRC_SCRAPEDO, error_category=CAT_RATE_LIMIT),
+            EntityResult(company_name="D", country="US", sno=4,
+                         error="missing from LLM response"),
+        ]
+        counts: dict[str, int] = {"found": 0, "not_found": 0, "errored": 0}
+        for r in results:
+            counts[classify_one_result(r)] += 1
+        outcome, _ = classify_ai_mode_outcomes(
+            [
+                EntityResult(company_name="A", country="US", sno=1,
+                             website_url="https://a.com", confidence=90),
+                EntityResult(company_name="B", country="US", sno=2),
+                EntityResult(company_name="C", country="US", sno=3,
+                             error="scrape.do error: HTTP 429",
+                             error_source=SRC_SCRAPEDO, error_category=CAT_RATE_LIMIT),
+                EntityResult(company_name="D", country="US", sno=4,
+                             error="missing from LLM response"),
+            ]
+        )
+        self.assertEqual(counts, outcome)
 
 
 class TestBuildRunUpdateOutcome(unittest.TestCase):

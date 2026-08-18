@@ -24,9 +24,7 @@ _PIPELINE_LABELS = {
     "ai_deep": "Google AI (Deep)",
     "gmaps": "Google Maps",
     "gsearch": "Google Search",
-    "full": "Upload Console",
     "firmographics": "Firmographics",
-    "url_discovery": "URL Discovery",
 }
 
 
@@ -132,7 +130,7 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
                         errored: int | None = None, error_sources: dict | None = None,
                         success: int | None = None, failed: int | None = None,
                         total_rows: int | None = None, searches: int | None = None,
-                        search_label: str = "Searches",
+                        search_label: str = "Searches", credits: int | None = None,
                         tokens: int | None = None, input_tokens: int | None = None,
                         output_tokens: int | None = None, cost_usd: float | None = None,
                         llm_cost_usd: float | None = None, serpwow_cost_usd: float | None = None,
@@ -164,12 +162,16 @@ def notify_run_complete(*, pipeline: str, company: str | None, run_ref: str, sta
         fields.append(_field("🎯 Outcome", f"*{success or 0:,}* succeeded\n*{failed or 0:,}* failed"))
     if isinstance(total_rows, int):
         fields.append(_field("📋 Rows", f"{total_rows:,}"))
-    # SerpWow cell: searches THEN cost in one field when a SerpWow cost is given;
-    # otherwise the bare search count (e.g. AI Mode's scrape.do flat-fee searches).
+    # Provider cell: searches THEN cost when a per-search USD is given; credits when the
+    # provider bills in credits (scrape.do Google Maps); otherwise the bare count
+    # (e.g. AI Mode's scrape.do flat-fee searches).
     if isinstance(searches, int):
         if isinstance(serpwow_cost_usd, (int, float)):
             fields.append(_field(f"🔎 {search_label}",
                                  f"{searches:,} searches · {_fmt_usd(serpwow_cost_usd)}"))
+        elif isinstance(credits, int):
+            fields.append(_field(f"🔎 {search_label}",
+                                 f"{searches:,} requests · {credits:,} credits"))
         else:
             fields.append(_field(f"🔎 {search_label}", f"{searches:,}"))
     if isinstance(tokens, int):

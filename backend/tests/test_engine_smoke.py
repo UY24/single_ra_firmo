@@ -1,9 +1,10 @@
 # backend/tests/test_engine_smoke.py
 """Offline end-to-end smoke test for the unified two-mode AI engine.
 
-Mocks the module seams (ScrapeDoClient + make_llm_client) so no network access
-is needed, and proves mode-specific batching, the new on-disk layout, and the
-unified output schema.
+Drives the broker engine in-process (tests/ai_mode_drive.py emulates publish ->
+consume -> finish, no RabbitMQ) with the module seams (ScrapeDoClient +
+make_llm_client) mocked so no network access is needed, and proves mode-specific
+batching, the on-disk layout, and the unified output schema.
 """
 import csv
 import json
@@ -15,7 +16,9 @@ from pathlib import Path
 from unittest import mock
 
 from app.services.ai_mode import ai_mode_service, run_store
+from app.services.ai_mode import worker as ai_worker
 from app.services.ai_mode.models import TokenUsage
+from tests.ai_mode_drive import drive_run
 
 CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in range(1, 7))
 
@@ -24,12 +27,12 @@ FAKE_ENV = {
     "GEMINI_API_KEY": "fake-key",
     "AI_MODE_LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
-    "SCRAPEDO_CONCURRENCY": "2",
+    "AI_MODE_STATUS_FLUSH_SEC": "0",
     # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated
-    # .env would otherwise make run_ai_mode_sync attempt a live S3 upload).
+    # .env would otherwise attempt a live S3 upload).
     "S3_BUCKET": "",
-    # Unset so the Slack notifier no-ops (a populated .env would otherwise make
-    # run_ai_mode_sync POST to a live webhook). Notify tests assert the calls.
+    # Unset so the Slack notifier no-ops (a populated .env would otherwise POST
+    # to a live webhook). Notify tests assert the calls.
     "SLACK_WEBHOOK_URL": "",
 }
 
@@ -89,11 +92,13 @@ class TestEngineSmoke(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE"):
+        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE"):
             os.environ.pop(env, None)
+        ai_worker._reset_for_tests()
         self.results_root = results_root
 
     def tearDown(self):
+        ai_worker._reset_for_tests()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
@@ -103,7 +108,7 @@ class TestEngineSmoke(unittest.TestCase):
             CSV_SIX.encode("utf-8"), "input.csv",
             mode_key=mode_key, company_name="Acme Corp", company_id="acme-id-1",
         )
-        ai_mode_service.run_ai_mode_sync(info["run_id"])
+        drive_run(info["run_id"])
         return info
 
     def test_ai_bulk_six_entities_one_scrape_call(self):
@@ -120,6 +125,38 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(len(FakeScrapeDoClient.queries), 2)
         self.assertIn("OSINT", FakeScrapeDoClient.queries[0])
 
+    def test_outputs_carry_every_input_column_end_to_end(self):
+        """The wiring the writer's own tests can't see: run_ai_mode_finish must hand
+        StreamingRunReport the resolved company column, or the whole passthrough silently
+        reverts to the fixed seven. The blank-name row is here on purpose — it is dropped
+        by parse_entities_csv, so a cursor that doesn't drop it too shifts every row
+        after it onto the wrong company."""
+        csv_text = ("firm_id,company_name,country,notes\n"
+                    "f1,Company 1,Japan,alpha\n"
+                    "f2,Company 2,Japan,beta\n"
+                    ",,Japan,DROPPED — no company name\n"
+                    "f3,Company 3,Japan,gamma\n")
+        info = ai_mode_service.prepare_ai_mode_run(
+            csv_text.encode("utf-8"), "input.csv",
+            mode_key="ai_bulk", company_name="Acme Corp", company_id="acme-id-1")
+        drive_run(info["run_id"])
+        run_dir = self.results_root / "acme-corp" / info["run_id"]
+
+        with (run_dir / "found.csv").open(newline="", encoding="utf-8-sig") as fh:
+            found = list(csv.DictReader(fh))
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
+            not_found = list(csv.DictReader(fh))
+        self.assertEqual(list(found[0]),
+                         ["firm_id", "company_name", "country", "notes",
+                          "website_url", "confidence", "flags", "attempt_log"])
+        self.assertEqual(list(not_found[0]), list(found[0]) + ["error"])
+        # Odd snos are found, even are not — so sno 1 (Company 1) and sno 3 (Company 3,
+        # the row AFTER the dropped one) land in found.csv with their own cells.
+        self.assertEqual([(r["firm_id"], r["company_name"], r["notes"]) for r in found],
+                         [("f1", "Company 1", "alpha"), ("f3", "Company 3", "gamma")])
+        self.assertEqual([(r["firm_id"], r["notes"]) for r in not_found],
+                         [("f2", "beta")])
+
     def test_outputs_layout_and_schema(self):
         info = self._run("ai_bulk")
         run_id = info["run_id"]
@@ -133,9 +170,9 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertFalse((run_dir / "report.json").exists())
         self.assertFalse((run_dir / "ai_mode_debug.log").exists())
 
-        with (run_dir / "found.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "found.csv").open(newline="", encoding="utf-8-sig") as fh:
             found_rows = list(csv.DictReader(fh))
-        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
             notfound_reader = csv.DictReader(fh)
             notfound_fields = notfound_reader.fieldnames
             notfound_rows = list(notfound_reader)
@@ -198,8 +235,9 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(kw["total_rows"], 6)
 
     def test_notify_run_failed_fires_on_crash(self):
-        # Force the run_ai_mode_sync except-path: assemble (write_outputs) raises.
-        with mock.patch.object(ai_mode_service, "write_outputs",
+        # Force run_ai_mode_finish's failure path: assemble (the Phase-3
+        # streaming report constructor) raises.
+        with mock.patch.object(ai_mode_service, "StreamingRunReport",
                                side_effect=RuntimeError("disk full")), \
                 mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed") as failed:
@@ -220,7 +258,7 @@ class TestEngineSmoke(unittest.TestCase):
         self.assertEqual(status["status"], "completed_with_errors")
         self.assertEqual(status["failed_request_count"], 2)
         run_dir = self.results_root / "acme-corp" / run_id
-        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8") as fh:
+        with (run_dir / "notFound.csv").open(newline="", encoding="utf-8-sig") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(len(rows), 6)
         self.assertIn("scrape.do error", rows[0]["error"])

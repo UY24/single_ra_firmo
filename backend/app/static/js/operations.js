@@ -17,6 +17,7 @@ import {
   copyCell,
   pageIntro,
   sectionHeading,
+  runHref,
 } from "./ui.js";
 
 const REFRESH_MS = 4000; // legacy refreshed the batch tab on a 4s timer
@@ -127,8 +128,6 @@ const HISTORY_PIPELINES = [
   { key: "relationship", label: "Relationship" },
   { key: "gmaps", label: "Google Maps" },
   { key: "gsearch", label: "Google Search" },
-  { key: "full", label: "Full" },
-  { key: "url_discovery", label: "URL Discovery" },
   { key: "firmographics", label: "Firmographics" },
 ];
 
@@ -160,9 +159,9 @@ function uploadHistoryCard(lifecycle) {
   let timer = null;
   const tbody = el("tbody", {});
   const empty = el("p", { class: "empty-state hidden" },
-    "No SerpWow uploads found.");
+    "No pipeline uploads found.");
   const note = el("p", { class: "message message--muted", "aria-live": "polite" },
-    "Showing all SerpWow uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
+    "Showing all pipeline uploads. Storage column shows S3 paths when S3_BUCKET is configured.");
   const errorArea = el("div", { class: "operations-feedback hidden" });
 
   function renderRows(items) {
@@ -176,7 +175,7 @@ function uploadHistoryCard(lifecycle) {
       },
         cell(uploadId ? el("a", {
           class: "table-link font-mono text-xs",
-          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          href: runHref(uploadId, "serpwow"),
           title: uploadId,
           "aria-label": `Open run ${uploadId}`,
         }, shortId(uploadId)) : "-"),
@@ -209,7 +208,7 @@ function uploadHistoryCard(lifecycle) {
       errorArea.classList.add("hidden");
       errorArea.replaceChildren();
       renderRows(Array.isArray(data.uploads) ? data.uploads : []);
-      note.textContent = "Showing all SerpWow uploads. Select a row to open its run detail.";
+      note.textContent = "Showing all pipeline uploads. Select a row to open its run detail.";
     } catch (e) {
       if (!isMounted() || currentGeneration !== generation || isAbortError(e)) return;
       errorArea.classList.remove("hidden");
@@ -232,7 +231,7 @@ function uploadHistoryCard(lifecycle) {
 
   const card = el("section", { class: "detail-section operations-section" },
     sectionHeading(
-      "SerpWow Uploads History",
+      "Pipeline Uploads History",
       "All modes in one table: progress, timing, downloads, and artifact storage paths.",
       refreshBtn,
     ),
@@ -352,7 +351,7 @@ function batchManagerCard(lifecycle) {
       return el("tr", { class: "data-row" },
         cell(uploadId ? el("a", {
           class: "table-link font-mono text-xs",
-          href: `#/runs/${encodeURIComponent(uploadId)}`,
+          href: runHref(uploadId, "serpwow"),
           title: uploadId,
           "aria-label": `Open run ${uploadId}`,
         }, shortId(uploadId)) : "-"),

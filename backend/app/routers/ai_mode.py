@@ -15,6 +15,19 @@ from app.services.companies import get_company_service
 
 router = APIRouter()
 ai_mode_tasks: set[asyncio.Task] = set()
+# Runs with a resume currently being prepared: two concurrent resume requests
+# could both pass the 409 status gate before either flips the status, then
+# double-publish (and double-bill) every missing batch.
+_resume_in_flight: set[str] = set()
+
+
+def _broker_unavailable_detail() -> str:
+    from app.services.ai_mode import broker as ai_broker
+
+    detail = "AI Mode job queue unavailable (RabbitMQ not connected)"
+    if ai_broker.last_error:
+        detail = f"{detail}: {ai_broker.last_error}"
+    return detail
 
 
 def _supabase_not_configured_detail() -> str:
@@ -50,6 +63,12 @@ async def create_ai_mode_upload(
     from app.services.ai_mode import ai_mode_service
     if mode not in MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(MODES)}")
+    from app.services.ai_mode import broker as ai_broker
+
+    # Gate BEFORE prepare so a broker outage never leaves an orphan run dir
+    # (same contract as SerpWow's 503 when RabbitMQ is down).
+    if not ai_broker.is_ready():
+        raise HTTPException(status_code=503, detail=_broker_unavailable_detail())
     svc = get_company_service()
     if svc is None:
         raise HTTPException(
@@ -94,9 +113,14 @@ async def create_ai_mode_upload(
     if run_db_id:
         info["run_db_id"] = run_db_id
         await asyncio.to_thread(ai_mode_service.set_run_db_id, info["run_id"], run_db_id)
-    task = asyncio.create_task(asyncio.to_thread(ai_mode_service.run_ai_mode_sync, info["run_id"]))
+    # Publishing 100k messages takes tens of seconds — return immediately and
+    # publish in the background; the worker process consumes as they land.
+    from app.services.ai_mode import worker as ai_worker
+
+    task = asyncio.create_task(ai_worker.publish_run_batches(info["run_id"]))
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)
+    info["engine"] = "broker"
     return info
 
 
@@ -104,15 +128,20 @@ async def create_ai_mode_upload(
 async def resume_ai_mode_upload(run_id: str) -> dict[str, Any]:
     """Re-run a failed/partial run IN PLACE (same run_id) — the only retry action.
 
-    The UI labels this "Rerun failed". It re-enters the same run: Phase 1 reuses
-    existing ``raw_responses/`` and re-scrapes only batches that failed to scrape
-    (no scrape.do re-spend on successes); Phase 2 reuses existing ``cleaned/``
-    batches and re-cleans only the failed ones. The engine updates the existing
-    Supabase run row (no new row). Genuinely not-found rows are NOT retried here —
-    use AI Mode Deep (``ai_deep``) for those.
+    The UI labels this "Rerun failed". Broker engine: terminal error markers are
+    cleared (those batches get retried) and ONLY batches without a parseable raw
+    file are republished — no scrape.do re-spend on successes; Phase 2 reuses
+    existing ``cleaned/`` batches, so only failed LLM work is redone. Updates the
+    existing Supabase run row (no new row). Genuinely not-found rows are NOT
+    retried here — use AI Mode Deep (``ai_deep``) for those. Also the migration
+    path for legacy (pre-broker) failed runs: same file layout, same resume.
     """
     from app.services.ai_mode import ai_mode_service, run_store, s3_sync
+    from app.services.ai_mode import broker as ai_broker
+    from app.services.ai_mode import worker as ai_worker
 
+    if not ai_broker.is_ready():
+        raise HTTPException(status_code=503, detail=_broker_unavailable_detail())
     run_dir = await asyncio.to_thread(run_store.find_run_dir, run_id)
     if run_dir is None:
         # Hosted/ephemeral disk: the local run dir may be gone, but the run was
@@ -123,22 +152,36 @@ async def resume_ai_mode_upload(run_id: str) -> dict[str, Any]:
             status_code=404,
             detail="AI mode run not found (no local run dir, and nothing in S3 to restore)",
         )
-    status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
-    state = str(status.get("status") or "")
-    if state not in {"failed", "completed_with_errors"}:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"run status is '{state}'; resume only applies to failed or "
-                "completed_with_errors runs"
-            ),
-        )
+    if run_id in _resume_in_flight:
+        raise HTTPException(status_code=409, detail="resume already in progress for this run")
+    _resume_in_flight.add(run_id)
+    try:
+        status = await asyncio.to_thread(ai_mode_service.get_ai_mode_status, run_id)
+        state = str(status.get("status") or "")
+        if state not in {"failed", "completed_with_errors"}:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run status is '{state}'; resume only applies to failed or "
+                    "completed_with_errors runs"
+                ),
+            )
+        # reset flips status to running/publishing, so once we leave this block
+        # a late duplicate request also fails the status gate above.
+        cleared = await asyncio.to_thread(ai_worker.reset_run_for_resume, run_id, run_dir)
+    finally:
+        _resume_in_flight.discard(run_id)
     task = asyncio.create_task(
-        asyncio.to_thread(ai_mode_service.run_ai_mode_sync, run_id, True)
+        ai_worker.publish_run_batches(run_id, only_missing=True)
     )
     ai_mode_tasks.add(task)
     task.add_done_callback(ai_mode_tasks.discard)
-    return {"run_id": run_id, "status": "running", "resumed": True}
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "resumed": True,
+        "cleared_error_markers": cleared,
+    }
 
 
 @router.get("/uploads/ai-mode")

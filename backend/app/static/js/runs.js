@@ -9,21 +9,14 @@ import {
   head,
   loadingCard,
   pageIntro,
+  PIPELINE_LABELS,
+  PIPELINES,
+  runHref,
+  engineOf,
   shortDate,
   statusBadge,
 } from "./ui.js";
 
-const PIPELINES = ["ai_bulk", "ai_deep", "gmaps", "gsearch", "full",
-                   "firmographics", "url_discovery"];
-const PIPELINE_LABELS = {
-  ai_bulk: "Google AI (Bulk)",
-  ai_deep: "Google AI (Deep)",
-  gmaps: "Google Maps",
-  gsearch: "Google Search",
-  full: "Upload Console",
-  firmographics: "Firmographics",
-  url_discovery: "URL Discovery",
-};
 const STATUSES = ["queued", "running", "completed", "completed_with_errors", "failed"];
 
 const selectCls = "control px-3 py-2 text-sm";
@@ -92,7 +85,7 @@ function runsTable(runs, companiesById) {
       cell(shortDate(r.created_at), "text-slate-400 whitespace-nowrap"),
       cell(el("a", {
         class: "table-link",
-        href: `#/runs/${encodeURIComponent(r.run_ref)}`,
+        href: runHref(r.run_ref, engineOf(r.pipeline)),
         "aria-label": `View ${companyName} run ${r.run_ref ?? ""}`,
       }, companyName), "font-semibold text-slate-50"),
       cell(PIPELINE_LABELS[r.pipeline] ?? r.pipeline ?? "-"),

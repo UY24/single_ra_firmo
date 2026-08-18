@@ -241,7 +241,7 @@ async function invalidRelationshipContract() {
   const root = await renderWith(async (path) => {
     if (path === "/companies") return companiesResponse();
     if (path === "/uploads/relationship/preview") {
-      return response({ total_rows: 5, unique_pairs: 0, blank_rows: 5, warnings: [warning] });
+      return response({ total_rows: 0, relationship: true, warnings: [warning] });
     }
     throw new Error(`Unexpected fetch: ${path}`);
   });
@@ -257,13 +257,41 @@ async function invalidRelationshipContract() {
   assert(root.textContent.includes(warning), "relationship preview warning disappeared");
 }
 
+async function firmographicsPreviewEndpointContract() {
+  // A firmographics CSV has no company_name/country, so the shared /uploads/preview
+  // (parse_entities_csv) reported it as headerless and positional — "col 1 = company
+  // name, col 2 = country" about a file whose first column is a URL.
+  const paths = [];
+  const root = await renderWith(async (path) => {
+    if (path === "/companies") return companiesResponse();
+    paths.push(path);
+    if (path === "/uploads/firmographics/preview") {
+      return response({ total_rows: 72, positional: false,
+                        columns_detected: { website_url: "Website" } });
+    }
+    throw new Error(`Unexpected fetch: ${path}`);
+  });
+
+  selectCompany(root);
+  await choosePipeline(root, "firmographics");
+  await upload(root, new File(["Website\nhttps://acme.com"], "firmo.csv",
+                              { type: "text/csv" }));
+
+  assert(paths.includes("/uploads/firmographics/preview"),
+    "firmographics did not use its own preview endpoint");
+  assert(!paths.includes("/uploads/preview"),
+    "firmographics still hit the entity-CSV preview");
+  assert(!root.textContent.includes("positional"),
+    "firmographics preview still claims positional parsing");
+}
+
 async function pipelineInvalidationContract() {
   const nextPreview = deferred();
   const genericRequests = [];
   const root = await renderWith(async (path, opts) => {
     if (path === "/companies") return companiesResponse();
     if (path === "/uploads/relationship/preview") {
-      return response({ total_rows: 1, unique_pairs: 1, blank_rows: 0 });
+      return response({ total_rows: 1, relationship: true });
     }
     if (path === "/uploads/preview") {
       genericRequests.push({ path, opts });
@@ -344,7 +372,7 @@ async function uploadContract() {
     assert(uploadRequest.body.get("file") === file, "launch changed the selected file");
     assert(uploadRequest.body.get("company_id") === "co-1", "launch omitted company_id");
     assert(uploadRequest.body.get("mode") === "ai_deep", "launch omitted AI mode");
-    assert(window.location.hash === "#/runs/run%20%2F1", "AI launch redirect changed");
+    assert(window.location.hash === "#/runs/run%20%2F1?engine=ai", "AI launch redirect changed");
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
@@ -355,6 +383,7 @@ for (const [name, contract] of [
   ["initial accessibility", initialAccessibilityContract],
   ["labels and placeholder", labelsAndPlaceholderContract],
   ["invalid relationship", invalidRelationshipContract],
+  ["firmographics preview endpoint", firmographicsPreviewEndpointContract],
   ["pipeline invalidation", pipelineInvalidationContract],
   ["stale preview", stalePreviewContract],
   ["upload", uploadContract],

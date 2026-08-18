@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from app.core.config import PROMPTS_DIR
 from app.services.serpwow.geo import _country_to_gl
 from app.services.serpwow.address import (
     _extract_address_component,
@@ -554,44 +555,42 @@ def build_selected_phase_queries(
     return attempt_queries
 
 
-def build_relationship_phase_queries(
+_RELATIONSHIP_PROMPT_CACHE: Optional[str] = None
+
+
+def load_relationship_prompt() -> str:
+    """The single AI Mode search prompt, read once per process.
+
+    Lives in app/prompts/ so it can be tuned without a code change — edit the file and
+    restart the worker. The filename is fixed, exactly like AI Mode's own prompts in
+    ``ai_mode/mode_config.py``.
+    """
+    global _RELATIONSHIP_PROMPT_CACHE
+    if _RELATIONSHIP_PROMPT_CACHE is None:
+        _RELATIONSHIP_PROMPT_CACHE = (
+            PROMPTS_DIR / "relationship_search.txt"
+        ).read_text(encoding="utf-8").strip()
+    return _RELATIONSHIP_PROMPT_CACHE
+
+
+def build_relationship_search_query(
     x_name: str,
     y_name: str,
-    city: str,
-    country: str,
     x_domain: str,
-    max_phases: int = 4,
-) -> list[tuple[str, str]]:
-    """Parallel phase queries for the relationship pipeline (spec §3).
+    input_url: str,
+) -> str:
+    """Fill the prompt for ONE row.
 
-    Y is used VERBATIM (noisy OCR included) — Google tolerates the noise and
-    algorithmic cleanup risks destroying signal. EVERY phase anchors to Company X
-    (name and/or domain) so a query can never surface an unrelated company that
-    merely shares Y's name (e.g. example.com vs the X-related example.org). Phases
-    1/2 need X's name; phase 4 needs X's domain (from Input_URL). When X's domain is
-    present it is added to phases 1/2 as context — NOT a site: restriction, so
-    external evidence still surfaces — while phase 4 uses it as a site: anchor.
-    (There is no phase 3: the old Y-only "official website" search had no tie to X
-    and could return a same-named but unrelated company, so it was removed.)
+    The prompt file may use exactly these four placeholders: {x_name}, {y_name},
+    {x_domain} (derived from input_url) and {input_url}. There is no location — the
+    CSV carries only Company X, Company Y and the portfolio-page URL.
+
+    Company Y is passed VERBATIM including OCR noise — that noise is meaningful input
+    the model is explicitly asked to resolve, not something to clean up.
     """
-    x = str(x_name or "").strip()
-    y = str(y_name or "").strip()
-    xd = str(x_domain or "").strip()
-    queries: list[tuple[str, str]] = []
-    if x:
-        x_ident = f'"{x}" (website: {xd})' if xd else f'"{x}"'
-        queries.append((
-            "phase1_relationship",
-            f'What is the financial relationship between {x_ident} and "{y}"? '
-            f'What is the official website of "{y}"? give actual url',
-        ))
-        x_terms = f'"{x}" "{xd}"' if xd else f'"{x}"'
-        queries.append((
-            "phase2_investment_evidence",
-            f'{x_terms} "{y}" investment OR portfolio OR funding OR acquisition',
-        ))
-    if xd:
-        anchor = f'"{x}" "{y}" site:{xd}' if x else f'"{y}" site:{xd}'
-        queries.append(("phase4_portfolio_anchor", anchor))
-    cap = max(1, int(max_phases))
-    return queries[:cap]
+    return load_relationship_prompt().format(
+        x_name=(x_name or "").strip(),
+        y_name=(y_name or "").strip(),
+        x_domain=(x_domain or "").strip() or "an unknown domain",
+        input_url=(input_url or "").strip() or "not provided",
+    )

@@ -10,7 +10,9 @@ from app.services.serpwow import engine
 PENDING = "Pending Gemini batch post-processing decision."
 
 
-def _state(rows, gemini_batch=None, pipeline="relationship"):
+# gsearch, not relationship: relationship runs have no state.json and no rows — their
+# stop is an S3 marker handled by the pointer branch, covered in test_relationship_endpoint.
+def _state(rows, gemini_batch=None, pipeline="gsearch"):
     state = {
         "upload_id": "u1", "company_id": "c1", "company_name": "Acme",
         "pipeline": pipeline, "phase": "all", "status": "processing",
@@ -88,9 +90,9 @@ class TestStopUpload(unittest.TestCase):
 
 class TestStopGuards(unittest.TestCase):
     def test_maybe_start_skips_stopped_uploads(self):
-        state = {"pipeline": "relationship", "status": "completed_with_errors",
+        state = {"pipeline": "gsearch", "status": "completed_with_errors",
                  "stopped_by_user_at": "t", "rows": []}
-        with patch.dict("os.environ", {"RELATIONSHIP_LLM_BATCH": "true"}), \
+        with patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}), \
              patch.object(engine, "persist_upload_state", AsyncMock()) as persist:
             asyncio.run(engine.maybe_start_gemini_batch_for_upload("u-stop", state))
         persist.assert_not_awaited()

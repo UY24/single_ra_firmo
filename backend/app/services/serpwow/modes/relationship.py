@@ -1,255 +1,320 @@
 # backend/app/services/serpwow/modes/relationship.py
-"""relationship mode executor (SerpWow AI Overview, X↔Y financial relationship).
+"""Relationship row logic over scrape.do Google AI Mode evidence.
 
-Per unique (X, Y) pair: fire the parallel phase queries, pool candidates
-(X-domain blacklisted) + AI-overview evidence, then either call Gemini per-pair
-(RELATIONSHIP_LLM_BATCH=false) or leave the verdict to the chunked Gemini batch
-at finalization (=true). The relationship verdict GATES the URL — see
-gemini_llm.apply_relationship_gate.
+One AI Mode call per row supplies the evidence (text_blocks + references);
+build_relationship_prompt, apply_relationship_gate and update_relationship_block turn
+it into a verdict.
+
+Everything here is a pure function. Orchestration lives in relationship_runner.py.
 """
 from __future__ import annotations
 
-import asyncio
-import json
+import re
 from typing import Any, Optional
 
-import httpx
-
-from app.services.common.env import (
-    get_bool_env as _get_bool_env,
-    get_float_env as _get_float_env,
-    get_int_env as _get_int_env,
-)
 from app.services.serpwow.constants import (
-    PIPELINE_RELATIONSHIP,
     REL_ERROR_CONFIRMED_URL_INVALID,
     REL_ERROR_NO_EVIDENCE,
     REL_ERROR_NO_X,
     REL_ERROR_NOT_CONFIRMED,
 )
-from app.services.serpwow.cost import calculate_gemini_cost_usd
 from app.services.serpwow.gemini_llm import (
     apply_relationship_gate,
-    choose_relationship_and_website,
+    update_relationship_block,
 )
-from app.services.serpwow.outcomes import categorize_http_error, SRC_GEMINI
-from app.services.serpwow.query_builders import build_relationship_phase_queries
-from app.services.serpwow.schemas import CrawlResponse
-from app.services.serpwow.serpwow_client import run_serpwow_search
 from app.services.serpwow.url_utils import (
     dedupe_candidate_urls,
     is_disallowed_official_url,
     url_matches_domain,
-    x_domain_from_input_url,
 )
 
 
-def _overview_text(raw_response: Any) -> str:
-    if not isinstance(raw_response, dict):
-        return ""
-    overview = raw_response.get("ai_overview")
-    if not isinstance(overview, dict):
-        return ""
-    contents = overview.get("ai_overview_contents")
-    if not isinstance(contents, list):
-        return ""
-    return " ".join(
-        (item.get("text") or "").strip()
-        for item in contents if isinstance(item, dict)
-    ).strip()
+def _column(row: dict[str, Any], *aliases: str) -> str:
+    """First matching column value, header-case-insensitively."""
+    lowered = {str(k).strip().lower(): v for k, v in row.items() if isinstance(k, str)}
+    for alias in aliases:
+        value = lowered.get(alias)
+        if value:
+            return str(value).strip()
+    return ""
 
 
-async def execute_relationship_lookup_for_worker(
-    y_name: str,
-    x_name: str,
-    input_url: str,
-    city: str,
-    country: str,
-    debug_upload_id: Optional[str] = None,
-    debug_row_index: Optional[int] = None,
-) -> tuple[CrawlResponse, str]:
-    x_domain = x_domain_from_input_url(input_url)
-    max_phases = max(1, _get_int_env("RELATIONSHIP_MAX_PHASES", 4))
-    queries = build_relationship_phase_queries(
-        x_name=x_name, y_name=y_name, city=city, country=country,
-        x_domain=x_domain, max_phases=max_phases)
+def row_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """The three logical fields the prompt needs, from arbitrary CSV headers.
 
-    timeout_sec = _get_float_env("SERPWOW_TIMEOUT_SEC", 45.0)
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        results = await asyncio.gather(
-            *[run_serpwow_search(q, country=country, client=client)
-              for _, q in queries],
-            return_exceptions=True,
-        )
+    Three, not five: an OCR'd portfolio page yields a Company X name, a Company Y name
+    and the page's own URL — no location. City/country were carried over from the
+    SerpWow pipeline, where they narrowed a keyword search; nothing supplies them here.
 
-    candidates: list[str] = []
+    Lives here rather than in relationship_runner so relationship_outputs can use it
+    without importing the runner — the runner imports write_outputs, so the reverse
+    direction would be a circular import.
+    """
+    return {
+        "row_index": row.get("row_index"),
+        "x_name": _column(row, "company_name_x", "company_x"),
+        "y_name": _column(row, "company_name_y", "company_y"),
+        "input_url": _column(row, "input_url"),
+    }
+
+
+def ai_mode_arrays(envelope: dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """(text_blocks, references) out of one row's stored envelope.
+
+    They live inside ``envelope["response"]`` — scrape.do's body kept verbatim, so the
+    raw/ object is an exact copy of what the provider sent. Envelopes written before
+    that change inlined the two arrays at the top level; the fallback reads those.
+    """
+    payload = envelope.get("response")
+    if not isinstance(payload, dict):
+        payload = envelope
+    blocks = payload.get("text_blocks")
+    refs = payload.get("references")
+    return (blocks if isinstance(blocks, list) else [],
+            refs if isinstance(refs, list) else [])
+
+
+# Keys dropped from the evidence text. This is an EXCLUDE list on purpose — the inverse of
+# the include-list that kept losing content (first `list` items, then `snippet_links`). A key
+# scrape.do adds tomorrow is unknown to this set, so it survives; only these named ones go:
+#   search_parameters — our own ~1.2KB prompt echoed back. The model is already given the
+#     task; re-reading our instructions as "evidence" is pure token cost, and it is where the
+#     https://example.com format example and X's portfolio URL live.
+#   type/level/index/reference_indexes — structural metadata, never prose. Their VALUES are
+#     block-type names and numbers ("paragraph", 3), so emitting them adds noise, not text.
+_NON_EVIDENCE_KEYS = frozenset(
+    {"search_parameters", "type", "level", "index", "reference_indexes"})
+
+
+def evidence_text(envelope: dict[str, Any]) -> str:
+    """Every string in the provider's response, in order, one per line.
+
+    Plain text, not JSON: the model reads the answer, not our serialisation of it, and the
+    braces/quotes/indentation were ~25% of the evidence tokens on every row.
+
+    Nothing is selected BY key. It walks whatever is there and emits each string it finds at
+    any depth, so `snippet`, `list`/`ordered_list` items, `snippet_links[].text` and
+    `snippet_links[].link` all come through — the last one being the resolved target of an
+    inline link, and on a real 100-row run the ONLY link source scrape.do gave us, since
+    `references[]` came back empty for all 100 rows.
+    """
+    payload = envelope.get("response")
+    if not isinstance(payload, dict):
+        payload = envelope
+    lines: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            if node.strip():
+                lines.append(node.strip())
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if key not in _NON_EVIDENCE_KEYS:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        # numbers/bools/None: no prose in them, and a bare "3" is noise to the reader.
+
+    walk(payload)
+    return "\n".join(lines)
+
+
+def extract_https_urls(text: str) -> list[str]:
+    """Every https:// URL in the evidence text, wherever it sat in the response.
+
+    Because that text is every string the response contained, this collects URLs typed into
+    the prose (what the search prompt asks for), ``snippet_links[].link`` (where AI Mode puts
+    the target when it renders the website as linked text instead) and ``references[].link``
+    — without knowing which key any of them came from.
+    """
     seen: set[str] = set()
-    ai_overview_texts: list[str] = []
-    seen_overview_texts: set[str] = set()
-    search_attempts: list[dict[str, Any]] = []
-    formatted_results: list[dict[str, Any]] = []
-    phase4_hit = False
-    serpwow_cost = 0.0
+    urls: list[str] = []
+    for match in re.findall(r'https://[^\s<>"\']+', text or ""):
+        url = match.rstrip(".,;:!?)]}")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
-    for (label, query), raw_result in zip(queries, results):
-        if isinstance(raw_result, Exception):
-            raw_result = {
-                "provider": "serpwow", "used": False, "query": query,
-                "official_website": None, "candidates": [], "status_code": None,
-                "search_url": None, "raw_response": None,
-                "error": f"{type(raw_result).__name__}: {raw_result}",
-                "error_category": categorize_http_error(
-                    None, f"{type(raw_result).__name__}: {raw_result}"),
-            }
-        serpwow_cost += 0.02
-        raw_response = raw_result.get("raw_response")
 
-        if label == "phase4_portfolio_anchor":
-            # Phase 4 confirms Y appears on X's own site — relationship EVIDENCE,
-            # never URL candidates (they're X's pages by construction).
-            organic = (raw_response or {}).get("organic_results") if isinstance(raw_response, dict) else None
-            phase4_hit = bool(organic)
-        else:
-            for cand in raw_result.get("candidates") or []:
-                if (cand and cand not in seen
-                        and not is_disallowed_official_url(cand)
-                        and not url_matches_domain(cand, x_domain)):
-                    seen.add(cand)
-                    candidates.append(cand)
+def build_evidence(envelope: dict[str, Any], x_domain: str) -> dict[str, Any]:
+    """Turn one AI Mode envelope into the arguments build_relationship_prompt expects.
 
-        text = _overview_text(raw_response)
-        if text and text not in seen_overview_texts:
-            seen_overview_texts.add(text)
-            ai_overview_texts.append(text)
+    The evidence text is every string in the response (see evidence_text). The candidate set
+    is every https:// URL in that same text — prose, ``snippet_links``, ``references`` —
+    minus directory/social/file URLs and minus Company X's own domain. That set is what the
+    gate validates the model's answer against, so it is the thing that stops a
+    hallucinated URL being reported as Company Y's website.
 
-        formatted_results.append({
-            "phase": label, "query": query,
-            "success": bool(raw_result.get("used")),
-            "error": raw_result.get("error"),
-            "error_category": raw_result.get("error_category"),
-            "status_code": raw_result.get("status_code"),
-            "search_url": raw_result.get("search_url"),
-            "raw_response": raw_response,
+    One text, one candidate source: since ``search_parameters`` is already excluded from it,
+    the ``https://example.com`` the prompt uses to show the required format and X's own
+    portfolio URL cannot leak into the allow-list as pickable websites for Company Y.
+    """
+    blocks, references = ai_mode_arrays(envelope)
+    text = evidence_text(envelope)
+
+    sources: list[dict[str, str]] = []
+    for ref in references:
+        if isinstance(ref, dict) and str(ref.get("link") or "").strip():
+            link = str(ref["link"]).strip()
+            sources.append({
+                "name": str(ref.get("title") or ref.get("source") or link).strip(),
+                "url": link,
+            })
+
+    candidates = dedupe_candidate_urls([
+        c for c in extract_https_urls(text)
+        if c and not is_disallowed_official_url(c) and not url_matches_domain(c, x_domain)
+    ])
+
+    error = envelope.get("error")
+    # "Did AI Mode answer" is a question about the BLOCKS, not about the evidence text: a
+    # response whose text_blocks came back empty can still have non-empty text.
+    answered = bool(blocks)
+    ai_overview_evidence: list[dict[str, Any]] = []
+    if blocks or references:
+        ai_overview_evidence.append({
+            "phase": "ai_mode",
+            # No "query" key: the response's own search_parameters.q inside `text` IS the
+            # query, verbatim. Repeating our ~1.2KB prompt as a header — and again in the
+            # search_attempts dump — cost three copies of it in every row's verdict prompt.
+            "text": text,
+            "sources": sources,
         })
-        search_attempts.append({
-            "attempt": label, "query": query,
-            "search_url": raw_result.get("search_url"),
-            "status": "candidates_found" if raw_result.get("candidates") else "no_candidates",
-            "status_code": raw_result.get("status_code"),
-            "error": raw_result.get("error"),
-        })
 
-    deduped = dedupe_candidate_urls(candidates)
-    has_evidence = bool(deduped or ai_overview_texts)
-    has_x = bool(str(x_name or "").strip())
-    batch_mode = _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
+    if error:
+        status = "error"
+        result_summary = str(error)
+    elif candidates:
+        status = "candidates_found"
+        result_summary = (f"{'AI Mode answered' if answered else 'No AI Mode text'}; "
+                          f"{len(candidates)} candidate(s)")
+    else:
+        status = "no_candidates"
+        result_summary = (f"{'AI Mode answered' if answered else 'No AI Mode text'}; "
+                          f"0 candidates")
 
-    skip_llm = False
-    row_error: Optional[str] = None
+    search_attempts = [{
+        "attempt": "ai_mode",
+        "status": status,
+        "error": error,
+        "result": result_summary,
+        "ai_overview_present": answered,
+        "candidate_count": len(candidates),
+        # A billed 200 that returned nothing. The run-level count comes off the
+        # envelope in relationship_outputs; this copy is what the verdict prompt sees.
+        "billed_empty": bool(envelope.get("billed_empty")),
+    }]
+
+    return {
+        "candidates": candidates,
+        "ai_overview_evidence": ai_overview_evidence,
+        "search_attempts": search_attempts,
+        "overview_text": text,
+    }
+
+
+def build_row_result(
+    row: dict[str, Any],
+    envelope: dict[str, Any],
+    parsed: Optional[dict[str, Any]],
+    candidates: list[str],
+    x_domain: str,
+) -> dict[str, Any]:
+    """Apply the unchanged gate and flatten one row into what the CSV writer needs.
+
+    ``parsed`` is the Gemini Batch verdict JSON, or None when the model never ran
+    (short-circuited row, no evidence, or a scrape failure).
+    """
+    relationship: dict[str, Any] = {"status": "pending", "summary": "", "flags": []}
     official_website: Optional[str] = None
-    gemini_cost = 0.0
-    relationship: dict[str, Any] = {
-        "status": "pending", "summary": "",
-        "verified_pair": f"{x_name} ↔ {y_name}", "flags": [],
-    }
-    final_url_selection_ai: dict[str, Any] = {
-        "provider": "google-gemini", "model": None, "used": False,
-        "error": "Skipped: batch mode or short-circuit.", "usage": {}, "raw": None,
-    }
+    row_error: Optional[str] = None
+    status = "unclear"
 
-    if not has_x:
-        # Gate can never pass without X — don't spend tokens (spec §2.1).
-        skip_llm = True
-        row_error = REL_ERROR_NO_X
-        relationship.update(status="not_confirmed",
-                            summary="Company X missing on this row.")
+    blocks, _refs = ai_mode_arrays(envelope)
+    has_x = bool(str(row.get("x_name") or "").strip())
+    has_evidence = bool(candidates or blocks)
+
+    if envelope.get("error"):
+        status = "not_confirmed"
+        relationship.update(status=status, summary=str(envelope["error"]))
+        relationship["flags"].append(
+            {"flag": "scrapedo_failed", "why": str(envelope["error"])})
+        row_error = str(envelope["error"])
+    elif not has_x:
+        # The gate can never pass without X — don't spend tokens on it.
+        status = "not_confirmed"
+        relationship.update(status=status, summary="Company X missing on this row.")
         relationship["flags"].append(
             {"flag": "no_company_x", "why": "row has no Company_Name_X to verify against"})
+        row_error = REL_ERROR_NO_X
     elif not has_evidence:
-        # Pure-noise OCR: nothing to judge (spec §3.2).
-        skip_llm = True
-        row_error = REL_ERROR_NO_EVIDENCE
-        relationship.update(status="not_confirmed",
-                            summary="All phases returned no candidates and no AI overview.")
-        relationship["flags"].append(
-            {"flag": "no_evidence", "why": "no candidates and no AI-overview text from any phase"})
-    elif not batch_mode:
-        parsed, error, model, usage = await asyncio.to_thread(
-            choose_relationship_and_website,
-            x_name, y_name, city, country,
-            deduped, ai_overview_texts, search_attempts, phase4_hit, x_domain)
-        if parsed is None:
-            # LLM failure: the gate cannot be guessed — fail the row (retryable).
-            # Tag the source so the worker's classify_exception attributes it to
-            # gemini, not the default server source.
-            err = RuntimeError(f"relationship LLM error: {error}")
-            err.error_source = SRC_GEMINI
-            raise err
-        gated_url, status, gate_flags = apply_relationship_gate(parsed, deduped, x_domain)
-        gemini_cost = calculate_gemini_cost_usd(usage)
-        official_website = gated_url
+        status = "not_confirmed"
         relationship.update(
             status=status,
-            summary=str(parsed.get("relationship_summary") or ""),
-        )
-        relationship["flags"].extend(gate_flags)
-        for extra in parsed.get("extra_flags") or []:
-            if isinstance(extra, str) and extra.strip():
-                relationship["flags"].append({"flag": extra.strip(), "why": "reported by LLM"})
-        final_url_selection_ai = {
-            "provider": "google-gemini", "model": model, "used": True,
-            "error": None, "usage": usage or {}, "raw": parsed,
-        }
+            summary="AI Mode returned no text and no references for this row.")
+        relationship["flags"].append(
+            {"flag": "no_evidence", "why": "empty AI Mode response"})
+        row_error = REL_ERROR_NO_EVIDENCE
+    elif parsed is None:
+        status = "unclear"
+        relationship.update(status=status, summary="No LLM verdict for this row.")
+        relationship["flags"].append(
+            {"flag": "llm_missing", "why": "Gemini batch produced no verdict"})
+        row_error = REL_ERROR_NOT_CONFIRMED
+    else:
+        official_website, status, gate_flags = apply_relationship_gate(
+            parsed, candidates, x_domain)
+        relationship = update_relationship_block(
+            relationship, parsed, status, gate_flags)
         if official_website is None:
-            row_error = REL_ERROR_NOT_CONFIRMED if status != "confirmed" else (
-                REL_ERROR_CONFIRMED_URL_INVALID)
-    # batch_mode with evidence: leave verdict to the finalization batch.
+            row_error = (REL_ERROR_CONFIRMED_URL_INVALID if status == "confirmed"
+                         else REL_ERROR_NOT_CONFIRMED)
 
-    summary_text = (
-        f"Relationship search for pair {x_name!r} ↔ {y_name!r}: "
-        f"{len(queries)} phase queries, {len(deduped)} candidates, "
-        f"{len(ai_overview_texts)} AI-overview texts, phase4_hit={phase4_hit}."
-    )
-    crawl_resp = CrawlResponse(
-        company_name=y_name,
-        country=country,
-        firm_id=None,
-        input_industry=None,
-        input_full_address=None,
-        official_website=official_website,
-        summary=summary_text,
-        address=None, phone=None, email=None, industry=None,
-        products=[], services=[],
-        website_company_descirption_ai=None,
-        website_company_descirption_translated_ai=None,
-        massive_proxy_cost_usd=0.0,
-        serpwow_cost_usd=serpwow_cost,
-        gemini_cost_usd=gemini_cost,
-        total_cost_usd=serpwow_cost + gemini_cost,
-        context={
-            "pipeline": PIPELINE_RELATIONSHIP,
-            "success": bool(official_website),
-            "used_proxy": False, "blocked": False,
-            "x_name": x_name,
-            "x_domain": x_domain,
-            "phase4_hit": phase4_hit,
-            "candidates": deduped,
-            "ai_overview_texts": ai_overview_texts,
-            "search_attempts": search_attempts,
-            "formatted_results": formatted_results,
-            "skip_llm": skip_llm,
-            "row_error": row_error,
-            "relationship": relationship,
-            "final_url_selection_ai": final_url_selection_ai,
-            "cost_breakdown": {
-                "massive_proxy_cost_usd": 0.0,
-                "serpwow_cost_usd": serpwow_cost,
-                "gemini_cost_usd": gemini_cost,
-                "total_cost_usd": serpwow_cost + gemini_cost,
-                "serpwow_request_count": len(queries),
-            },
-        },
-    )
-    unified_raw = {"queries": queries, "candidates": deduped,
-                   "results": formatted_results}
-    return crawl_resp, json.dumps(unified_raw)
+    return {
+        "row_index": row.get("row_index"),
+        "official_website": official_website or "",
+        "relationship_status": status,
+        "relationship": relationship,
+        "row_error": row_error or "",
+        "error_source": "scrapedo" if envelope.get("error") else "",
+        "candidates": candidates,
+        "attempt_log": build_attempt_log(envelope, candidates),
+    }
+
+
+def build_attempt_log(envelope: dict[str, Any], candidates: list[str]) -> str:
+    """The row's audit trail, one line per fact, for the output CSVs' attempt_log cell.
+
+    There is a single attempt per row rather than a per-phase list — but "one attempt"
+    is not "nothing worth recording": without this there is no way to tell a verdict
+    reached on 12 references from one reached on an empty response, which is exactly
+    what you need when judging the prompt.
+
+    Newline-joined, matching EntityResult.attempt_log_csv: each line renders on its own
+    row INSIDE one quoted CSV cell.
+    """
+    blocks, refs = ai_mode_arrays(envelope)
+    lines = [
+        f"provider: scrape.do google/search/ai-mode",
+        f"attempts: {envelope.get('request_count') or 0} "
+        f"(billed 200s: {envelope.get('successful_requests') or 0}, "
+        f"credits: {envelope.get('credits') or 0})",
+        f"ai_mode_text_blocks: {len(blocks)}",
+        f"ai_mode_references: {len(refs)}",
+        f"candidates_after_filtering: {len(candidates)}",
+    ]
+    if envelope.get("billed_empty"):
+        lines.append("billed_empty: HTTP 200 with no text and no references")
+    if envelope.get("error"):
+        lines.append(f"error: {envelope['error']}")
+    # The candidate set the gate was allowed to pick from — the single most useful thing
+    # when a confirmed row came back with no URL.
+    lines.extend(f"candidate: {url}" for url in candidates[:10])
+    if len(candidates) > 10:
+        lines.append(f"... and {len(candidates) - 10} more candidate(s)")
+    query = str(envelope.get("query") or "")
+    if query:
+        lines.append(f"query: {query[:300]}")
+    return "\n".join(lines)

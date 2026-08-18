@@ -34,7 +34,7 @@ class TestGmapsFinalize(unittest.TestCase):
             self.assertTrue((upload_dir / "notFound.csv").exists())
             self.assertTrue((upload_dir / "report.json").exists())
             self.assertTrue((upload_dir / "run.log").exists())
-            with (upload_dir / "found.csv").open() as fh:
+            with (upload_dir / "found.csv").open(encoding="utf-8-sig") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["website_url"], "https://acme-motors.com")
             self.assertEqual(rows[0]["confidence"], "90")
@@ -84,9 +84,9 @@ class TestGmapsFinalizeCompletedWithErrors(unittest.TestCase):
                  mock.patch.dict("os.environ", {}, clear=False):
                 asyncio.run(legacy_app._finalize_serpwow_outputs("gm2", _mixed_state()))
 
-            with (upload_dir / "found.csv").open() as fh:
+            with (upload_dir / "found.csv").open(encoding="utf-8-sig") as fh:
                 found_rows = list(csv.DictReader(fh))
-            with (upload_dir / "notFound.csv").open() as fh:
+            with (upload_dir / "notFound.csv").open(encoding="utf-8-sig") as fh:
                 not_found_rows = list(csv.DictReader(fh))
 
             self.assertEqual(len(found_rows), 1)

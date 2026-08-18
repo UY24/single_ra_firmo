@@ -122,6 +122,7 @@ async function renderStatus(ref, status, { ai = false } = {}) {
   timers = [];
   const aiPath = `/uploads/ai-mode/${encodeURIComponent(ref)}/status`;
   const legacyPath = `/uploads/${encodeURIComponent(ref)}/status`;
+  const failurePath = `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`;
   let aiCalls = 0;
   globalThis.fetch = async (path, options = {}) => {
     requests.push({ path, options });
@@ -133,6 +134,17 @@ async function renderStatus(ref, status, { ai = false } = {}) {
     } else {
       if (path === aiPath) return response({ detail: "Not Found" }, 404);
       if (path === legacyPath) return response(status);
+    }
+    if (path === failurePath) {
+      return response({
+        failed_rows: 2,
+        sample_failed_rows: [
+          { row_index: 63, company_name: "Kitche", error_source: "serpwow",
+            error_category: "timeout", error: "ReadTimeout" },
+          { row_index: 67, company_name: "CASCADE COFFEE", error_source: "serpwow",
+            error_category: "timeout", error: "ReadTimeout" },
+        ],
+      });
     }
     if (String(path).includes("/result?file=")) {
       return response('name,notes\nA,"line one\nline two"\n');
@@ -249,24 +261,215 @@ async function completedGmapsHeuristic() {
   assert(!root.textContent.includes("Input tokens"), "heuristic run exposed token metrics");
 }
 
+async function gmapsBillingBreakdown() {
+  // Based on the real 100-row run 8ffe96d9 (139 attempts, 87 billed 200s = 870 credits,
+  // 13 rows Google has no listing for at 4 free attempts each), plus a billed-empty row
+  // and two 200s whose BODY carried an error — both are credits spent for nothing.
+  // The card explains the 1000-vs-870 gap; it used to render "All phases 0 / Some 0".
+  const { root } = await renderStatus("gmaps-billing", {
+    pipeline: "gmaps", status: "completed_with_errors", total_rows: 100,
+    processed_rows: 100, failed_rows: 3,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 100,
+      websites_found: 68, websites_not_found: 32,
+      // 3 dead rows: 2 were billed (HTTP 200 + error body), 1 never got a 200.
+      outcome_breakdown: { found: 68, not_found: 29, errored: 3 },
+      empty_response_breakdown: { no_listing: 13, billed_empty: 1 },
+      available_files: [],
+      cost: {
+        scrapedo_requests: 139, scrapedo_successful_requests: 87,
+        scrapedo_failed_requests: 52, scrapedo_error_requests: 4,
+        scrapedo_no_results: 13, scrapedo_billed_empty: 1,
+        scrapedo_billed_errors: 2, scrapedo_credits: 870,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+  });
+  assert(root.textContent.includes("Scrape.do billing (10 credits per HTTP 200)"),
+    "gmaps billing heading missing");
+  assert(!root.textContent.includes("All phases"),
+    "gmaps still renders gsearch's per-phase empty-response split");
+  const pillValue = (label) => byClass(root, "pill")
+    .find((pill) => pill.children[0]?.textContent === label)?.children[1]?.textContent;
+  assert(pillValue("Billed calls") === "87 of 100 rows", "billed calls wrong");
+  // Charged and got nothing usable: the empty 200 plus both error-body 200s.
+  assert(pillValue("Billed but no result") === "3", "billed-for-nothing count wrong");
+  // Every attempt failed, so nothing was charged: 13 no-listing rows + the one dead row
+  // that never got a 200. The two BILLED error rows must not be counted here.
+  assert(pillValue("Failed after retries") === "14", "unbilled dead rows wrong");
+  assert(pillValue("Unbilled attempts") === "52", "retry attempts not shown");
+  assert(!root.textContent.includes("No Maps listing"),
+    "no-listing chip should be folded into the unbilled-failure count");
+  assert(root.textContent.includes("870"), "credits missing from the cost card");
+}
+
+async function failedRowsViewer() {
+  const ref = "failed rows/&";
+  const { root } = await renderStatus(ref, {
+    pipeline: "relationship", status: "completed_with_errors",
+    total_rows: 100, processed_rows: 100, failed_rows: 2,
+    serpwow_summary: {
+      confidence_mode: "llm", websites_found: 50, websites_not_found: 50,
+      outcome_breakdown: { found: 50, not_found: 48, errored: 2 },
+      error_breakdown: { by_source: { serpwow: 2 }, by_category: { timeout: 2 } },
+      relationship_breakdown: { confirmed: 50, not_confirmed: 48, unclear: 0 },
+      available_files: [], cost: {},
+    },
+  });
+  const button = byText(root, "button", "View failed rows (2)");
+  assert(button?.listeners.click, "failed-row viewer button missing");
+  assert(button.getAttribute("aria-expanded") === "false", "failed rows started expanded");
+  assert(!requests.some(({ path }) => String(path).includes("failure-analysis")),
+    "failed rows fetched before expansion");
+  await button.click();
+  await settle();
+  assert(requests.some(({ path }) => path ===
+    `/uploads/${encodeURIComponent(ref)}/failure-analysis?sample_limit=100`),
+  "failure-analysis URL changed");
+  assert(button.getAttribute("aria-expanded") === "true", "failed rows did not expand");
+  const results = byClass(root, "failed-rows-results")[0];
+  assert(results?.getAttribute("aria-live") === "polite", "failed rows missing live region");
+  for (const text of ["63", "Kitche", "67", "CASCADE COFFEE", "serpwow", "timeout", "ReadTimeout"]) {
+    assert(results.textContent.includes(text), `failed rows missing ${text}`);
+  }
+  assert(byClass(results, "overflow-x-auto").length === 1,
+    "failed-row table is not horizontally scrollable");
+  assert(byClass(results, "data-table").length === 1, "failed-row data table missing");
+}
+
 async function completedRelationship() {
   const { root } = await renderStatus("relationship", {
-    pipeline: "relationship", status: "completed", total_rows: 2, processed_rows: 2,
+    pipeline: "relationship", status: "completed", total_rows: 5, processed_rows: 5,
     processing_seconds_total: 5, processing_seconds_avg: 2.5,
     serpwow_summary: {
       confidence_mode: "llm", is_batch: false, model: "gemini-rel",
-      total_rows_original: 5, websites_found: 3, websites_not_found: 1, blank_rows: 1,
-      outcome_breakdown: { found: 3, not_found: 1, errored: 0 }, unique_pairs: 2,
-      available_files: ["found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log"],
+      websites_found: 3, websites_not_found: 2,
+      outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
+        "retry.csv", "report.json", "run.log"],
       relationship_breakdown: { confirmed: 2, not_confirmed: 1, unclear: 1 },
       token_usage: { prompt_tokens: 50, completion_tokens: 10 }, cost: { total_usd: 0.2 },
     },
   });
   assertOutcomeFirst(root, "3 of 5");
-  assert(labelValue(root, "Skipped") === "1", "relationship skipped outcome missing");
-  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1", "Unique pairs"]) {
+  for (const text of ["Relationship verdict", "Confirmed2", "Not confirmed1", "Unclear1"]) {
     assert(root.textContent.includes(text), `relationship detail missing ${text}`);
   }
+}
+
+// The two payloads below are byte-for-byte what engine._relationship_status builds
+// after the scrape.do migration: no gemini_batch, no rows[], no file_links, no
+// success_rows — a relationship run has no state.json to derive them from. This case
+// is the proof that the counter-driven response still drives the unchanged UI.
+async function counterDrivenRelationshipTerminal() {
+  const { root } = await renderStatus("rel-counter", {
+    upload_id: "rel-counter", pipeline: "relationship", company_name: "Acme",
+    status: "completed", total_rows: 5, processed_rows: 5, failed_rows: 0,
+    phase: "completed", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      pipeline: "relationship", status: "completed", total_rows: 5,
+      websites_found: 3, websites_not_found: 2,
+      relationship_breakdown: { confirmed: 3, not_confirmed: 2, unclear: 0 },
+      outcome_breakdown: { found: 3, not_found: 2, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {} },
+      empty_response_breakdown: { no_ai_text: 1 },
+      confidence_mode: "llm",
+      available_files: ["confirmed_relation.csv", "notconfirmed_relation.csv",
+        "retry.csv", "report.json", "run.log"],
+      cost: {
+        scrapedo_requests: 5, scrapedo_successful_requests: 5,
+        scrapedo_failed_requests: 0, scrapedo_error_requests: 0,
+        scrapedo_billed_empty: 1, scrapedo_credits: 50,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+  });
+  assertOutcomeFirst(root, "3 of 5");
+  assert(root.textContent.includes("Relationship verdict"), "verdict section missing");
+  assert(root.textContent.includes("Scrape.do"), "scrape.do cost card missing");
+  assert(root.textContent.includes("50"), "scrape.do credits missing");
+  // One AI Mode call per row means ONE empty-response number, keyed on text_blocks.
+  // The SerpWow-era per-phase split (Both phases / Phase 1 only / Phase 2 only)
+  // rendered three permanent zeroes here and never showed the actual count.
+  assert(root.textContent.includes("Empty AI Mode answers (HTTP 200)"),
+    "empty AI Mode answers section missing");
+  assert(root.textContent.includes("No AI Mode text"),
+    "no_ai_text chip missing");
+  assert(!/Phase 1 only|All phases|SerpWow/.test(root.textContent),
+    "relationship still renders SerpWow-shaped empty-response chips");
+  assert(!byText(root, "button", "Stop run"), "terminal run still offered Stop");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "counter-driven terminal run rendered no Files card");
+  // retry.csv is the rerun/refund list — the rows that got no answer, ready to upload back.
+  for (const name of ["confirmed_relation.csv", "notconfirmed_relation.csv",
+    "retry.csv", "report.json", "run.log"]) {
+    assert(files.textContent.includes(name), `Files card missing ${name}`);
+  }
+  assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
+  assert(!byTag(files, "button").some((button) => button.disabled),
+    "terminal relationship files rendered disabled");
+  // A relationship run has no state.json, so /output (json and xlsx) 404s — the Files
+  // card must not offer them. gsearch keeps them (see failedReportingRunShowsFiles).
+  assert(!files.textContent.includes("output.json")
+    && !files.textContent.includes("output.xlsx"),
+  "relationship Files card advertised the state-driven output endpoints");
+}
+
+async function counterDrivenRelationshipFailedMidScrape() {
+  // Terminal (so filesReady is true) but write_outputs never ran: available_files is
+  // empty and every file link must render disabled rather than as an enabled 404.
+  const { root } = await renderStatus("rel-failed", {
+    upload_id: "rel-failed", pipeline: "relationship", company_name: "Acme",
+    status: "failed", total_rows: 5, processed_rows: 2, failed_rows: 2,
+    phase: "failed", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      total_rows: 5, websites_found: 0, websites_not_found: 3,
+      confidence_mode: "llm", available_files: [],
+      outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
+      empty_response_breakdown: { no_ai_text: 0 },
+      cost: {
+        scrapedo_requests: 2, scrapedo_credits: 20,
+        scrapedo_error_requests: 0, scrapedo_billed_empty: 0,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "retry.csv",
+      "report.json", "run.log"],
+  });
+  const files = byClass(root, "files-section")[0];
+  assert(files, "failed relationship run hid the Files surface");
+  const buttons = byTag(files, "button");
+  assert(buttons.length === 5, `expected 5 file buttons, got ${buttons.length}`);
+  assert(buttons.every((button) => button.disabled),
+    "failed mid-scrape run offered enabled links to files it never wrote");
+  // The failed-rows viewer is offered, so its endpoint must answer (see
+  // FailureAnalysisTests in test_relationship_endpoint.py).
+  assert(byText(root, "button", "View failed rows (2)"), "failed-row viewer missing");
+}
+
+async function counterDrivenRelationshipRunning() {
+  const { root } = await renderStatus("rel-running", {
+    upload_id: "rel-running", pipeline: "relationship", company_name: "Acme",
+    status: "processing", total_rows: 500000, processed_rows: 1236, failed_rows: 2,
+    phase: "scraping", updated_at: "2026-08-04T00:00:00Z",
+    serpwow_summary: {
+      total_rows: 500000, websites_found: 0, websites_not_found: 498764,
+      confidence_mode: "llm", available_files: [],
+      outcome_breakdown: { found: 0, not_found: 0, errored: 2 },
+      empty_response_breakdown: { no_ai_text: 5 },
+      cost: {
+        scrapedo_requests: 1240, scrapedo_credits: 12340,
+        scrapedo_error_requests: 0, scrapedo_billed_empty: 5,
+        llm_usd: 0.0, total_usd: 0.0,
+      },
+    },
+    files: ["confirmed_relation.csv", "notconfirmed_relation.csv", "report.json", "run.log"],
+  });
+  // A missing gemini_batch must not make a running run look "finalizing" or terminal.
+  assert(byText(root, "button", "Stop run"), "running relationship run offered no Stop");
+  assert(!byClass(root, "files-section").length, "running run exposed files that do not exist yet");
+  assertOutcomeFirst(root, "0 of 500,000");
 }
 
 async function finalizingBatch() {
@@ -304,21 +507,24 @@ async function completedWithErrorsBatchIsTerminal() {
       outcome_breakdown: { found: 2, not_found: 0, errored: 1 },
       error_breakdown: { by_source: { gemini: 1 }, by_category: { llm_error: 1 } },
       available_files: ["found.csv", "notFound.csv", "report.json", "run.log"],
-      cost: {},
+      cost: { serpwow_searches: 15, serpwow_billable_searches: 0,
+              serpwow_usd: 0, total_usd: 0 },
     },
   });
   assert(byClass(root, "files-section").length === 1,
     "completed_with_errors batch must be terminal and expose files");
+  assert(root.textContent.includes("15 searches") && root.textContent.includes("15 failed"),
+    "SerpWow failed attempts were not visible beside cost");
 }
 
-async function fullPipelineIgnoresBatchState() {
-  const { root } = await renderStatus("full-batch", {
-    pipeline: "full", status: "completed", total_rows: 2, processed_rows: 2,
+async function nonReportingPipelineIgnoresBatchState() {
+  const { root } = await renderStatus("firmo-batch", {
+    pipeline: "firmographics", status: "completed", total_rows: 2, processed_rows: 2,
     success_rows: 2, failed_rows: 0, gemini_batch: { status: "running" },
   });
-  assert(timers.length === 0, "full pipeline silently kept polling irrelevant batch state");
-  assert(!root.textContent.includes("finalizing"), "full pipeline showed reporting finalizing state");
-  assert(byClass(root, "files-section").length === 1, "terminal full pipeline files missing");
+  assert(timers.length === 0, "non-reporting pipeline silently kept polling irrelevant batch state");
+  assert(!root.textContent.includes("finalizing"), "non-reporting pipeline showed reporting finalizing state");
+  assert(byClass(root, "files-section").length === 1, "terminal non-reporting pipeline files missing");
 }
 
 async function failedReportingRunShowsFiles() {
@@ -374,7 +580,7 @@ async function cancelledBatchTerminalizes() {
 
 async function legacyCompatibility() {
   const { root } = await renderStatus("legacy", {
-    pipeline: "full", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
+    pipeline: "firmographics", status: "completed_with_errors", total_rows: 7, processed_rows: 7,
     success_rows: 5, failed_rows: 2, processing_seconds_total: 14, processing_seconds_avg: 2,
     updated_at: "2026-07-12T10:30:00Z",
   });
@@ -385,7 +591,7 @@ async function legacyCompatibility() {
   assert(labelValue(root, "Failed") === "2", "legacy failed rows must use Failed label");
   const title = byClass(root, "detail-title")[0]?.textContent;
   const subtitle = byClass(root, "detail-subtitle")[0]?.textContent;
-  assert(title === "Upload Console", "legacy header exposed raw pipeline code or upload reference");
+  assert(title === "Firmographics", "legacy header exposed raw pipeline code or upload reference");
   assert(subtitle?.includes("Run legacy") && subtitle.includes("Updated") && subtitle.includes("Jul"),
     "legacy header omitted the human-readable run context timestamp");
   assert(byClass(root, "files-section").length === 1, "legacy terminal files missing");
@@ -444,11 +650,16 @@ async function completedAiMode() {
 async function erroredAiMode() {
   const ref = "ai errors";
   const payload = aiPayload("completed_with_errors", 1);
+  payload.failed_request_count = 1;
+  payload.scrapedo_failed_requests = 1;
   assertProductionTerminalAiShape(payload);
   const { root } = await renderStatus(ref, payload, { ai: true });
   assertOutcomeFirst(root, "4 of 6");
   assert(labelValue(root, "Not found") === "1", "AI inclusive not-found double counted errors");
   assert(labelValue(root, "Errors") === "1", "AI Mode outcome errors wrong");
+  const scrapeCost = byClass(root, "cost-item").find((item) => item.children[0]?.textContent === "Scrape.do");
+  assert(scrapeCost?.textContent.includes("5 searches") && scrapeCost.textContent.includes("1 failed"),
+    "AI scrape.do cost did not show failed search count");
   const rerun = byText(root, "button", "Rerun failed");
   assert(rerun?.listeners.click, "AI Mode rerun action missing");
   await rerun.click();
@@ -621,10 +832,15 @@ async function accessibleModalLifecycleAndRace() {
 await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
+await gmapsBillingBreakdown();
+await failedRowsViewer();
 await completedRelationship();
+await counterDrivenRelationshipTerminal();
+await counterDrivenRelationshipRunning();
+await counterDrivenRelationshipFailedMidScrape();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
-await fullPipelineIgnoresBatchState();
+await nonReportingPipelineIgnoresBatchState();
 await failedReportingRunShowsFiles();
 await cancelledBatchTerminalizes();
 await legacyCompatibility();

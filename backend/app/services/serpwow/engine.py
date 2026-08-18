@@ -12,7 +12,8 @@ extracted into focused sibling modules (all re-imported below for backward-compa
   serpwow_client / gemini_llm          — SerpWow HTTP + Gemini confidence/selection
   csv_input / xlsx_export / serpwow_reporting — I/O + reporting
   modes/{gsearch,gmaps,firmographics,full,common} — per-mode row executors
-  gmaps_client / codetails             — standalone SerpWow Places / codetails API scripts
+  scrapedo_maps_client                 — scrape.do Google Maps search (gmaps pipeline)
+  codetails                            — standalone SerpWow codetails API script
 
 Shared, provider-agnostic helpers live in ``app/services/common/`` (text, env).
 """
@@ -22,6 +23,7 @@ import io
 import json
 import os
 import re
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -130,17 +132,13 @@ from app.services.serpwow.gemini_llm import (
     choose_final_website_with_gemini,
 )
 from app.services.serpwow.constants import (
-    PIPELINE_FULL,
-    PIPELINE_URL_DISCOVERY,
     PIPELINE_FIRMOGRAPHICS,
     PIPELINE_GMAPS,
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
     REPORTING_PIPELINES,
-    REL_ERROR_CONFIRMED_URL_INVALID,
-    REL_ERROR_NOT_CONFIRMED,
 )
-from app.services.serpwow.schemas import CrawlRequest, FirmographicsRequest, CrawlResponse
+from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
 from app.services.serpwow.row_logging import (
     _now_iso,
     _short_text,
@@ -152,12 +150,8 @@ from app.services.serpwow.modes.common import (
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
-from app.services.serpwow.modes.relationship import (
-    execute_relationship_lookup_for_worker,
-)
 from app.services.serpwow.modes.gmaps import execute_gmaps_lookup
 from app.services.serpwow.modes.firmographics import execute_firmographic_extraction
-from app.services.serpwow.modes.full import execute_company_lookup
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -223,7 +217,13 @@ s3_client = None
 
 # Pipeline id constants live in constants.py; re-imported at the top of this module.
 
-_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv", "skipped.csv", "report.json", "run.log",
+_GSEARCH_RESULT_FILES = {"found.csv", "notFound.csv",
+                         "confirmed_relation.csv", "notconfirmed_relation.csv",
+                         # The rerun/refund list (gmaps + relationship): the rows that
+                         # got no answer, with their original input columns so the file
+                         # can be downloaded and uploaded straight back.
+                         "retry.csv",
+                         "skipped.csv", "report.json", "run.log",
                          "output.json", "state.json"}
 
 
@@ -291,33 +291,28 @@ _get_bool_env = get_bool_env
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
     """True when Gemini batch confidence scoring applies to this pipeline.
 
-    full    -> ENABLE_GEMINI_BATCH_POSTPROCESS (legacy flag)
     gsearch -> GSEARCH_LLM_BATCH (independent toggle)
-    gmaps   -> GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH
+
+    gsearch is the ONLY pipeline here. relationship owns its own Gemini Batch driver in
+    relationship_runner, and gmaps has no LLM mode at all since it moved to the S3-only
+    runner — its confidence is heuristic and computed inside the row task.
     """
-    pipe = str(pipeline or PIPELINE_FULL)
+    pipe = str(pipeline or "")
     if pipe == PIPELINE_GSEARCH:
         return _get_bool_env("GSEARCH_LLM_BATCH", False)
-    if pipe == PIPELINE_GMAPS:
-        mode = (os.getenv("GMAPS_CONFIDENCE_MODE", "heuristic") or "heuristic").strip().lower()
-        return mode == "llm" and _get_bool_env("GMAPS_LLM_BATCH", False)
-    if pipe == PIPELINE_RELATIONSHIP:
-        return _get_bool_env("RELATIONSHIP_LLM_BATCH", False)
-    if pipe == PIPELINE_FULL:
-        return _get_bool_env("ENABLE_GEMINI_BATCH_POSTPROCESS", False)
     return False
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
-    """gsearch/gmaps: True while the Gemini batch hasn't reached a terminal status.
+    """gsearch: True while the Gemini batch hasn't reached a terminal status.
 
     Used to DEFER the terminal completion side-effects (Supabase 'completed' sync,
     Slack ping, output-file finalize) until the batch is done, so a batch run
     reports completion once with final numbers — like AI Mode. The `full`
     pipeline is intentionally left unchanged.
     """
-    pipe = str(state.get("pipeline") or PIPELINE_FULL)
-    if pipe not in {PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP}:
+    pipe = str(state.get("pipeline") or "")
+    if pipe != PIPELINE_GSEARCH:
         return False
     if not _batch_postprocess_enabled_for(pipe):
         return False
@@ -407,11 +402,15 @@ async def _get_upload_active_row_count(upload_id: str) -> int:
 
 
 async def _get_rabbitmq_queue_depth() -> Optional[int]:
-    if rabbitmq_queue is None:
+    # aio_pika's Queue.declare() takes no `passive` kwarg (it raised TypeError
+    # and this probe silently returned None, disabling the drained-queue gate);
+    # the passive probe must go through channel.declare_queue.
+    if rabbitmq_channel is None:
         return None
     try:
-        declare_result = await rabbitmq_queue.declare(passive=True)
-        count = getattr(declare_result, "message_count", None)
+        queue_name = os.getenv("RABBITMQ_QUEUE", "singleRA_search_jobs")
+        probe = await rabbitmq_channel.declare_queue(queue_name, passive=True)
+        count = getattr(getattr(probe, "declaration_result", None), "message_count", None)
         if count is None:
             return None
         return max(0, int(count))
@@ -499,7 +498,19 @@ def _batch_output_json_s3_key(upload_id: str, company_name: str = "", pipeline: 
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+    """Write JSON ATOMICALLY (temp file + os.replace).
+
+    A plain write_text leaves a truncated file if the process dies mid-write, and for
+    state.json that loses the WHOLE run's progress, not one row. os.replace is atomic
+    within a filesystem, so a reader sees either the old file or the new one.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _company_slug(value: str) -> str:
@@ -545,7 +556,7 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
             {
                 "phase": fr.get("phase"),
                 "used": fr.get("success"),
-                "error": fr.get("error"),
+                "error": serpwow_client.sanitize_serpwow_error_text(fr.get("error")),
                 "status_code": fr.get("status_code"),
                 "error_category": fr.get("error_category"),
             }
@@ -572,7 +583,11 @@ def _write_error_dumps(upload_dir: Path, state: dict[str, Any]) -> dict[str, Pat
                 "company_name": company_name,
                 "error_source": row.get("error_source"),
                 "error_category": row.get("error_category"),
-                "error_detail": row.get("error"),
+                "error_detail": (
+                    serpwow_client.sanitize_serpwow_error_text(row.get("error"))
+                    if row.get("error_source") == _outcomes.SRC_SERPWOW
+                    else row.get("error")
+                ),
                 "http_status": http_status,
                 "phases": phases,
             }
@@ -733,7 +748,9 @@ def get_s3_client():
             config=BotoConfig(
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
-                retries={"max_attempts": max(1, s3_retries), "mode": "standard"},
+                # "adaptive" adds AWS's client-side rate limiter, which is their documented answer to
+                # S3 SlowDown (HTTP 503): it backs off proactively instead of just retrying harder.
+                retries={"max_attempts": max(1, s3_retries), "mode": "adaptive"},
                 max_pool_connections=100,
             ),
         )
@@ -831,22 +848,49 @@ def _list_local_state_files_sync(limit: int) -> list[Path]:
     return state_files[:limit]
 
 
+_TERMINAL_STATUSES = frozenset({"completed", "completed_with_errors", "failed"})
+# upload_id -> monotonic time of the last state.json S3 mirror (see write_upload_artifact).
+_last_state_s3_flush: dict[str, float] = {}
+
+
+def _is_terminal_state_status(data: dict[str, Any]) -> bool:
+    return str(data.get("status") or "") in _TERMINAL_STATUSES
+
+
 async def write_upload_artifact(upload_id: str, name: str, data: dict[str, Any]) -> None:
-    # 1. Always write to the local filesystem first for immediate local consistency
+    # 1. Always write to the local filesystem first for immediate local consistency.
+    #    Off the event loop: this is the hot path (once per row per update) and a large
+    #    state.json blocks every other in-flight row's HTTP while it serializes.
     local_path = _state_file(upload_id) if name == "state" else _output_file(upload_id)
-    _write_json(local_path, data)
+    await asyncio.to_thread(_write_json, local_path, data)
 
     # 2. If S3 is enabled, schedule S3 write in the background
     use_s3 = bool(os.getenv("S3_BUCKET"))
     if use_s3:
         company_name = str(data.get("company_name") or "")
-        pipeline = str(data.get("pipeline") or PIPELINE_FULL)
+        pipeline = str(data.get("pipeline") or "")
         key = (
             _state_s3_key(upload_id, company_name, pipeline)
             if name == "state"
             else _output_s3_key(upload_id, company_name, pipeline)
         )
         _remember_s3_run_prefix(upload_id, key.rsplit("/", 1)[0])
+
+        # state.json is re-PUT to the SAME key on every row update, and it grows with the
+        # run — a 100-row run uploaded ~84MB of near-identical copies (2 per row x 420KB),
+        # which saturates uplink and hot-spots one S3 key (the documented SlowDown cause).
+        # Throttle it: local disk stays the source of truth and is written every time, the
+        # S3 copy lags at most SERPWOW_S3_STATE_FLUSH_SEC. Terminal snapshots ALWAYS
+        # mirror, so the final state is never missing from S3 — and rows are idempotent,
+        # so a cold-start resume from a slightly stale mirror only re-does safe work.
+        if name == "state" and not _is_terminal_state_status(data):
+            interval = _get_float_env("SERPWOW_S3_STATE_FLUSH_SEC", 5.0)
+            now = time.monotonic()
+            if (now - _last_state_s3_flush.get(upload_id, 0.0)) < interval:
+                return
+            _last_state_s3_flush[upload_id] = now
+        elif name == "state":
+            _last_state_s3_flush.pop(upload_id, None)   # terminal: stop tracking
 
         async def _write_s3_background():
             max_retries = 5
@@ -926,7 +970,7 @@ def _batch_deletion_tombstone_s3_key(upload_id: str, state: dict[str, Any]) -> s
     prefix = _resolved_upload_s3_prefix(
         upload_id,
         str(state.get("company_name") or ""),
-        str(state.get("pipeline") or PIPELINE_FULL),
+        str(state.get("pipeline") or ""),
     )
     return f"{prefix}/batch_deleted_by_user.json"
 
@@ -1209,10 +1253,14 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: st
 
 def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
     timing_summary = build_processing_timing_summary(state.get("rows", []))
+    # Total = wall-clock (start→completion); avg/count = per-row work stats. Mirror
+    # summarize_upload_state so the output payload agrees with /status and the cache.
+    elapsed = _run_elapsed_seconds(state)
+    total_seconds = elapsed if elapsed is not None else timing_summary["processing_seconds_total"]
     return {
         "upload_id": state["upload_id"],
         "company_name": state.get("company_name") or "",
-        "pipeline": state.get("pipeline") or PIPELINE_FULL,
+        "pipeline": state.get("pipeline") or "",
         "status": state["status"],
         "gemini_batch": state.get("gemini_batch"),
         "created_at": state.get("created_at"),
@@ -1221,7 +1269,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
         "processed_rows": state["processed_rows"],
         "success_rows": state["success_rows"],
         "failed_rows": state["failed_rows"],
-        "processing_seconds_total": timing_summary["processing_seconds_total"],
+        "processing_seconds_total": total_seconds,
         "processing_seconds_avg": timing_summary["processing_seconds_avg"],
         "processing_seconds_count": timing_summary["processing_seconds_count"],
         "results": [
@@ -1251,21 +1299,6 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        from app.services.serpwow.gemini_llm import build_relationship_prompt
-        return build_relationship_prompt(
-            x_name=str(row.get("x_name") or _ctx_probe.get("x_name") or ""),
-            y_name=str(row.get("company_name") or ""),
-            city=str(row.get("city") or ""),
-            country=str(row.get("country") or ""),
-            candidates=[c for c in (_ctx_probe.get("candidates") or []) if isinstance(c, str)],
-            ai_overview_texts=list(_ctx_probe.get("ai_overview_texts") or []),
-            search_attempts=list(_ctx_probe.get("search_attempts") or []),
-            phase4_hit=bool(_ctx_probe.get("phase4_hit")),
-            x_domain=str(_ctx_probe.get("x_domain") or ""),
-        )
     input_obj = {
         "company_name": row.get("company_name"),
         "country": row.get("country"),
@@ -1697,8 +1730,11 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
         ctx = ((row.get("result") or {}).get("context")
                if isinstance((row.get("result") or {}).get("context"), dict) else {})
         if ctx.get("skip_llm"):
-            # relationship short-circuit rows (no evidence / no X) were already
-            # finalized by the worker — never seed them into the batch.
+            # Worker-decided short-circuit rows were already finalized.
+            continue
+        if ctx.get("pipeline") == PIPELINE_GSEARCH and not ctx.get("candidates"):
+            # Defense for legacy/in-flight rows created before gsearch persisted
+            # skip_llm: Gemini cannot select a URL from an empty candidate set.
             continue
         row_index = int(row.get("row_index", 0) or 0)
         key = f"row-{row_index}"
@@ -1718,10 +1754,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
     a batch-decided no-website row is a business not_found (outcome=not_found), not
     an error. Mirrors the existing single-job mapping (candidate-set guard via
     is_disallowed_official_url; domain-mismatch is non-fatal -> flag, keep URL)."""
-    _ctx_probe = ((row.get("result") or {}).get("context")
-                  if isinstance((row.get("result") or {}).get("context"), dict) else {})
-    if _ctx_probe.get("pipeline") == PIPELINE_RELATIONSHIP:
-        return _apply_relationship_batch_parsed_to_row(row, parsed, row_usage, batch_model)
     result = row.get("result") if isinstance(row.get("result"), dict) else {}
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
     row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
@@ -1765,69 +1797,6 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
         return "completed"
     row["status"] = "completed"
     row["error"] = _outcomes.BATCH_NOT_FOUND
-    row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
-    row["error_source"] = None
-    row["error_category"] = None
-    return "completed"
-
-
-def _apply_relationship_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
-                                            row_usage: dict[str, Any], batch_model: str) -> str:
-    """Relationship variant of _apply_batch_parsed_to_row: the LLM's
-    relationship_status GATES the URL (spec §4). Always returns 'completed' now:
-    a not-confirmed / confirmed-but-invalid gate is a business not_found
-    (outcome=not_found), not an error."""
-    from app.services.serpwow.gemini_llm import apply_relationship_gate
-
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    context = result.get("context") if isinstance(result.get("context"), dict) else {}
-    row_batch_cost_usd = calculate_gemini_batch_cost_usd(row_usage or {})
-    updated_gemini = round(_as_float(result.get("gemini_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    updated_total = round(_as_float(result.get("total_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-
-    candidates = [c for c in (context.get("candidates") or []) if isinstance(c, str)]
-    x_domain = str(context.get("x_domain") or "")
-    gated_url, status, gate_flags = apply_relationship_gate(
-        parsed if isinstance(parsed, dict) else {}, candidates, x_domain)
-
-    relationship = context.get("relationship") if isinstance(context.get("relationship"), dict) else {
-        "status": "pending", "summary": "", "verified_pair": "", "flags": []}
-    relationship["status"] = status
-    relationship["summary"] = str((parsed or {}).get("relationship_summary") or "")
-    rel_flags = relationship.get("flags") if isinstance(relationship.get("flags"), list) else []
-    rel_flags.extend(gate_flags)
-    for extra in (parsed or {}).get("extra_flags") or []:
-        if isinstance(extra, str) and extra.strip():
-            rel_flags.append({"flag": extra.strip(), "why": "reported by LLM"})
-    relationship["flags"] = rel_flags
-    context["relationship"] = relationship
-
-    result["official_website"] = gated_url
-    result["gemini_cost_usd"] = updated_gemini
-    result["total_cost_usd"] = updated_total
-    cb = context.get("cost_breakdown") if isinstance(context.get("cost_breakdown"), dict) else {}
-    cb["gemini_batch_cost_usd"] = round(_as_float(cb.get("gemini_batch_cost_usd"), 0.0) + row_batch_cost_usd, 8)
-    cb["gemini_cost_usd"] = updated_gemini
-    cb["total_cost_usd"] = updated_total
-    context["cost_breakdown"] = cb
-    context["gemini_batch_ai"] = {"provider": "google-gemini-batch", "model": batch_model,
-                                  "used": True, "usage": row_usage,
-                                  "cost_usd": row_batch_cost_usd,
-                                  "raw": parsed, "error": None}
-    context["success"] = bool(gated_url)
-    result["context"] = context
-    row["result"] = result
-
-    if gated_url:
-        row["status"] = "completed"
-        row["error"] = None
-        row["outcome"] = _outcomes.OUTCOME_FOUND
-        row["error_source"] = None
-        row["error_category"] = None
-        return "completed"
-    row["status"] = "completed"
-    row["error"] = (REL_ERROR_NOT_CONFIRMED if status != "confirmed"
-                    else REL_ERROR_CONFIRMED_URL_INVALID)
     row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
     row["error_source"] = None
     row["error_category"] = None
@@ -2062,10 +2031,9 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
             # Rows that DID get a parsed dict were already fully decided (found or
             # not_found, both now status="completed") by the loop above and must not
             # be re-touched here, even though not_found rows also have no website.
-            # Rows NEVER seeded into the batch (skip_llm relationship no-X/no-evidence
-            # short-circuits, already finalized not_found/completed by the worker; or
-            # non-terminal rows) are absent from chunk_id_by_ridx -> must NOT be touched,
-            # else an unrelated row going through the batch would corrupt them to error.
+            # Rows never seeded normally stay untouched. The one exception is an exact
+            # pending sentinel: that row completed after the input snapshot and must not
+            # remain pending once this batch is terminal.
             results_by_chunk_id = {r["chunk_id"]: r for r in results}
             _pending_sentinel = "Pending Gemini batch post-processing decision."
             for row in state.get("rows", []):
@@ -2075,7 +2043,13 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                     continue
                 ridx = int(row.get("row_index", 0) or 0)
                 if ridx not in chunk_id_by_ridx:
-                    continue  # never a batch item (skip_llm short-circuit / non-terminal)
+                    if row.get("error") == _pending_sentinel:
+                        row["status"] = "failed"
+                        row["outcome"] = _outcomes.OUTCOME_ERROR
+                        row["error_source"] = _outcomes.SRC_GEMINI
+                        row["error_category"] = _outcomes.CAT_INTERNAL
+                        row["error"] = "Gemini batch missed row after its input snapshot."
+                    continue
                 if isinstance(parsed_all.get(ridx), dict):
                     continue  # already decided (found/not_found) above
                 chunk_result = results_by_chunk_id.get(chunk_id_by_ridx.get(ridx, -1)) or {}
@@ -2120,7 +2094,7 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
 
 
 async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return
     if state.get("stopped_by_user_at"):
         # /uploads/{id}/stop terminalizes the upload; don't launch a batch for it.
@@ -2152,7 +2126,7 @@ async def maybe_start_gemini_batch_for_upload(upload_id: str, state: dict[str, A
 
 
 async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, Any]) -> None:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     status = str(gemini_batch_meta.get("status") or "")
@@ -2168,7 +2142,7 @@ async def maybe_resume_gemini_batch_for_upload(upload_id: str, state: dict[str, 
 
 
 async def maybe_reconcile_gemini_batch_status(upload_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+    if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
         return state
     gemini_batch_meta = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
     local_status = str(gemini_batch_meta.get("status") or "").strip()
@@ -2292,9 +2266,42 @@ def build_processing_timing_summary(rows: Any) -> dict[str, Any]:
     }
 
 
+def _run_elapsed_seconds(state: dict[str, Any]) -> Optional[float]:
+    """Wall-clock seconds from run start (created_at) to completion.
+
+    Completion = the latest terminal timestamp among the rows' status_updated_at and the
+    Gemini batch's completed_at — a stable value that does NOT drift when later
+    reconciler/finalize passes re-persist the state. While the run is still non-terminal,
+    measure up to 'now' so the UI shows live elapsed. This is the true wall-clock span,
+    NOT the sum of per-row work times (which overcounts wildly under parallel workers).
+    Returns None if created_at is unparseable (legacy states) so callers can fall back.
+    """
+    start = _parse_iso_datetime(state.get("created_at"))
+    if start is None:
+        return None
+    ends: list[Any] = []
+    for r in state.get("rows", []) or []:
+        if isinstance(r, dict):
+            d = _parse_iso_datetime(r.get("status_updated_at"))
+            if d is not None:
+                ends.append(d)
+    gb = state.get("gemini_batch") if isinstance(state.get("gemini_batch"), dict) else {}
+    d = _parse_iso_datetime(gb.get("completed_at"))
+    if d is not None:
+        ends.append(d)
+    terminal = state.get("status") in {"completed", "completed_with_errors"}
+    if terminal:
+        # Prefer the last row/batch terminal timestamp; fall back to the last persist
+        # (updated_at) for states that predate per-row status_updated_at.
+        end = max(ends) if ends else _parse_iso_datetime(state.get("updated_at"))
+    else:
+        end = datetime.now(timezone.utc)
+    if end is None:
+        return None
+    return round(max((end - start).total_seconds(), 0.0), 3)
+
+
 def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
-    if not state.get("pipeline"):
-        state["pipeline"] = PIPELINE_FULL
     rows = state.get("rows", [])
     total = len(rows)
     processed = sum(1 for r in rows if r.get("status") in {"completed", "failed"})
@@ -2342,7 +2349,15 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
             outcome_counts["errored"] += 1
     state["outcome_counts"] = outcome_counts
 
-    state.update(build_processing_timing_summary(rows))
+    timing = build_processing_timing_summary(rows)
+    elapsed = _run_elapsed_seconds(state)
+    # Total = wall-clock start→completion. The per-row sum (timing[...]) overcounts
+    # under parallel workers, so only fall back to it when created_at is missing.
+    # Avg/row stays the mean per-row work time.
+    state["processing_seconds_total"] = (
+        elapsed if elapsed is not None else timing["processing_seconds_total"])
+    state["processing_seconds_avg"] = timing["processing_seconds_avg"]
+    state["processing_seconds_count"] = timing["processing_seconds_count"]
     state["updated_at"] = _now_iso()
     return state
 
@@ -2415,6 +2430,8 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
                     "row_index": row.get("row_index"),
                     "company_name": row.get("company_name"),
                     "country": row.get("country"),
+                    "error_source": row.get("error_source"),
+                    "error_category": row.get("error_category"),
                     "error": row.get("error"),
                     "official_website": official_website or None,
                     "status_updated_at": row.get("status_updated_at"),
@@ -2444,11 +2461,16 @@ def build_failure_analysis(state: dict[str, Any], sample_limit: int = 20) -> dic
 def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "") -> dict[str, str]:
     bucket = os.getenv("S3_BUCKET")
     pipe = pipeline or ""
-    names = ["state.json", "output.json"]
-    if pipe in REPORTING_PIPELINES:
-        names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if pipe == PIPELINE_RELATIONSHIP:
-        names += ["skipped.csv"]
+        # No state.json / output.json: this pipeline keeps no state dict and no local
+        # disk — S3 object presence IS its state. Advertising them produced two links
+        # to objects that never exist.
+        names = ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                 "report.json", "run.log"]
+    else:
+        names = ["state.json", "output.json"]
+        if pipe in REPORTING_PIPELINES:
+            names += ["found.csv", "notFound.csv", "report.json", "run.log"]
     if bucket:
         prefix = _resolved_upload_s3_prefix(upload_id, company_name, pipe)
         return {name: f"s3://{bucket}/{prefix}/{name}" for name in names}
@@ -2457,12 +2479,12 @@ def _upload_file_links(upload_id: str, company_name: str = "", pipeline: str = "
 
 
 def _reporting_result_names(pipeline: str) -> list[str]:
+    if pipeline == PIPELINE_RELATIONSHIP:
+        return ["confirmed_relation.csv", "notconfirmed_relation.csv",
+                "report.json", "run.log"]
     if pipeline not in REPORTING_PIPELINES:
         return []
-    names = ["found.csv", "notFound.csv"]
-    if pipeline == PIPELINE_RELATIONSHIP:
-        names.append("skipped.csv")
-    return [*names, "report.json", "run.log"]
+    return ["found.csv", "notFound.csv", "report.json", "run.log"]
 
 
 def _list_available_reporting_files_s3_sync(
@@ -2533,8 +2555,8 @@ async def _available_reporting_files(
 def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
     try:
         summary = summarize_upload_state(dict(state))
-        state_pipeline = str(summary.get("pipeline") or PIPELINE_FULL)
-        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL))
+        state_pipeline = str(summary.get("pipeline") or "")
+        file_links = _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or ""))
         upload_summaries_cache[upload_id] = {
             "upload_id": summary.get("upload_id"),
             "pipeline": state_pipeline,
@@ -2576,7 +2598,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         if svc is None:
             return False
         upload_id = str(state.get("upload_id") or "")
-        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or PIPELINE_FULL))
+        file_links = _upload_file_links(upload_id, str(state.get("company_name") or ""), str(state.get("pipeline") or ""))
         extra: dict[str, Any] = {}
         success_count = state.get("success_rows")
         failed_count = state.get("failed_rows")
@@ -2596,10 +2618,6 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
             ob = summ.get("outcome_breakdown") or {}
             success_count = ob.get("found", summ["websites_found"])
             failed_count = ob.get("errored", 0)
-            if state.get("relationship"):
-                # Relationship canonical outcomes are already fanned to original
-                # searchable rows; only the original total needs an explicit field.
-                extra["total_rows"] = summ["total_rows"]
         return svc.update_run(
             run_db_id,
             status=str(state.get("status") or ""),
@@ -2679,7 +2697,7 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
         from app.core import notify
 
         status = str(state.get("status") or "")
-        pipeline = notify.pipeline_label(state.get("pipeline") or PIPELINE_FULL)
+        pipeline = notify.pipeline_label(state.get("pipeline") or "")
         # relationship state counters/total_rows are PAIR-level; the Slack ping
         # should match the CSVs the user downloads (ORIGINAL-ROW-level), so use
         # the original row count when this is a relationship upload.
@@ -2716,15 +2734,28 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
                     found = ob.get("found")
                     not_found = ob.get("not_found")
                     errored = ob.get("errored")
+                    # scrape.do-billed pipelines (gmaps) report requests + credits;
+                    # SerpWow ones keep reporting per-search USD.
+                    # Truthy, not "is not None": _build_cost emits these keys as 0 for
+                    # every SerpWow pipeline too. Checks failed/credits as well so a run
+                    # whose every call failed still reports as scrape.do.
+                    _is_scrapedo = bool(gs["cost"].get("scrapedo_requests")
+                                        or gs["cost"].get("scrapedo_credits")
+                                        or gs["cost"].get("scrapedo_failed_requests"))
                     extra = {
-                        "searches": gs["cost"]["serpwow_searches"],
-                        "search_label": "SerpWow searches",
+                        "searches": (gs["cost"]["scrapedo_requests"] if _is_scrapedo
+                                     else gs["cost"]["serpwow_searches"]),
+                        "search_label": ("Scrape.do requests" if _is_scrapedo
+                                         else "SerpWow searches"),
+                        "credits": gs["cost"]["scrapedo_credits"] if _is_scrapedo else None,
                         "tokens": tu.get("total_tokens"),
                         "input_tokens": tu.get("prompt_tokens"),
                         "output_tokens": tu.get("completion_tokens"),
                         "cost_usd": gs["cost"]["total_usd"],
                         "llm_cost_usd": gs["cost"]["llm_usd"],
-                        "serpwow_cost_usd": gs["cost"]["serpwow_usd"],
+                        # None for scrape.do runs so the ping shows credits instead of
+                        # a misleading $0.00 per-search cost.
+                        "serpwow_cost_usd": None if _is_scrapedo else gs["cost"]["serpwow_usd"],
                         "found": found,
                         "not_found": not_found,
                         "errored": errored,
@@ -2748,9 +2779,8 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
 
 
 async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> None:
-    """Write found/notFound/report/run.log for a terminal SerpWow upload
-    (gsearch or gmaps) and mirror them to S3. Best-effort: logs + swallows
-    everything, never raises."""
+    """Write found/notFound/report/run.log for a terminal gsearch upload and mirror them
+    to S3. Best-effort: logs + swallows everything, never raises."""
     try:
         upload_dir = _find_upload_dir(upload_id)
         paths = await asyncio.to_thread(serpwow_reporting.write_outputs, upload_dir, state)
@@ -2963,11 +2993,8 @@ async def update_row_state(
 async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any]) -> dict[str, Any]:
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return state
-    if str(state.get("pipeline") or PIPELINE_FULL) not in {
-        PIPELINE_FULL,
-        PIPELINE_URL_DISCOVERY,
+    if str(state.get("pipeline") or "") not in {
         PIPELINE_FIRMOGRAPHICS,
-        PIPELINE_GMAPS,
         PIPELINE_GSEARCH,
     }:
         return state
@@ -3000,7 +3027,7 @@ async def maybe_requeue_stuck_queued_rows(upload_id: str, state: dict[str, Any])
         if age_sec < cooldown_sec:
             return state
 
-    pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+    pipeline = str(state.get("pipeline") or "")
     phase = str(state.get("phase") or "all")
     upload_company_name = str(state.get("company_name") or "")
     jobs = [_build_row_job_payload(upload_id, row, pipeline, phase, upload_company_name=upload_company_name) for row in queued_rows]
@@ -3218,11 +3245,29 @@ async def init_rabbitmq() -> None:
     await rabbitmq_queue.bind(rabbitmq_exchange, routing_key=routing_key)
     rabbitmq_last_error = None
 
+    # AI Mode rides the same connection with its OWN channel/queue (independent
+    # QoS — scrape.do concurrency must not share SerpWow's prefetch). Best-effort:
+    # a failure here 503s AI-Mode uploads (broker.is_ready() False) but must not
+    # take SerpWow down with it.
+    try:
+        from app.services.ai_mode import broker as ai_mode_broker
+
+        await ai_mode_broker.init_ai_mode_broker(rabbitmq_connection)
+    except Exception as exc:
+        print(f"[ai-mode-broker] init failed (SerpWow unaffected): {exc}")
+
 
 async def close_rabbitmq() -> None:
     global rabbitmq_connection, rabbitmq_channel, rabbitmq_exchange, rabbitmq_queue, rabbitmq_consumer_tasks
 
     await stop_worker_consumers()
+
+    try:
+        from app.services.ai_mode import broker as ai_mode_broker
+
+        await ai_mode_broker.close_ai_mode_broker()
+    except Exception:
+        pass
 
     rabbitmq_queue = None
     rabbitmq_exchange = None
@@ -3262,6 +3307,76 @@ async def publish_job(job: dict[str, Any]) -> None:
     )
 
 
+async def publish_relationship_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole relationship run.
+
+    Goes to the shared named exchange under RELATIONSHIP_ROUTING_KEY — the same
+    exchange consume_relationship_runs binds its queue to, and the one AI Mode and
+    SerpWow already use, so every binding is visible in one place in the management UI.
+
+    Failure is tolerated — and that tolerance lives HERE, not at the call sites, so every
+    caller (upload, retry-failed-rows, anything added later) gets it. Both callers reach
+    this only AFTER the run is fully created in S3, so letting a wait_for timeout or any
+    AMQP error propagate 500s the request with no upload_id while the run exists and the
+    re-drive scan starts spending money on it 300s later. Never raises: the worker's
+    stale-run scan picks the run up within RELATIONSHIP_REDRIVE_SCAN_SEC, so a broker
+    hiccup delays a run, never loses it.
+    """
+    from app.services.serpwow.relationship_runner import RELATIONSHIP_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[relationship] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=RELATIONSHIP_ROUTING_KEY,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[relationship] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
+
+
+async def publish_gmaps_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole gmaps run.
+
+    Same contract as publish_relationship_run, including that failure is tolerated HERE
+    rather than at the call sites: the run already exists in S3 by this point, so letting
+    an AMQP error propagate would 500 the request with no upload_id while the run exists.
+    The worker's stale-run scan picks it up, so a broker hiccup delays a run, never loses
+    one.
+    """
+    from app.services.serpwow.gmaps_runner import GMAPS_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[gmaps] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=GMAPS_ROUTING_KEY,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[gmaps] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
+
+
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
     """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
     legacy binary: found->completed, everything-else->failed (no not_found remap)."""
@@ -3285,7 +3400,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
     input_industry = str(job.get("industry") or "") or None
     input_full_address = str(job.get("full_address") or "") or None
     official_website_input = str(job.get("official_website") or "") or None
-    pipeline = str(job.get("pipeline") or PIPELINE_FULL).strip() or PIPELINE_FULL
+    pipeline = str(job.get("pipeline") or "").strip() or ""
     started_monotonic = asyncio.get_event_loop().time()
     _log_row_stage(
         "worker.row_start",
@@ -3335,16 +3450,6 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 input_industry=input_industry,
                 input_full_address=input_full_address,
             )
-        elif pipeline == PIPELINE_GMAPS:
-            crawl_response, serpwow_raw_json = await execute_gmaps_lookup(
-                company_name=company_name,
-                country=country,
-                firm_id=firm_id,
-                input_industry=input_industry,
-                input_full_address=input_full_address,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-            )
         elif pipeline == PIPELINE_GSEARCH:
             phase_value = str(job.get("phase") or "all").strip() or "all"
             crawl_response, serpwow_raw_json = await execute_gsearch_lookup_for_worker(
@@ -3357,27 +3462,11 @@ async def process_upload_job(job: dict[str, Any]) -> None:
                 debug_row_index=row_index,
                 phase=phase_value,
             )
-        elif pipeline == PIPELINE_RELATIONSHIP:
-            crawl_response, serpwow_raw_json = await execute_relationship_lookup_for_worker(
-                y_name=company_name,
-                x_name=str(job.get("x_name") or ""),
-                input_url=str(job.get("input_url") or ""),
-                city=str(job.get("city") or ""),
-                country=country,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-            )
         else:
-            crawl_response, serpwow_raw_json = await execute_company_lookup(
-                company_name=company_name,
-                country=country,
-                firm_id=firm_id,
-                input_industry=input_industry,
-                input_full_address=input_full_address,
-                debug_upload_id=upload_id,
-                debug_row_index=row_index,
-                include_firmographics=(pipeline != PIPELINE_URL_DISCOVERY),
-            )
+            # relationship is deliberately absent: it is run-driven (one message per
+            # RUN, see relationship_runner), never row-driven, so a relationship job
+            # arriving here is a bug this correctly rejects.
+            raise ValueError(f"unknown pipeline {pipeline!r}")
 
         s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
             upload_id=upload_id,
@@ -3639,7 +3728,7 @@ async def reconcile_pending_gemini_batches() -> None:
             upload_id = str(state.get("upload_id") or "").strip()
             if not upload_id:
                 continue
-            if not _batch_postprocess_enabled_for(str(state.get("pipeline") or PIPELINE_FULL)):
+            if not _batch_postprocess_enabled_for(str(state.get("pipeline") or "")):
                 continue
             gb = state.get("gemini_batch")
             if not isinstance(gb, dict):
@@ -3668,10 +3757,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
     GSEARCH_ROW_STALE_TIMEOUT_SEC is re-published up to GSEARCH_ROW_MAX_REQUEUE times,
     then FORCE-FAILED so the completion barrier can always resolve. Best-effort.
 
-    Also covers gmaps uploads, but ONLY when gmaps batch mode is enabled
-    (GMAPS_CONFIDENCE_MODE=llm AND GMAPS_LLM_BATCH) — a stuck row there blocks
-    maybe_start_gemini_batch_for_upload from ever starting since it waits for all
-    rows to be terminal. Per-row/heuristic gmaps has no such barrier and is skipped.
+    gsearch only: it is the last pipeline with per-row messages and a Phase 1->2 barrier.
     """
     if rabbitmq_exchange is None or rabbitmq_queue is None:
         return
@@ -3690,12 +3776,11 @@ async def reconcile_stuck_gsearch_rows() -> None:
         for state in states:
             if not isinstance(state, dict):
                 continue
-            _rec_pipe = str(state.get("pipeline") or PIPELINE_FULL)
-            # gsearch always needs terminalization (Phase 1->2 barrier); gmaps needs it
-            # only in batch mode, where a stuck row blocks the finalization batch from
-            # ever starting. Per-row/heuristic gmaps has no such barrier -> skip.
-            if not (_rec_pipe in {PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}
-                    or (_rec_pipe == PIPELINE_GMAPS and _batch_postprocess_enabled_for(_rec_pipe))):
+            _rec_pipe = str(state.get("pipeline") or "")
+            # gsearch alone needs terminalization (its Phase 1->2 barrier). The S3-only
+            # pipelines are not here: they have no per-row messages to re-publish and run
+            # their own stale-run scans (relationship_runner / gmaps_runner).
+            if _rec_pipe != PIPELINE_GSEARCH:
                 continue
             if str(state.get("status") or "") not in {"queued", "processing"}:
                 continue
@@ -3712,7 +3797,7 @@ async def reconcile_stuck_gsearch_rows() -> None:
                 stuck.append(row)
             if not stuck:
                 continue
-            pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+            pipeline = str(state.get("pipeline") or "")
             phase = str(state.get("phase") or "all")
             upload_company_name = str(state.get("company_name") or "")
             async with get_upload_lock(upload_id):
@@ -3780,6 +3865,12 @@ async def periodic_batch_reconciler() -> None:
             break
         await reconcile_pending_gemini_batches()
         await reconcile_stuck_gsearch_rows()
+        try:
+            from app.services.ai_mode import worker as ai_mode_worker
+
+            await ai_mode_worker.reconcile_ai_mode_runs()
+        except Exception as exc:
+            print(f"[ai-mode-reconcile] sweep failed: {exc}")
 
 
 async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
@@ -3805,9 +3896,29 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         gemini_batch_reconciler_stop = asyncio.Event()
         gemini_batch_reconciler_task = asyncio.create_task(periodic_batch_reconciler())
 
+    # AI Mode consumers ride the same worker process (own channel/queue/QoS).
+    # Best-effort: an AI-Mode failure must not take the SerpWow consumers down.
+    try:
+        from app.services.ai_mode import worker as ai_mode_worker
+
+        await ai_mode_worker.start_ai_mode_consumers()
+        # Startup sweep: re-dispatch dead finish tasks, republish lost batches,
+        # and flip phantom-'running' runs left behind by a hard kill.
+        await ai_mode_worker.reconcile_ai_mode_runs()
+    except Exception as exc:
+        print(f"[ai-mode-worker] consumers failed to start: {exc}")
+
 
 async def stop_worker_consumers() -> None:
     global rabbitmq_consumer_tasks, rabbitmq_stop_event
+
+    try:
+        from app.services.ai_mode import worker as ai_mode_worker
+
+        await ai_mode_worker.stop_ai_mode_consumers()
+    except Exception:
+        pass
+
     if not rabbitmq_consumer_tasks:
         return
 
@@ -3871,6 +3982,13 @@ async def shutdown_event() -> None:
     if gemini_batch_tasks:
         await asyncio.gather(*gemini_batch_tasks.values(), return_exceptions=True)
         gemini_batch_tasks.clear()
+    # Release the gmaps pipeline's pooled scrape.do connections.
+    try:
+        from app.services.serpwow import scrapedo_maps_client
+
+        await scrapedo_maps_client.close_shared_client()
+    except Exception:
+        pass
     await close_rabbitmq()
 
 
@@ -3889,49 +4007,6 @@ async def ui_page() -> RedirectResponse:
 @app.get("/get-url/")
 async def get_url(url: str) -> dict[str, str]:
     return {"message": f"Successfully received URL: {url}", "url": url}
-
-
-@app.get("/crawl", response_model=CrawlResponse)
-async def crawl_url_get(
-    company_name: str,
-    country: str,
-    firm_id: Optional[str] = None,
-    industry: Optional[str] = None,
-    full_address: Optional[str] = None,
-) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name,
-        country,
-        firm_id=firm_id,
-        input_industry=industry,
-        input_full_address=full_address,
-    )
-    return response
-
-
-@app.post("/crawl", response_model=CrawlResponse)
-async def crawl_url_post(payload: CrawlRequest) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name=payload.company_name,
-        country=payload.country,
-        firm_id=payload.firm_id,
-        input_industry=payload.industry,
-        input_full_address=payload.full_address,
-    )
-    return response
-
-
-@app.post("/crawl/url-discovery", response_model=CrawlResponse)
-async def crawl_url_discovery_post(payload: CrawlRequest) -> CrawlResponse:
-    response, _ = await execute_company_lookup(
-        company_name=payload.company_name,
-        country=payload.country,
-        firm_id=payload.firm_id,
-        input_industry=payload.industry,
-        input_full_address=payload.full_address,
-        include_firmographics=False,
-    )
-    return response
 
 
 @app.post("/crawl/firmographics", response_model=CrawlResponse)
@@ -3958,7 +4033,6 @@ async def _create_upload_with_rows(
     extra_state: Optional[dict[str, Any]] = None,
     run_total_rows: Optional[int] = None,
 ) -> dict[str, Any]:
-    _PAIR_EXTRA_KEYS = ("x_name", "input_url", "city", "source_row_indices")
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv file is supported.")
 
@@ -4046,7 +4120,6 @@ async def _create_upload_with_rows(
                 "s3_html_key": None,
                 "s3_serpwow_json_key": None,
                 "result": None,
-                **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row},
             }
             for row in parsed_rows
         ],
@@ -4080,7 +4153,6 @@ async def _create_upload_with_rows(
             "phase": phase,
             "uploaded_at": _now_iso(),
             "upload_company_name": company_name,
-            **{k: row[k] for k in _PAIR_EXTRA_KEYS if k in row and k != "source_row_indices"},
         }
         try:
             await publish_job(job)
@@ -4119,40 +4191,6 @@ async def _create_upload_with_rows(
     }
 
 
-@app.post("/uploads")
-async def create_upload(
-    file: UploadFile = File(...),
-    company_id: str = Form(...),
-    company_name: str = Form(""),
-) -> dict[str, Any]:
-    raw = await file.read()
-    _validate_canonical_upload_csv(raw)
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_FULL, company_id=company_id, company_name=company_name
-    )
-
-
-@app.post("/uploads/url-discovery")
-async def create_url_discovery_upload(
-    file: UploadFile = File(...),
-    company_id: str = Form(...),
-    company_name: str = Form(""),
-) -> dict[str, Any]:
-    raw = await file.read()
-    _validate_canonical_upload_csv(raw)
-    try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_URL_DISCOVERY, company_id=company_id, company_name=company_name
-    )
-
-
 @app.post("/uploads/firmographics")
 async def create_firmographics_upload(
     file: UploadFile = File(...),
@@ -4175,15 +4213,66 @@ async def create_gmaps_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    """Create an S3-only gmaps run: validate, park input.csv in S3, publish ONE message.
+
+    No state.json and no local disk (2026-08). The rows are never materialised here — the
+    worker streams input.csv back out of S3 — which is what makes a 500k-row upload cost
+    the API process a fixed amount of memory instead of ~150MB of Entity objects.
+    """
+    import uuid
+
+    from app.core import s3 as core_s3
+    from app.models.entities import InvalidCSVError, parse_entities_csv
+    from app.services.serpwow import s3_run_store as run_store
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
     raw = await file.read()
-    _validate_canonical_upload_csv(raw)
+    # CSV first: a bad CSV must report the CSV problem, not a config problem.
+    # sample_limit=0 validates every row but retains none — only the count is used.
     try:
-        parsed_rows = parse_csv_rows(raw)
-    except ValueError as exc:
+        parsed = parse_entities_csv(raw, sample_limit=0)
+    except InvalidCSVError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_GMAPS, company_id=company_id, company_name=company_name
-    )
+
+    # gmaps runs on scrape.do's Google Maps API — fail fast instead of burning a whole
+    # run's rows on a missing token. Checked AFTER CSV validation so a user with a bad
+    # CSV hears about their CSV, not about our server config.
+    if not os.getenv("SCRAPEDO_TOKEN", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="SCRAPEDO_TOKEN is not configured — required for the gmaps pipeline.")
+    # S3 is not optional the way it is for the state-driven pipelines: this run has no
+    # local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the gmaps pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = run_store.run_prefix(company_name or company_id, run_id, GMAPS_SEGMENT)
+    total = parsed.total_rows
+
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_GMAPS,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(run_store.put_bytes, run_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: there is no state dict to read it from later.
+    await asyncio.to_thread(run_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id, GMAPS_SEGMENT)
+    # The API writes status.json exactly once, before publishing; from the first scrape on
+    # the worker is the only writer. created_at is stamped ONCE here and carried by every
+    # later drive, so total wall clock survives a worker restart mid-run.
+    counters = run_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_gmaps_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_GMAPS,
+            "total_rows": total, "company_id": company_id}
 
 
 @app.post("/uploads/gsearch")
@@ -4204,10 +4293,44 @@ async def create_gsearch_upload(
     )
 
 
+@app.post("/uploads/firmographics/preview")
+async def preview_firmographics_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Dry-run parse for the New Run preview, using the parser the UPLOAD uses.
+
+    The shared /uploads/preview runs parse_entities_csv, which requires company_name +
+    country; a firmographics CSV has neither, so it fell through to positional parsing
+    and told the user "col 1 = company name, col 2 = country" about a file whose first
+    column is a URL. Costs nothing — no state, no queue, no Supabase.
+    """
+    from app.services.serpwow.csv_input import firmographics_columns
+
+    raw = await file.read()
+    try:
+        rows = parse_firmographics_csv_rows(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    header = next(csv.reader(io.StringIO(raw.decode("utf-8-sig", errors="replace"))), [])
+    sample_columns = ["website_url", "company_name", "country",
+                      "firm_id", "industry", "full_address"]
+    return {
+        "total_rows": len(rows),
+        "positional": False,
+        "warnings": [] if rows else ["No enrichable rows — every row is missing a website."],
+        "columns_detected": firmographics_columns(header),
+        "sample_columns": sample_columns,
+        # The row dict's key is still official_website (the state/executor field name);
+        # only the user-facing column is website_url.
+        "sample_rows": [{**{c: r.get(c, "") for c in sample_columns},
+                         "website_url": r["official_website"]}
+                        for r in rows[:5]],
+    }
+
+
 @app.post("/uploads/relationship/preview")
 async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Dry-run parse for the New Run preview: header mapping, blank/dedupe
-    counts, and a sample of the pairs that would actually be searched.
+    """Dry-run parse for the New Run preview: header mapping, row count, and a
+    sample of the rows that would be searched (one row in → one row out, no dedup).
     Costs nothing — no state, no queue, no Supabase."""
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
@@ -4220,39 +4343,25 @@ async def preview_relationship_upload(file: UploadFile = File(...)) -> dict[str,
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    pairs = parsed["pairs"]
-    total = len(parsed["original_rows"])
-    blank = len(parsed["blank_row_indices"])
-    duplicates = (total - blank) - len(pairs)
+    rows = parsed["rows"]          # first SAMPLE_LIMIT only, never the whole file
+    total = parsed["total_rows"]
     warnings: list[str] = []
-    if blank:
-        warnings.append(
-            f"{blank} row(s) have a blank Company_Name_Y — skipped for free (they land in skipped.csv)."
-        )
-    if duplicates > 0:
-        warnings.append(
-            f"{duplicates} duplicate (X, Y) row(s) — each unique pair is searched once and the result copied to every duplicate."
-        )
-    if not pairs:
-        warnings.append("No searchable rows — every Company_Name_Y is blank; the upload would be rejected.")
+    if not rows:
+        warnings.append("No searchable rows — the CSV contains no data rows.")
 
     return {
         "total_rows": total,
-        "blank_rows": blank,
-        "unique_pairs": len(pairs),
+        "relationship": True,
         "warnings": warnings,
         "columns_detected": parsed["columns_detected"],
-        "sample_columns": ["company_name_x", "company_name_y", "input_url", "city", "country", "csv_rows"],
+        "sample_columns": ["company_name_x", "company_name_y", "input_url"],
         "sample_rows": [
             {
-                "company_name_x": p["x_name"],
-                "company_name_y": p["y_name"],
-                "input_url": p["input_url"],
-                "city": p["city"],
-                "country": p["country"],
-                "csv_rows": len(p["source_row_indices"]),
+                "company_name_x": r["x_name"],
+                "company_name_y": r["y_name"],
+                "input_url": r["input_url"],
             }
-            for p in pairs[:5]
+            for r in rows
         ],
     }
 
@@ -4263,57 +4372,85 @@ async def create_relationship_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    import uuid
+
+    from app.core import s3 as core_s3
+    from app.services.serpwow import s3_run_store as rel_store
     from app.services.serpwow.relationship_csv import (
         InvalidRelationshipCSV,
         parse_relationship_csv,
     )
 
-    # The relationship gate REQUIRES the LLM (no heuristic mode) and SerpWow —
-    # fail fast at upload time like AI Mode does, instead of failing every row.
-    for env_key in ("GEMINI_API_KEY", "SERPWOW_API_KEY"):
-        if not os.getenv(env_key, "").strip():
-            raise HTTPException(status_code=400,
-                                detail=f"{env_key} is not configured — required for the relationship pipeline.")
-
     raw = await file.read()
+    # CSV first: a bad CSV must report the CSV problem, not a config problem.
     try:
-        parsed = parse_relationship_csv(raw)
+        # sample_limit=0: the upload path needs the row COUNT and the raw bytes, which
+        # go straight to S3 for the worker to stream. It never looks at parsed rows.
+        parsed = parse_relationship_csv(raw, sample_limit=0)
     except InvalidRelationshipCSV as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not parsed["pairs"]:
-        raise HTTPException(status_code=400,
-                            detail="No searchable rows — every Company_Name_Y is blank.")
 
-    parsed_rows = [
-        {
-            "row_index": p["pair_index"],
-            "company_name": p["y_name"],
-            "country": p["country"],
-            "firm_id": "", "industry": "", "full_address": "", "official_website": "",
-            "x_name": p["x_name"],
-            "input_url": p["input_url"],
-            "city": p["city"],
-            "source_row_indices": p["source_row_indices"],
-        }
-        for p in parsed["pairs"]
-    ]
-    response = await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_RELATIONSHIP,
-        company_id=company_id, company_name=company_name,
-        run_total_rows=len(parsed["original_rows"]),
-        extra_state={
-            "relationship": {
-                "header": parsed["header"],
-                "original_rows": parsed["original_rows"],
-                "blank_row_indices": parsed["blank_row_indices"],
-                "blank_rows": len(parsed["blank_row_indices"]),
-                "row_count_original": len(parsed["original_rows"]),
-            }
-        },
-    )
-    response["blank_rows"] = len(parsed["blank_row_indices"])
-    response["unique_pairs"] = len(parsed["pairs"])
-    return response
+    # No empty-rows guard: parse_relationship_csv raises on a blank required value and
+    # on a header-only CSV, so total_rows is never 0 when it returns.
+    for env_key in ("GEMINI_API_KEY", "SCRAPEDO_TOKEN"):
+        if not os.getenv(env_key, "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{env_key} is not configured — required for the relationship pipeline.")
+    # S3 is not optional here the way it is for the state-driven pipelines: this run has
+    # no local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the relationship pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = rel_store.run_prefix(company_name or company_id, run_id)
+    total = parsed["total_rows"]
+
+    # Best-effort Supabase run row; create_run never raises (returns None untracked).
+    # get_company_service() itself is None when Supabase is unconfigured.
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_RELATIONSHIP,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(rel_store.put_bytes, rel_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: phase 3 has no state dict to read it from.
+    await asyncio.to_thread(rel_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id)
+    # The API writes status.json exactly once, before publishing. From the first scrape
+    # on, the worker is the only writer.
+    # created_at is stamped ONCE here and carried by every later drive, so total wall
+    # clock survives a worker restart mid-run.
+    counters = rel_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_relationship_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_RELATIONSHIP,
+            "total_rows": total, "company_id": company_id}
+
+
+def _find_s3_run(run_id: str) -> tuple[Optional[dict[str, Any]], str]:
+    """(pointer, segment) for an S3-only run, or (None, "") if this id is not one.
+
+    Two pipelines now keep their runs entirely in S3 with no state.json, each in its own
+    pointer namespace. Endpoints that serve both — status, stop, retry, failure-analysis,
+    result files — resolve the id here rather than each guessing a namespace. Two small
+    GETs at most, and the miss is what tells the caller to fall through to the
+    state-driven path.
+    """
+    from app.services.serpwow import s3_run_store as run_store
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
+    for segment in (run_store.PIPELINE_SEGMENT, GMAPS_SEGMENT):
+        pointer = run_store.read_run_pointer(run_id, segment)
+        if pointer:
+            return pointer, segment
+    return None, ""
 
 
 @app.post("/uploads/{upload_id}/retry-failed-rows")
@@ -4321,6 +4458,33 @@ async def retry_failed_rows(
     upload_id: str,
     limit: int = Query(0, ge=0, le=5000),
 ) -> dict[str, Any]:
+    from app.services.serpwow import s3_run_store as rel_store
+
+    # Rerun failed (S3-only pipelines): drop the error markers so a re-drive rescrapes
+    # exactly those rows. Checked before the broker guard on purpose — the re-drive
+    # scan starts the run even if the publish below is skipped.
+    pointer, segment = await asyncio.to_thread(_find_s3_run, upload_id)
+    if pointer:
+        prefix = pointer["prefix"]
+
+        def _dead_markers() -> list[str]:
+            keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
+            # `limit` used to be accepted and then ignored, so a cautious "retry 100 of
+            # them" silently tried all 50k.
+            return keys[:limit] if limit else keys
+
+        # Bulk delete: 1000 keys per call instead of one call per row, which is what made
+        # this time out on any run with a lot of dead rows.
+        removed = await asyncio.to_thread(
+            lambda: rel_store.delete_objects(_dead_markers()))
+        await asyncio.to_thread(rel_store.clear_stop, prefix)
+        await (publish_gmaps_run(upload_id) if segment == "gmaps"
+               else publish_relationship_run(upload_id))
+        return {"upload_id": upload_id, "retried_rows": removed,
+                # operations.js reads enqueued_rows for its status line.
+                "enqueued_rows": removed,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     if rabbitmq_exchange is None:
         detail = "RabbitMQ not connected. Try again shortly."
         if rabbitmq_last_error:
@@ -4359,7 +4523,7 @@ async def retry_failed_rows(
                 raise HTTPException(status_code=404, detail="Upload ID not found") from exc
             raise
 
-        pipeline = str(state.get("pipeline") or PIPELINE_FULL)
+        pipeline = str(state.get("pipeline") or "")
         phase = str(state.get("phase") or "all")
         # Retrying a stopped upload re-opens it: clear the stop marker so the
         # batch post-process can run again once the retried rows finish.
@@ -4471,6 +4635,20 @@ async def stop_upload(upload_id: str) -> dict[str, Any]:
     RabbitMQ messages are then dropped by the worker's idempotency guard) and
     best-effort cancel a pending/running Gemini batch. The upload terminalizes
     on this persist, so outputs/Supabase/Slack fire with whatever was done."""
+    from app.services.serpwow import s3_run_store as rel_store
+
+    # S3-only runs have no rows and no engine-side Gemini batch to cancel — the stop is
+    # an S3 marker the runner polls between rows.
+    pointer, _segment = await asyncio.to_thread(_find_s3_run, upload_id)
+    if pointer:
+        await asyncio.to_thread(rel_store.request_stop, pointer["prefix"])
+        # run_detail.js reports stopped_rows/batch_cancelled in its confirmation
+        # message; neither is knowable here (rows are not tracked individually), so
+        # send honest zeros rather than leave the UI rendering "undefined".
+        return {"upload_id": upload_id, "stop_requested": True,
+                "stopped_rows": 0, "batch_cancelled": False,
+                "status_url": f"/uploads/{upload_id}/status"}
+
     _pending_sentinel = "Pending Gemini batch post-processing decision."
     async with get_upload_lock(upload_id):
         try:
@@ -4556,7 +4734,7 @@ async def uploads_list(
     pipeline_value = None
     if pipeline:
         candidate = str(pipeline).strip().lower()
-        if candidate in {PIPELINE_FULL, PIPELINE_URL_DISCOVERY, PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}:
+        if candidate in {PIPELINE_FIRMOGRAPHICS, PIPELINE_GMAPS, PIPELINE_GSEARCH, PIPELINE_RELATIONSHIP}:
             pipeline_value = candidate
     items = await list_upload_summaries(limit, pipeline=pipeline_value)
     return {"count": len(items), "uploads": items}
@@ -4569,8 +4747,8 @@ async def batch_jobs_list(limit: int = Query(200, ge=1, le=500)) -> dict[str, An
     local_by_job: dict[str, dict[str, Any]] = {}
     local_by_upload: dict[str, dict[str, Any]] = {}
     for item in items:
-        if str(item.get("pipeline") or PIPELINE_FULL) not in {
-            PIPELINE_FULL, PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
+        if str(item.get("pipeline") or "") not in {
+            PIPELINE_GSEARCH, PIPELINE_GMAPS, PIPELINE_RELATIONSHIP,
         }:
             continue
         batch_meta = item.get("gemini_batch") if isinstance(item.get("gemini_batch"), dict) else {}
@@ -4991,8 +5169,215 @@ async def batch_job_delete_by_name(
     }
 
 
+_RELATIONSHIP_FILES = ("confirmed_relation.csv", "notconfirmed_relation.csv",
+                       "retry.csv", "report.json", "run.log")
+
+# Keyed by BOTH status.json phases and report.json summary statuses (the two vocabularies
+# do not collide). "stopped" maps to "completed" deliberately: run_detail.js's terminal
+# set has no rule for it, so passing it through would poll forever and never render the
+# Files card — and a stopped run IS terminal, with its outputs written.
+_RELATIONSHIP_RUN_STATUS = {
+    "queued": "queued", "scraping": "processing", "cleaning": "processing",
+    "reporting": "processing", "completed": "completed",
+    "completed_with_errors": "completed_with_errors",
+    "stopped": "completed", "failed": "failed",
+}
+# Mirrors run_detail.js's ROW_TERMINAL_STATUSES.
+_RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed"}
+
+
+_GMAPS_FILES = ("found.csv", "notFound.csv", "retry.csv", "report.json", "run.log")
+
+
+def _s3_run_available_files(prefix: str, names: tuple[str, ...]) -> list[str]:
+    """Which of the run's output files actually exist.
+
+    One scoped LIST per name (each returns 0 or 1 keys) rather than a single LIST of the
+    run prefix: at 500k rows that prefix holds a million per-row objects.
+    """
+    from app.services.serpwow import s3_run_store as run_store
+
+    return [name for name in names
+            if next(run_store.iter_keys(f"{prefix}/{name}"), None) is not None]
+
+
+def _s3_run_elapsed(counters: dict[str, Any]) -> Optional[int]:
+    """Wall clock from an S3-only run's created_at to now, for mid-run display.
+
+    report.json only exists once the run is terminal, so without this the Processing-time
+    tile stayed blank for the whole run.
+    """
+    import calendar
+    import time as _time
+
+    try:
+        started = calendar.timegm(
+            _time.strptime(str(counters.get("created_at")), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(_time.time() - started))
+
+
+async def _s3_run_status(run_id: str, *, segment: str, pipeline: str,
+                         files: tuple[str, ...],
+                         fallback: Any) -> Optional[dict[str, Any]]:
+    """Build the /status response for an S3-only run from its status.json counters.
+
+    Same JSON shape as the state-driven pipelines, so run_detail.js is unchanged. Returns
+    None when this id is not a run of this pipeline. `fallback` builds the mid-run summary
+    for the window before report.json exists — the one part that differs per pipeline.
+    """
+    from app.services.serpwow import s3_run_store as rel_store
+
+    pointer = await asyncio.to_thread(rel_store.read_run_pointer, run_id, segment)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    phase = str(counters.get("phase") or "queued")
+    total = int(counters.get("rows_total") or 0)
+    scraped = int(counters.get("rows_scraped") or 0)
+    failed = int(counters.get("rows_failed") or 0)
+
+    report = await asyncio.to_thread(
+        rel_store.get_object, f"{prefix}/report.json") or {}
+    summary = report.get("summary") or fallback(counters, total, scraped, failed)
+    # Prefer the status write_outputs computed — it is what _notify_terminal sent to
+    # Supabase, so taking it here is what stops the detail page and the Runs list
+    # disagreeing (phase only ever reaches "completed", never "completed_with_errors").
+    #
+    # But ONLY when phase == "completed", because report.json OUTLIVES its run:
+    # retry_failed_rows deletes the error markers, not the outputs, so a re-driven run
+    # sits at phase "scraping" with the PREVIOUS run's terminal report.json still in
+    # place. write_outputs rewrites report.json immediately before setting the phase to
+    # "completed", so that phase — and only that one — proves the report is this drive's.
+    # ("stopped" needs no special case: write_outputs makes summary["status"] "stopped"
+    # exactly when it sets that phase, and both map to "completed" below.)
+    reported = str(summary.get("status") or "") if phase == "completed" else ""
+    status = _RELATIONSHIP_RUN_STATUS.get(reported or phase, "processing")
+
+    # Only advertise files that exist. A run that failed mid-scrape is terminal — so the
+    # UI renders the Files card — but wrote none of the four; gsearch guards exactly this
+    # case with available_files, and without it every link is an enabled 404. Gated on the
+    # derived status, so a re-driven run (non-terminal again) advertises nothing either.
+    available: list[str] = []
+    if status in _RELATIONSHIP_TERMINAL_STATUSES:
+        available = await asyncio.to_thread(_s3_run_available_files, prefix, files)
+
+    return {
+        "upload_id": run_id,
+        "pipeline": pipeline,
+        # Mid-run the report doesn't exist yet, so serve timings from the counters. The UI
+        # reads processing_seconds_total/avg at the top level, not inside the summary.
+        "created_at": counters.get("created_at"),
+        "processing_seconds_total": summary.get("processing_seconds_total"),
+        "processing_seconds_avg": summary.get("processing_seconds_avg"),
+        "company_name": pointer.get("company_name"),
+        "status": status,
+        "total_rows": total,
+        "processed_rows": scraped + failed,
+        "failed_rows": failed,
+        "phase": phase,
+        "updated_at": counters.get("updated_at"),
+        "serpwow_summary": {**summary, "available_files": available},
+        "files": list(files),
+    }
+
+
+def _relationship_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
+                                   failed: int) -> dict[str, Any]:
+    """The summary shown while a relationship run is still in flight."""
+    return {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "llm",
+        # Always true for this pipeline — phase 2 is always the Gemini Batch verdict pass,
+        # there is no per-row LLM path. Must match relationship_outputs' summary so the
+        # Batch chip doesn't flip from "On" to "Off" while a run is still in progress.
+        "is_batch": True,
+        # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
+        # these are honest zeros rather than absent keys — the tiles render 0, not blank,
+        # and fill in for real once report.json exists.
+        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _s3_run_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
+                          "cleaning": int(counters.get("llm_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": int(counters.get("requests") or 0),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0, "scrapedo_billed_empty":
+                     int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+
+
+def _gmaps_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
+                            failed: int) -> dict[str, Any]:
+    """The summary shown while a gmaps run is still in flight.
+
+    No model, no tokens, no batch: heuristic confidence is computed inside the row task,
+    so there is nothing deferred to report on.
+    """
+    from app.services.serpwow.scrapedo_maps_client import CREDITS_PER_CALL
+
+    # Billed 200s aren't a counter of their own — credits ARE 10 per billed 200, so the
+    # split is exact arithmetic, not an estimate. Mid-run the billing card needs it to
+    # say "87 of 100 rows billed"; report.json carries the real per-row sum at the end.
+    requests = int(counters.get("requests") or 0)
+    billed = int(counters.get("credits") or 0) // CREDITS_PER_CALL
+    return {
+        "total_rows": total, "websites_found": 0,
+        "websites_not_found": max(0, total - scraped),
+        "confidence_mode": "heuristic",
+        "is_batch": False,
+        "model": None,
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _s3_run_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {
+            "no_listing": int(counters.get("rows_no_listing") or 0),
+            "billed_empty": int(counters.get("rows_billed_empty") or 0)},
+        "cost": {"scrapedo_requests": requests,
+                 "scrapedo_successful_requests": billed,
+                 "scrapedo_failed_requests": max(0, requests - billed),
+                 "scrapedo_credits": int(counters.get("credits") or 0),
+                 "scrapedo_error_requests": 0,
+                 "scrapedo_billed_empty": int(counters.get("rows_billed_empty") or 0),
+                 "llm_usd": 0.0, "total_usd": 0.0},
+    }
+
+
+async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a relationship run. None if it is not one."""
+    from app.services.serpwow import s3_run_store as rel_store
+
+    return await _s3_run_status(
+        run_id, segment=rel_store.PIPELINE_SEGMENT, pipeline=PIPELINE_RELATIONSHIP,
+        files=_RELATIONSHIP_FILES, fallback=_relationship_fallback_summary)
+
+
+async def _gmaps_status(run_id: str) -> Optional[dict[str, Any]]:
+    """Build the /status response for a gmaps run. None if it is not one."""
+    from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+
+    return await _s3_run_status(
+        run_id, segment=GMAPS_SEGMENT, pipeline=PIPELINE_GMAPS,
+        files=_GMAPS_FILES, fallback=_gmaps_fallback_summary)
+
+
 @app.get("/uploads/{upload_id}/status")
 async def upload_status(upload_id: str) -> dict[str, Any]:
+    # The S3-only pipelines have no state.json — they are counter-driven. Check their
+    # pointers first; the response shape is identical so the UI needs no change.
+    for build in (_relationship_status, _gmaps_status):
+        s3_status = await build(upload_id)
+        if s3_status is not None:
+            return s3_status
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:
@@ -5011,7 +5396,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     # batch mode, found counts, cost, tokens) so the run-detail UI can show the
     # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
     serpwow_summary = None
-    if (summary.get("pipeline") or PIPELINE_FULL) in REPORTING_PIPELINES:
+    if (summary.get("pipeline") or "") in REPORTING_PIPELINES:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))
@@ -5028,7 +5413,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 available_files = await _available_reporting_files(
                     upload_id,
                     str(summary.get("company_name") or ""),
-                    str(summary.get("pipeline") or PIPELINE_FULL),
+                    str(summary.get("pipeline") or ""),
                 )
             serpwow_summary = {
                 "websites_found": gs["websites_found"],
@@ -5041,15 +5426,17 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "is_batch": gs["is_batch"],
                 "cost": gs["cost"],
                 "token_usage": gs["token_usage"],
-                **{k: gs[k] for k in ("blank_rows", "searchable_rows", "unique_pairs",
-                                      "relationship_breakdown") if k in gs},
-                **({"total_rows_original": gs["total_rows"]} if "unique_pairs" in gs else {}),
+                # blank_rows / searchable_rows / unique_pairs / total_rows_original were
+                # dropped with relationship's (X, Y) dedup — nothing produces them and
+                # nothing in the UI reads them.
+                **{k: gs[k] for k in ("relationship_breakdown",
+                                      "empty_response_breakdown") if k in gs},
             }
         except Exception:
             serpwow_summary = None
     return {
         "upload_id": summary["upload_id"],
-        "pipeline": summary.get("pipeline") or PIPELINE_FULL,
+        "pipeline": summary.get("pipeline") or "",
         "status": summary["status"],
         "gemini_batch": summary.get("gemini_batch"),
         "serpwow_summary": serpwow_summary,
@@ -5063,7 +5450,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
         "processing_seconds_total": summary.get("processing_seconds_total", 0.0),
         "processing_seconds_avg": summary.get("processing_seconds_avg", 0.0),
         "processing_seconds_count": summary.get("processing_seconds_count", 0),
-        "file_links": _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or PIPELINE_FULL)),
+        "file_links": _upload_file_links(upload_id, str(summary.get("company_name") or ""), str(summary.get("pipeline") or "")),
         "rows": [
             {
                 "row_index": row["row_index"],
@@ -5083,11 +5470,97 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     }
 
 
+async def _relationship_failure_analysis(
+    run_id: str, sample_limit: int,
+) -> Optional[dict[str, Any]]:
+    """build_failure_analysis's shape, sourced from errors/ objects instead of rows[].
+
+    The "View failed rows" control run_detail.js offers whenever outcome_breakdown.errored
+    is non-zero calls this; without a branch here a relationship run answered 404 and the
+    page showed a red error under its own button.
+
+    ``failed_rows`` is exact (one LIST of errors/, the same scan list_done_rows does). The
+    aggregate buckets are computed over the SAMPLE only — the alternative is GETting up to
+    500k error objects to answer a debug panel that reads neither.
+    """
+    from app.services.serpwow import s3_run_store as rel_store
+
+    pointer, _segment = await asyncio.to_thread(_find_s3_run, run_id)
+    if not pointer:
+        return None
+    prefix = str(pointer.get("prefix") or "")
+    limit = max(1, int(sample_limit))
+
+    def _by_row_index(key: str) -> tuple[int, int, str]:
+        # NOT plain sorted(): shard directories are numeric but unpadded, so errors/10/
+        # sorts before errors/2/ and the "first N" sample becomes a lexicographic slice
+        # once a run exceeds ten shards.
+        idx = rel_store._idx_from_key(key)
+        return (1, 0, key) if idx is None else (0, idx, "")
+
+    def _collect() -> tuple[int, list[dict[str, Any]]]:
+        keys = list(rel_store.iter_keys(f"{prefix}/errors/"))
+        rows: list[dict[str, Any]] = []
+        for key in sorted(keys, key=_by_row_index)[:limit]:
+            envelope = rel_store.get_object(key) or {}
+            fields = envelope.get("fields") or {}
+            rows.append({
+                "row_index": envelope.get("row_index"),
+                "company_name": fields.get("y_name"),
+                # How many scrape.do calls this row actually cost before it died. Without
+                # it a row that burned all SCRAPEDO_MAX_RETRIES reads exactly like a row
+                # that was tried once, and the retries look like they were never there.
+                "attempts": envelope.get("request_count"),
+                # Only scrape.do can produce an error object — the verdict and reporting
+                # phases never write one (see relationship_runner._scrape_one).
+                "error_source": "scrapedo",
+                "error_category": envelope.get("error_category"),
+                "error": envelope.get("error"),
+                "official_website": None,
+                "status_updated_at": None,
+            })
+        rows.sort(key=lambda row: (row["row_index"] is None, row["row_index"]))
+        return len(keys), rows
+
+    counters = await asyncio.to_thread(rel_store.read_status, prefix) or {}
+    failed_count, sample = await asyncio.to_thread(_collect)
+    total_rows = int(counters.get("rows_total") or 0)
+
+    def _buckets(field: str, name: str) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for row in sample:
+            value = str(row.get(field) or "").strip()
+            if value:
+                counts[value] = counts.get(value, 0) + 1
+        return [{name: k, "count": v} for k, v in
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]]
+
+    return {
+        "upload_id": run_id,
+        "status": str(counters.get("phase") or ""),
+        "gemini_batch": None,
+        "total_rows": total_rows,
+        "failed_rows": failed_count,
+        "failed_rate_pct": (round((failed_count / total_rows) * 100, 2)
+                            if total_rows else 0.0),
+        "failed_missing_official_website": failed_count,
+        "error_buckets": _buckets("error", "reason"),
+        "search_attempt_error_buckets": [],
+        "by_source": _buckets("error_source", "source"),
+        "by_category": _buckets("error_category", "category"),
+        "sample_failed_rows": sample,
+    }
+
+
 @app.get("/uploads/{upload_id}/failure-analysis")
 async def upload_failure_analysis(
     upload_id: str,
     sample_limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
+    relationship_analysis = await _relationship_failure_analysis(upload_id, sample_limit)
+    if relationship_analysis is not None:
+        return relationship_analysis
+
     try:
         state = await get_upload_state(upload_id)
     except KeyError as exc:
@@ -5157,6 +5630,22 @@ async def upload_result_file(
     file: str = Query(...),
     download: bool = Query(False),
 ) -> Response:
+    from app.services.serpwow import s3_run_store as rel_store
+
+    pointer, segment = await asyncio.to_thread(_find_s3_run, upload_id)
+    if pointer:
+        allowed = ({"found.csv", "notFound.csv"} if segment == "gmaps"
+                   else {"confirmed_relation.csv", "notconfirmed_relation.csv"}) | {
+            "report.json", "run.log", "input.csv", "status.json"}
+        if file not in allowed:
+            raise HTTPException(status_code=400, detail=f"Unknown file {file!r}")
+        data = await asyncio.to_thread(
+            rel_store.get_bytes, f"{pointer['prefix']}/{file}")
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"{file} not available yet")
+        media = "application/json" if file.endswith(".json") else "text/plain"
+        return Response(content=data, media_type=media)
+
     if file not in _GSEARCH_RESULT_FILES:
         raise HTTPException(status_code=400, detail="file not allowed")
     upload_dir = _find_upload_dir(upload_id)
@@ -5187,61 +5676,18 @@ async def upload_result_file(
     return Response(content=data, media_type=media, headers=headers)
 
 
-@app.get("/gmaps/discover")
-async def gmaps_discover(q: str, country: Optional[str] = None) -> dict[str, Any]:
-    started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
-    try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        import aiohttp
-        gl = gmaps_module.country_to_gl(country) if country else gmaps_module.get_gl_from_query(q)
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            cids = await gmaps_module.fetch_data_cids(session, q, gl_override=gl)
-        return {
-            "query": q,
-            "gl": gl,
-            "cids": cids,
-            "processing_seconds": round(asyncio.get_running_loop().time() - started_monotonic, 3),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/gmaps/details")
-async def gmaps_details(cid: str) -> dict[str, Any]:
-    started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
-    try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=30)
-        sem = asyncio.Semaphore(1)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            detail = await gmaps_module.fetch_place_detail(session, cid, sem)
-        response = dict(detail) if isinstance(detail, dict) else {"detail": detail}
-        response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
-        return response
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
+# The old /gmaps/discover + /gmaps/details debug routes are gone with the SerpWow
+# two-step flow: there is no data_cid discovery step to inspect any more, and
+# scrape.do's maps/search returns the website inline (see scrapedo_maps_client).
 @app.get("/gmaps/search")
 async def gmaps_search(q: str, country: Optional[str] = None) -> dict[str, Any]:
     started_monotonic = asyncio.get_running_loop().time()
-    api_key = os.getenv("SERPWOW_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="SERPWOW_API_KEY is not configured")
-    
+    if not os.getenv("SCRAPEDO_TOKEN", "").strip():
+        raise HTTPException(status_code=400, detail="SCRAPEDO_TOKEN is not configured")
+
     try:
-        from app.services.serpwow import gmaps_client as gmaps_module
-        res = await gmaps_module.process_gmaps_query(q, country=country)
+        from app.services.serpwow import scrapedo_maps_client as gmaps_module
+        res = await gmaps_module.process_gmaps_query(q, gl=_country_to_gl(country))
         response = dict(res) if isinstance(res, dict) else {"result": res}
         response["processing_seconds"] = round(asyncio.get_running_loop().time() - started_monotonic, 3)
         return response

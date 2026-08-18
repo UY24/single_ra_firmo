@@ -122,6 +122,7 @@ class TestUploadEndpointMapsConfigErrorTo400(_PreparedEnv):
         svc.get_company.return_value = {"id": "acme-id-1", "name": "Acme Corp"}
         svc.create_run.return_value = None
         with mock.patch("app.routers.ai_mode.get_company_service", return_value=svc), \
+                mock.patch("app.services.ai_mode.broker.is_ready", return_value=True), \
                 TestClient(app) as client:
             return client.post(
                 "/uploads/ai-mode",

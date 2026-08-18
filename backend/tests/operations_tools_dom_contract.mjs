@@ -139,7 +139,7 @@ async function terminalAndActionContract() {
   reset();
   queue("/uploads?limit=200", { uploads: [
     {
-      upload_id: "partial", pipeline: "full", status: "completed_with_errors",
+      upload_id: "partial", pipeline: "gmaps", status: "completed_with_errors",
       gemini_batch: { status: "completed_with_errors" }, file_links: {},
     },
     {
@@ -174,7 +174,7 @@ async function terminalAndActionContract() {
     "completed_with_errors batch should enable JSON download");
   assert(!linkByHref(root, "/uploads/gmaps-running/output?download=true"),
     "gmaps running batch must not enable downloads");
-  assert(linkByHref(root, "#/runs/up%20id%2F1%3F"),
+  assert(linkByHref(root, "#/runs/up%20id%2F1%3F?engine=serpwow"),
     `batch upload ID needs a real run link: ${byTag(root, "a").map((link) => link.getAttribute("href")).join(",")}`);
   assert(byText(root, "span", "Batch Cancelled"), "cancelled label missing");
   const partialLabel = byText(root, "span", "Batch Completed With Errors");

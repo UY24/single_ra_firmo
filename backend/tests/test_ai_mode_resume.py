@@ -1,9 +1,10 @@
 # backend/tests/test_ai_mode_resume.py
-"""Offline test: Phase-2 resume reuses cleaned batches and never re-scrapes.
+"""Offline test: broker resume reuses cleaned batches and never re-scrapes.
 
 Drives the Gemini-batch cleanup path (AI_MODE_LLM_BATCH=true) with the
-gemini_batch seams mocked. Pre-seeds raw_responses/ (so Phase 1 resumes with no
-scrape.do calls) and one cleaned/ batch (so Phase 2 re-submits only the rest).
+gemini_batch seams mocked. Pre-seeds raw_responses/ (so the resume republish
+skips every batch -> no scrape.do calls) and one cleaned/ batch (so the finish
+task re-submits only the rest to Gemini).
 """
 import json
 import os
@@ -13,6 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 from app.services.ai_mode import ai_mode_service, run_store
+from app.services.ai_mode import worker as ai_worker
+from tests.ai_mode_drive import drive_run
 
 # Two ai_deep batches of 3 → request_000001 (snos 1-3), request_000002 (snos 4-6).
 CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in range(1, 7))
@@ -96,12 +99,14 @@ class TestPhase2Resume(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "SCRAPEDO_BATCH_SIZE", "AI_MODE_BATCH_POLL_SEC"):
+        for env in ("AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE", "AI_MODE_BATCH_POLL_SEC"):
             os.environ.pop(env, None)
         os.environ["AI_MODE_BATCH_POLL_SEC"] = "5"  # min; no sleep happens (single poll, all terminal)
+        ai_worker._reset_for_tests()
         self.results_root = results_root
 
     def tearDown(self):
+        ai_worker._reset_for_tests()
         for p in self._patches:
             p.stop()
         self._tmp.cleanup()
@@ -115,12 +120,15 @@ class TestPhase2Resume(unittest.TestCase):
         run_dir = run_store.find_run_dir(run_id)
         self.assertIsNotNone(run_dir)
 
-        # Pre-seed BOTH raw files (Phase 1 reuses → no scrape.do) and ONE cleaned
-        # batch (Phase 2 should skip batch-000001, submit only batch-000002).
+        # Pre-seed BOTH raw files (the resume republish skips them → no
+        # scrape.do), a stale error marker (reset must clear it), and ONE cleaned
+        # batch (the finish task should skip batch-000001, submit only -000002).
         raw_dir = run_dir / ai_mode_service.RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
         for i in (1, 2):
             (raw_dir / f"request_{i:06d}.json").write_text(json.dumps(RAW_PAYLOAD), encoding="utf-8")
+        stale_marker = raw_dir / "request_000003.error.json"
+        stale_marker.write_text(json.dumps({"error": "old failure"}), encoding="utf-8")
         cleaned_dir = run_dir / ai_mode_service.CLEANED_DIRNAME
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         (cleaned_dir / "batch-000001.json").write_text(
@@ -129,16 +137,28 @@ class TestPhase2Resume(unittest.TestCase):
                         "usage": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}}),
             encoding="utf-8",
         )
+        # Mimic the crashed run the resume endpoint acts on.
+        ai_mode_service.set_status_fields(
+            run_id, status="failed", engine="broker",
+            gemini_batch_jobs=["batches/stale"], requeue_attempts={"2": 1},
+        )
 
-        ai_mode_service.run_ai_mode_sync(run_id, resume=True)
+        # The endpoint's two actions: reset, then republish only missing batches.
+        cleared = ai_worker.reset_run_for_resume(run_id, run_dir)
+        self.assertEqual(cleared, 1)
+        self.assertFalse(stale_marker.exists())
+        published = drive_run(run_id, only_missing=True)
 
-        # No scrape.do calls — raw files were reused.
+        # Both raws existed → only the check message was published; no scrapes.
+        self.assertEqual([p["type"] for p in published], ["check"])
         self.assertEqual(FakeScrapeDoClient.queries, [])
+        # Stale bookkeeping cleared by the reset.
+        status = ai_mode_service.get_ai_mode_status(run_id)
+        self.assertNotIn("batches/stale", status.get("gemini_batch_jobs") or [])
         # Only the un-cleaned batch was submitted to Gemini.
         self.assertNotIn("batch-000001", self.fake_gemini.submitted)
         self.assertIn("batch-000002", self.fake_gemini.submitted)
 
-        status = ai_mode_service.get_ai_mode_status(run_id)
         self.assertIn(status["status"], ("completed", "completed_with_errors"))
         report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
         self.assertEqual(len(report["entities"]), 6)
@@ -146,6 +166,59 @@ class TestPhase2Resume(unittest.TestCase):
         self.assertEqual(report["summary"]["websites_found"], 3)
         # A cleaned file now exists for the batch that was (re)submitted this run.
         self.assertTrue((cleaned_dir / "batch-000002.json").exists())
+
+
+class TestResumeEndpoint(unittest.TestCase):
+    """POST /uploads/ai-mode/{run_id}/resume — broker gates + dispatch contract."""
+
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from app.routers.ai_mode import router
+
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def test_resume_503_when_broker_down(self):
+        res = self._client().post("/uploads/ai-mode/whatever/resume")
+        self.assertEqual(res.status_code, 503)
+        self.assertIn("queue", res.json()["detail"].lower())
+
+    def test_resume_resets_and_republishes_only_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results_root = Path(tmp) / "ai_mode_results"
+            publish = mock.AsyncMock(return_value=0)
+            with mock.patch.dict(os.environ, FAKE_ENV), \
+                    mock.patch.object(run_store, "AI_MODE_RESULTS_DIR", results_root), \
+                    mock.patch("app.services.ai_mode.broker.is_ready", return_value=True), \
+                    mock.patch("app.services.ai_mode.worker.publish_run_batches", publish):
+                info = ai_mode_service.prepare_ai_mode_run(
+                    CSV_SIX.encode("utf-8"), "input.csv",
+                    mode_key="ai_deep", company_name="Acme Corp", company_id="acme-1",
+                )
+                run_id = info["run_id"]
+                run_dir = run_store.find_run_dir(run_id)
+                marker = run_dir / "raw_responses" / "request_000002.error.json"
+                marker.write_text(json.dumps({"error": "boom"}), encoding="utf-8")
+
+                # Non-terminal status → 409, nothing dispatched.
+                ai_mode_service.set_status_fields(run_id, status="running")
+                res = self._client().post(f"/uploads/ai-mode/{run_id}/resume")
+                self.assertEqual(res.status_code, 409)
+                publish.assert_not_called()
+                self.assertTrue(marker.exists())
+
+                # Failed status → markers cleared + republish(only_missing=True).
+                ai_mode_service.set_status_fields(run_id, status="failed")
+                res = self._client().post(f"/uploads/ai-mode/{run_id}/resume")
+                self.assertEqual(res.status_code, 200)
+                body = res.json()
+                self.assertTrue(body["resumed"])
+                self.assertEqual(body["cleared_error_markers"], 1)
+                self.assertFalse(marker.exists())
+                publish.assert_called_once_with(run_id, only_missing=True)
 
 
 class TestS3Rehydrate(unittest.TestCase):

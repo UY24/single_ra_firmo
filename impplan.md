@@ -914,15 +914,9 @@ class TestModeConfig(unittest.TestCase):
     def test_defaults(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("AI_BULK_BATCH_SIZE", None)
-            os.environ.pop("SCRAPEDO_BATCH_SIZE", None)
             os.environ.pop("AI_DEEP_BATCH_SIZE", None)
             self.assertEqual(get_mode("ai_bulk").batch_size(), 10)
             self.assertEqual(get_mode("ai_deep").batch_size(), 3)
-
-    def test_bulk_falls_back_to_legacy_env(self):
-        with mock.patch.dict(os.environ, {"SCRAPEDO_BATCH_SIZE": "7"}):
-            os.environ.pop("AI_BULK_BATCH_SIZE", None)
-            self.assertEqual(get_mode("ai_bulk").batch_size(), 7)
 
     def test_unknown_mode_raises(self):
         with self.assertRaises(KeyError):
@@ -952,12 +946,10 @@ class ModeConfig:
     prompt_file: str
     batch_size_env: str
     default_batch_size: int
-    legacy_env: str | None = None   # ai_bulk honors old SCRAPEDO_BATCH_SIZE for one release
-
     def batch_size(self) -> int:
-        for env in (self.batch_size_env, self.legacy_env):
-            if env and os.getenv(env):
-                return max(1, int(os.getenv(env)))
+        env = os.getenv(self.batch_size_env)
+        if env:
+            return max(1, int(env))
         return self.default_batch_size
 
     def search_prompt(self) -> str:
@@ -966,7 +958,7 @@ class ModeConfig:
 
 MODES: dict[str, ModeConfig] = {
     "ai_bulk": ModeConfig("ai_bulk", "AI Mode 1 — Bulk", "ai_bulk_search.txt",
-                          "AI_BULK_BATCH_SIZE", 10, legacy_env="SCRAPEDO_BATCH_SIZE"),
+                          "AI_BULK_BATCH_SIZE", 10),
     "ai_deep": ModeConfig("ai_deep", "AI Mode 2 — Deep Search", "ai_deep_search.txt",
                           "AI_DEEP_BATCH_SIZE", 3),
 }
@@ -1687,7 +1679,7 @@ Create `main.js` with the hash router: map `#/dashboard|companies|new-run|runs|o
 **Files:**
 - Modify: `$ROOT/.env.example`, `$ROOT/HANDOFF.md`, `$ROOT/readme.md`
 
-- [ ] **Step 1: Complete `.env.example`** — add with comments: `SUPABASE_URL=`, `SUPABASE_SERVICE_ROLE_KEY=`, `AI_BULK_BATCH_SIZE=10`, `AI_DEEP_BATCH_SIZE=3`, `SCRAPEDO_COST_PER_REQUEST_USD=0`, `AI_MODE_LOG_LEVEL=INFO`, `API_RELOAD=false`, `UVICORN_LOG_LEVEL=info`, `GEMINI_MODEL=gemini-2.5-flash-lite`. Note `SCRAPEDO_BATCH_SIZE` as deprecated (read by ai_bulk as fallback).
+- [ ] **Step 1: Complete `.env.example`** — add with comments: `SUPABASE_URL=`, `SUPABASE_SERVICE_ROLE_KEY=`, `AI_BULK_BATCH_SIZE=10`, `AI_DEEP_BATCH_SIZE=3`, `SCRAPEDO_COST_PER_REQUEST_USD=0`, `AI_MODE_LOG_LEVEL=INFO`, `API_RELOAD=false`, `UVICORN_LOG_LEVEL=info`, `GEMINI_MODEL=gemini-2.5-flash-lite`.
 
 - [ ] **Step 2: Update `HANDOFF.md`** — new §: repo layout (`backend/app/...`), run commands (`cd backend && ../.venv/bin/python -m app.main`, UI at `/app`), the unified input format, the two modes, Supabase setup (migration file + env keys), what was deleted. Update `readme.md` run instructions.
 

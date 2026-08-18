@@ -4,13 +4,17 @@ Drives the AI Mode pipeline (scrape.do Google AI Mode -> LLM cleanup) for both
 ``ai_bulk`` and ``ai_deep`` modes and writes results under
 ``ai_mode_results/<company_slug>/<run_id>/`` (spec §6).
 
-This module is a pure-sync orchestration layer. ``run_ai_mode_sync`` is intended
-to be invoked from a thread (e.g. ``asyncio.to_thread``); it never raises to the
-caller, instead reflecting any failure in the run's ``status.json``.
+This module is a pure-sync orchestration layer. The scrape phase is driven by
+the RabbitMQ worker (``services/ai_mode/worker.py``) one batch at a time via
+``scrape_batch_sync``; once every batch has a raw file or error marker, the
+worker dispatches ``run_ai_mode_finish`` (Phases 2+3: LLM cleanup + streaming
+assembly). Both are intended to run in a thread (``asyncio.to_thread``) and
+never raise — failures land in the run's ``status.json`` (status="failed").
 
 Public API (other modules depend on these names/signatures):
     prepare_ai_mode_run(raw_csv, filename, *, mode_key, company_name, company_id) -> dict
-    run_ai_mode_sync(run_id) -> None
+    scrape_batch_sync(run_dir, mode, settings, scrapedo_client, request_index, group) -> dict
+    run_ai_mode_finish(run_id, ...) -> None
     list_ai_mode_runs() -> list[dict]
     get_ai_mode_status(run_id) -> dict
     get_ai_mode_result_path(run_id, file_name) -> Path
@@ -25,7 +29,6 @@ import re
 import shutil
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
@@ -44,7 +47,11 @@ from app.services.ai_mode.cleanup import (
 from app.services.ai_mode.llm_client import make_llm_client, parse_gemini_usage
 from app.services.ai_mode.mode_config import get_mode
 from app.services.ai_mode.models import TokenUsage, utc_now_iso
-from app.services.ai_mode.run_reporting import write_outputs
+from app.services.ai_mode.run_reporting import (  # noqa: F401 (classify_one_result re-exported)
+    StreamingRunReport,
+    classify_one_result,
+    write_outputs,
+)
 from app.services.ai_mode.scrapedo_client import ScrapeDoClient
 from app.services.ai_mode.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
 from app.services.serpwow.outcomes import (
@@ -190,12 +197,12 @@ def build_ai_mode_settings() -> Settings:
     """Build (and validate) scrape.do Settings from the process environment.
 
     Reads website_url_finder's own process env (config.py has already loaded
-    .env); does NOT load any scrape.do .env file. ``batch_size`` here is the
-    legacy env value only; the engine batches by ModeConfig.batch_size().
+    .env); does NOT load any scrape.do .env file. The engine batches by
+    ModeConfig.batch_size().
     """
     settings = Settings(
         scrapedo_token=_str_env("SCRAPEDO_TOKEN"),
-        batch_size=_int_env("SCRAPEDO_BATCH_SIZE", 10),
+        batch_size=10,
         scrapedo_timeout_seconds=_float_env("SCRAPEDO_TIMEOUT_SECONDS", 90.0),
         scrapedo_max_retries=_int_env("SCRAPEDO_MAX_RETRIES", 2),
         scrapedo_max_query_chars=_int_env("SCRAPEDO_MAX_QUERY_CHARS", 6000),
@@ -335,25 +342,16 @@ def classify_ai_mode_outcomes(results: list[EntityResult]) -> tuple[dict, dict]:
     Mutates errored EntityResults' ``error_source``/``error_category`` so
     ``final_report.json`` carries them.
     """
-    found = not_found = errored = 0
+    outcome_breakdown = {"found": 0, "not_found": 0, "errored": 0}
     by_source: dict[str, int] = {}
     by_category: dict[str, int] = {}
     for r in results:
-        if r.website_url:
-            found += 1
-            continue
-        if not (r.error_source or r.error):
-            not_found += 1
-            continue
-        # Genuine error. Attribute an untagged per-entity failure to Gemini.
-        if not r.error_source:
-            r.error_source = SRC_GEMINI
-            r.error_category = r.error_category or categorize_http_error(None, r.error or "")
-        errored += 1
-        by_source[r.error_source] = by_source.get(r.error_source, 0) + 1
-        if r.error_category:
-            by_category[r.error_category] = by_category.get(r.error_category, 0) + 1
-    outcome_breakdown = {"found": found, "not_found": not_found, "errored": errored}
+        bucket = classify_one_result(r)
+        outcome_breakdown[bucket] += 1
+        if bucket == "errored":
+            by_source[r.error_source] = by_source.get(r.error_source, 0) + 1
+            if r.error_category:
+                by_category[r.error_category] = by_category.get(r.error_category, 0) + 1
     error_breakdown = {"by_source": by_source, "by_category": by_category}
     return outcome_breakdown, error_breakdown
 
@@ -391,12 +389,18 @@ def _reconcile_status_from_report(run_dir: Path, status: dict) -> dict:
 # Status persistence + accessors
 # --------------------------------------------------------------------------- #
 def _persist_status(run_id: str, run_dir: Path, status: dict) -> None:
-    """Write ``status.json`` for the run and update the in-memory cache."""
+    """Write ``status.json`` for the run and update the in-memory cache.
+
+    Atomic (tmp + os.replace): the file is read cross-process (API UI polls,
+    worker, reconciler) and flushed every ~2s during scraping — a truncating
+    write_text could be torn by a hard kill or read mid-write, wedging the run.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     status["available_files"] = _available_files(run_dir)
-    (run_dir / "status.json").write_text(
-        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    path = run_dir / "status.json"
+    tmp = run_dir / "status.json.tmp"
+    tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
     _RUNS[run_id] = status
 
 
@@ -647,204 +651,263 @@ def _initial_status(
 
 
 # --------------------------------------------------------------------------- #
-# run_ai_mode_sync (orchestrator)
+# One-batch scraper (idempotent; also the broker worker's unit of work)
 # --------------------------------------------------------------------------- #
-def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
-    """Execute the full scrape.do -> LLM pipeline for a prepared run.
+def scrape_batch_sync(
+    run_dir: Path,
+    mode,
+    settings: Settings,
+    scrapedo_client,
+    request_index: int,
+    group: list[Entity],
+) -> dict:
+    """Scrape ONE batch to ``raw_responses/request_NNNNNN.json`` (idempotent).
 
-    Synchronous; intended to be called via ``asyncio.to_thread``. Never raises to
-    the caller: any unexpected error is captured in status.json (status="failed").
-    Persists status after every batch so a UI can poll progress.
+    Returns a small metadata record WITHOUT the scrape payload — callers re-read
+    the raw file from disk when they need the text, so holding a full run's
+    records stays O(batches), never O(payload bytes) (1M-row memory safety).
+    An existing parseable raw file is reused without re-scraping (resume, and
+    broker redelivery idempotency in the queue engine).
+    """
+    from app.services.ai_mode import s3_sync
 
-    When ``resume`` is True (re-running a failed/partial run on the SAME run_id),
-    Phase 1 reuses existing ``raw_responses/`` (no scrape.do re-spend) and Phase 2
-    reuses existing ``cleaned/`` batches, so only the still-failed Gemini work is
-    redone. Phase 2 resume is automatic (the cleaned/ pre-load is harmless on a
-    fresh run); ``resume`` additionally preserves the prior run.log and drops stale
-    batch-job names.
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_name = f"request_{request_index:06d}.json"
+    raw_path = raw_dir / raw_name
+    rel_raw_path = f"{RAW_RESPONSES_DIRNAME}/{raw_name}"
+    geo_params, geo_debug = _geo_params_for_group(settings)
+    # Resume/redelivery: reuse an existing, parseable raw response.
+    if raw_path.exists():
+        try:
+            json.loads(raw_path.read_text(encoding="utf-8"))
+            return {
+                "request_index": request_index, "ok": True, "error": None,
+                "scrapedo_seconds": 0.0, "rel_raw_path": rel_raw_path,
+                "geo_debug": geo_debug, "reused": True,
+            }
+        except (ValueError, OSError):
+            pass
+    query = mode.search_prompt().replace("{entities}", format_entities_for_prompt(group))
+    t0 = time.perf_counter()
+    try:
+        payload = scrapedo_client.search_google_ai_mode(query, extra_params=geo_params)
+        seconds = time.perf_counter() - t0
+        # Atomic write (tmp + os.replace): a crash mid-write must never leave a
+        # truncated raw file — existence checks treat the file as "scraped".
+        tmp_path = raw_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(tmp_path, raw_path)
+        # Stream the scrape to S3 immediately (best-effort).
+        s3_sync.mirror_file_to_s3(run_dir, mode.key, raw_path)
+        return {
+            "request_index": request_index, "ok": True, "error": None,
+            "scrapedo_seconds": seconds, "rel_raw_path": rel_raw_path,
+            "geo_debug": geo_debug, "reused": False,
+        }
+    except Exception as exc:  # scrape.do failure for this batch
+        seconds = time.perf_counter() - t0
+        return {
+            "request_index": request_index, "ok": False,
+            "error": sanitize_secret_text(str(exc)),
+            "scrapedo_seconds": seconds, "rel_raw_path": None,
+            "geo_debug": geo_debug, "reused": False,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Shared failure path + finish engine (Phases 2+3)
+# --------------------------------------------------------------------------- #
+def _fail_run(
+    run_id: str, run_dir: Path, status: dict, exc: BaseException, wall_t0: float
+) -> None:
+    """Terminal-failure bookkeeping for run_ai_mode_finish: status.json ->
+    failed, Supabase update, S3 mirror of the partial run dir, Slack failure
+    ping. Never raises."""
+    status["status"] = "failed"
+    status["error"] = sanitize_secret_text(str(exc))
+    status["updated_at"] = utc_now_iso()
+    _persist_status(run_id, run_dir, status)
+    _supabase_update_run(
+        status.get("run_db_id"),
+        status="failed",
+        error=status["error"],
+        duration_seconds=round(time.perf_counter() - wall_t0, 3),
+        finished_at=utc_now_iso(),
+    )
+    _ai_log(
+        run_id,
+        run_dir,
+        f"AI Mode run crashed error={status['error']}",
+        logging.ERROR,
+    )
+    # Mirror the failed run dir to S3 too, so raw_responses/run.log are available
+    # for debugging (best-effort; never mask the original failure).
+    try:
+        from app.services.ai_mode.s3_sync import mirror_run_to_s3
+        mode_key = str(status.get("mode") or "ai_bulk")
+        mirrored = mirror_run_to_s3(run_dir, mode_key)
+        if mirrored:
+            _ai_log(
+                run_id,
+                run_dir,
+                f"Mirrored {len(mirrored)} file(s) of the failed run to S3 "
+                f"under {run_dir.parent.name}/{mode_key}/{run_id}",
+            )
+    except Exception:  # never let mirroring obscure the crash
+        pass
+    # Slack ping on failure (best-effort; never mask the original crash).
+    try:
+        from app.core import notify
+        notify.notify_run_failed(
+            pipeline=str(status.get("mode_label") or status.get("mode") or "AI Mode"),
+            company=status.get("company_name"),
+            run_ref=run_id,
+            error=status["error"],
+            total_rows=status.get("total_rows"),
+            duration_seconds=round(time.perf_counter() - wall_t0, 3),
+        )
+    except Exception:
+        logging.getLogger("ai_mode").warning("slack notify (failed) failed", exc_info=True)
+
+
+def _rebuild_phase1_recs(run_dir: Path, groups: list[list[Entity]]) -> list[dict]:
+    """Rebuild Phase-1 batch records from disk (broker worker / crash recovery).
+
+    File presence is the durable truth: a parseable raw file is a scraped batch;
+    an ``request_NNNNNN.error.json`` marker is a terminal scrape failure; neither
+    means the batch was lost (reported as an error so the run still terminalizes).
+    Per-batch scrape timings are not persisted for successes, so they read 0.0 —
+    the run-level total comes from the status.json counter instead.
+    """
+    raw_dir = run_dir / RAW_RESPONSES_DIRNAME
+    recs: list[dict] = []
+    for idx, group in enumerate(groups, start=1):
+        raw_name = f"request_{idx:06d}.json"
+        rec = {
+            "request_index": idx,
+            "group": group,
+            "group_names": [e.company_name for e in group],
+            "scrapedo_seconds": 0.0,
+            "geo_debug": {},
+            "reused": True,
+        }
+        ok = False
+        raw_path = raw_dir / raw_name
+        if raw_path.exists():
+            try:
+                json.loads(raw_path.read_text(encoding="utf-8"))
+                ok = True
+            except (ValueError, OSError):
+                ok = False
+        if ok:
+            rec.update(ok=True, error=None,
+                       rel_raw_path=f"{RAW_RESPONSES_DIRNAME}/{raw_name}")
+        else:
+            error = "batch was never scraped (message lost)"
+            seconds = 0.0
+            err_path = raw_dir / f"request_{idx:06d}.error.json"
+            if err_path.exists():
+                try:
+                    marker = json.loads(err_path.read_text(encoding="utf-8"))
+                    error = str(marker.get("error") or error)
+                    seconds = float(marker.get("seconds") or 0.0)
+                except (ValueError, OSError, TypeError):
+                    pass
+            rec.update(ok=False, error=error, rel_raw_path=None,
+                       scrapedo_seconds=seconds)
+        recs.append(rec)
+    return recs
+
+
+def run_ai_mode_finish(
+    run_id: str,
+    *,
+    resume: bool = False,
+    phase1_recs: list[dict] | None = None,
+    started_at: str | None = None,
+    wall_t0: float | None = None,
+    scrape_stats: dict | None = None,
+) -> None:
+    """Phases 2+3: LLM-clean every scraped batch, stream-assemble the outputs.
+
+    Standalone and resumable — the broker worker dispatches this once the scrape
+    barrier resolves (and the reconciler re-dispatches it after a crash); the
+    sync engine calls it with its in-memory ``phase1_recs`` so exact per-batch
+    scrape timings are preserved. When ``phase1_recs`` is None, Phase-1 state is
+    rebuilt from disk (raw files + error markers). Never raises: failures land
+    in status.json (status="failed") via _fail_run.
     """
     run_dir = run_store.find_run_dir(run_id)
     if run_dir is None:
-        _ensure_ai_mode_logger().error("[run:%s] run dir not found; cannot run", run_id)
+        _ensure_ai_mode_logger().error("[run:%s] run dir not found; cannot finish", run_id)
         return
     status = _read_status(run_id, run_dir)
-    started_at = utc_now_iso()
-    wall_t0 = time.perf_counter()
+    started_at = started_at or str(status.get("started_at") or utc_now_iso())
+    if wall_t0 is None:
+        wall_t0 = time.perf_counter()
     run_log = _run_log_path(run_dir)
-    if not resume and run_log.exists():
-        try:
-            run_log.unlink()
-        except OSError:
-            pass
-    _ai_log(run_id, run_dir, "AI Mode run resuming" if resume else "AI Mode run starting")
-
-    status["status"] = "running"
-    status["started_at"] = started_at
-    status["updated_at"] = utc_now_iso()
-    status["error"] = None
-    _persist_status(run_id, run_dir, status)
-    _supabase_update_run(status.get("run_db_id"), status="running", started_at=started_at)
+    _report_in_progress: StreamingRunReport | None = None
 
     try:
         mode = get_mode(str(status.get("mode") or "ai_bulk"))
-        batch_size = mode.batch_size()
-        search_prompt = mode.search_prompt()
-
-        settings = build_ai_mode_settings()
+        # Honor the prepare-time batch size persisted in status.json (the same
+        # value the publisher grouped by) — recomputing from env could regroup
+        # entities differently and misalign answers with the wrong companies.
+        try:
+            batch_size = int(status.get("batch_size") or 0) or mode.batch_size()
+        except (TypeError, ValueError):
+            batch_size = mode.batch_size()
         cfg = build_ai_mode_llm_config()
-        _ai_log(
-            run_id,
-            run_dir,
-            "Settings loaded "
-            f"mode={mode.key} batch_size={batch_size} max_query_chars={settings.scrapedo_max_query_chars} "
-            f"timeout={settings.scrapedo_timeout_seconds}s retries={settings.scrapedo_max_retries} "
-            f"device={settings.scrapedo_device or '-'} hl={settings.scrapedo_hl or '-'} "
-            f"gl={settings.scrapedo_gl or '-'} google_domain={settings.scrapedo_google_domain or '-'} "
-            f"include_html={settings.scrapedo_include_html} llm_provider={cfg.provider} llm_model={cfg.model}",
-        )
         llm = make_llm_client(cfg)
-        scrapedo_client = ScrapeDoClient(
-            token=settings.scrapedo_token,
-            timeout_seconds=settings.scrapedo_timeout_seconds,
-            max_retries=settings.scrapedo_max_retries,
-            device=settings.scrapedo_device,
-            hl=settings.scrapedo_hl,
-            gl=settings.scrapedo_gl,
-            google_domain=settings.scrapedo_google_domain,
-            safe=settings.scrapedo_safe,
-            include_html=settings.scrapedo_include_html,
-            log=lambda message: _ai_log(run_id, run_dir, message, logging.DEBUG),
-        )
 
         input_csv = run_dir / "input.csv"
-        entities: list[Entity] = parse_entities_csv(input_csv.read_bytes()).entities
-        _ai_log(
-            run_id,
-            run_dir,
-            f"Loaded entities mode={mode.key} total_entities={len(entities)} input_csv={input_csv}",
-        )
-
+        # Keep the ParsedCSV, not just its entities: Phase 3 needs columns_detected /
+        # positional to pass the input's own columns through to found/notFound.csv,
+        # and re-parsing a 1M-row CSV to learn its header would be absurd.
+        parsed_input = parse_entities_csv(input_csv.read_bytes())
+        entities: list[Entity] = parsed_input.entities
         groups = list(chunked(entities, batch_size))
-        _ai_log(
-            run_id,
-            run_dir,
-            f"Created {len(groups)} Scrape.do batch(es) from batch_size={batch_size}",
-        )
-        status["batches_total"] = len(groups)
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
-
         raw_dir = run_dir / RAW_RESPONSES_DIRNAME
         raw_dir.mkdir(parents=True, exist_ok=True)
         cleaned_dir = run_dir / CLEANED_DIRNAME
         cleaned_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write-through to S3 as files are produced (mirrors SerpWow's per-row
-        # uploads): stream input.csv/status.json now and each raw/cleaned file as
-        # it lands, so a hard kill (OOM/SIGKILL/spot reclaim) that bypasses the
-        # end-of-run mirror still leaves a resumable copy in S3. The end-of-run
-        # mirror still writes the aggregates (final_report/found/notFound).
         from app.services.ai_mode import s3_sync
-        for _seed in ("input.csv", "status.json"):
-            s3_sync.mirror_file_to_s3(run_dir, mode.key, run_dir / _seed)
-
-        results: list[EntityResult] = []
-        per_request_records: list[dict] = []
-        usage_total = TokenUsage()
-        entities_without_scrape_data = 0
-        llm_errors = 0
-        scrapedo_seconds_total = 0.0
-        llm_seconds_total = 0.0
 
         batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
-        concurrency = max(1, _int_env("SCRAPEDO_CONCURRENCY", 5))
+        status["status"] = "running"
         status["model"] = cfg.model
         status["is_batch"] = batch_mode
-        _persist_status(run_id, run_dir, status)
+        status["batches_total"] = len(groups)
 
-        # ------------------------------------------------------------- #
-        # PHASE 1 - scrape every batch (parallel, bounded by concurrency)
-        # ------------------------------------------------------------- #
-        status["phase"] = "scraping"
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
+        # Phase-1 records: exact (sync engine) or rebuilt from disk (worker).
+        if phase1_recs is not None:
+            ordered = phase1_recs
+        else:
+            ordered = _rebuild_phase1_recs(run_dir, groups)
+            _ai_log(
+                run_id, run_dir,
+                f"Finish: rebuilt {len(ordered)} Phase-1 record(s) from disk "
+                f"(ok={sum(1 for r in ordered if r['ok'])})",
+            )
+        ok_batches = [r for r in ordered if r["ok"]]
 
-        def _scrape_one(request_index: int, group: list[Entity]) -> dict:
-            group_names = [e.company_name for e in group]
-            query = search_prompt.replace("{entities}", format_entities_for_prompt(group))
-            geo_params, geo_debug = _geo_params_for_group(settings)
-            raw_name = f"request_{request_index:06d}.json"
-            raw_path = raw_dir / raw_name
-            rel_raw_path = f"{RAW_RESPONSES_DIRNAME}/{raw_name}"
-            # Resume: reuse an existing, parseable raw response instead of re-scraping.
-            if raw_path.exists():
-                try:
-                    payload = json.loads(raw_path.read_text(encoding="utf-8"))
-                    return {
-                        "request_index": request_index, "group": group, "group_names": group_names,
-                        "payload": payload, "error": None, "scrapedo_seconds": 0.0,
-                        "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
-                    }
-                except (ValueError, OSError):
-                    pass
-            t0 = time.perf_counter()
-            try:
-                payload = scrapedo_client.search_google_ai_mode(
-                    query, extra_params=geo_params
-                )
-                seconds = time.perf_counter() - t0
-                raw_path.write_text(
-                    json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-                )
-                # Stream the scrape to S3 immediately (runs in the scrape worker
-                # thread, off the main path; best-effort).
-                s3_sync.mirror_file_to_s3(run_dir, mode.key, raw_path)
-                return {
-                    "request_index": request_index, "group": group, "group_names": group_names,
-                    "payload": payload, "error": None, "scrapedo_seconds": seconds,
-                    "rel_raw_path": rel_raw_path, "geo_debug": geo_debug,
-                }
-            except Exception as exc:  # scrape.do failure for this batch
-                seconds = time.perf_counter() - t0
-                return {
-                    "request_index": request_index, "group": group, "group_names": group_names,
-                    "payload": None, "error": sanitize_secret_text(str(exc)),
-                    "scrapedo_seconds": seconds, "rel_raw_path": None, "geo_debug": geo_debug,
-                }
+        stats = dict(scrape_stats or {})
+        entities_without_scrape_data = stats.get("entities_without_scrape_data")
+        if entities_without_scrape_data is None:
+            entities_without_scrape_data = sum(
+                len(r["group"]) for r in ordered if not r["ok"]
+            )
+        scrapedo_seconds_total = stats.get("scrapedo_seconds_total")
+        if scrapedo_seconds_total is None:
+            scrapedo_seconds_total = float(status.get("scrapedo_seconds_total") or 0.0)
 
-        scraped: dict[int, dict] = {}
-        scrape_done = 0
-        _ai_log(
-            run_id, run_dir,
-            f"Phase 1 scrape starting batches={len(groups)} concurrency={concurrency}",
-        )
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {
-                pool.submit(_scrape_one, idx, grp): idx
-                for idx, grp in enumerate(groups, start=1)
-            }
-            for fut in as_completed(futures):
-                rec = fut.result()
-                scraped[rec["request_index"]] = rec
-                scrapedo_seconds_total += rec["scrapedo_seconds"]
-                if rec["error"]:
-                    entities_without_scrape_data += len(rec["group"])
-                scrape_done += 1
-                status["batches_done"] = scrape_done
-                status["scrapedo_request_count"] = scrape_done
-                status["scrapedo_seconds_total"] = round(scrapedo_seconds_total, 3)
-                status["entities_without_scrape_data"] = entities_without_scrape_data
-                status["scrapedo_failed_requests"] = sum(
-                    1 for r in scraped.values() if r["error"]
-                )
-                status["updated_at"] = utc_now_iso()
-                _persist_status(run_id, run_dir, status)
-        ordered = [scraped[i] for i in sorted(scraped)]
-        ok_batches = [r for r in ordered if r["payload"] is not None]
-        _ai_log(
-            run_id, run_dir,
-            f"Phase 1 scrape complete ok={len(ok_batches)} failed={len(ordered) - len(ok_batches)}",
-        )
+        per_request_records: list[dict] = []
+        usage_total = TokenUsage()
+        llm_errors = 0
+        llm_seconds_total = 0.0
 
         # ------------------------------------------------------------- #
         # PHASE 2 - clean every scraped batch (sync OR Gemini Batch)
@@ -853,9 +916,12 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         status["updated_at"] = utc_now_iso()
         _persist_status(run_id, run_dir, status)
 
-        batch_results_by_index: dict[int, list[EntityResult]] = {}
         llm_error_by_index: dict[int, str | None] = {}
         llm_seconds_by_index: dict[int, float] = {}
+        # Rare-case fallback: a batch whose cleaned/ write failed keeps its text
+        # here so Phase 3 doesn't turn an LLM success into an error. Bounded by
+        # write FAILURES only — normal batches live on disk, not in RAM.
+        cleaned_write_fallback: dict[str, dict] = {}
 
         def _error_results(
             rec: dict, message: str,
@@ -885,35 +951,43 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
 
         def _write_cleaned(key: str, text: str, usage_md: dict | None) -> None:
             # Persist one successfully-cleaned batch so a resume can skip it.
-            # Best-effort: a write failure must never fail the run.
+            # Best-effort: a write failure must never fail the run (the text is
+            # kept in cleaned_write_fallback so Phase 3 still assembles it).
             if not (text or "").strip():
                 return
+            record = {"key": key, "text": text, "usage": usage_md}
             path = cleaned_dir / f"{key}.json"
             try:
-                path.write_text(
-                    json.dumps({"key": key, "text": text, "usage": usage_md}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
             except OSError as exc:
                 _ai_log(run_id, run_dir, f"failed to write cleaned/{key}.json: {exc}", logging.WARNING)
+                cleaned_write_fallback[key] = record
                 return
             s3_sync.mirror_file_to_s3(run_dir, mode.key, path)
 
         def _load_cleaned(key: str) -> dict | None:
             # Return a previously-cleaned {key,text,usage} record, or None.
             path = cleaned_dir / f"{key}.json"
-            if not path.exists():
-                return None
+            if path.exists():
+                try:
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    obj = None
+                if isinstance(obj, dict) and str(obj.get("text") or "").strip():
+                    return obj
+            return cleaned_write_fallback.get(key)
+
+        def _load_raw_payload(request_index: int) -> Any:
+            # Re-read one batch's scrape payload from disk (never held in RAM).
+            path = raw_dir / f"request_{request_index:06d}.json"
             try:
-                obj = json.loads(path.read_text(encoding="utf-8"))
+                return json.loads(path.read_text(encoding="utf-8"))
             except (ValueError, OSError):
                 return None
-            if isinstance(obj, dict) and str(obj.get("text") or "").strip():
-                return obj
-            return None
 
         def _messages_for(rec: dict) -> list[dict]:
-            return build_cleanup_messages(_payload_text(rec["payload"]), rec["group"])
+            payload = _load_raw_payload(rec["request_index"])
+            return build_cleanup_messages(_payload_text(payload), rec["group"])
 
         if batch_mode:
             if not _str_env("GEMINI_API_KEY"):
@@ -924,27 +998,30 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             timeout_sec = max(60, _int_env("AI_MODE_BATCH_TIMEOUT_SEC", 172800))
             clean_t0 = time.perf_counter()
 
-            collected_by_key: dict[str, dict] = {}
-            # Resume: reuse batches already cleaned on a prior attempt; only the
-            # rest get re-submitted to Gemini (Phase 1 already reused raw files, so
-            # scrape.do is never re-billed). Harmless on a fresh run (cleaned/ empty).
-            for rec in ok_batches:
-                key = f"batch-{rec['request_index']:06d}"
-                loaded = _load_cleaned(key)
-                if loaded is not None:
-                    collected_by_key[key] = loaded
-            already_cleaned = len(collected_by_key)
+            def _key_for(rec: dict) -> str:
+                return f"batch-{rec['request_index']:06d}"
 
-            items: list[tuple[str, dict]] = []
-            for rec in ok_batches:
-                key = f"batch-{rec['request_index']:06d}"
-                if key in collected_by_key:
-                    continue
-                items.append((key, gemini_batch.messages_to_gemini_request(_messages_for(rec))))
-            shards = [items[i : i + shard_size] for i in range(0, len(items), shard_size)]
+            def _index_from_key(key: str) -> int | None:
+                try:
+                    return int(str(key).rsplit("-", 1)[-1])
+                except (ValueError, TypeError):
+                    return None
+
+            # Resume: batches already cleaned on a prior attempt are skipped; only
+            # the rest get re-submitted to Gemini (Phase 1 already reused raw files,
+            # so scrape.do is never re-billed). Harmless on a fresh run.
+            pending_recs = [rec for rec in ok_batches if _load_cleaned(_key_for(rec)) is None]
+            already_cleaned = len(ok_batches) - len(pending_recs)
+            # Shards hold small metadata records only; each shard's request bodies
+            # are built just-in-time at submit (payload text re-read from disk) so
+            # a 100k-batch run never holds every request body in RAM.
+            shards = [
+                pending_recs[i : i + shard_size]
+                for i in range(0, len(pending_recs), shard_size)
+            ]
             _ai_log(
                 run_id, run_dir,
-                f"Phase 2 Gemini batch: {len(items)} requests in {len(shards)} shard(s) "
+                f"Phase 2 Gemini batch: {len(pending_recs)} requests in {len(shards)} shard(s) "
                 f"shard_size={shard_size} max_inflight={max_inflight} model={cfg.model}"
                 + (f" (reusing {already_cleaned} already-cleaned)" if already_cleaned else ""),
             )
@@ -957,9 +1034,17 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 while next_shard < len(shards) and len(inflight) < max_inflight:
                     si = next_shard
                     next_shard += 1
+                    # Build this shard's request bodies just-in-time and drop them
+                    # after submit (memory stays O(one shard), not O(all batches)).
+                    shard_items = [
+                        (_key_for(rec),
+                         gemini_batch.messages_to_gemini_request(_messages_for(rec)))
+                        for rec in shards[si]
+                    ]
                     create_obj = gemini_batch.create_batch(
-                        cfg.model, shards[si], display_name=f"ai-mode-{run_id}-shard-{si + 1}"
+                        cfg.model, shard_items, display_name=f"ai-mode-{run_id}-shard-{si + 1}"
                     )
+                    del shard_items
                     name = gemini_batch.batch_name_from_create(create_obj)
                     if not name:
                         raise RuntimeError(
@@ -994,10 +1079,19 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     if gemini_batch.is_terminal(sname, done):
                         if gemini_batch.is_success(sname, done, batch_obj):
                             for c in gemini_batch.collect_results(batch_obj):
-                                if c.get("key"):
-                                    collected_by_key[c["key"]] = c
-                                    if c.get("text") and not c.get("error"):
-                                        _write_cleaned(c["key"], c["text"], c.get("usage"))
+                                key = c.get("key")
+                                if not key:
+                                    continue
+                                if c.get("text") and not c.get("error"):
+                                    # Durable checkpoint; Phase 3 reads it back
+                                    # from disk (nothing retained in RAM).
+                                    _write_cleaned(key, c["text"], c.get("usage"))
+                                else:
+                                    cidx = _index_from_key(key)
+                                    if cidx is not None:
+                                        llm_error_by_index[cidx] = sanitize_secret_text(
+                                            f"LLM error: {c.get('error') or 'empty batch output'}"
+                                        )
                             _ai_log(
                                 run_id, run_dir,
                                 f"Gemini batch shard {si + 1} succeeded job={name} state={sname}",
@@ -1013,74 +1107,42 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     inflight.pop(name, None)
                 if next_shard < len(shards) or inflight:
                     time.sleep(poll_sec)
+                    # Heartbeat: a Gemini batch can take hours — keep updated_at
+                    # fresh so the reconciler's staleness checks (and operators)
+                    # never mistake a healthy long wait for a dead run.
+                    status["updated_at"] = utc_now_iso()
+                    _persist_status(run_id, run_dir, status)
 
-            for rec in ok_batches:
-                idx = rec["request_index"]
-                key = f"batch-{idx:06d}"
-                c = collected_by_key.get(key)
-                if c is None or c.get("error") or not c.get("text"):
-                    msg = sanitize_secret_text(
-                        "missing from LLM batch output"
-                        if c is None
-                        else f"LLM error: {c.get('error')}"
-                    )
-                    llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(
-                        rec, msg, source=SRC_GEMINI,
-                        category=categorize_http_error(None, msg))
-                    llm_errors += len(rec["group"])
-                    continue
-                parsed_array = parse_json_array_from_text(c["text"])
-                if parsed_array is None:
-                    msg = sanitize_secret_text("LLM error: could not parse JSON array from batch output")
-                    llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(
-                        rec, msg, source=SRC_GEMINI,
-                        category=categorize_http_error(None, msg))
-                    llm_errors += len(rec["group"])
-                    continue
-                usage_total = usage_total + parse_gemini_usage(c.get("usage"))
-                batch_results_by_index[idx] = parse_cleanup_response(parsed_array, rec["group"])
+            # (Per-batch resolution happens in Phase 3, reading cleaned/ files.)
             llm_seconds_total = time.perf_counter() - clean_t0
         else:
             for rec in ok_batches:
                 idx = rec["request_index"]
                 key = f"batch-{idx:06d}"
-                # Resume: reuse a previously-cleaned batch instead of re-calling the LLM.
-                loaded = _load_cleaned(key)
-                if loaded is not None:
-                    parsed_array = parse_json_array_from_text(loaded["text"])
-                    if parsed_array is not None:
-                        usage_total = usage_total + parse_gemini_usage(loaded.get("usage"))
-                        batch_results_by_index[idx] = parse_cleanup_response(parsed_array, rec["group"])
-                        llm_seconds_by_index[idx] = 0.0
-                        continue
+                # Resume: a previously-cleaned batch is left for Phase 3 to read.
+                if _load_cleaned(key) is not None:
+                    llm_seconds_by_index[idx] = 0.0
+                    continue
                 messages = _messages_for(rec)
                 t0 = time.perf_counter()
                 try:
                     parsed, usage = llm.complete_json(messages)
                     secs = time.perf_counter() - t0
-                    usage_total = usage_total + usage
                     parsed_array = coerce_json_array(parsed)
                     if parsed_array is None:
+                        # Tokens were consumed even though the reply is unusable;
+                        # count them here (successes are counted in Phase 3 from
+                        # the cleaned file's usage metadata).
+                        usage_total = usage_total + usage
                         msg = "LLM error: response was not a JSON array"
                         llm_error_by_index[idx] = msg
-                        batch_results_by_index[idx] = _error_results(
-                            rec, msg, source=SRC_GEMINI,
-                            category=categorize_http_error(None, msg))
                         llm_errors += len(rec["group"])
                     else:
-                        batch_results_by_index[idx] = parse_cleanup_response(
-                            parsed_array, rec["group"]
-                        )
                         _write_cleaned(key, json.dumps(parsed_array, ensure_ascii=False), _usage_metadata(usage))
                 except Exception as exc:
                     secs = time.perf_counter() - t0
                     msg = sanitize_secret_text(f"LLM error: {exc}")
                     llm_error_by_index[idx] = msg
-                    batch_results_by_index[idx] = _error_results(
-                        rec, msg, source=SRC_GEMINI,
-                        category=categorize_http_error(None, msg))
                     llm_errors += len(rec["group"])
                 llm_seconds_by_index[idx] = secs
                 llm_seconds_total += secs
@@ -1089,16 +1151,30 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                 _persist_status(run_id, run_dir, status)
 
         # ------------------------------------------------------------- #
-        # PHASE 3 - assemble results + per-request records (in order)
+        # PHASE 3 - stream assembly (in order): read each batch's cleaned
+        # file from disk, classify, and write it straight into the report.
+        # Memory stays O(one batch) — no run-wide results list.
         # ------------------------------------------------------------- #
+        report = _report_in_progress = StreamingRunReport(
+            run_dir,
+            # found/notFound carry the uploaded CSV's own columns ahead of ours. The
+            # writer streams input.csv itself; it needs the header that resolved to the
+            # company name so it can replay parse_entities_csv's skip-blank-name rule.
+            # Headerless (positional) input has no header to pass through and a
+            # different skip rule — fall back to the classic columns.
+            None if parsed_input.positional
+            else parsed_input.columns_detected.get("company_name"))
+        # Recount authoritatively while streaming (the sync path counted
+        # provisionally above for incremental UI persists).
+        llm_errors = 0
         for rec in ordered:
             idx = rec["request_index"]
-            if rec["payload"] is None:
-                results.extend(_error_results(
+            if not rec["ok"]:
+                batch_results = _error_results(
                     rec, f"scrape.do error: {rec['error']}",
                     source=SRC_SCRAPEDO,
                     category=categorize_http_error(None, rec["error"] or ""),
-                ))
+                )
                 _ai_log(
                     run_id,
                     run_dir,
@@ -1106,23 +1182,44 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                     f"({rec['error']})",
                     logging.WARNING,
                 )
-                per_request_records.append(
-                    {
-                        "request_index": idx,
-                        "entity_count": len(rec["group"]),
-                        "entity_names": rec["group_names"],
-                        "status": "error",
-                        "error": rec["error"],
-                        "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
-                        "llm_seconds": 0.0,
-                        "combined_seconds": round(rec["scrapedo_seconds"], 3),
-                        "raw_json_file": rec["rel_raw_path"],
-                        "scrapedo_params": rec["geo_debug"],
-                    }
-                )
+                record = {
+                    "request_index": idx,
+                    "entity_count": len(rec["group"]),
+                    "entity_names": rec["group_names"],
+                    "status": "error",
+                    "error": rec["error"],
+                    "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
+                    "llm_seconds": 0.0,
+                    "combined_seconds": round(rec["scrapedo_seconds"], 3),
+                    "raw_json_file": rec["rel_raw_path"],
+                    "scrapedo_params": rec["geo_debug"],
+                }
+                report.add_batch(record, batch_results)
+                per_request_records.append(record)
                 continue
-            batch_results = batch_results_by_index.get(idx, [])
-            results.extend(batch_results)
+            key = f"batch-{idx:06d}"
+            rec_error = llm_error_by_index.get(idx)
+            loaded = None if rec_error else _load_cleaned(key)
+            batch_results = []
+            if rec_error is None and loaded is None:
+                rec_error = (
+                    "missing from LLM batch output"
+                    if batch_mode
+                    else "LLM error: batch not cleaned"
+                )
+            if rec_error is None:
+                parsed_array = parse_json_array_from_text(loaded["text"])
+                if parsed_array is None:
+                    rec_error = "LLM error: could not parse JSON array from batch output"
+                else:
+                    usage_total = usage_total + parse_gemini_usage(loaded.get("usage"))
+                    batch_results = parse_cleanup_response(parsed_array, rec["group"])
+            if rec_error is not None:
+                rec_error = sanitize_secret_text(rec_error)
+                batch_results = _error_results(
+                    rec, rec_error, source=SRC_GEMINI,
+                    category=categorize_http_error(None, rec_error))
+                llm_errors += len(rec["group"])
             for r in batch_results:
                 if r.website_url:
                     _ai_log(
@@ -1138,22 +1235,22 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
                         f"batch {idx} {r.company_name} ({r.country}) -> not found"
                         + (f" ({r.error})" if r.error else ""),
                     )
-            rec_error = llm_error_by_index.get(idx)
             llm_secs = llm_seconds_by_index.get(idx, 0.0)
-            per_request_records.append(
-                {
-                    "request_index": idx,
-                    "entity_count": len(rec["group"]),
-                    "entity_names": rec["group_names"],
-                    "status": "error" if rec_error else "success",
-                    "error": rec_error,
-                    "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
-                    "llm_seconds": round(llm_secs, 3),
-                    "combined_seconds": round(rec["scrapedo_seconds"] + llm_secs, 3),
-                    "raw_json_file": rec["rel_raw_path"],
-                    "scrapedo_params": rec["geo_debug"],
-                }
-            )
+            record = {
+                "request_index": idx,
+                "entity_count": len(rec["group"]),
+                "entity_names": rec["group_names"],
+                "status": "error" if rec_error else "success",
+                "error": rec_error,
+                "scrapedo_seconds": round(rec["scrapedo_seconds"], 3),
+                "llm_seconds": round(llm_secs, 3),
+                "combined_seconds": round(rec["scrapedo_seconds"] + llm_secs, 3),
+                "raw_json_file": rec["rel_raw_path"],
+                "scrapedo_params": rec["geo_debug"],
+            }
+            report.add_batch(record, batch_results)
+            per_request_records.append(record)
+            del batch_results
 
         # ----------------------------------------------------------------- #
         # Outputs: found.csv / notFound.csv / ONE final_report.json
@@ -1161,12 +1258,17 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
         total_wall = time.perf_counter() - wall_t0
         completed_at = utc_now_iso()
         failed_request_count = _failed_request_count(per_request_records)
-        websites_found = sum(1 for r in results if r.website_url)
-        websites_not_found = len(results) - websites_found
         # 3-way outcome taxonomy (SerpWow parity): found / not_found / error.
-        # Tags error_source/error_category on errored EntityResults in place, so
-        # final_report.json carries them (Task 6 wired to_report_dict).
-        outcome_breakdown, error_breakdown = classify_ai_mode_outcomes(results)
+        # The streaming report classified (and tagged) every row as it was added,
+        # so the breakdowns are read off its counters — no results list needed.
+        websites_found = report.websites_found
+        websites_not_found = report.websites_not_found
+        entities_processed = websites_found + websites_not_found
+        outcome_breakdown = dict(report.counts)
+        error_breakdown = {
+            "by_source": dict(report.by_source),
+            "by_category": dict(report.by_category),
+        }
         errored = outcome_breakdown["errored"]
         # completed_with_errors iff there are genuine errors (a run with only
         # not_found rows is a clean `completed`). `errored` is a superset of
@@ -1197,7 +1299,7 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             "llm": {"provider": cfg.provider, "base_url": cfg.base_url, "model": cfg.model},
             "batch_size": batch_size,
             "total_input_entities": len(entities),
-            "entities_processed": len(results),
+            "entities_processed": entities_processed,
             "entities_without_scrape_data": entities_without_scrape_data,
             "llm_errors": llm_errors,
             "websites_found": websites_found,
@@ -1217,7 +1319,7 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             "started_at": started_at,
             "completed_at": completed_at,
         }
-        output_paths = write_outputs(run_dir, results, summary=summary, requests=per_request_records)
+        output_paths = report.close(summary)
 
         # Per-request summary lines into the single run.log.
         for record in per_request_records:
@@ -1240,7 +1342,7 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
 
         # Reflect final summary counts in the status.
         status["status"] = run_status
-        status["entities_processed"] = len(results)
+        status["entities_processed"] = entities_processed
         status["entities_without_scrape_data"] = entities_without_scrape_data
         status["llm_errors"] = llm_errors
         status["scrapedo_request_count"] = len(per_request_records)
@@ -1323,51 +1425,9 @@ def run_ai_mode_sync(run_id: str, resume: bool = False) -> None:
             )
         except Exception:
             logging.getLogger("ai_mode").warning("slack notify (complete) failed", exc_info=True)
-
     except Exception as exc:  # never raise to caller
-        status["status"] = "failed"
-        status["error"] = sanitize_secret_text(str(exc))
-        status["updated_at"] = utc_now_iso()
-        _persist_status(run_id, run_dir, status)
-        _supabase_update_run(
-            status.get("run_db_id"),
-            status="failed",
-            error=status["error"],
-            duration_seconds=round(time.perf_counter() - wall_t0, 3),
-            finished_at=utc_now_iso(),
-        )
-        _ai_log(
-            run_id,
-            run_dir,
-            f"AI Mode run crashed error={status['error']}",
-            logging.ERROR,
-        )
-        # Mirror the failed run dir to S3 too, so raw_responses/run.log are available
-        # for debugging (best-effort; never mask the original failure).
-        try:
-            from app.services.ai_mode.s3_sync import mirror_run_to_s3
-            mode_key = str(status.get("mode") or "ai_bulk")
-            mirrored = mirror_run_to_s3(run_dir, mode_key)
-            if mirrored:
-                _ai_log(
-                    run_id,
-                    run_dir,
-                    f"Mirrored {len(mirrored)} file(s) of the failed run to S3 "
-                    f"under {run_dir.parent.name}/{mode_key}/{run_id}",
-                )
-        except Exception:  # never let mirroring obscure the crash
-            pass
-        # Slack ping on failure (best-effort; never mask the original crash).
-        try:
-            from app.core import notify
-            notify.notify_run_failed(
-                pipeline=str(status.get("mode_label") or status.get("mode") or "AI Mode"),
-                company=status.get("company_name"),
-                run_ref=run_id,
-                error=status["error"],
-                total_rows=status.get("total_rows"),
-                duration_seconds=round(time.perf_counter() - wall_t0, 3),
-            )
-        except Exception:
-            logging.getLogger("ai_mode").warning("slack notify (failed) failed", exc_info=True)
-        return
+        # Discard any half-written CSVs so a crashed finish never leaves
+        # truncated found/notFound files served as complete.
+        if _report_in_progress is not None:
+            _report_in_progress.abort()
+        _fail_run(run_id, run_dir, status, exc, wall_t0)

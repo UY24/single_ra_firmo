@@ -40,8 +40,11 @@ class CrawlResponse(BaseModel):
     services: list[str] = []
     website_company_descirption_ai: Optional[str] = None
     website_company_descirption_translated_ai: Optional[str] = None
-    massive_proxy_cost_usd: float
-    serpwow_cost_usd: float
+    # Provider-specific costs are Optional: a pipeline that doesn't use a provider
+    # leaves it None ("not applicable") rather than reporting a misleading $0.00.
+    # gmaps runs on scrape.do (credits, not USD) and sets neither.
+    massive_proxy_cost_usd: Optional[float] = None
+    serpwow_cost_usd: Optional[float] = None
     gemini_cost_usd: float
     total_cost_usd: float
     context: dict[str, Any]

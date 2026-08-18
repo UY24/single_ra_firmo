@@ -51,38 +51,29 @@ class TestRowReconcile(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertIn("terminalized", (failed.get("error") or ""))
 
-    async def test_gmaps_batch_mode_stuck_row_is_requeued(self):
-        # gmaps in batch mode (GMAPS_CONFIDENCE_MODE=llm + GMAPS_LLM_BATCH=true) has
-        # the same Phase1->2 barrier as gsearch (maybe_start_gemini_batch_for_upload
-        # waits for all rows terminal) -> the reconciler MUST cover it too.
+    async def test_the_reconciler_ignores_gmaps_entirely(self):
+        """gmaps has no per-row messages since it moved to the S3-only runner — nothing
+        to re-publish, and its own stale-run scan (gmaps_runner.redrive_stale_runs) is
+        what recovers it. Re-publishing here would push a row job no consumer reads."""
         state = {"upload_id": "u1", "pipeline": "gmaps", "status": "processing",
                  "rows": [_row(1, "completed", 0), _row(2, "processing", 9999)]}
-        persisted = {}
         published_list = []
 
         async def fake_publish(job): published_list.append(job)
 
-        async def fake_persist(uid, st): persisted["state"] = st
-
         with mock.patch.dict("os.environ", {
             "GSEARCH_ROW_STALE_TIMEOUT_SEC": "60", "GSEARCH_ROW_MAX_REQUEUE": "1",
-            "GMAPS_CONFIDENCE_MODE": "llm", "GMAPS_LLM_BATCH": "true",
         }, clear=False), \
              mock.patch.object(app, "_list_local_state_files_sync", return_value=[]), \
              mock.patch.object(app, "_collect_states_for_reconcile", new=mock.AsyncMock(return_value=[state])), \
              mock.patch.object(app, "_get_rabbitmq_queue_depth", new=mock.AsyncMock(return_value=0)), \
              mock.patch.object(app, "read_upload_artifact", new=mock.AsyncMock(return_value=state)), \
-             mock.patch.object(app, "persist_upload_state", new=fake_persist), \
              mock.patch.object(app, "publish_job", new=fake_publish), \
              mock.patch.object(app, "rabbitmq_exchange", object()), \
              mock.patch.object(app, "rabbitmq_queue", object()):
             await app.reconcile_stuck_gsearch_rows()
 
-        self.assertEqual([j["row_index"] for j in published_list], [2])
-        requeued = [x for x in persisted["state"]["rows"] if x["row_index"] == 2][0]
-        self.assertEqual(requeued["status"], "queued")
-        self.assertEqual(requeued["requeue_attempts"], 1)
-
+        self.assertEqual(published_list, [])
     async def test_gmaps_heuristic_mode_is_skipped(self):
         # Heuristic gmaps (default mode) has no Gemini-batch barrier -> the
         # reconciler must NOT touch it, even with a long-stuck row.

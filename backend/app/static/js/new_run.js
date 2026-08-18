@@ -1,6 +1,6 @@
 // backend/app/static/js/new_run.js - full-width "start a new run" workflow.
 import { api, el, fmtNum } from "./api.js";
-import { errorCard, head, cell } from "./ui.js";
+import { errorCard, head, cell, runHref } from "./ui.js";
 
 const _AI_COLS = [
   { name: "company_name", req: true,  hint: "company, name, entity_name, entity, organization" },
@@ -18,18 +18,17 @@ const _SW_COLS = [
   { name: "full_address", req: false, hint: "address, fulladdress, input_full_address" },
 ];
 const _FIRMO_COLS = [
-  { name: "official_website", req: true,  hint: "website, url, domain" },
-  { name: "company_name",     req: false, hint: "company, name  (falls back to domain)" },
+  { name: "website_url",      req: true,  hint: "official_website, website, url, domain" },
+  { name: "company_name",     req: false, hint: "company, name, entity_name, entity, organization" },
   { name: "country",          req: false, hint: "country_name, nation" },
   { name: "firm_id",          req: false, hint: "firmid, id" },
   { name: "industry",         req: false, hint: "input_industry" },
   { name: "full_address",     req: false, hint: "address, fulladdress, input_full_address" },
 ];
 const _REL_COLS = [
-  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR text ok; blank rows -> skipped.csv)" },
+  { name: "Company_Name_Y", req: true,  hint: "the company to find (OCR-derived text is accepted)" },
   { name: "Company_Name_X", req: true,  hint: "the investor firm — the relationship is verified against it" },
-  { name: "Input_URL",      req: false, hint: "Company X's page URL; its domain powers the site:<X-domain> phase + blocks X's own site from results" },
-  { name: "city / country", req: false, hint: "added to the plain \"Y official website\" phase" },
+  { name: "Input_URL",      req: true,  hint: "Company X's full official page URL; also prevents returning X's own site" },
 ];
 
 const PIPELINES = [
@@ -38,13 +37,11 @@ const PIPELINES = [
   { key: "ai_deep", label: "AI Mode 2 - Deep Search", endpoint: "/uploads/ai-mode", ai: true,
     desc: "Small batches, deeper investigation, better for hard targets.", csvCols: _AI_COLS },
   { key: "gmaps", label: "Google Maps", endpoint: "/uploads/gmaps",
-    desc: "Fast SerpWow Maps discovery for local business signals.", csvCols: _SW_COLS },
+    desc: "Fast Scrape.do Maps discovery for local business signals.", csvCols: _SW_COLS },
   { key: "gsearch", label: "Google Search", endpoint: "/uploads/gsearch",
     desc: "Search-phase pipeline across Google result strategies.", csvCols: _SW_COLS },
   { key: "relationship", label: "Financial Relationship", endpoint: "/uploads/relationship",
-    desc: "Verifies an X↔Y financial relationship and returns Y's website only when confirmed.", csvCols: _REL_COLS },
-  { key: "full", label: "Upload Console", endpoint: "/uploads",
-    desc: "Discovery, crawl, extraction, and post-processing in one run.", csvCols: _SW_COLS },
+    desc: "Verifies a financial relationship and returns Company Y's website only when confirmed.", csvCols: _REL_COLS },
   { key: "firmographics", label: "Firmographics", endpoint: "/uploads/firmographics",
     desc: "Enrichment for rows that already have a website.", csvCols: _FIRMO_COLS },
 ];
@@ -141,13 +138,10 @@ function previewTables(preview) {
       el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.total_rows)),
       " rows detected."),
   ];
-  // Relationship preview: surface the search plan (pairs/blanks) up front.
-  if (preview.unique_pairs != null) {
+  // Relationship preview: surface the search plan up front.
+  if (preview.relationship) {
     parts.push(el("p", { class: "section-copy" },
-      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.unique_pairs)),
-      " unique (X, Y) pairs will be searched · ",
-      el("span", { class: "font-semibold text-slate-50" }, fmtNum(preview.blank_rows)),
-      " blank rows skipped."));
+      "Each row is verified with one Google AI Mode search (relationship + website)."));
   }
 
   if ((preview.warnings ?? []).length) parts.push(amberCallout(preview.warnings));
@@ -199,9 +193,7 @@ function summaryItem(label, valueNode) {
 
 export function previewCanLaunch(preview, pipeline) {
   if (!preview || !pipeline) return false;
-  return pipeline.key === "relationship"
-    ? Number(preview.unique_pairs ?? 0) > 0
-    : Number(preview.total_rows ?? 0) > 0;
+  return Number(preview.total_rows ?? 0) > 0;
 }
 
 export async function render(root) {
@@ -342,11 +334,16 @@ export async function render(root) {
 
     const pipelineKey = pipeline.key;
     previewArea.replaceChildren(el("p", { class: "section-copy" }, "Previewing..."));
-    // Relationship CSVs have their own header shape (Company_Name_Y /
-    // Company_Name_X / Input_URL), so they get their own dry-run preview
-    // endpoint; everything else uses the shared /uploads/preview.
-    const previewEndpoint = (!pipeline.ai && pipelineKey === "relationship")
-      ? "/uploads/relationship/preview" : "/uploads/preview";
+    // Preview with the parser the UPLOAD will use. Relationship (Company_Name_Y /
+    // Company_Name_X / Input_URL) and firmographics (website_url, no company/country
+    // required) have their own header shapes, so they get their own dry-run endpoints;
+    // the shared /uploads/preview runs parse_entities_csv and would report their files
+    // as headerless, positional "col 1 = company, col 2 = country".
+    const previewEndpoint = pipeline.ai
+      ? "/uploads/preview"
+      : ({ relationship: "/uploads/relationship/preview",
+           firmographics: "/uploads/firmographics/preview" }[pipelineKey]
+         ?? "/uploads/preview");
     const requestIsCurrent = () => generation === previewGeneration
       && state.file === file
       && state.pipeline?.key === pipelineKey;
@@ -405,7 +402,7 @@ export async function render(root) {
         el("p", { class: "text-sm font-semibold text-emerald-600" },
           `Run started (${info.run_id ?? info.upload_id ?? "ok"}). Redirecting...`));
       const target = state.pipeline.ai
-        ? `#/runs/${encodeURIComponent(info.run_id)}`
+        ? runHref(info.run_id, "ai")
         : "#/runs";
       setTimeout(() => { window.location.hash = target; }, 700);
     } catch (e) {

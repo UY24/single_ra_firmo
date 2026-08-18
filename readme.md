@@ -1,7 +1,7 @@
 # website_url_finder
 
 Company-website discovery behind one FastAPI app: cheap **SerpWow pipelines** (gmaps /
-gsearch / full / url_discovery / firmographics) plus **AI Mode** (`ai_bulk` / `ai_deep`,
+gsearch / firmographics / relationship) plus **AI Mode** (`ai_bulk` / `ai_deep`,
 scrape.do Google AI Mode + LLM cleanup). Company/run tracking lives in Supabase; the UI is
 served at `/app`.
 
@@ -84,7 +84,7 @@ cd backend && ../.venv/bin/python -m app.main    # or run the module directly
 
 **Terminal 2 — the SerpWow worker (SerpWow pipelines only):** AI Mode runs entirely
 in-process and needs neither RabbitMQ nor a worker. For the SerpWow pipelines
-(full / url_discovery / firmographics / gmaps / gsearch), first start RabbitMQ (the bundled
+(firmographics / gmaps / gsearch / relationship), first start RabbitMQ (the bundled
 compose file provides a `rabbitmq:3.13-management` container; user/pass default to
 `guest`/`guest` unless set in `.env`):
 
@@ -119,5 +119,6 @@ rows"** button that carries resolved rows over.
 
 ## More docs
 
-- `HANDOFF.md` — architecture and current state (start at the top)
+- `CLAUDE.md` — architecture (durable)
+- `HANDOFF.md` — current state: what's done, what's owed, what's blocking 500k
 - `docs/` — SerpWow pipeline internals, configuration reference, API endpoints

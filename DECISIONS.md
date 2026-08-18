@@ -9,6 +9,33 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-18 — firmographics' input column is `website_url`
+
+The firmographics upload required `official_website` (aliases `website`/`url`/`domain`) —
+and did **not** accept `website_url`, which is the exact name every other pipeline WRITES
+into found.csv. So the natural workflow (run gmaps or AI Mode, feed the found rows into
+firmographics for enrichment) failed validation on the file we had just produced.
+
+### D27. Rename the user-facing column, keep the old names as aliases
+
+`website_url` is now the canonical name — first in the alias tuple, and the name in both
+error messages and the "Expected CSV columns" chip in `new_run.js`.
+`official_website`/`website`/`url`/`domain` still resolve, so no existing CSV breaks.
+
+### D28. The internal key stays `official_website`
+
+The parsed row's dict key, the state row's field, the executor argument and the XLSX's
+`input_official_website` column are untouched. Renaming those is a different change with a
+real blast radius (state rows, the firmographics executor, the XLSX schema) and no user
+benefit — the ask was about the column a user has to type in their CSV. The mapping is
+one line in `csv_input.parse_firmographics_csv_rows`.
+
+Covered by `tests/test_firmographics_csv.py` — the first test this parser has ever had:
+`website_url` resolves, every legacy alias still resolves, and the error message names
+the column it actually wants.
+
+---
+
 ## 2026-08-11 (d) — every output CSV is the input file plus the computed columns
 
 *"i want what the input file has thats all."*

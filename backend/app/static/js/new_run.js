@@ -18,7 +18,7 @@ const _SW_COLS = [
   { name: "full_address", req: false, hint: "address, fulladdress, input_full_address" },
 ];
 const _FIRMO_COLS = [
-  { name: "official_website", req: true,  hint: "website, url, domain" },
+  { name: "website_url",      req: true,  hint: "official_website, website, url, domain" },
   { name: "company_name",     req: false, hint: "company, name  (falls back to domain)" },
   { name: "country",          req: false, hint: "country_name, nation" },
   { name: "firm_id",          req: false, hint: "firmid, id" },

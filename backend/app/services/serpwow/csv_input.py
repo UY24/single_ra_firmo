@@ -142,7 +142,8 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     if not reader.fieldnames:
         raise ValueError(
-            "CSV must include headers for firmographics upload. Required: official_website (or website/url/domain)."
+            "CSV must include headers for firmographics upload. "
+            "Required: website_url (or official_website/website/url/domain)."
         )
 
     normalized = {_normalize_header(h): h for h in reader.fieldnames if h}
@@ -153,7 +154,9 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
     industry_key = None
     full_address_key = None
 
-    for key in ("official_website", "website", "url", "domain"):
+    # website_url first: it is what every other pipeline WRITES into found.csv, so an
+    # enrichment run can take that file back unchanged. The rest are legacy aliases.
+    for key in ("website_url", "official_website", "website", "url", "domain"):
         if key in normalized:
             website_key = normalized[key]
             break
@@ -180,7 +183,8 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
 
     if not website_key:
         raise ValueError(
-            "Firmographics CSV must include official_website (or website/url/domain) column."
+            "Firmographics CSV must include a website_url "
+            "(or official_website/website/url/domain) column."
         )
 
     for idx, row in enumerate(reader, start=1):
@@ -204,5 +208,5 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
         )
 
     if not rows:
-        raise ValueError("Firmographics CSV has no valid rows with official_website.")
+        raise ValueError("Firmographics CSV has no valid rows with a website_url.")
     return rows

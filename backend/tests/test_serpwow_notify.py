@@ -93,22 +93,31 @@ class NotifyTerminalRoutingTests(unittest.TestCase):
         self.assertNotIn("success", kw)
         self.assertNotIn("failed", kw)
 
-    def test_non_gsearch_omits_search_token_cost(self):
-        # firmographics has no serpwow_reporting-style cost/token tracking -> omitted.
+    def test_firmographics_reports_scrapedo_credits(self):
+        """firmographics joined COST_SUMMARY_PIPELINES in 2026-08-19: it spends scrape.do
+        credits per row, so the ping must say so instead of reporting a bare row count."""
         state = {"upload_id": "UP4", "company_name": "Acme Inc", "pipeline": "firmographics",
-                 "status": "completed", "total_rows": 2, "success_rows": 2, "failed_rows": 0}
+                 "status": "completed", "total_rows": 2, "success_rows": 2, "failed_rows": 0,
+                 "rows": [{"status": "completed", "outcome": "found",
+                           "result": {"official_website": "https://a.com",
+                                      "gemini_cost_usd": 0.0002,
+                                      "context": {"cost_breakdown": {
+                                          "scrapedo_requests": 2,
+                                          "scrapedo_successful_requests": 2,
+                                          "scrapedo_credits": 15,
+                                          "scrapedo_search_successful": 1,
+                                          "scrapedo_ai_overview_successful": 1}}}}]}
         with mock.patch("app.core.notify.notify_run_complete") as done, \
                 mock.patch("app.core.notify.notify_run_failed"):
             la._notify_slack_terminal(state)
         kw = done.call_args.kwargs
-        self.assertNotIn("searches", kw)
-        self.assertNotIn("tokens", kw)
-        self.assertNotIn("cost_usd", kw)
-        # `full` is not a REPORTING_PIPELINES member -> keeps the old success/failed pair.
-        self.assertEqual(kw["success"], 2)
-        self.assertEqual(kw["failed"], 0)
-        self.assertNotIn("found", kw)
-        self.assertNotIn("errored", kw)
+        self.assertEqual(kw["credits"], 15)
+        self.assertEqual(kw["search_label"], "Scrape.do requests")
+        # Credits are not dollars: the provider USD figure must be suppressed, and the
+        # only USD reported is the LLM's.
+        self.assertIsNone(kw["serpwow_cost_usd"])
+        self.assertNotIn("success", kw)
+        self.assertNotIn("failed", kw)
 
     def test_gsearch_includes_searches_tokens_cost(self):
         # gsearch has real serpwow_searches/tokens/cost (LLM batch/per-row

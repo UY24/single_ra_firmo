@@ -132,6 +132,24 @@ def classify_finalized_row(result: dict[str, Any], *, pipeline: str,
     total, succeeded, errored, dominant_cat, first_detail, phase_source = _phase_stats(
         result or {})
     degraded = bool(succeeded and errored)
+    if pipeline == "firmographics":
+        # firmographics is HANDED the website, so official_website is an echo of the
+        # INPUT and says nothing about whether the row worked. Judging it the usual way
+        # made every row "found" -- including rows whose provider call failed outright,
+        # which then reported success at zero cost. Classify on what the row actually
+        # produced instead: the provider erroring is an error, no AI overview to extract
+        # from is a business not-found, anything else is found.
+        if total > 0 and succeeded == 0:
+            source = phase_source or SRC_SCRAPEDO
+            return OutcomeInfo(OUTCOME_ERROR, source,
+                               dominant_cat or CAT_INTERNAL,
+                               error_detail=first_detail or f"{source} search failed")
+        if not official:
+            return OutcomeInfo(OUTCOME_NOT_FOUND)
+        enriched = any(
+            (result or {}).get(field) for field in
+            ("address", "phone", "email", "industry", "products", "services"))
+        return OutcomeInfo(OUTCOME_FOUND) if enriched else OutcomeInfo(OUTCOME_NOT_FOUND)
     if official:
         # gsearch falls back to the raw first candidate as official_website, so a
         # per-row Gemini SELECTION failure still yields a found row (no retry, no

@@ -5,7 +5,7 @@ Asserts that:
 1. _upload_s3_prefix produces the correct prefix for an upload company name.
 2. _build_row_job_payload carries upload_company_name in the payload.
 3. process_upload_job passes the upload company (folder) AND the row company
-   (filename) to upload_serpwow_json_to_s3.
+   (filename) to upload_raw_response_to_s3.
 4. Per-row raw JSON is keyed under serpwow_response/ with a 6-digit index +
    the row company name.
 """
@@ -89,7 +89,7 @@ class TestBuildRowJobPayload(unittest.TestCase):
 class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
     """
     Behavioral test: process_upload_job passes the upload company (from
-    job['upload_company_name']) to upload_serpwow_json_to_s3, not the row company.
+    job['upload_company_name']) to upload_raw_response_to_s3, not the row company.
     """
 
     def _make_job(self, upload_company="ISI Market Test", row_company="Row Company LLC"):
@@ -136,7 +136,7 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
 
         with mock.patch.object(app, "execute_gsearch_lookup_for_worker",
                                side_effect=_fake_gsearch), \
-             mock.patch.object(app, "upload_serpwow_json_to_s3",
+             mock.patch.object(app, "upload_raw_response_to_s3",
                                side_effect=fake_s3_upload), \
              mock.patch.object(app, "update_row_state",
                                side_effect=fake_update_row_state), \
@@ -151,7 +151,7 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
             asyncio.run(app.process_upload_job(job))
 
         self.assertIn("upload_company_name", captured,
-                      "upload_serpwow_json_to_s3 was never called")
+                      "upload_raw_response_to_s3 was never called")
         # Folder uses the UPLOAD company (one folder per run)...
         self.assertEqual(
             captured["upload_company_name"], "ISI Market Test",
@@ -165,7 +165,7 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
 
 
 class TestSerpwowKeyLayout(unittest.TestCase):
-    """_upload_serpwow_json_sync: per-row raw JSON lands under serpwow_response/
+    """_upload_raw_response_sync: per-row raw JSON lands under serpwow_response/
     with a 6-digit index + the ROW company name, inside the UPLOAD company folder."""
 
     def tearDown(self):
@@ -180,7 +180,7 @@ class TestSerpwowKeyLayout(unittest.TestCase):
 
         with mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}, clear=False), \
              mock.patch.object(app, "get_s3_client", return_value=_FakeS3()):
-            key = app._upload_serpwow_json_sync(
+            key = app._upload_raw_response_sync(
                 "uid123", 1, '{"x": 1}', "gsearch",
                 upload_company_name="ISI Market Test",
                 row_company_name="A M Corporation",
@@ -202,7 +202,7 @@ class TestSerpwowKeyLayout(unittest.TestCase):
         app._s3_run_prefix_cache["uid123"] = "ISI_Market_Test/gsearch/uid123"
         with mock.patch.dict("os.environ", {"S3_BUCKET": "bkt"}, clear=False), \
              mock.patch.object(app, "get_s3_client", return_value=_FakeS3()):
-            key = app._upload_serpwow_json_sync(
+            key = app._upload_raw_response_sync(
                 "uid123", 1, '{"x": 1}', "gsearch",
                 upload_company_name="ISI Market Test",
                 row_company_name="A M Corporation",
@@ -214,6 +214,28 @@ class TestSerpwowKeyLayout(unittest.TestCase):
             "000001_A_M_Corporation_serpwow.json",
         )
         self.assertEqual(captured["Key"], key)
+
+
+class RawArtifactNamingTests(unittest.TestCase):
+    """The per-row raw object says which provider produced it.
+
+    A firmographics row holds a scrape.do SERP, so storing it as
+    ``serpwow_response/..._serpwow.json`` mislabelled every row of that pipeline after its
+    2026-08-19 migration. gsearch is the one pipeline still on SerpWow and must keep its
+    existing names, or its pre- and post-change runs split across two folders.
+    """
+
+    def test_firmographics_uses_search_response(self) -> None:
+        self.assertEqual(app._raw_artifact_names("firmographics"),
+                         ("search_response", "search"))
+
+    def test_gsearch_keeps_serpwow_response(self) -> None:
+        self.assertEqual(app._raw_artifact_names("gsearch"),
+                         ("serpwow_response", "serpwow"))
+
+    def test_unknown_pipeline_falls_back(self) -> None:
+        self.assertEqual(app._raw_artifact_names(""),
+                         ("serpwow_response", "serpwow"))
 
 
 if __name__ == "__main__":

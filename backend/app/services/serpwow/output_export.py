@@ -1,4 +1,4 @@
-# backend/app/services/serpwow/xlsx_export.py
+# backend/app/services/serpwow/output_export.py
 """Dependency-free tabular export of an upload's output payload: XLSX and CSV.
 
 Both formats come from ONE table builder (``build_upload_output_table``) so a column

@@ -10,10 +10,9 @@ extracted into focused sibling modules (all re-imported below for backward-compa
   geo / cost / url_utils / address     — leaf helpers (locale, pricing, URLs, addresses)
   query_builders / gmaps_scoring       — search-query construction, Maps scoring
   serpwow_client / gemini_llm          — SerpWow HTTP + Gemini confidence/selection
-  csv_input / xlsx_export / serpwow_reporting — I/O + reporting
+  csv_input / output_export / serpwow_reporting — I/O + reporting
   modes/{gsearch,gmaps,firmographics,full,common} — per-mode row executors
   scrapedo_maps_client                 — scrape.do Google Maps search (gmaps pipeline)
-  codetails                            — standalone SerpWow codetails API script
 
 Shared, provider-agnostic helpers live in ``app/services/common/`` (text, env).
 """
@@ -65,7 +64,7 @@ from app.services.serpwow.url_utils import (
     _domain_from_url,
     _normalize_website_input,
 )
-from app.services.serpwow.xlsx_export import (
+from app.services.serpwow.output_export import (
     _sanitize_excel_text,
     _excel_col_name,
     _xlsx_cell_xml,
@@ -126,7 +125,7 @@ from app.services.serpwow.gemini_llm import (
     _parse_json_from_text,
     _gemini_generate_content_json,
     analyze_with_gemini,
-    standardize_serpwow_ai_overview_with_gemini,
+    standardize_ai_overview_with_gemini,
     parse_city_state_from_full_address_with_gemini,
     transliterate_inputs_with_gemini,
     classify_address_with_gemini,
@@ -137,6 +136,7 @@ from app.services.serpwow.constants import (
     PIPELINE_GMAPS,
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
+    COST_SUMMARY_PIPELINES,
     REPORTING_PIPELINES,
 )
 from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
@@ -147,7 +147,7 @@ from app.services.serpwow.row_logging import (
     _log_row_stage,
 )
 from app.services.serpwow.modes.common import (
-    run_serpwow_from_codetails,
+    run_scrapedo_search_for_firmographics,
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
@@ -1213,18 +1213,35 @@ async def write_upload_text_artifact(upload_id: str, name: str, text: str, conte
     local_path.write_text(text, encoding="utf-8")
 
 
-def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> str:
+# Per-row raw-response artifact naming, by pipeline. The folder and filename suffix say
+# WHICH PROVIDER produced the bytes, so a stored object is self-describing — a
+# firmographics row holds a scrape.do SERP, not a SerpWow response. gsearch is the only
+# pipeline still on SerpWow and keeps its existing names, so its old and new runs stay in
+# one folder.
+_RAW_ARTIFACT_NAMES: dict[str, tuple[str, str]] = {
+    PIPELINE_FIRMOGRAPHICS: ("search_response", "search"),
+}
+_DEFAULT_RAW_ARTIFACT_NAMES = ("serpwow_response", "serpwow")
+
+
+def _raw_artifact_names(pipeline: str) -> tuple[str, str]:
+    """(folder, filename suffix) for one pipeline's per-row raw provider response."""
+    return _RAW_ARTIFACT_NAMES.get(str(pipeline or ""), _DEFAULT_RAW_ARTIFACT_NAMES)
+
+
+def _upload_raw_response_sync(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> str:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         raise RuntimeError("S3_BUCKET not configured")
 
     # Folder uses the UPLOAD company (one folder per run); the per-row filename
     # uses the ROW company so each response is identifiable. Per-row raw responses
-    # live under a serpwow_response/ subfolder, apart from the run aggregates.
+    # live in a provider-named subfolder, apart from the run aggregates.
     safe_name = _safe_name(row_company_name or upload_company_name)
     prefix = _resolved_upload_s3_prefix(
         upload_id, upload_company_name, pipeline)
-    key = f"{prefix}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
+    folder, suffix = _raw_artifact_names(pipeline)
+    key = f"{prefix}/{folder}/{row_index:06d}_{safe_name}_{suffix}.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -1234,12 +1251,12 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pip
     return key
 
 
-async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> tuple[Optional[str], Optional[str]]:
+async def upload_raw_response_to_s3(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> tuple[Optional[str], Optional[str]]:
     if not raw_json:
-        return None, "No SerpWow raw JSON available to upload"
+        return None, "No raw provider response available to upload"
     try:
         key = await asyncio.to_thread(
-            _upload_serpwow_json_sync,
+            _upload_raw_response_sync,
             upload_id,
             row_index,
             raw_json,
@@ -1296,7 +1313,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # XLSX export (_sanitize_excel_text/_excel_col_name/_xlsx_cell_xml/
-# build_upload_output_xlsx_bytes) lives in xlsx_export.py; re-imported at the top.
+# build_upload_output_xlsx_bytes) lives in output_export.py; re-imported at the top.
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
@@ -2324,15 +2341,21 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     state["success_rows"] = success
     state["failed_rows"] = failed
 
+    pipeline_name = str(state.get("pipeline") or "")
+
     def _outcome_of(r: dict[str, Any]) -> Optional[str]:
         oc = r.get("outcome")
         if oc:
             return oc
         # Derive for rows without an explicit outcome (out-of-scope pipelines,
         # or peripheral status="failed" paths like user-stop/redelivery-drop).
+        # The "did it produce a result" test lives in serpwow_reporting and is SHARED
+        # with its _derive_outcome twin: firmographics answers it differently (its
+        # official_website is the input echoed back), and two copies would drift.
         if r.get("status") == "completed":
-            result_obj = r.get("result") if isinstance(r.get("result"), dict) else {}
-            return _outcomes.OUTCOME_FOUND if result_obj.get("official_website") else _outcomes.OUTCOME_NOT_FOUND
+            return (_outcomes.OUTCOME_FOUND
+                    if serpwow_reporting.row_produced_a_result(r.get("result"), pipeline_name)
+                    else _outcomes.OUTCOME_NOT_FOUND)
         if r.get("status") == "failed":
             return _outcomes.OUTCOME_ERROR
         return None
@@ -2604,7 +2627,7 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         extra: dict[str, Any] = {}
         success_count = state.get("success_rows")
         failed_count = state.get("failed_rows")
-        if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
+        if str(state.get("pipeline") or "") in COST_SUMMARY_PIPELINES:
             results = serpwow_reporting.state_to_entity_results(state)
             summ = serpwow_reporting.build_summary(state, results)
             extra = {
@@ -2721,7 +2744,7 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             # the same serpwow_reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            is_reporting = str(state.get("pipeline") or "") in REPORTING_PIPELINES
+            is_reporting = str(state.get("pipeline") or "") in COST_SUMMARY_PIPELINES
             if is_reporting:
                 try:
                     gs = serpwow_reporting.build_summary(
@@ -3387,7 +3410,10 @@ def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postpr
         result, pipeline=pipeline,
         ctx_row_error=(str(ctx.get("row_error")).strip() or None) if ctx.get("row_error") else None,
         skip_llm=bool(ctx.get("skip_llm")))
-    if pipeline in REPORTING_PIPELINES:
+    if pipeline in COST_SUMMARY_PIPELINES:
+        # firmographics joined this set in 2026-08-19: a row whose website simply has no
+        # AI overview is a business not-found, and the legacy binary below turned that
+        # into a "failed" row that "Rerun failed" would re-buy at 10 credits a go.
         return info, info.row_status
     # Out of scope: legacy behavior — only 'found' is completed.
     return info, ("completed" if info.outcome == _outcomes.OUTCOME_FOUND else "failed")
@@ -3470,7 +3496,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             # arriving here is a bug this correctly rejects.
             raise ValueError(f"unknown pipeline {pipeline!r}")
 
-        s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
+        s3_serpwow_json_key, s3_error = await upload_raw_response_to_s3(
             upload_id=upload_id,
             row_index=row_index,
             raw_json=serpwow_raw_json,
@@ -3984,11 +4010,13 @@ async def shutdown_event() -> None:
     if gemini_batch_tasks:
         await asyncio.gather(*gemini_batch_tasks.values(), return_exceptions=True)
         gemini_batch_tasks.clear()
-    # Release the gmaps pipeline's pooled scrape.do connections.
+    # Release the pooled scrape.do connections (gmaps' Maps client and firmographics'
+    # Search client each hold their own pool).
     try:
-        from app.services.serpwow import scrapedo_maps_client
+        from app.services.serpwow import scrapedo_maps_client, scrapedo_search_client
 
         await scrapedo_maps_client.close_shared_client()
+        await scrapedo_search_client.close_shared_client()
     except Exception:
         pass
     await close_rabbitmq()
@@ -5399,7 +5427,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     # batch mode, found counts, cost, tokens) so the run-detail UI can show the
     # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
     serpwow_summary = None
-    if (summary.get("pipeline") or "") in REPORTING_PIPELINES:
+    if (summary.get("pipeline") or "") in COST_SUMMARY_PIPELINES:
         try:
             gs = serpwow_reporting.build_summary(
                 summary, serpwow_reporting.state_to_entity_results(summary))

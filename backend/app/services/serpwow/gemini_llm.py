@@ -124,7 +124,7 @@ def analyze_with_gemini(
     return None, (last_error or "Gemini model resolution failed"), configured_model, None
 
 
-def standardize_serpwow_ai_overview_with_gemini(
+def standardize_ai_overview_with_gemini(
     company_name: str,
     country: str,
     official_website: str,
@@ -145,7 +145,7 @@ def standardize_serpwow_ai_overview_with_gemini(
 
     prompt = (
         "You are a data normalization system.\n"
-        "Convert the provided SerpWow AI Overview into strict JSON only.\n"
+        "Convert the provided Google AI Overview into strict JSON only.\n"
         "Schema:\n"
         "{\n"
         '  "address": string|null,\n'
@@ -163,7 +163,7 @@ def standardize_serpwow_ai_overview_with_gemini(
         f"Company: {company_name}\n"
         f"Country: {country}\n"
         f"Official Website: {official_website}\n\n"
-        "SerpWow AI Overview JSON:\n"
+        "Google AI Overview JSON:\n"
         f"{json.dumps(ai_overview, ensure_ascii=True)[:14000]}"
     )
 

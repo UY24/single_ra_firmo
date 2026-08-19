@@ -44,8 +44,24 @@ class TestEmptyResponseBreakdown(unittest.TestCase):
                          {"all_phases": 0, "some_phases": 0})
 
     def test_other_pipelines_return_none(self):
+        # gmaps has no state.json at all since 2026-08 and reports its own no_listing
+        # count from gmaps_outputs, so it never routes through here.
         self.assertIsNone(empty_response_breakdown({"pipeline": "gmaps", "rows": []}))
-        self.assertIsNone(empty_response_breakdown({"pipeline": "firmographics", "rows": []}))
+        self.assertIsNone(empty_response_breakdown({"pipeline": "relationship", "rows": []}))
+
+    def test_firmographics_counts_billed_rows_with_no_overview(self):
+        """A billed search that yielded no AI overview is credits spent for nothing."""
+        def _row(**scrapedo):
+            return {"result": {"context": {"scrapedo": scrapedo}}}
+        state = {"pipeline": "firmographics", "rows": [
+            _row(billed_no_overview=True),                    # paid, nothing to extract
+            _row(billed_no_overview=True, deferred=True),     # paid twice, still nothing
+            _row(deferred=True),                              # deferred but recovered
+            _row(),                                           # complete inline
+            {"result": {"context": {}}},                      # provider never ran
+        ]}
+        self.assertEqual(empty_response_breakdown(state),
+                         {"no_ai_overview": 2, "deferred": 2})
 
 
 if __name__ == "__main__":

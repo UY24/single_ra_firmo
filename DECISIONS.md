@@ -9,6 +9,128 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-19 — firmographics onto scrape.do Google Search; `xlsx_export` renamed
+
+### D37. `xlsx_export.py` → `output_export.py`
+
+The module writes CSV *and* XLSX since yesterday, and CSV is now the advertised format, so
+the filename named the secondary one. `output_export` pairs with `csv_input` (input parsing
+↔ output export) and stays clear of the `*_outputs.py` family (`gmaps_outputs`,
+`relationship_outputs`), which writes run-level found/notFound files rather than the
+per-upload table. Blast radius was four references.
+
+### D38. Two endpoints, because the AI Overview is not always ready
+
+`/plugin/google/search` returns `ai_overview` inline only when
+`ai_overview.state == "complete"`. On `"deferred"` the content needs a second call to
+`/plugin/google/search/ai-overview?session_key=…`. Both are implemented; a row costs 10
+credits normally and 15 when Google defers.
+
+Rejected: treating a deferred row as a not-found and skipping the follow-up. It would make
+the fill rate depend on Google's generation latency, which is not a property of the company
+being enriched — the same row would enrich or not depending on when it ran.
+
+### D39. The deferred follow-up is NEVER retried
+
+The session key is single-use and expires after 60 seconds; a reused or expired key returns
+`404 {"error": "session not found"}`. A retry therefore *cannot* succeed, so the client
+makes exactly one attempt and, on failure, keeps the search result it already paid for. The
+failure is recorded as `ai_overview_error` and the row is **not** an error: the search was
+billed and its SERP is intact, there is just no overview to normalise. It counts as
+`billed_no_overview` — the refund-claim bucket — which is the honest classification.
+
+This is the one place in the repo where "retry transient failures" is wrong, so it is
+called out in the client rather than left to be re-derived.
+
+### D40. The deferred stub is discarded before the follow-up
+
+Caught by a test, not by review: on a deferred row the inline `ai_overview` block is
+`{state, session_key}` — a stub with no content. Leaving it in place made
+`billed_no_overview` false (the dict is non-empty) and would have handed the stub to the
+LLM as if it were an overview. It is now dropped, and only what the follow-up returns
+counts as content. The same test run caught `deferred` being derived from the FINAL state,
+which a successful follow-up rewrites to `"complete"` — hiding the 5 credits it had just
+cost. `deferred` is now recorded independently.
+
+### D41. Credits only; the sole USD figure is the LLM
+
+`serpwow_cost_usd` and `massive_proxy_cost_usd` are left `None` rather than `0.0` —
+"not applicable" instead of a misleading zero, the convention gmaps set — and
+`total_cost_usd == gemini_cost_usd`. The per-ENDPOINT counts are kept alongside the
+credit total because 10 and 5 credits are not interchangeable: a 100-row run billing 1150
+credits is unexplainable from `scrapedo_credits` alone, but obvious as
+"100 searches + 30 deferred follow-ups".
+
+### D42. `COST_SUMMARY_PIPELINES`, a superset of `REPORTING_PIPELINES`
+
+firmographics needs the billing card, the Supabase cost fields and the Slack credit line.
+It does **not** need `found.csv`/`notFound.csv`: it is handed the website, so that split
+would publish a discovery result it never computed. Rather than add it to
+`REPORTING_PIPELINES` and then special-case the file writer, the two concerns got two
+sets — money at the `/status`/Supabase/Slack sites, files still on `REPORTING_PIPELINES`.
+
+Rejected: a bespoke firmographics summary block on `/status`. `build_summary` already
+routes on the presence of the `scrapedo_*` cost keys, so the existing one worked unchanged
+once the pipeline emitted them; a parallel implementation would be a second thing to keep
+in sync with the UI.
+
+### D43. `official_website` stops meaning "found" for this pipeline
+
+The migration surfaced a pre-existing bug rather than causing it: `classify_finalized_row`
+checks `official_website` first, and for firmographics that is the INPUT echoed back. Every
+row was therefore `found` — including rows whose provider call failed outright, which
+reported success at $0. A firmographics branch now classifies on what the row *produced*:
+provider error ⇒ `error`, no overview or no extracted fields ⇒ `not_found`, fields ⇒
+`found`.
+
+The no-explicit-outcome fallback existed in **two** places with the same wrong test
+(`_derive_outcome` in reporting, `_outcome_of` in `summarize_upload_state`). Fixing one
+would have made report.json and `/status` disagree about the same run, so both now call one
+shared `serpwow_reporting.row_produced_a_result(result, pipeline)`.
+
+firmographics also joined the 3-way `row_status` remap: a website with no AI overview is
+`completed`/`not_found`, not a `failed` row that "Rerun failed" would re-buy at 10 credits
+to get the same empty answer.
+
+### D44. `codetails.py` deleted
+
+firmographics was its only caller. It also `print`ed the full request URL — API key
+included — to stdout on every row, and re-read `.env` at import time inside the worker.
+Its query wording survives as `modes.common.build_firmographics_query` so migrated runs
+stay comparable with the SerpWow ones.
+
+### D45b. SerpWow removed from the firmographics path — where it stops
+
+Removed: `codetails.py`; `standardize_serpwow_ai_overview_with_gemini` →
+`standardize_ai_overview_with_gemini` (firmographics is its only caller, and its prompt no
+longer tells the model it is reading a "SerpWow AI Overview"); the explicit
+`serpwow_cost_usd=None` / `massive_proxy_cost_usd=None` arguments (they are already the
+schema defaults, so passing them only put the old provider's name back in the module); and
+the per-row raw object's name.
+
+That last one mattered most: every firmographics row was being stored as
+`serpwow_response/000001_x_serpwow.json` while containing a scrape.do SERP. It is now
+`search_response/000001_x_search.json`, chosen by `engine._raw_artifact_names(pipeline)`.
+gsearch deliberately keeps `serpwow_response/` — it IS still on SerpWow, and changing it
+would split its pre- and post-change runs across two folders for no gain. The shared
+uploader lost its provider name too (`upload_raw_response_to_s3`), because it serves both.
+
+**Kept SerpWow-named, deliberately:** the `services/serpwow/` package path (the agreed last
+rename), the shared `serpwow_reporting` module, and `CrawlResponse.serpwow_cost_usd` /
+`s3_serpwow_json_key` with their CSV columns. Those are cross-pipeline schema: renaming
+them changes gsearch's output columns and every stored row's shape, which is a migration,
+not a cleanup.
+
+### D46. Not done: `knowledge_graph` is fetched and still unread
+
+The Search endpoint returns `knowledge_graph` (address, phone, founded, HQ, type) and
+`organic_results` in the same 10-credit call, and the pipeline still normalises
+`ai_overview` alone — so the fill-rate upside of the migration is unclaimed, and a row with
+no overview reports nothing despite the SERP holding real contact data. The whole SERP IS
+persisted as the row's raw artifact, so this can be claimed later without re-buying a
+single call. Left out because it changes what the LLM is asked, which is a prompt decision,
+not a provider swap.
+
 ## 2026-08-18 — per-row output: CSV instead of XLSX, and the UTF-8 fix
 
 A 71-row firmographics run was downloaded as XLSX. Two problems: the format is awkward to

@@ -185,9 +185,9 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(mark_running_patcher.stop)
         mark_running_patcher.start()
 
-        # Patch upload_serpwow_json_to_s3 to be a no-op (no real S3).
+        # Patch upload_raw_response_to_s3 to be a no-op (no real S3).
         s3_patcher = mock.patch.object(
-            app, "upload_serpwow_json_to_s3",
+            app, "upload_raw_response_to_s3",
             new=mock.AsyncMock(return_value=(None, None))
         )
         self.addCleanup(s3_patcher.stop)

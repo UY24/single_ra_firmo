@@ -1,8 +1,7 @@
 # backend/app/services/serpwow/modes/common.py
-"""Shared per-mode sub-clients (codetails + gmaps standalone wrappers)."""
+"""Shared per-mode sub-clients (scrape.do search + gmaps standalone wrappers)."""
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 
 from app.services.serpwow.geo import (
@@ -16,92 +15,69 @@ from app.services.serpwow.url_utils import (
     is_disallowed_official_url,
 )
 
-async def run_serpwow_from_codetails(official_website: str, country: Optional[str] = None) -> dict[str, Any]:
+async def run_scrapedo_search_for_firmographics(
+    official_website: str, country: Optional[str] = None,
+) -> dict[str, Any]:
+    """One scrape.do Google Search (+ deferred AI-Overview fetch) for a known website.
+
+    Never raises: every failure comes back inside the envelope so the executor can
+    classify the row.
+
+    The query is still built from the DOMAIN, not the full URL — see ``_domain_from_url``.
+    That is a known limitation: ``https://grupoltn.com/acerolatina`` asks about
+    ``grupoltn.com``, so a sub-brand path enriches its parent group instead.
+    """
     domain = _domain_from_url(official_website)
     if not domain:
         return {
-            "provider": "serpwow",
+            "provider": "scrapedo",
             "used": False,
             "domain": None,
             "query": None,
             "request_count": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "credits": 0,
             "ai_overview": None,
             "raw_response": None,
             "error": "Could not extract domain from official website URL",
+            "error_category": "input",
         }
 
     try:
-        from app.services.serpwow import codetails as codetails_module
+        from app.services.serpwow import scrapedo_search_client as search_client
     except Exception as exc:
         return {
-            "provider": "serpwow",
+            "provider": "scrapedo",
             "used": False,
             "domain": domain,
             "query": None,
             "request_count": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "credits": 0,
             "ai_overview": None,
             "raw_response": None,
-            "error": f"Failed to import codetails.py: {str(exc)}",
+            "error": f"Failed to import scrapedo_search_client.py: {str(exc)}",
+            "error_category": "internal",
         }
 
-    try:
-        request_count = 0
-        query = (
-            codetails_module.build_query(domain)
-            if hasattr(codetails_module, "build_query")
-            else f"What is the address, phone, email, industry, products, services of {domain}"
-        )
-        gl = _country_to_gl(country)
-        raw_data = await asyncio.to_thread(codetails_module.fetch_serpwow, query, gl)
-        request_count += 1
-        ai_overview = (
-            codetails_module.get_ai_overview(raw_data)
-            if hasattr(codetails_module, "get_ai_overview")
-            else raw_data.get("ai_overview", {})
-        )
+    query = build_firmographics_query(domain)
+    envelope = await search_client.search_with_ai_overview(
+        query, gl=_country_to_gl(country))
+    # `domain` is not in the client's envelope (it only knows the query string), but the
+    # executor and the stored row both report it, so add it here.
+    return {**envelope, "domain": domain}
 
-        is_placeholder = (
-            bool(codetails_module.ai_overview_is_placeholder(ai_overview))
-            if hasattr(codetails_module, "ai_overview_is_placeholder")
-            else False
-        )
-        if is_placeholder and hasattr(codetails_module, "build_fallback_query"):
-            fallback_query = codetails_module.build_fallback_query(domain)
-            fallback_data = await asyncio.to_thread(
-                codetails_module.fetch_serpwow, fallback_query, gl
-            )
-            request_count += 1
-            fallback_ai = (
-                codetails_module.get_ai_overview(fallback_data)
-                if hasattr(codetails_module, "get_ai_overview")
-                else fallback_data.get("ai_overview", {})
-            )
-            if not codetails_module.ai_overview_is_placeholder(fallback_ai):
-                raw_data = fallback_data
-                ai_overview = fallback_ai
-                query = fallback_query
 
-        return {
-            "provider": "serpwow",
-            "used": True,
-            "domain": domain,
-            "query": query,
-            "request_count": request_count,
-            "ai_overview": ai_overview,
-            "raw_response": raw_data,
-            "error": None,
-        }
-    except Exception as exc:
-        return {
-            "provider": "serpwow",
-            "used": False,
-            "domain": domain,
-            "query": None,
-            "request_count": 0,
-            "ai_overview": None,
-            "raw_response": None,
-            "error": str(exc),
-        }
+def build_firmographics_query(domain: str) -> str:
+    """The one question this pipeline asks Google.
+
+    Kept word-for-word across the 2026-08-19 provider change so runs either side of it are
+    comparable: a different fill rate is then the provider's doing, not the query's.
+    """
+    return (f"What is the address, phone, email, industry, products, "
+            f"services of {domain}")
 
 
 async def run_gmaps_from_module(

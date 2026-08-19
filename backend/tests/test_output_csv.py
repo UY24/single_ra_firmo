@@ -1,10 +1,10 @@
-"""Offline tests for the CSV export of an upload's output payload (xlsx_export)."""
+"""Offline tests for the CSV export of an upload's output payload (output_export)."""
 import csv
 import io
 import json
 import unittest
 
-from app.services.serpwow.xlsx_export import (
+from app.services.serpwow.output_export import (
     build_upload_output_csv_bytes,
     build_upload_output_table,
     build_upload_output_xlsx_bytes,

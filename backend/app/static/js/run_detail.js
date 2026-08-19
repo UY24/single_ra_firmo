@@ -403,6 +403,42 @@ function verdictSection(rb) {
 function emptyResponsesSection(g) {
   const eb = g.empty_response_breakdown || {};
   const cost = g.cost || {};
+  // firmographics buys TWO differently-priced calls: a Google Search (10 credits per
+  // HTTP 200) and, only when Google defers the AI Overview, a follow-up fetch (5
+  // credits). The totals alone cannot explain the bill, so split by endpoint.
+  if (eb.no_ai_overview != null) {
+    const rows = safeCount(g.total_rows);
+    const searchBilled = safeCount(cost.scrapedo_search_successful);
+    const aioBilled = safeCount(cost.scrapedo_ai_overview_successful);
+    const searchCredits = searchBilled * 10;
+    const aioCredits = aioBilled * 5;
+    const unbilled = Math.max(0, safeCount(cost.scrapedo_requests)
+                                 - safeCount(cost.scrapedo_successful_requests));
+    // Billed and answered, but no overview to extract from — Google had none, or the
+    // deferred fetch failed. Credits spent for nothing: the refund claim.
+    const paidForNothing = safeCount(eb.no_ai_overview);
+    const failed = safeCount(cost.scrapedo_error_requests);
+    return el("section", { class: "detail-section" },
+      sectionHeading(
+        "Scrape.do billing (10 credits per search, 5 per deferred AI Overview)",
+        "Credits are charged on HTTP 200s only, so failed attempts and retries are free. "
+        + "A deferred overview means Google had not finished generating it when the SERP "
+        + "was served, so a second call was needed for that row."),
+      el("div", { class: "detail-section-body relationship-verdict" },
+        chip("Search calls billed",
+          rows ? `${fmtNum(searchBilled)} of ${fmtNum(rows)} rows` : fmtNum(searchBilled),
+          "good"),
+        chip("Search credits", fmtNum(searchCredits), "muted"),
+        chip("AI Overview follow-ups", fmtNum(aioBilled), aioBilled ? "info" : "muted"),
+        chip("AI Overview credits", fmtNum(aioCredits), "muted"),
+        chip("Deferred rows", fmtNum(eb.deferred ?? 0), (eb.deferred ?? 0) ? "info" : "muted"),
+        chip("Billed but no overview", fmtNum(paidForNothing),
+          paidForNothing ? "danger" : "muted"),
+        chip("Failed after retries", fmtNum(failed), failed ? "warn" : "muted"),
+        chip("Unbilled attempts", fmtNum(unbilled), "muted"),
+      ),
+    );
+  }
   if (eb.no_listing != null) {
     const billed = safeCount(cost.scrapedo_successful_requests);
     const rows = safeCount(g.total_rows);

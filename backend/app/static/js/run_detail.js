@@ -759,6 +759,14 @@ function renderLegacyStatus(root, ref, s) {
       chips.push(chip("Batch", g.is_batch ? "On" : "Off", g.is_batch ? "good" : "muted"));
       if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
+  } else if (g?.llm_mode) {
+    // A pipeline that uses an LLM for something OTHER than confidence — firmographics
+    // normalises the AI Overview into its six fields. It reports confidence_mode: null
+    // (it is handed the website, so there is nothing to be confident about), which used to
+    // hide the fact that a paid model ran at all, and whether batched or not.
+    chips.push(chip("LLM", g.llm_mode === "batch" ? "Batch" : "Inline",
+      g.llm_mode === "batch" ? "good" : "info"));
+    if (g.model) chips.push(chip("Model", g.model, "muted"));
   }
   // Which provider is actually working right now. `phase` is served by the
   // counter-driven status endpoint; without this the run looked identical whether
@@ -780,6 +788,14 @@ function renderLegacyStatus(root, ref, s) {
   if (phaseSecs && (phaseSecs.scraping || phaseSecs.cleaning)) {
     chips.push(chip("scrape.do", fmtDuration(phaseSecs.scraping ?? 0), "muted"));
     chips.push(chip("LLM", fmtDuration(phaseSecs.cleaning ?? 0), "muted"));
+  }
+  // Row-parallel pipelines have no run-level phase split, so their time is reported as a
+  // per-row AVERAGE. Labelled "/row" so it is not read as wall clock: summing it across
+  // rows at high concurrency would exceed the run's own duration.
+  const avgSecs = g?.phase_seconds_avg;
+  if (avgSecs && (avgSecs.provider || avgSecs.llm)) {
+    chips.push(chip("scrape.do/row", fmtDuration(avgSecs.provider ?? 0), "muted"));
+    chips.push(chip("LLM/row", fmtDuration(avgSecs.llm ?? 0), "muted"));
   }
 
   const isRel = s.pipeline === "relationship";

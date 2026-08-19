@@ -256,5 +256,59 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(raw, "")
 
 
+class SummaryChipTests(unittest.TestCase):
+    """What the run-detail header must be able to say about a firmographics run.
+
+    It reports confidence_mode=None (it is handed the website, so there is nothing to be
+    confident about), which hid the fact that a paid model ran at all — and whether it ran
+    batched. llm_mode/model/phase_seconds_avg are what the chips read instead.
+    """
+
+    def _state(self, rows):
+        return {"upload_id": "UP", "company_name": "T", "pipeline": "firmographics",
+                "status": "completed", "total_rows": len(rows), "rows": rows}
+
+    def _row(self, search=1.0, llm=0.5, model="gemini-2.5-flash-lite"):
+        return {"row_index": 1, "status": "completed", "outcome": "found",
+                "result": {"official_website": "https://a.com", "address": "X",
+                           "gemini_cost_usd": 0.0002,
+                           "context": {
+                               "timing": {"search_seconds": search, "llm_seconds": llm,
+                                          "total_seconds": search + llm},
+                               "mapping_ai": {"model": model,
+                                              "usage": {"promptTokenCount": 900,
+                                                        "candidatesTokenCount": 200}},
+                               "cost_breakdown": {"scrapedo_requests": 1,
+                                                  "scrapedo_successful_requests": 1,
+                                                  "scrapedo_credits": 10,
+                                                  "scrapedo_search_successful": 1}}}}
+
+    def test_llm_mode_is_inline_and_model_is_reported(self) -> None:
+        from app.services.serpwow import reporting as rep
+        state = self._state([self._row()])
+        s = rep.build_summary(state, rep.state_to_entity_results(state))
+        # Gemini batch is gsearch-only machinery; this pipeline calls it once per row.
+        self.assertEqual(s["llm_mode"], "inline")
+        self.assertEqual(s["model"], "gemini-2.5-flash-lite")
+        self.assertIsNone(s["confidence_mode"])
+        self.assertEqual(s["token_usage"]["total_tokens"], 1100)
+
+    def test_phase_time_is_a_per_row_average_not_a_sum(self) -> None:
+        """Rows run concurrently, so a SUM would exceed the run's own wall clock."""
+        from app.services.serpwow import reporting as rep
+        rows = [self._row(search=2.0, llm=1.0), self._row(search=4.0, llm=3.0)]
+        state = self._state(rows)
+        s = rep.build_summary(state, rep.state_to_entity_results(state))
+        self.assertEqual(s["phase_seconds_avg"], {"provider": 3.0, "llm": 2.0})
+
+    def test_pipelines_without_the_split_grow_no_key(self) -> None:
+        from app.services.serpwow import reporting as rep
+        state = {"upload_id": "UP", "pipeline": "gsearch", "status": "completed", "rows": [
+            {"status": "completed", "outcome": "found",
+             "result": {"official_website": "https://a.com", "context": {}}}]}
+        s = rep.build_summary(state, rep.state_to_entity_results(state))
+        self.assertNotIn("phase_seconds_avg", s)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -100,6 +100,15 @@ class OutputCsvTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], "upload_id")
 
+    def test_one_honest_raw_key_column(self) -> None:
+        """s3_html_key + s3_serpwow_json_key were two columns of the SAME value, both
+        misnamed: nothing ever held HTML, and the SerpWow one carried a scrape.do payload
+        for every migrated pipeline. They collapsed into one on 2026-08-19."""
+        headers, _ = build_upload_output_table(_payload())
+        self.assertIn("raw_response_s3_key", headers)
+        self.assertNotIn("s3_html_key", headers)
+        self.assertNotIn("s3_serpwow_json_key", headers)
+
     def test_xlsx_export_still_builds(self) -> None:
         """The refactor that extracted the shared table must not break the XLSX path."""
         self.assertTrue(build_upload_output_xlsx_bytes(_payload()).startswith(b"PK"))

@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.serpwow.serpwow_reporting import empty_response_breakdown
+from app.services.serpwow.reporting import empty_response_breakdown
 
 
 def _phase(empty=True, error=None, overview=False, cands=0):

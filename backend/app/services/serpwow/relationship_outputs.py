@@ -31,7 +31,7 @@ from app.services.serpwow.modes.relationship import (
     build_row_result,
     row_fields,
 )
-from app.services.serpwow.serpwow_reporting import (
+from app.services.serpwow.reporting import (
     retry_column,
     retry_row,
     s3_passthrough,

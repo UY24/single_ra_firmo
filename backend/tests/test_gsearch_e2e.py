@@ -443,9 +443,9 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
                                 "_update_supabase_run must have been called")
         # Take the last call (terminal one).
         last_supabase = self.supabase_calls[-1]
-        from app.services.serpwow import serpwow_reporting
-        results = serpwow_reporting.state_to_entity_results(last_supabase)
-        summary = serpwow_reporting.build_summary(last_supabase, results)
+        from app.services.serpwow import reporting
+        results = reporting.state_to_entity_results(last_supabase)
+        summary = reporting.build_summary(last_supabase, results)
         supabase_found = summary["websites_found"]
         supabase_not_found = summary["websites_not_found"]
 

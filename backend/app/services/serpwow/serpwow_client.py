@@ -200,7 +200,7 @@ def extract_ai_overview_text(raw_response: Any) -> str:
     """Flatten a SerpWow AI-overview block to plain text (empty if none present).
 
     Used both to build AI-overview evidence and to detect "empty 200" phases
-    (no overview text + no candidates) — see serpwow_reporting.empty_response_breakdown.
+    (no overview text + no candidates) — see reporting.empty_response_breakdown.
     """
     if not isinstance(raw_response, dict):
         return ""

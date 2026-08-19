@@ -124,26 +124,19 @@ def analyze_with_gemini(
     return None, (last_error or "Gemini model resolution failed"), configured_model, None
 
 
-def standardize_ai_overview_with_gemini(
+def build_ai_overview_prompt(
     company_name: str,
     country: str,
     official_website: str,
     ai_overview: dict[str, Any],
-) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None, "GEMINI_API_KEY not configured", None, None
+) -> str:
+    """The firmographics normalisation prompt, for BOTH transports.
 
-    configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    model_candidates = [configured_model, "gemini-2.5-flash-lite"]
-    seen_models = set()
-    ordered_models = []
-    for model_name in model_candidates:
-        if model_name and model_name not in seen_models:
-            seen_models.add(model_name)
-            ordered_models.append(model_name)
-
-    prompt = (
+    Extracted 2026-08-19 when batch mode landed: the batch path builds its request in
+    ``engine._build_batch_prompt_for_row``, and a second copy of this text is how inline and
+    batched runs would start answering the same row differently.
+    """
+    return (
         "You are a data normalization system.\n"
         "Convert the provided Google AI Overview into strict JSON only.\n"
         "Schema:\n"
@@ -164,8 +157,32 @@ def standardize_ai_overview_with_gemini(
         f"Country: {country}\n"
         f"Official Website: {official_website}\n\n"
         "Google AI Overview JSON:\n"
+        # Truncated because a rich overview can be far larger than the answer needs.
         f"{json.dumps(ai_overview, ensure_ascii=True)[:14000]}"
     )
+
+
+def standardize_ai_overview_with_gemini(
+    company_name: str,
+    country: str,
+    official_website: str,
+    ai_overview: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str], Optional[dict[str, Any]]]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None, "GEMINI_API_KEY not configured", None, None
+
+    configured_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model_candidates = [configured_model, "gemini-2.5-flash-lite"]
+    seen_models = set()
+    ordered_models = []
+    for model_name in model_candidates:
+        if model_name and model_name not in seen_models:
+            seen_models.add(model_name)
+            ordered_models.append(model_name)
+
+    prompt = build_ai_overview_prompt(
+        company_name, country, official_website, ai_overview)
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],

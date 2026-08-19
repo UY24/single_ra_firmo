@@ -113,7 +113,7 @@ def _select_best_gmaps_website(
 
 def _gmaps_confidence_for_entry(entry: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Map a scored gmaps candidate (or None) to a heuristic confidence 'raw'
-    block matching the shape serpwow_reporting reads."""
+    block matching the shape reporting reads."""
     if not entry or not entry.get("url"):
         return {
             "official_website": None, "confidence_score": 0, "confidence": "low",

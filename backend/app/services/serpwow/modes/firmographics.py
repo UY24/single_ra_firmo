@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, Optional
 
 from app.services.serpwow.schemas import CrawlResponse
@@ -20,6 +21,7 @@ from app.services.serpwow.address import (
 )
 from app.services.serpwow.constants import (
     PIPELINE_FIRMOGRAPHICS,
+    batch_postprocess_enabled_for,
 )
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
@@ -136,8 +138,13 @@ async def execute_firmographic_extraction(
         )
         return response, ""
 
+    # The two phases are timed separately: this pipeline interleaves them per row (there
+    # is no run-level scrape-then-clean split), so "where did the time go" can only be
+    # answered per row and then averaged.
+    _started = time.perf_counter()
     scrapedo_context = await run_scrapedo_search_for_firmographics(
         normalized_official, country=clean_country)
+    search_seconds = round(time.perf_counter() - _started, 3)
     # The row's durable raw artifact is the provider's WHOLE SERP, verbatim: the overview
     # we use plus the knowledge_graph / organic_results we do not yet, so a stored row can
     # be re-judged without re-buying the call.
@@ -157,8 +164,24 @@ async def execute_firmographic_extraction(
         "raw": None,
     }
 
+    llm_seconds = 0.0
     ai_overview = scrapedo_context.get("ai_overview")
-    if isinstance(ai_overview, dict) and ai_overview:
+    # Batch mode: the normalisation is done later, in one Gemini Batch job over the whole
+    # upload (engine.run_gemini_batch_for_upload). Skipping the inline call here is the
+    # whole point -- doing both would pay for every row twice.
+    batch_mode = batch_postprocess_enabled_for(PIPELINE_FIRMOGRAPHICS)
+    if batch_mode:
+        mapping_ai_context = {
+            "provider": "google-gemini",
+            "model": None,
+            "used": False,
+            "error": None,
+            "usage": {},
+            "raw": None,
+            "deferred_to_batch": True,
+        }
+    if isinstance(ai_overview, dict) and ai_overview and not batch_mode:
+        _started = time.perf_counter()
         mapped_output, mapped_error, mapped_model, mapped_usage = (
             await asyncio.to_thread(
                 standardize_ai_overview_with_gemini,
@@ -168,6 +191,7 @@ async def execute_firmographic_extraction(
                 ai_overview,
             )
         )
+        llm_seconds = round(time.perf_counter() - _started, 3)
         if isinstance(mapped_output, dict):
             mapped_columns = {key: mapped_output.get(key) for key in
                               ("address", "phone", "email", "industry")}
@@ -202,6 +226,9 @@ async def execute_firmographic_extraction(
         "scrapedo": scrapedo_context,
         "mapping_ai": mapping_ai_context,
         "cost_breakdown": cost_breakdown,
+        # The worker merges total_seconds into this dict; these two say how the row's time
+        # divided between the provider and the LLM.
+        "timing": {"search_seconds": search_seconds, "llm_seconds": llm_seconds},
     }
     provider_error = scrapedo_context.get("error")
     if provider_error:
@@ -213,6 +240,9 @@ async def execute_firmographic_extraction(
             "error_source": "scrapedo",
             "error_category": scrapedo_context.get("error_category") or "internal",
         }]
+    elif batch_mode and isinstance(ai_overview, dict) and ai_overview:
+        # Terminal for the row task, but the batch has the last word on the six fields.
+        summary = "AI overview captured; awaiting Gemini batch normalisation."
     elif not isinstance(ai_overview, dict) or not ai_overview:
         # Billed, answered, but Google had no AI Overview (or the deferred fetch failed).
         # A business not-found for enrichment purposes, NOT an error.

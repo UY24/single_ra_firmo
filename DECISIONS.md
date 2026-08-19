@@ -86,7 +86,7 @@ provider error ⇒ `error`, no overview or no extracted fields ⇒ `not_found`, 
 The no-explicit-outcome fallback existed in **two** places with the same wrong test
 (`_derive_outcome` in reporting, `_outcome_of` in `summarize_upload_state`). Fixing one
 would have made report.json and `/status` disagree about the same run, so both now call one
-shared `serpwow_reporting.row_produced_a_result(result, pipeline)`.
+shared `reporting.row_produced_a_result(result, pipeline)`.
 
 firmographics also joined the 3-way `row_status` remap: a website with no AI overview is
 `completed`/`not_found`, not a `failed` row that "Rerun failed" would re-buy at 10 credits
@@ -116,10 +116,100 @@ would split its pre- and post-change runs across two folders for no gain. The sh
 uploader lost its provider name too (`upload_raw_response_to_s3`), because it serves both.
 
 **Kept SerpWow-named, deliberately:** the `services/serpwow/` package path (the agreed last
-rename), the shared `serpwow_reporting` module, and `CrawlResponse.serpwow_cost_usd` /
+rename), the shared `reporting` module, and `CrawlResponse.serpwow_cost_usd` /
 `s3_serpwow_json_key` with their CSV columns. Those are cross-pipeline schema: renaming
 them changes gsearch's output columns and every stored row's shape, which is a migration,
 not a cleanup.
+
+### D49. `serpwow_reporting.py` → `reporting.py`
+
+Asked directly: why is there still a file with that name? Because it was named when SerpWow
+was the only provider, and by now three of the four pipelines it serves are on scrape.do. It
+never contained provider-specific code — its cost accounting routes on the DATA (does the
+row's `cost_breakdown` carry `scrapedo_*` keys?), which is exactly why adding two migrated
+pipelines to it needed no branch. `reporting.py` inside `services/serpwow/` is unambiguous;
+the package rename stays the agreed last step.
+
+Deliberately left: `CrawlResponse.serpwow_cost_usd`. It is cross-pipeline schema and appears
+in gsearch's output; renaming it is a migration of every stored row, not a cleanup.
+
+### D50. firmographics batch mode rides `GSEARCH_LLM_BATCH`
+
+`FIRMOGRAPHICS_LLM_BATCH` defaults to whatever `GSEARCH_LLM_BATCH` is, so one switch moves
+both, and a dedicated key exists only for when they should differ. Same fallback idiom the
+repo already uses for `AI_MODE_WORKER_CONCURRENCY` → `WORKER_CONCURRENCY`.
+
+**Blank counts as unset.** `get_bool_env` falls back only when the variable is ABSENT, and
+`.env.example` ships every key as `NAME=` — so `FIRMOGRAPHICS_LLM_BATCH=` sitting blank in a
+real `.env` would have returned False and quietly made "one toggle for both" untrue. Fixed in
+the helper, not in `get_bool_env`, whose absent-only semantics other callers depend on.
+
+Note for whoever deploys this: the live `.env` has `GSEARCH_LLM_BATCH=true`, so firmographics
+batching becomes ACTIVE on the next worker restart without anyone setting a new key. That is
+what "use the same toggle" means, but it is a behaviour change, not a no-op.
+
+### D51. One gate, one prompt — the duplication was the real risk
+
+The batch/inline decision existed twice: `engine._batch_postprocess_enabled_for` and a second
+`_get_bool_env("GSEARCH_LLM_BATCH")` inside `modes/gsearch`. Adding a third copy for
+firmographics is how the executor ends up batching while the engine thinks it is inline (or
+vice versa) — one pays twice, the other never fills the fields. It now lives once, in
+`constants.py`, next to the other per-pipeline policy sets.
+
+Same reasoning for the prompt: the normalisation text was inline in
+`standardize_ai_overview_with_gemini`, and the batch path builds its own request. Two copies
+means a batched run and an inline run can answer the same row differently — the one thing a
+mode toggle must never do. Extracted to `gemini_llm.build_ai_overview_prompt`, used by both;
+a test asserts the batch request carries it.
+
+### D52. Rows with no AI overview are never submitted to the batch
+
+Nothing to normalise, so a request could only come back empty — and Gemini Batch bills input
+tokens for it. Those rows are already terminal as `not_found` from the scrape phase. Costs
+one `continue` in `_build_batch_items_for_state`.
+
+### D47. Two misnamed S3-key columns collapse into one
+
+`s3_html_key` and `s3_serpwow_json_key` were separate CSV columns that always held the
+**same value** (the worker assigned one from the other), under two names that were both
+wrong: nothing ever contained HTML, and the SerpWow one carried a scrape.do payload on every
+migrated pipeline. Now one `raw_response_s3_key`. Nothing outside the export and the state
+plumbing read either — no UI, no endpoint — so this was a deletion, not a migration.
+
+`engine._raw_response_key(row)` reads the new field then both legacy names, so a run written
+before today still shows its artifact on the detail page. Keeping the fallback is 4 lines;
+the alternative is a rewrite of every stored `state.json`.
+
+Rejected: keeping `s3_serpwow_json_key` as a duplicate alias "for compatibility". Nothing
+consumes it, and a second column of identical data is what created the confusion.
+
+### D48. LLM tag, model and per-row phase times for firmographics
+
+The run header showed nothing about the LLM, because `confidence_mode: None` (D43's honest
+answer — the pipeline is handed the website) also gated the Batch and Model chips. A paid
+Gemini call per row was invisible, including whether it was batched.
+
+`build_summary` now emits `llm_mode` and `model`; the UI has an `else if (g?.llm_mode)`
+branch for "uses an LLM, but not for confidence" and renders `LLM: Inline` + `Model: …`.
+Answering "is batch on?" in the UI is the point — it is a real cost question and the code
+gives one answer (`_batch_postprocess_enabled_for` is gsearch-only), so the page should say
+so rather than leave it to be read out of the source.
+
+**Times are per-row AVERAGES, not sums, and labelled `/row`.** gmaps and AI Mode have
+run-level phases (scrape everything, then clean everything) so their `phase_seconds` are
+real wall-clock durations. firmographics interleaves both per row across many workers, so
+there is no such thing as "the scraping phase" — a sum of per-row seconds at concurrency 100
+would print as many times the run's actual duration and look like a bug in the timer.
+Averages are the only honest reduction, and the `/row` suffix stops them being read as wall
+clock.
+
+Rejected: reusing the existing `phase_seconds` keys (`scraping`/`cleaning`). Zero UI change,
+but it would put a per-row average behind a label the other pipelines use for wall clock,
+which is exactly the kind of quiet unit mismatch nobody catches later.
+
+Also fixed on the way: the worker **replaced** `context["timing"]` with
+`{total_seconds: …}`, silently dropping any split an executor had already recorded. It
+merges now.
 
 ### D46. Not done: `knowledge_graph` is fetched and still unread
 
@@ -275,10 +365,10 @@ It duplicates columns the input already has, and nothing in the repo reads these
 back (`grep` over `app/`: found.csv is written and served, never parsed). "Same as the
 input" is the whole request; a second naming convention next to it defeats it.
 
-### D21. `passthrough_fieldnames` lives in `common/text.py`, not `serpwow_reporting.py`
+### D21. `passthrough_fieldnames` lives in `common/text.py`, not `reporting.py`
 
 `ai_mode/run_reporting.py` is deliberately standalone (docstring: models + `serpwow.outcomes`
-only), and `serpwow_reporting` pulls in `serpwow_client` → `httpx`. `common/text.py` is
+only), and `reporting` pulls in `serpwow_client` → `httpx`. `common/text.py` is
 already the home of the one other AI-Mode↔SerpWow shared helper (`slugify_company`) and
 imports nothing but `re`. Ten pure lines go there; both engines import them.
 
@@ -464,9 +554,9 @@ column, `retry_reason`, suffixed with `_` if the input already has one.
 Reason format is uniform across both pipelines so one grep works on either file:
 `<kind>: <detail> | attempts=N credits=N`.
 
-### D12. One shared helper, in `serpwow_reporting`
+### D12. One shared helper, in `reporting`
 
-`retry_column()` + `retry_row()` live in `serpwow_reporting.py` — already the shared,
+`retry_column()` + `retry_row()` live in `reporting.py` — already the shared,
 dependency-light module gmaps imports, and relationship now imports it too (it pulls in
 only `models/results` and `serpwow_client`, so no cycle). The alternative — the same
 15 lines in both `gmaps_outputs` and `relationship_outputs` — is exactly how the two

@@ -1,12 +1,21 @@
-# backend/app/services/serpwow/serpwow_reporting.py
-"""found.csv / notFound.csv / report.json / run.log for SerpWow pipelines.
+# backend/app/services/serpwow/reporting.py
+"""found.csv / notFound.csv / report.json / run.log + the run summary, for the
+state-driven upload pipelines.
 
-Pipeline-agnostic: converts a terminal SerpWow upload ``state["rows"]`` (each row
-carries a CrawlResponse dict under ``result``) into the shared EntityResult
-schema, then writes the same file set AI Mode produces so the Runs UI can view
-them uniformly. Used by both ``gsearch`` (LLM confidence) and ``gmaps``
-(heuristic confidence) — the confidence block is read from whichever context key
-the pipeline populated.
+**Provider-agnostic** — it was ``serpwow_reporting.py`` until 2026-08-19, by which point
+three of the four pipelines it serves had migrated to scrape.do and the name was simply
+wrong. It converts a terminal upload's ``state["rows"]`` (each row carrying a
+CrawlResponse dict under ``result``) into the shared EntityResult schema, then writes the
+same file set AI Mode produces so the Runs UI can view them uniformly.
+
+Consumers: ``gsearch`` (SerpWow, LLM confidence), ``relationship`` and ``firmographics``
+(scrape.do) for their summaries, and ``gmaps_outputs``/``relationship_outputs`` for the
+shared per-row conversion. Cost accounting routes on the DATA — the presence of
+``scrapedo_*`` keys in a row's ``cost_breakdown`` — not on the pipeline name, which is why
+adding a migrated pipeline needed no branch here.
+
+Deliberately standalone-ish: it imports only ``models/results.py`` plus siblings, to avoid
+a circular import back into ``engine``.
 """
 from __future__ import annotations
 
@@ -373,6 +382,10 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     scrapedo_aio_requests = 0
     scrapedo_aio_ok = 0
     scrapedo_aio_deferred = 0
+
+    search_seconds = 0.0
+    llm_seconds = 0.0
+    timed_rows = 0
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
@@ -414,6 +427,11 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                         if isinstance(item, dict) and item.get("success"))
                     if isinstance(formatted, list) and formatted else request_count
                 )
+        timing = ctx.get("timing")
+        if isinstance(timing, dict) and "search_seconds" in timing:
+            search_seconds += float(timing.get("search_seconds") or 0.0)
+            llm_seconds += float(timing.get("llm_seconds") or 0.0)
+            timed_rows += 1
         llm_usd += float(result.get("gemini_cost_usd") or 0.0)
         for key in ("final_url_selection_ai", "gemini_batch_ai", "mapping_ai"):
             obj = ctx.get(key)
@@ -481,6 +499,20 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                 by_category[row["error_category"]] = by_category.get(row["error_category"], 0) + 1
     summary["outcome_breakdown"] = outcome_breakdown
     summary["error_breakdown"] = {"by_source": by_source, "by_category": by_category}
+
+    # Per-row AVERAGES, not sums: this pipeline interleaves provider and LLM work per row
+    # under many concurrent workers, so a sum would read as many times the run's wall clock
+    # and mean nothing. Emitted only when rows actually carried the split, so no other
+    # pipeline's summary grows a key.
+    if timed_rows:
+        summary["phase_seconds_avg"] = {
+            "provider": round(search_seconds / timed_rows, 2),
+            "llm": round(llm_seconds / timed_rows, 2),
+        }
+    # How the LLM ran, so the UI can say so instead of leaving the user to guess. Batch is
+    # gsearch-only machinery; firmographics calls Gemini inline, once per row.
+    if model:
+        summary["llm_mode"] = "batch" if is_batch else "inline"
 
     ebd = empty_response_breakdown(state)
     if ebd is not None:

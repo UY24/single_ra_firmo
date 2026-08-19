@@ -1,6 +1,6 @@
 import json, tempfile, unittest
 from pathlib import Path
-from app.services.serpwow import serpwow_reporting as rep
+from app.services.serpwow import reporting as rep
 from app.services.serpwow import outcomes as o
 
 

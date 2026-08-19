@@ -79,7 +79,7 @@ What changed (reasoning in `DECISIONS.md`, call graph in `FLOW.md` §6):
   502 "no results" and a 502 "request failed" are the same billing event: four attempts,
   nothing charged. `report.json` still reports `no_listing` separately. gsearch and
   relationship branches untouched.
-- `serpwow_reporting._build_cost` — new `scrapedo_billed_errors` (rows that errored with a
+- `reporting._build_cost` — new `scrapedo_billed_errors` (rows that errored with a
   billed 200). Subtracting it from `errored` is what stops a paid error row appearing in
   two chips at once. Defaults to 0, so gsearch/relationship reports are unchanged.
 - `s3_run_store.Counters` — `rows_no_listing` was **never in `_FIELDS`**, so
@@ -113,7 +113,7 @@ no prose — the gate still produced a verdict); the count stays in `report.json
 
 A billed error (HTTP 200 whose body carried the error) is marked `— billed, refundable`
 too; a row that died before any 200 is not, because it cost nothing. Membership rule +
-reason strings live in ONE shared helper, `serpwow_reporting.retry_row()`, so the two
+reason strings live in ONE shared helper, `reporting.retry_row()`, so the two
 pipelines can't drift.
 
 **S3 layout, for the record:** `raw/` = the call and everything that came back (query,
@@ -172,10 +172,10 @@ Verified against real run `8ffe96d9` — its 10 columns
 (`entity_name … firm_id`) come out first, in order.
 
 - The rule lives once, in `common/text.passthrough_fieldnames` / `passthrough_row` —
-  **there, not in `serpwow_reporting`**, because `ai_mode/run_reporting.py` is
-  standalone-by-contract and `serpwow_reporting` pulls in `httpx`.
+  **there, not in `reporting`**, because `ai_mode/run_reporting.py` is
+  standalone-by-contract and `reporting` pulls in `httpx`.
   `relationship_outputs._passthrough_fieldnames` is now a one-line wrapper over it.
-- `serpwow_reporting.CSV_COLUMNS` is split into `RESULT_COLUMNS` + the three echoed fields
+- `reporting.CSV_COLUMNS` is split into `RESULT_COLUMNS` + the three echoed fields
   and is byte-identical, so the **gsearch** writer is untouched.
 - **AI Mode: the writer owns the input.csv cursor.** `StreamingRunReport(run_dir,
   company_column)` pulls one input row per `EntityResult`, so alignment is an invariant of

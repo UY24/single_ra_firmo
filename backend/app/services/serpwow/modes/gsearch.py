@@ -163,7 +163,7 @@ async def execute_gsearch_lookup_for_worker(
             "search_url": raw_result.get("search_url"),
             # AI-overview presence + usable-candidate count per phase, so the reporting
             # layer can flag "empty 200" phases (no overview + 0 candidates) uniformly
-            # with relationship mode. See serpwow_reporting.empty_response_breakdown.
+            # with relationship mode. See reporting.empty_response_breakdown.
             "ai_overview_present": bool(extract_ai_overview_text(raw_result.get("raw_response"))),
             "candidate_count": phase_candidate_count,
             # raw_response deliberately NOT stored: it's already persisted as this

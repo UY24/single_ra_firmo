@@ -23,7 +23,7 @@ from app.services.serpwow.outcomes import SRC_GEMINI, categorize_http_error
 
 RESULT_COLUMNS = ["website_url", "confidence", "flags", "attempt_log"]
 # Fallback header, used only when the run's input.csv can't be passed through (see
-# StreamingRunReport). Mirrors serpwow_reporting.CSV_COLUMNS.
+# StreamingRunReport). Mirrors reporting.CSV_COLUMNS.
 CSV_COLUMNS = ["company_name", "company_local_name", "country"] + RESULT_COLUMNS
 # "error" is reserved for BOTH files, not just notFound.csv, so an input column by that
 # name is renamed identically in each and the two headers stay parallel.

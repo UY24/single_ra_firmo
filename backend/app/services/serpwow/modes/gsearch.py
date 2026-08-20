@@ -19,6 +19,7 @@ from app.services.serpwow.address import (
     _marker_variants,
     _normalize_location_token,
 )
+from app.services.common import llm_batch
 from app.services.serpwow.constants import (
     PIPELINE_GSEARCH,
 )
@@ -197,7 +198,7 @@ async def execute_gsearch_lookup_for_worker(
     }
     gemini_cost = 0.0
     llm_error_for_row: Optional[str] = None
-    batch_mode = _get_bool_env("GSEARCH_LLM_BATCH", False)
+    batch_mode = llm_batch.batch_enabled(PIPELINE_GSEARCH)
     enable_final = _get_bool_env("ENABLE_FINAL_URL_GEMINI", True)
     if not batch_mode and enable_final and candidates:
         final_output, final_error, final_model, final_usage = await asyncio.to_thread(

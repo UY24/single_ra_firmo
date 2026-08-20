@@ -20,6 +20,7 @@ from typing import Any
 
 import aio_pika
 
+from app.services.common import llm_batch
 from app.services.common.env import get_int_env as _get_int_env
 from app.services.serpwow import s3_run_driver as driver
 from app.services.serpwow import s3_run_store as store
@@ -104,7 +105,7 @@ async def run_scrape_phase(prefix: str, counters: store.Counters) -> None:
 
 
 def _shard_size() -> int:
-    return max(1, _get_int_env("GEMINI_BATCH_SHARD_SIZE", 5000))
+    return llm_batch.shard_size()
 
 
 def _max_inflight() -> int:
@@ -122,7 +123,7 @@ def _max_inflight() -> int:
     PREREQUISITE is a sized executor (`loop.set_default_executor(ThreadPoolExecutor(...))`
     at worker startup, or an explicit per-shard executor) — deliberately not done yet.
     """
-    return max(1, _get_int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
+    return llm_batch.max_inflight()
 
 
 def _batch_timeout_sec() -> int:
@@ -133,7 +134,7 @@ def _batch_timeout_sec() -> int:
     relationship shard after 30 minutes when the Batch API's own target is "within 24h
     per job". Default 48h = Gemini's hard job expiry, past which the job cannot succeed.
     """
-    return max(60, _get_int_env("RELATIONSHIP_BATCH_TIMEOUT_SEC", 172800))
+    return llm_batch.timeout_sec()
 
 
 def _poll_to_terminal(gb, name: str, counters: store.Counters | None) -> dict:
@@ -162,10 +163,10 @@ def _poll_to_terminal(gb, name: str, counters: store.Counters | None) -> dict:
             # paying for a second one (see _reattach_batches).
             raise TimeoutError(
                 f"Gemini batch {name} did not finish within "
-                f"RELATIONSHIP_BATCH_TIMEOUT_SEC")
+                f"GEMINI_BATCH_TIMEOUT_SEC")
         if counters is not None:
             counters.flush(force=True)
-        _time.sleep(_get_int_env("GEMINI_BATCH_POLL_SEC", 30))
+        _time.sleep(llm_batch.poll_sec())
 
 
 def _collect(gb, obj: dict, model: str) -> dict[str, dict]:
@@ -201,7 +202,9 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
 
     if not items:
         return {}
-    model = os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite")
+    # Was GEMINI_BATCH_MODEL with NO GEMINI_MODEL fallback, so setting only
+    # GEMINI_MODEL moved the other three pipelines and left this one behind.
+    model = llm_batch.batch_model()
     created = gb.create_batch(model, items, display_name=f"relationship-{prefix}")
     name = gb.batch_name_from_create(created)
     indices = sorted(int(key) for key, _body in items)

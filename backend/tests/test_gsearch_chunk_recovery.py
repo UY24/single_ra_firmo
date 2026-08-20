@@ -138,8 +138,8 @@ class TestResumeAfterRestart(unittest.IsolatedAsyncioTestCase):
             persisted["state"] = st
 
         with mock.patch.dict("os.environ", {
-                "GSEARCH_GEMINI_CHUNK_SIZE": "5",
-                "GSEARCH_GEMINI_MAX_INFLIGHT": "5",
+                "GEMINI_BATCH_SHARD_SIZE": "5",
+                "GEMINI_BATCH_MAX_INFLIGHT": "5",
                 "GEMINI_API_KEY": "k",
                 "GEMINI_BATCH_TIMEOUT_SEC": "3600",
                 "GEMINI_BATCH_POLL_SEC": "5",
@@ -269,26 +269,19 @@ class TestBatchTimeout(unittest.IsolatedAsyncioTestCase):
         def patched_loop_time():
             return real_loop_time() + time_offset["v"]
 
-        original_get_int_env = app._get_int_env
-
-        def patched_get_int_env(name, default):
-            if name == "GSEARCH_GEMINI_CHUNK_SIZE":
-                return 5
-            if name == "GSEARCH_GEMINI_MAX_INFLIGHT":
-                return 5
-            return original_get_int_env(name, default)
-
         async def fast_sleep(delay):
             await _asyncio.sleep(0)
 
         with mock.patch.dict("os.environ", {
                 "GEMINI_API_KEY": "k",
+                # 10 rows / 5 per shard = the two chunks this test needs.
+                "GEMINI_BATCH_SHARD_SIZE": "5",
+                "GEMINI_BATCH_MAX_INFLIGHT": "5",
             }, clear=False), \
              mock.patch.object(app, "read_upload_artifact",
                                new=mock.AsyncMock(side_effect=lambda u, k: persisted["state"])), \
              mock.patch.object(app, "persist_upload_state", new=fake_persist), \
              mock.patch.object(app, "write_upload_text_artifact", new=mock.AsyncMock()), \
-             mock.patch.object(app, "_get_int_env", side_effect=patched_get_int_env), \
              mock.patch("app.services.ai_mode.gemini_batch.create_batch", side_effect=fake_create), \
              mock.patch("app.services.ai_mode.gemini_batch.get_batch", side_effect=fake_get_with_bump), \
              mock.patch("app.services.ai_mode.gemini_batch.collect_results", side_effect=fake_collect), \
@@ -375,8 +368,8 @@ class TestPartialOutput(unittest.IsolatedAsyncioTestCase):
             persisted["state"] = st
 
         with mock.patch.dict("os.environ", {
-                "GSEARCH_GEMINI_CHUNK_SIZE": "100",
-                "GSEARCH_GEMINI_MAX_INFLIGHT": "5",
+                "GEMINI_BATCH_SHARD_SIZE": "100",
+                "GEMINI_BATCH_MAX_INFLIGHT": "5",
                 "GEMINI_API_KEY": "k",
                 "GEMINI_BATCH_TIMEOUT_SEC": "3600",
                 "GEMINI_BATCH_POLL_SEC": "5",
@@ -486,8 +479,8 @@ class TestReFinalizeAfterRetry(unittest.IsolatedAsyncioTestCase):
             persisted["state"] = st
 
         with mock.patch.dict("os.environ", {
-                "GSEARCH_GEMINI_CHUNK_SIZE": "100",
-                "GSEARCH_GEMINI_MAX_INFLIGHT": "5",
+                "GEMINI_BATCH_SHARD_SIZE": "100",
+                "GEMINI_BATCH_MAX_INFLIGHT": "5",
                 "GEMINI_API_KEY": "k",
                 "GEMINI_BATCH_TIMEOUT_SEC": "3600",
                 "GEMINI_BATCH_POLL_SEC": "5",

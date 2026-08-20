@@ -19,9 +19,9 @@ from app.services.serpwow.schemas import CrawlResponse
 from app.services.serpwow.address import (
     _is_address_aligned,
 )
+from app.services.common import llm_batch
 from app.services.serpwow.constants import (
     PIPELINE_FIRMOGRAPHICS,
-    batch_postprocess_enabled_for,
 )
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
@@ -169,7 +169,7 @@ async def execute_firmographic_extraction(
     # Batch mode: the normalisation is done later, in one Gemini Batch job over the whole
     # upload (engine.run_gemini_batch_for_upload). Skipping the inline call here is the
     # whole point -- doing both would pay for every row twice.
-    batch_mode = batch_postprocess_enabled_for(PIPELINE_FIRMOGRAPHICS)
+    batch_mode = llm_batch.batch_enabled(PIPELINE_FIRMOGRAPHICS)
     if batch_mode:
         mapping_ai_context = {
             "provider": "google-gemini",

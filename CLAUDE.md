@@ -218,15 +218,8 @@ its parent group — a known limitation, unchanged by the migration.
   `/status` cannot disagree. firmographics also joined the 3-way `row_status` remap, so a
   website with no overview is `completed`/`not_found` instead of a `failed` row that
   "Rerun failed" would re-buy at 10 credits.
-- **Gemini batch mode** (2026-08-19): `FIRMOGRAPHICS_LLM_BATCH`, which **defaults to
-  `GSEARCH_LLM_BATCH`** — one toggle for both, set the firmographics key only to diverge
-  (the same fallback idiom as `AI_MODE_WORKER_CONCURRENCY` → `WORKER_CONCURRENCY`). A
-  **blank** value counts as unset, because `get_bool_env` only falls back when the variable
-  is ABSENT and `.env.example` ships every key as `NAME=`; without that check a blank line
-  silently turned batching off. The gate is ONE function,
-  `constants.batch_postprocess_enabled_for` — `engine._batch_postprocess_enabled_for` is a
-  thin alias and the mode executors import it directly, replacing the old copy of the env
-  read inside `modes/gsearch`. In batch mode the executor **skips its inline Gemini call**
+- **Gemini batch mode**: gated by `LLM_BATCH` (or a `FIRMOGRAPHICS_LLM_BATCH` override) via
+  `common/llm_batch.batch_enabled` — see the batch-config section above. In batch mode the executor **skips its inline Gemini call**
   (doing both would bill every row twice) and marks
   `context.mapping_ai.deferred_to_batch`. Three branches in the shared batch engine:
   `_build_batch_prompt_for_row` (the firmographics normalisation prompt),
@@ -277,6 +270,44 @@ its parent group — a known limitation, unchanged by the migration.
 - Tests: `test_firmographics_scrapedo.py` (client + credit math + executor, all via
   `httpx.MockTransport`); `test_gsearch_s3_slug.RawArtifactNamingTests` pins the two
   artifact-folder names.
+
+### Gemini batch config — ONE resolver for all four pipelines (`common/llm_batch.py`, 2026-08-19)
+All four batching pipelines (`ai_bulk`/`ai_deep`, `gsearch`, `firmographics`, `relationship`)
+already shared ONE driver — `ai_mode/gemini_batch.py`. Only the config around it had drifted,
+so `common/llm_batch.py` now owns every batch setting and each call site reads it there.
+
+- **`LLM_BATCH` is the one toggle.** `AI_MODE_LLM_BATCH` / `GSEARCH_LLM_BATCH` /
+  `FIRMOGRAPHICS_LLM_BATCH` survive as per-pipeline **overrides only**. A **blank** override
+  counts as UNSET and falls through to the global — `env.get_bool_env` falls back only on an
+  ABSENT variable and `.env.example` ships every key as `NAME=`, so blank-means-off would have
+  silently defeated the global. That check is made once, in the resolver.
+- **`batch_enabled(pipeline)` and `uses_shared_row_batch(pipeline)` are different questions.**
+  relationship batches (its Gemini call IS the verdict — no inline path exists, so it has no
+  toggle) but through its OWN driver in `relationship_runner`; `engine`'s gate
+  (`_batch_postprocess_enabled_for`) must therefore say **no** for it, or a second duplicate
+  job gets seeded for the same run. Conflating the two broke exactly that, caught by
+  `test_gsearch_batch_gate`. gmaps has no LLM and answers False to both.
+- **One key per mechanical knob**, and the old duplicates are **deleted**:
+  `GSEARCH_GEMINI_CHUNK_SIZE` → `GEMINI_BATCH_SHARD_SIZE` (5000),
+  `GSEARCH_GEMINI_MAX_INFLIGHT` → `GEMINI_BATCH_MAX_INFLIGHT` (5),
+  `RELATIONSHIP_BATCH_TIMEOUT_SEC` + `AI_MODE_BATCH_TIMEOUT_SEC` → `GEMINI_BATCH_TIMEOUT_SEC`
+  (**172800 = 48h, Gemini's job expiry** — a Batch job runs and bills on Google's side whether
+  or not we poll, so the old 1800 abandoned work already paid for), `AI_MODE_BATCH_POLL_SEC` →
+  `GEMINI_BATCH_POLL_SEC`. Closes HANDOFF blocker #1.
+- **Model: `GEMINI_BATCH_MODEL` → `GEMINI_MODEL` → `gemini-2.5-flash-lite`.** The second step
+  is load-bearing: `relationship_runner` read only `GEMINI_BATCH_MODEL`, so setting just
+  `GEMINI_MODEL` moved three pipelines and left relationship on the hardcoded default.
+  `test_llm_batch_config` guards the invariant by **scanning every pipeline module for a direct
+  env read** of any batch key — verified to fail when the bug is reintroduced.
+- **Worker executor is sized** (`start_worker_consumers`): `max(32, max_inflight + 16)` via
+  `loop.set_default_executor`. HANDOFF blocker #4, and it is **relationship-only** —
+  `engine`'s chunk driver `await`s `asyncio.sleep` between polls and AI Mode polls all shards
+  from one thread, while `relationship_runner._poll_to_terminal` blocks a pool thread per
+  in-flight shard for hours. Headroom matters because that executor is shared with every S3
+  write and CSV parse in the worker.
+- **Not done**: AI Mode's override still forces `provider="gemini"` over
+  `AI_MODE_LLM_PROVIDER` (batch cleanup is Gemini-only). That is why AI Mode keeps a separate
+  key instead of one shared meaning; decoupling it is its own change.
 
 ### Shared layers
 - **Canonical CSV input** (`models/entities.py`, `parse_entities_csv`): requires a company-name column (aliases `company_name|company|name|entity_name|entity|organization|organisation|legal_name`) **and** a country column (`country|country_name|nation`); optional `company_local_name|address|firm_id|industry`. Headerless 2+-col files parse positionally. The **old `Company Name ENG`/`Country Code`/`ISIC` format is rejected with 400** (no auto-detect). `InvalidCSVError` → 400.

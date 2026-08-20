@@ -1,10 +1,10 @@
 # backend/app/services/serpwow/constants.py
-"""Pipeline identifiers and per-pipeline policy shared across the upload modes."""
+"""Pipeline identifiers and per-pipeline policy shared across the upload modes.
+
+Batch-vs-inline policy is NOT here: it lives in ``common/llm_batch.py``, which both this
+package and ``ai_mode`` import.
+"""
 from __future__ import annotations
-
-import os
-
-from app.services.common.env import get_bool_env
 
 PIPELINE_FIRMOGRAPHICS = "firmographics"
 PIPELINE_GMAPS = "gmaps"
@@ -30,34 +30,3 @@ REL_ERROR_NO_EVIDENCE = "No search evidence found for this company pair."
 REL_ERROR_NO_X = "Company X missing — financial relationship cannot be verified."
 REL_ERROR_NOT_CONFIRMED = "No financial relationship confirmed between Company X and Company Y."
 REL_ERROR_CONFIRMED_URL_INVALID = "Relationship confirmed but no valid candidate URL survived validation."
-
-
-def batch_postprocess_enabled_for(pipeline: str) -> bool:
-    """True when this pipeline's Gemini work should run as a BATCH job instead of inline.
-
-    ONE definition, imported by ``engine`` (which seeds and drives the batch) and by the
-    mode executors (which must then skip their inline call, or the run pays twice). It used
-    to live in ``engine`` with a second copy of the env read inside ``modes/gsearch``, which
-    is exactly how the two drift.
-
-    ``FIRMOGRAPHICS_LLM_BATCH`` defaults to whatever ``GSEARCH_LLM_BATCH`` is set to, so ONE
-    toggle switches batching for both; set the firmographics key only to make them differ.
-    That fallback mirrors ``AI_MODE_WORKER_CONCURRENCY`` -> ``WORKER_CONCURRENCY``.
-
-    relationship is absent on purpose: it owns its own Gemini Batch driver in
-    ``relationship_runner``. gmaps has no LLM at all.
-    """
-    pipe = str(pipeline or "")
-    gsearch_batch = get_bool_env("GSEARCH_LLM_BATCH", False)
-    if pipe == PIPELINE_GSEARCH:
-        return gsearch_batch
-    if pipe == PIPELINE_FIRMOGRAPHICS:
-        # BLANK counts as unset, so the GSEARCH_LLM_BATCH fallback still applies.
-        # get_bool_env only falls back when the variable is ABSENT, and .env.example ships
-        # every key as `NAME=` -- so a blank line would have silently overridden the
-        # fallback to False and made "one toggle for both" quietly untrue.
-        override = os.getenv("FIRMOGRAPHICS_LLM_BATCH")
-        if override is None or not override.strip():
-            return gsearch_batch
-        return get_bool_env("FIRMOGRAPHICS_LLM_BATCH", gsearch_batch)
-    return False

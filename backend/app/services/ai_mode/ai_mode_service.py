@@ -36,6 +36,7 @@ from typing import Any, Iterable, TypeVar
 from app.core.config import LEGACY_AI_MODE_RESULT_DIR
 from app.models.entities import Entity, InvalidCSVError, format_entities_for_prompt, parse_entities_csv
 from app.models.results import EntityResult
+from app.services.common import llm_batch
 from app.services.ai_mode import gemini_batch, run_store
 from app.services.ai_mode.cost import build_cost_summary, calculate_llm_cost_usd
 from app.services.ai_mode.cleanup import (
@@ -225,7 +226,9 @@ def build_ai_mode_llm_config() -> LLMConfig:
     """
     # Batch cleanup is Gemini-only, so AI_MODE_LLM_BATCH forces the Gemini provider
     # regardless of AI_MODE_LLM_PROVIDER (which governs only the normal/sync path).
-    batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
+    # ai_bulk and ai_deep share ONE override key (AI_MODE_LLM_BATCH), so either
+    # name resolves identically -- this function does not know which mode it is for.
+    batch_mode = llm_batch.batch_enabled("ai_bulk")
     if batch_mode:
         provider = "gemini"
     else:
@@ -238,7 +241,7 @@ def build_ai_mode_llm_config() -> LLMConfig:
         provider = "gemini"
         api_key = _str_env("GEMINI_API_KEY")
         if batch_mode:
-            model = _str_env("GEMINI_BATCH_MODEL") or _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
+            model = llm_batch.batch_model()
         else:
             model = _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
         base_url = DEFAULT_LLM_BASE_URLS["gemini"]
@@ -876,7 +879,7 @@ def run_ai_mode_finish(
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         from app.services.ai_mode import s3_sync
 
-        batch_mode = _bool_env("AI_MODE_LLM_BATCH", False)
+        batch_mode = llm_batch.batch_enabled("ai_bulk")
         status["status"] = "running"
         status["model"] = cfg.model
         status["is_batch"] = batch_mode
@@ -992,10 +995,12 @@ def run_ai_mode_finish(
         if batch_mode:
             if not _str_env("GEMINI_API_KEY"):
                 raise RuntimeError("GEMINI_API_KEY not configured (required for AI_MODE_LLM_BATCH)")
-            shard_size = max(1, _int_env("GEMINI_BATCH_SHARD_SIZE", 5000))
-            max_inflight = max(1, _int_env("GEMINI_BATCH_MAX_INFLIGHT", 5))
-            poll_sec = max(5, _int_env("AI_MODE_BATCH_POLL_SEC", 15))
-            timeout_sec = max(60, _int_env("AI_MODE_BATCH_TIMEOUT_SEC", 172800))
+            shard_size = llm_batch.shard_size()
+            max_inflight = llm_batch.max_inflight()
+            poll_sec = llm_batch.poll_sec()
+            # Same concept and same 48h default as the other three pipelines, so it
+            # shares GEMINI_BATCH_TIMEOUT_SEC now rather than carrying its own key.
+            timeout_sec = llm_batch.timeout_sec()
             clean_t0 = time.perf_counter()
 
             def _key_for(rec: dict) -> str:

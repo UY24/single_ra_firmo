@@ -355,7 +355,7 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
         fake = FakeS3()
         _seed(fake)
         with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "60",
+                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "60",
                                              "GEMINI_BATCH_POLL_SEC": "30"}, clear=False), \
                 mock.patch("time.sleep", slept.append), \
                 mock.patch("time.monotonic", side_effect=[0.0, 10.0, 70.0, 70.0]):
@@ -373,7 +373,7 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
         fake = FakeS3()
         _seed(fake)
         with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
-                mock.patch.dict(os.environ, {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "99999"},
+                mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "99999"},
                                 clear=False), \
                 mock.patch("time.sleep", lambda _s: None):
             out = runner._run_gemini_batch(PREFIX, [("0", {})])
@@ -1135,7 +1135,7 @@ class BatchReattachTests(unittest.TestCase):
         gb = self._gb(terminal=False)
         with _patched(fake), mock.patch.object(ai_mode_pkg, "gemini_batch", gb), \
                 mock.patch.dict(os.environ,
-                                {"RELATIONSHIP_BATCH_TIMEOUT_SEC": "60",
+                                {"GEMINI_BATCH_TIMEOUT_SEC": "60",
                                  "GEMINI_BATCH_POLL_SEC": "1"}, clear=False), \
                 mock.patch("time.sleep", lambda _s: None), \
                 mock.patch("time.monotonic", side_effect=[0.0, 70.0, 70.0]):
@@ -1204,7 +1204,7 @@ class BatchReattachTests(unittest.TestCase):
         it here abandoned every relationship shard after 30 minutes."""
         with mock.patch.dict(os.environ, {"GEMINI_BATCH_TIMEOUT_SEC": "1800"},
                              clear=False):
-            os.environ.pop("RELATIONSHIP_BATCH_TIMEOUT_SEC", None)
+            os.environ.pop("GEMINI_BATCH_TIMEOUT_SEC", None)
             self.assertEqual(runner._batch_timeout_sec(), 172800)
 
 

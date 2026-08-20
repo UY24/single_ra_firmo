@@ -9,6 +9,85 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-19 (b) — one resolver for all Gemini batch config
+
+Pushback, fairly: adding firmographics batch mode I made `FIRMOGRAPHICS_LLM_BATCH` fall back to
+**`GSEARCH_LLM_BATCH`** — a pipeline-specific key acting as a global default. That reads as
+nonsense. Measuring the rest turned up more of the same.
+
+### D53. `LLM_BATCH` is the global; the three old keys are demoted to overrides
+
+A global default deserves a global name. The per-pipeline keys stay so one pipeline can differ
+from the rest, which is a real need (batching gsearch but not AI Mode, say), but you normally
+set one value.
+
+Rejected: **one toggle with no overrides at all.** Two concrete blockers, not stylistic ones.
+`relationship` has no inline path — its Gemini call IS the verdict — so the toggle would have
+to be silently ignored, and a setting that cannot be honoured is worse than no setting. And
+`ai_mode_service.build_ai_mode_llm_config` makes its toggle **force `provider="gemini"`** over
+`AI_MODE_LLM_PROVIDER`, so a shared flag would quietly move AI Mode off an OpenAI gateway — a
+billing change disguised as a transport change. AI Mode therefore keeps its own key.
+
+### D54. "Is it batched?" and "is it batched BY ENGINE?" are different questions
+
+First cut collapsed them and `test_gsearch_batch_gate` caught it immediately: `relationship`
+answered True to engine's gate, which would have seeded a **second, duplicate** Gemini job on
+top of the one `relationship_runner` already drives. Now `batch_enabled` answers the honest
+question (relationship: yes, always) and `uses_shared_row_batch` answers engine's (gsearch and
+firmographics only). The test was right and the design was wrong.
+
+### D55. Blank counts as unset — in ONE place
+
+`env.get_bool_env` falls back only when a variable is ABSENT, while `.env.example` ships every
+key as `NAME=`. So a blank override reads as an explicit "off" and silently defeats the global.
+I hit this once already in `constants.py`; the tri-state read (`True` / `False` / `None` for
+absent-or-blank) now lives only in the resolver, so no call site can get it wrong again.
+`get_bool_env` itself is untouched — other callers depend on its absent-only semantics.
+
+### D56. Two names for one number, deleted
+
+`GSEARCH_GEMINI_CHUNK_SIZE` and `GSEARCH_GEMINI_MAX_INFLIGHT` were second names for
+`GEMINI_BATCH_SHARD_SIZE` / `GEMINI_BATCH_MAX_INFLIGHT` with **identical defaults** (5000 / 5).
+Tuning the documented pair did nothing for gsearch or firmographics. Same for the timeout
+(`RELATIONSHIP_BATCH_TIMEOUT_SEC`, `AI_MODE_BATCH_TIMEOUT_SEC`) and the poll interval
+(`AI_MODE_BATCH_POLL_SEC`). All deleted; a test asserts setting the dead names has no effect,
+so they cannot creep back as a silent alias.
+
+Unified timeout is **48h**, Gemini's own job expiry, not the old 1800. A Batch job runs and
+bills on Google's side whether or not we are still polling, so a 30-minute deadline abandons
+work already paid for. Closes HANDOFF blocker #1.
+
+### D57. The model fallback was a live bug, so the test guards the invariant not the instance
+
+`relationship_runner` read `GEMINI_BATCH_MODEL` with no `GEMINI_MODEL` fallback: setting only
+`GEMINI_MODEL=gemini-2.5-pro` moved three pipelines and left relationship on flash-lite.
+Rather than assert that one line is fixed, the test **scans every pipeline module for a direct
+env read of any batch key** and fails if one exists. Verified by reintroducing the bug and
+watching it fail, then restoring — a guard nobody has checked can fail is not a guard.
+
+### D58. Blocker #4 is relationship-only, so the fix is small
+
+HANDOFF says raising `GEMINI_BATCH_MAX_INFLIGHT` "creates nothing" because each shard holds a
+thread. That is true of exactly one of the three drivers:
+
+- `engine._run_one_gemini_chunk` — `await asyncio.sleep` between polls; a thread only for the
+  brief `get_batch`. Bounded by async tasks.
+- `ai_mode_service` — polls every in-flight shard inside ONE `to_thread`.
+- `relationship_runner._poll_to_terminal` — blocking `time.sleep` INSIDE a thread, one per
+  in-flight shard for the job's whole life. This is the one.
+
+So the fix is `loop.set_default_executor(ThreadPoolExecutor(...))` at worker startup, exactly
+as that function's own docstring prescribes — not a rewrite of the poll loop. Sized
+`max(32, max_inflight + 16)`: that executor is shared with every S3 write and CSV parse in the
+worker, so sizing it to the batch count alone would trade one bottleneck for a worse one.
+
+### D59. Operational note, not a code change
+
+The live `.env` pins `GEMINI_BATCH_MODEL=gemini-2.5-flash-lite` and
+`GEMINI_BATCH_TIMEOUT_SEC=1800`, and has `GSEARCH_LLM_BATCH=true` with no `LLM_BATCH`. The new
+defaults do not reach that deployment until those lines are edited — deliberately left to the
+user rather than changed under them.
+
 ## 2026-08-19 — firmographics onto scrape.do Google Search; `xlsx_export` renamed
 
 ### D37. `xlsx_export.py` → `output_export.py`

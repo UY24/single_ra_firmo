@@ -5,7 +5,7 @@ Flow exercised (no real cloud services):
   2. Call process_upload_job() for 5 rows (rows 1-5); leave row 6 stuck ("queued").
   3. Call reconcile_stuck_gsearch_rows() → row 6 force-failed via reconciler.
   4. After all rows are terminal, maybe_start_gemini_batch_for_upload triggers
-     run_gemini_batch_for_upload with GSEARCH_GEMINI_CHUNK_SIZE=2 → ≥2 chunks.
+     run_gemini_batch_for_upload with GEMINI_BATCH_SHARD_SIZE=2 → ≥2 chunks.
      Chunk 1 (the second chunk) is patched to JOB_STATE_FAILED.
   5. persist_upload_state fires _finalize_serpwow_outputs → found.csv / notFound.csv.
   6. Slack notify_run_complete is patched to capture calls.
@@ -145,8 +145,8 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
         # Environment: batch mode ON, small chunk size for ≥2 chunks, no real cloud.
         self.env = {
             "GSEARCH_LLM_BATCH": "true",
-            "GSEARCH_GEMINI_CHUNK_SIZE": "2",   # 6 rows → 3 chunks
-            "GSEARCH_GEMINI_MAX_INFLIGHT": "10",
+            "GEMINI_BATCH_SHARD_SIZE": "2",   # 6 rows → 3 chunks
+            "GEMINI_BATCH_MAX_INFLIGHT": "10",
             "ENABLE_FINAL_URL_GEMINI": "false",  # skip per-row LLM
             "GSEARCH_ROW_STALE_TIMEOUT_SEC": "60",
             "GSEARCH_ROW_MAX_REQUEUE": "0",      # force-fail immediately

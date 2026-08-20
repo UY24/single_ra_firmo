@@ -17,6 +17,7 @@ extracted into focused sibling modules (all re-imported below for backward-compa
 Shared, provider-agnostic helpers live in ``app/services/common/`` (text, env).
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
@@ -46,6 +47,7 @@ from app.core.config import PROJECT_ROOT
 from app.services.common.env import get_float_env, get_int_env, get_bool_env
 from app.services.common.text import slugify_company
 from app.services.serpwow import serpwow_client
+from app.services.common import llm_batch
 from app.services.serpwow import reporting
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
@@ -138,7 +140,6 @@ from app.services.serpwow.constants import (
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
     COST_SUMMARY_PIPELINES,
-    batch_postprocess_enabled_for,
     REPORTING_PIPELINES,
 )
 from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
@@ -292,10 +293,13 @@ _get_bool_env = get_bool_env
 
 
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
-    """Thin alias for the shared policy in constants.py — see
-    ``constants.batch_postprocess_enabled_for``. Kept because ~5 call sites in this module
-    use the private name."""
-    return batch_postprocess_enabled_for(pipeline)
+    """Does THIS module's chunked row-batch driver handle the pipeline?
+
+    Deliberately ``uses_shared_row_batch``, not ``batch_enabled``: relationship batches too,
+    but through its own driver in relationship_runner, and answering "yes" here would seed a
+    second duplicate job for it.
+    """
+    return llm_batch.uses_shared_row_batch(pipeline)
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
@@ -1902,8 +1906,8 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
     {chunk_id, job_name, status, error, parsed_by_row, usage}. Never raises — a failed
     chunk returns status='failed' with its rows unmapped (-> not found)."""
     from app.services.ai_mode import gemini_batch as gb
-    poll_interval = max(5, _get_int_env("GEMINI_BATCH_POLL_SEC", 15))
-    poll_timeout = max(60, _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 1800))
+    poll_interval = llm_batch.poll_sec()
+    poll_timeout = llm_batch.timeout_sec()
     result = {"chunk_id": chunk_id, "job_name": existing_job_name or None,
               "status": "failed", "error": None, "parsed_by_row": {}, "usage": {}}
     try:
@@ -2005,9 +2009,11 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 await persist_upload_state(upload_id, state)
             return
 
-        batch_model = os.getenv("GEMINI_BATCH_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-        chunk_size = max(1, _get_int_env("GSEARCH_GEMINI_CHUNK_SIZE", 5000))
-        max_inflight = max(1, _get_int_env("GSEARCH_GEMINI_MAX_INFLIGHT", 5))
+        # GSEARCH_GEMINI_CHUNK_SIZE / GSEARCH_GEMINI_MAX_INFLIGHT are gone: they were a
+        # second name for GEMINI_BATCH_SHARD_SIZE / _MAX_INFLIGHT with identical defaults.
+        batch_model = llm_batch.batch_model()
+        chunk_size = llm_batch.shard_size()
+        max_inflight = llm_batch.max_inflight()
         chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
         # Row -> owning chunk id, so a chunk failure can be traced back to its rows below.
         chunk_id_by_ridx: dict[int, int] = {}
@@ -3952,6 +3958,26 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         return
 
     rabbitmq_stop_event = asyncio.Event()
+
+    # HANDOFF blocker #4. relationship_runner._poll_to_terminal does a BLOCKING sleep inside
+    # asyncio.to_thread, so each in-flight Gemini shard holds one default-executor thread for
+    # the job's whole (multi-hour) life. The default pool is min(32, cpu+4) -- SIX on a 2-vCPU
+    # box -- so GEMINI_BATCH_MAX_INFLIGHT above that created nothing. Its own docstring
+    # prescribes exactly this fix.
+    #
+    # Sized off max_inflight PLUS headroom, never max_inflight alone: this executor is shared
+    # with every S3 write, CSV parse and _write_json in the worker, and starving those to make
+    # room for pollers would trade one bottleneck for a worse one. Consumers-only path, since
+    # the API process makes no provider calls.
+    #
+    # engine's own chunk driver and AI Mode do NOT need this (they await asyncio.sleep, and
+    # poll all shards from a single thread, respectively) -- it is relationship that pays.
+    executor_size = max(32, llm_batch.max_inflight() + 16)
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=executor_size, thread_name_prefix="worker"))
+    print(f"[worker] default executor sized to {executor_size} threads "
+          f"(GEMINI_BATCH_MAX_INFLIGHT={llm_batch.max_inflight()})")
+
     count = worker_count if worker_count is not None else _get_int_env("WORKER_CONCURRENCY", 4)
     count = max(1, int(count))
     rabbitmq_consumer_tasks = [
@@ -5369,7 +5395,7 @@ def _relationship_fallback_summary(counters: dict[str, Any], total: int, scraped
         # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
         # these are honest zeros rather than absent keys — the tiles render 0, not blank,
         # and fill in for real once report.json exists.
-        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "model": llm_batch.batch_model(),
         "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "processing_seconds_total": _s3_run_elapsed(counters),
         "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),

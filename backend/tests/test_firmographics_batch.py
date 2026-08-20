@@ -1,4 +1,6 @@
-"""Offline tests for firmographics Gemini BATCH mode (FIRMOGRAPHICS_LLM_BATCH).
+"""Offline tests for firmographics Gemini BATCH mode.
+
+Toggle RESOLUTION is tested in test_llm_batch_config.py, next to the shared resolver.
 
 Drives the real chunk engine (``engine.run_gemini_batch_for_upload``) with the Gemini Batch
 API mocked, the same way test_gsearch_chunked does.
@@ -12,40 +14,12 @@ from unittest import mock
 import httpx
 
 from app.services.serpwow import engine as app
-from app.services.serpwow.constants import batch_postprocess_enabled_for
 from app.services.serpwow import scrapedo_search_client as sc
 from app.services.serpwow.modes import firmographics as fm
 
 FIELDS = {"address": "Bertha-Benz-Str. 2", "phone": "+49 7142 9930-0",
           "email": "info@acme.com", "industry": "Manufacturing",
           "products": ["Towbars"], "services": ["OE development"]}
-
-
-class ToggleTests(unittest.TestCase):
-    """One switch by default; a dedicated key only when you want them to differ."""
-
-    def test_off_by_default(self) -> None:
-        with mock.patch.dict(os.environ, {"GSEARCH_LLM_BATCH": "", "FIRMOGRAPHICS_LLM_BATCH": ""}):
-            self.assertFalse(batch_postprocess_enabled_for("firmographics"))
-
-    def test_gsearch_toggle_also_turns_firmographics_on(self) -> None:
-        """A BLANK override must not defeat the fallback: .env.example ships `NAME=`."""
-        with mock.patch.dict(os.environ, {"GSEARCH_LLM_BATCH": "true",
-                                          "FIRMOGRAPHICS_LLM_BATCH": ""}):
-            self.assertTrue(batch_postprocess_enabled_for("firmographics"))
-            self.assertTrue(batch_postprocess_enabled_for("gsearch"))
-
-    def test_firmographics_key_can_diverge(self) -> None:
-        with mock.patch.dict(os.environ, {"GSEARCH_LLM_BATCH": "true",
-                                          "FIRMOGRAPHICS_LLM_BATCH": "false"}):
-            self.assertFalse(batch_postprocess_enabled_for("firmographics"))
-            self.assertTrue(batch_postprocess_enabled_for("gsearch"))
-
-    def test_other_pipelines_never_batch_here(self) -> None:
-        with mock.patch.dict(os.environ, {"GSEARCH_LLM_BATCH": "true"}):
-            # relationship owns its own Batch driver; gmaps has no LLM.
-            self.assertFalse(batch_postprocess_enabled_for("relationship"))
-            self.assertFalse(batch_postprocess_enabled_for("gmaps"))
 
 
 class ExecutorSkipsInlineCallTests(unittest.TestCase):

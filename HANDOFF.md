@@ -31,7 +31,12 @@ any `static/js` file.
 
 ## Blockers before 500k
 
-1. **`GEMINI_BATCH_TIMEOUT_SEC` is 30 min in the live `.env`, not the 48h relationship wants.**
+1. ~~**`GEMINI_BATCH_TIMEOUT_SEC` is 30 min in the live `.env`.**~~ **CODE FIXED 2026-08-19** —
+   one `GEMINI_BATCH_TIMEOUT_SEC`, default **172800 (48h)**, shared by all four pipelines via
+   `common/llm_batch.py`; `RELATIONSHIP_BATCH_TIMEOUT_SEC` and `AI_MODE_BATCH_TIMEOUT_SEC` are
+   deleted. **Still owed from YOU:** the live `.env` pins `1800` on line 227 — edit it or the
+   old deadline stands. Original note below for context.
+   **`GEMINI_BATCH_TIMEOUT_SEC` was 30 min in the live `.env`, not the 48h relationship wants.**
    `relationship_runner.py:289` defaults to 172800 but reads the *shared* SerpWow key, and
    `.env:212` sets `1800`. A Gemini verdict shard that outlives 30 min raises and the run's rows
    keep no `cleaned/` object. Either give relationship its own key or raise the shared one.
@@ -44,7 +49,11 @@ any `static/js` file.
    run parks it permanently; recovery is hand-typing the run id into Operations. Fix: attempts
    counter in `status.json` (AI Mode's `requeue_attempts` pattern) and let the scan pick `failed`
    up N times — a re-drive is free.
-4. **`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.** Each shard holds a thread for its whole
+4. ~~**`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.**~~ **DONE 2026-08-19.** The worker
+   sizes its default executor to `max(32, max_inflight + 16)` in `start_worker_consumers`.
+   Note the blocker was **relationship-only**: engine's chunk driver awaits `asyncio.sleep`
+   between polls and AI Mode polls all shards from one thread, so neither ever held a thread
+   per shard. Original note: **`GEMINI_BATCH_MAX_INFLIGHT` was silently capped.** Each shard holds a thread for its whole
    multi-hour poll, so raising it past the default `ThreadPoolExecutor`'s `min(32, cpu+4)`
    (**6 on a 2-vCPU box**) creates nothing. Needs a sized executor.
 5. ~~**gmaps state store.**~~ **DONE 2026-08-10.** gmaps is S3-only: no `state.json`, object

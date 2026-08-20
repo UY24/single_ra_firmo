@@ -104,6 +104,22 @@ def error_key(prefix: str, idx: int) -> str:
     return f"{prefix}/errors/{_shard(idx)}/{_row_name(idx)}.json"
 
 
+def pending_llm_key(prefix: str, idx: int) -> str:
+    """Marker: this row's LLM work was DEFERRED to a batch job.
+
+    Written by firmographics' scrape phase only when batching is on. Its whole purpose is
+    to make phase 2's pending set ONE paginated LIST instead of one GET per row: without it
+    the phase had to open every rows/ object to ask "was this one deferred?", which is
+    500k GETs at scale — in a phase that does nothing at all in inline mode.
+    """
+    return f"{prefix}/pending_llm/{_shard(idx)}/{_row_name(idx)}"
+
+
+def list_pending_llm_rows(prefix: str) -> set[int]:
+    """Row indices whose LLM work was deferred to a batch. Empty in inline mode."""
+    return list_done_rows(prefix, "pending_llm")
+
+
 def cleaned_key(prefix: str, idx: int) -> str:
     return f"{prefix}/cleaned/{_shard(idx)}/{_row_name(idx)}.json"
 

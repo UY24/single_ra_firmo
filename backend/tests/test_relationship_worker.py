@@ -67,10 +67,10 @@ class RelationshipWorkerWiringTests(unittest.TestCase):
         # M4: still alive despite the channel setup having raised.
         self.assertFalse(results["done"])
 
-    def test_both_s3_only_pipelines_get_a_consumer_and_a_redrive_loop(self) -> None:
-        """gmaps joined relationship on the run-per-message model in 2026-08. Starting
-        only one of them would leave the other's uploads sitting in a queue nobody reads,
-        with no re-drive scan to rescue them either."""
+    def test_every_s3_only_pipeline_gets_a_consumer_and_a_redrive_loop(self) -> None:
+        """gmaps joined relationship on the run-per-message model in 2026-08, and
+        firmographics in 2026-08-20. Missing any one of them leaves that pipeline's uploads
+        sitting in a queue nobody reads, with no re-drive scan to rescue them either."""
         started: list[str] = []
 
         class FakeChannel:
@@ -92,13 +92,21 @@ class RelationshipWorkerWiringTests(unittest.TestCase):
                         new=mock.AsyncMock(return_value=0)), \
                     mock.patch(
                         "app.services.serpwow.gmaps_runner.redrive_stale_runs",
+                        new=mock.AsyncMock(return_value=0)), \
+                    mock.patch(
+                        "app.services.serpwow.firmographics_runner"
+                        ".consume_firmographics_runs",
+                        new=mock.AsyncMock(
+                            side_effect=lambda ch: started.append("firmographics"))), \
+                    mock.patch(
+                        "app.services.serpwow.firmographics_runner.redrive_stale_runs",
                         new=mock.AsyncMock(return_value=0)):
                 await worker._start_run_workers()
                 return len(app_engine.rabbitmq_consumer_tasks)
 
         redrive_loops = asyncio.run(run())
-        self.assertEqual(sorted(started), ["gmaps", "relationship"])
-        self.assertEqual(redrive_loops, 2)
+        self.assertEqual(sorted(started), ["firmographics", "gmaps", "relationship"])
+        self.assertEqual(redrive_loops, 3)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import copy
 import tempfile
 import unittest
@@ -802,7 +803,10 @@ class TestBatchJobActionRealPersistence(unittest.IsolatedAsyncioTestCase):
         }
         run_batch = AsyncMock()
 
-        with patch.object(engine, "persist_upload_state", AsyncMock()), \
+        # The batch gate reads LLM_BATCH / GSEARCH_LLM_BATCH, and tests/__init__ blanks
+        # both so the suite cannot inherit a developer .env. State the intent here.
+        with patch.dict(os.environ, {"GSEARCH_LLM_BATCH": "true"}), \
+             patch.object(engine, "persist_upload_state", AsyncMock()), \
              patch.object(engine, "run_gemini_batch_for_upload", run_batch):
             await engine.maybe_start_gemini_batch_for_upload(upload_id, state)
             await asyncio.sleep(0)

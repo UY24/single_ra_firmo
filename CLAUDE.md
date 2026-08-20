@@ -164,9 +164,52 @@ Two **kinds** of dial, deliberately not one — but in practice you set only the
 
 `scrapedo_slot()` is **one gate shared by gmaps AND AI Mode** — scrape.do's cap is per *account* and both run in the same worker process, so two separate caps could sum past it. It stays even when you intend to run one pipeline at a time, because that isn't fully manual: AI Mode's periodic reconciler re-dispatches finish tasks and republishes missing batches on its own, and the resume endpoint can start work you didn't. The cap turns "only run one at a time" from a rule someone has to remember into an enforced invariant. Note the provider cap deliberately does **not** track `WORKER_CONCURRENCY` — if it did, raising slots would silently raise the vendor limit and defeat the point. gmaps wraps its HTTP call; AI Mode wraps its `to_thread(scrape_batch_sync)`. It's a concurrency cap only: if scrape.do also enforces requests/second, a token bucket goes **inside** that helper and no call site changes.
 
-Why per-row cost matters here: `update_row_state` rewrites the **entire** `state.json` per row under a per-upload lock, so throughput is capped by state size regardless of concurrency. Rows therefore must not carry provider payloads — gmaps and gsearch persist their context **without** `raw_response` (it's already in `serpwow_response/`), which took a row from 39.2 KB to 2.2 KB and the ceiling at 1k rows from 4.3 to ~76 rows/s. That's enough for 100 concurrency up to roughly **2.7k rows**; beyond that the per-upload lock is the limit again and the fix is per-row files + O(1) counters (AI Mode's model). `_write_json` is atomic (temp + `os.replace`) and runs off the event loop.
+Why per-row cost matters here — and this now applies to **gsearch alone**, the last state-driven pipeline: `update_row_state` rewrites the **entire** `state.json` per row under a per-upload lock, so throughput is capped by state size regardless of concurrency. Rows therefore must not carry provider payloads — gmaps and gsearch persist their context **without** `raw_response` (it's already in `serpwow_response/`), which took a row from 39.2 KB to 2.2 KB and the ceiling at 1k rows from 4.3 to ~76 rows/s. That's enough for 100 concurrency up to roughly **2.7k rows**; beyond that the per-upload lock is the limit again and the fix is per-row files + O(1) counters (AI Mode's model). `_write_json` is atomic (temp + `os.replace`) and runs off the event loop.
 
-### firmographics pipeline (scrape.do Google Search) — credits only, two priced endpoints
+### firmographics pipeline (scrape.do Google Search) — S3-only, built for 500k rows
+**No `state.json` and no local disk since 2026-08-20** — the third pipeline to move, and the
+migration removed a hard ~2.7k-row ceiling: `update_row_state` rewrote the WHOLE state file
+under a per-upload lock on every row, so bytes written grew with the SQUARE of the row count
+(~7.6GB at 2.7k rows, ~262TB at 500k). Measured after the move: **2.01 S3 writes and ~881
+bytes per row, flat at any run size.**
+
+S3 object presence IS the row state, three objects with three meanings:
+`raw/<shard>/row_NNNNNN.json` = the provider's SERP verbatim; `rows/…` = OUR result + its
+cost, and the **phase-1 DONE marker** (written after `raw/`, so a crash between the two just
+re-scrapes); `cleaned/…` = the six fields when a Gemini **batch** produced them (absent in
+inline mode); `pending_llm/…` = a tiny marker meaning "this row's LLM work was deferred".
+That last one exists so **phase 2's pending set is ONE list, not a GET per row** — it used to
+open every `rows/` object to ask "was this deferred?", which is 500k round-trips inside a
+phase that does nothing at all in inline mode (`test_firmographics_runner` pins it).
+
+Orchestration is `firmographics_runner` (ONE RabbitMQ message per RUN on
+`firmographics_runs`, ack-on-receipt, bounded task window from `SCRAPEDO_CONCURRENCY`,
+`redrive_stale_runs` for durability) over the shared `s3_run_driver`/`s3_run_store` — the
+generic half is 100% shared with gmaps and relationship, so the runner is ~380 lines.
+**Three phases**: scrape → LLM → outputs, and the LLM phase runs unconditionally rather than
+being branched around by the mode flag, because which mode a run used has to be recoverable
+from the objects, not from current env.
+
+- **Outputs** (`firmographics_outputs.write_outputs`, memory O(one row), spooled temp files):
+  **`enriched.csv` / `notEnriched.csv`** — not found/notFound, because this pipeline is HANDED
+  the website and a found/not-found split would name a discovery result it never computed —
+  plus `retry.csv`, `report.json` (**summary only**) and `run.log`, all under
+  `<company-slug>/firmographics/<run_id>/`. Columns are the uploaded header verbatim then
+  `address, phone, email, industry, products, services, llm_model, scrapedo_credits,
+  enrichment_note`. `retry.csv`'s membership rule is the SHARED `reporting.retry_row`, so the
+  three pipelines' rerun lists speak one vocabulary; a row with no `website_url` is excluded
+  (not rerunnable — the INPUT is what is missing).
+- **`/uploads/{id}/output` and its CSV form 404 for this pipeline now** — there is no
+  state.json to build them from. `run_detail.js` knows via `NO_STATE_PIPELINES` and
+  advertises the result files instead.
+- Upload validates every row and retains **none** (`csv_input.count_firmographics_csv_rows`),
+  writes `input.csv` to S3 and publishes one message; 400s early on a missing
+  `SCRAPEDO_TOKEN`/`GEMINI_API_KEY`/`S3_BUCKET` rather than burning a run.
+- `row_fields` resolves headers through `csv_input.firmographics_columns` — the SAME alias
+  table the upload validates against, so a header accepted at upload can never be one the
+  worker fails to find.
+
+#### Provider + cost (unchanged by the S3 move) — credits only, two priced endpoints
 Migrated off SerpWow **2026-08-19**, the last of the three. Still state-driven (per-row
 RabbitMQ messages, `state.json`) — only the provider changed, so the ~2.7k-row state
 ceiling from the concurrency section still applies to it.

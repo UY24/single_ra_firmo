@@ -8,9 +8,14 @@ archived newest-first in `docs/HISTORY.md`. This file is only current state + wh
 
 - Branch **`relationship-scrapedo`**, **5 commits ahead of `origin/relationship-scrapedo`** (pushed branch exists; these are not on it) — newest `ced718c` (output CSVs carry the input columns). Only the firmographics column rename below is uncommitted.
 - **778/778** offline tests + **6/6** `.mjs` DOM contracts passing.
-- Two pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03) and
-  **relationship** (Google AI Mode, 2026-08-04). **gsearch** and **firmographics** still call
-  `api.serpwow.com`. AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
+- **Three** pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03),
+  **relationship** (Google AI Mode, 2026-08-04) and **firmographics** (Google Search,
+  2026-08-19). **gsearch alone** still calls `api.serpwow.com`.
+  AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
+- **All three scrape.do pipelines are now S3-only** (no state.json, no local disk, one message
+  per run). firmographics migrated 2026-08-20 — measured at **2.01 S3 writes / ~881 bytes per
+  row, flat at any run size**. **gsearch is the last state-driven pipeline**, and the ~2.7k-row
+  ceiling now applies to it alone.
 - gmaps is live-verified (3 real 100-row runs). relationship has had real runs — the last three
   commits are fixes they surfaced — but the checklist below is not finished.
 
@@ -61,7 +66,10 @@ any `static/js` file.
    It reuses *relationship's* primitives (`s3_run_store` + the new `s3_run_driver`), not AI Mode's,
    and is two phases rather than three — its LLM confidence modes were deleted, so there is no
    batch pass. Old state-driven gmaps runs are not migrated (hard cutover; their S3 data remains).
-6. **API-process memory — partly fixed.** `parse_relationship_csv` (2026-08-05) and
+6. ~~**firmographics cannot reach 500k.**~~ **DONE 2026-08-20** — S3-only, three phases,
+   `firmographics_runs` queue. Its LLM phase finds its work with one LIST (`pending_llm/`
+   markers) rather than a GET per row.
+7. **API-process memory — partly fixed.** `parse_relationship_csv` (2026-08-05) and
    `parse_entities_csv` (2026-08-10, via `sample_limit`) now validate every row while retaining
    none, so a 500k-row upload no longer materialises its rows in the API process. Still open:
    `/uploads/{id}/result` reads a whole several-hundred-MB CSV into memory instead of streaming
@@ -255,9 +263,10 @@ gmaps on AI Mode's primitives — checklist in `docs/HISTORY.md` (2026-07-14).
 
 - **`errorTaxonomy` branch is NOT merged — user's call.** `found`/`not_found`/`error` taxonomy,
   reviewed, offline-green, not live-verified. Details in `docs/HISTORY.md` (2026-07-10).
-- **Decide gsearch / firmographics.** User intends to retire them; retiring before the gmaps state
-  rework is cheaper than preserving behaviour for pipelines about to be deleted. Rename
-  `serpwow_*` → `scrapedo_*` per pipeline as it migrates, package rename last.
+- **Decide gsearch.** It is the ONLY pipeline left on SerpWow and the only one still
+  state-driven, so the ~2.7k-row ceiling and `serpwow_client` exist for it alone. Retiring it
+  would let the `services/serpwow/` package rename (and `CrawlResponse.serpwow_cost_usd`)
+  finally happen. firmographics is no longer part of this decision — it migrated 2026-08-19/20.
 - **AI Mode's empty-response spend** (`scrapedo_empty_requests/` at the repo root) — the real money
   leak, never investigated. gmaps measured `scrapedo_billed_empty=0`, so it isn't leaking.
 
@@ -271,3 +280,20 @@ gmaps on AI Mode's primitives — checklist in `docs/HISTORY.md` (2026-07-14).
 - **Log decisions in `DECISIONS.md`** (newest first, including what was deliberately not
   done) and keep `FLOW.md` honest about what calls what — update its §6 table whenever the
   part of the path you touched moves.
+
+## Owed verification — firmographics S3-only (2026-08-20)
+
+Offline-green (12 dedicated tests drive the real runner + real store against a fake S3) but
+**never run live**. Checklist, mirroring what gmaps and relationship went through:
+
+1. Upload a 100-row CSV to `/uploads/firmographics`; confirm `enriched.csv` /
+   `notEnriched.csv` / `retry.csv` / `report.json` / `run.log` all appear in the Files card,
+   and that `output.json` / `output.csv` are NOT offered (they 404 by design now).
+2. Reconcile `report.json`'s `scrapedo_credits` against scrape.do's dashboard:
+   `10 x search 200s + 5 x ai-overview 200s`. The deferred count is the number to watch —
+   it has never been observed on a real run.
+3. `kill -9` the worker mid-scrape, restart, confirm the re-drive resumes with zero
+   re-scraped rows and zero re-spend (the offline test asserts this; live proves it).
+4. Run once with `LLM_BATCH=true` and once `false`; the six fields must match. Both paths send
+   a byte-identical prompt, so a difference means the batch mapping is wrong.
+5. Slack ping + the Supabase row on a terminal run.

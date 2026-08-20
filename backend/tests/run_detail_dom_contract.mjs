@@ -517,14 +517,45 @@ async function completedWithErrorsBatchIsTerminal() {
     "SerpWow failed attempts were not visible beside cost");
 }
 
-async function nonReportingPipelineIgnoresBatchState() {
-  const { root } = await renderStatus("firmo-batch", {
+async function firmographicsIsS3OnlyAndCarriesNoBatchState() {
+  // firmographics moved to the S3-only runner on 2026-08-20, so it has no state.json and
+  // therefore no gemini_batch field at all — the case this used to cover (a non-reporting
+  // pipeline handed batch state) can no longer be produced by the server.
+  //
+  // What must hold instead: it is terminal on its own status, it advertises its OWN result
+  // files, and it does NOT offer output.json / output.csv — both 404 without a state.json.
+  const { root } = await renderStatus("firmo-s3", {
     pipeline: "firmographics", status: "completed", total_rows: 2, processed_rows: 2,
-    success_rows: 2, failed_rows: 0, gemini_batch: { status: "running" },
+    success_rows: 2, failed_rows: 0,
+    serpwow_summary: {
+      total_rows: 2, websites_found: 2, websites_not_found: 0,
+      confidence_mode: null, model: "gemini-2.5-flash-lite", llm_mode: "inline",
+      available_files: ["enriched.csv", "notEnriched.csv", "retry.csv",
+                        "report.json", "run.log"],
+      cost: { llm_usd: 0.0004, scrapedo_requests: 2, scrapedo_credits: 20,
+              scrapedo_search_successful: 2, scrapedo_ai_overview_successful: 0,
+              total_usd: 0.0004 },
+      outcome_breakdown: { found: 2, not_found: 0, errored: 0 },
+      empty_response_breakdown: { no_ai_overview: 0, deferred: 0 },
+      token_usage: { prompt_tokens: 200, completion_tokens: 100, total_tokens: 300 },
+    },
   });
-  assert(timers.length === 0, "non-reporting pipeline silently kept polling irrelevant batch state");
-  assert(!root.textContent.includes("finalizing"), "non-reporting pipeline showed reporting finalizing state");
-  assert(byClass(root, "files-section").length === 1, "terminal non-reporting pipeline files missing");
+  assert(timers.length === 0, "terminal S3-only run kept polling");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "terminal firmographics run hid its Files surface");
+  assert(files.textContent.includes("enriched.csv")
+    && files.textContent.includes("notEnriched.csv"),
+  "firmographics did not advertise its own result files");
+  assert(!files.textContent.includes("found.csv"),
+    "firmographics advertised gsearch's file names");
+  assert(!files.textContent.includes("output.json")
+    && !files.textContent.includes("output.csv"),
+  "firmographics advertised state-driven output endpoints it has no state for");
+  // No Confidence chip: the website is an input, so there is nothing to be confident
+  // about. The LLM chip is what says a paid model ran, and in which mode.
+  assert(!root.textContent.includes("Heuristic"),
+    "firmographics showed a confidence mode it does not have");
+  assert(root.textContent.includes("Inline"), "firmographics hid its LLM mode");
 }
 
 async function failedReportingRunShowsFiles() {
@@ -840,7 +871,7 @@ await counterDrivenRelationshipRunning();
 await counterDrivenRelationshipFailedMidScrape();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
-await nonReportingPipelineIgnoresBatchState();
+await firmographicsIsS3OnlyAndCarriesNoBatchState();
 await failedReportingRunShowsFiles();
 await cancelledBatchTerminalizes();
 await legacyCompatibility();

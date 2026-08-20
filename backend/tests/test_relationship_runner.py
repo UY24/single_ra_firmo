@@ -10,6 +10,7 @@ from app.services import ai_mode as ai_mode_pkg
 # Imported for its side effect: mock.patch.object(ai_mode_pkg, "gemini_batch") below
 # needs the submodule attribute to exist, and only an import sets it.
 from app.services.ai_mode import gemini_batch as _gemini_batch  # noqa: F401
+from app.services.common import llm_batch
 from app.services.serpwow import relationship_runner as runner
 from app.services.serpwow import s3_run_driver as driver
 from app.services.serpwow import s3_run_store as store
@@ -380,8 +381,10 @@ class GeminiBatchTimeoutTests(unittest.TestCase):
         self.assertEqual(out["0"]["parsed"], {})
         # usage + model are kept now, not discarded — the UI's token/model tiles read them.
         self.assertIn("usage", out["0"])
-        self.assertEqual(out["0"]["model"], os.getenv("GEMINI_BATCH_MODEL",
-                                                      "gemini-2.5-flash-lite"))
+        # Assert against the RESOLVER, not os.getenv with a default: a blank-but-present
+        # GEMINI_BATCH_MODEL (which tests/__init__ sets, so the suite ignores a developer
+        # .env) makes os.getenv return "" while llm_batch correctly treats it as unset.
+        self.assertEqual(out["0"]["model"], llm_batch.batch_model())
 
 
 class VerdictPhaseTests(unittest.TestCase):

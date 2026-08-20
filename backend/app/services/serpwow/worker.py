@@ -42,16 +42,22 @@ async def _start_s3_run_worker(label: str, consume, redrive, scan_env: str) -> N
 
 
 async def _start_run_workers() -> None:
-    from app.services.serpwow import gmaps_runner, relationship_runner
+    from app.services.serpwow import (
+        firmographics_runner,
+        gmaps_runner,
+        relationship_runner,
+    )
 
     for label, module, scan_env, consume in (
         ("relationship", relationship_runner, "RELATIONSHIP_REDRIVE_SCAN_SEC",
          relationship_runner.consume_relationship_runs),
         ("gmaps", gmaps_runner, "GMAPS_REDRIVE_SCAN_SEC",
          gmaps_runner.consume_gmaps_runs),
+        ("firmographics", firmographics_runner, "FIRMOGRAPHICS_REDRIVE_SCAN_SEC",
+         firmographics_runner.consume_firmographics_runs),
     ):
-        # Per-pipeline try: one pipeline's broker problem must not stop the other from
-        # consuming, and both are already best-effort against the SerpWow consumers.
+        # Per-pipeline try: one pipeline's broker problem must not stop the others from
+        # consuming, and all are already best-effort against the SerpWow consumers.
         try:
             await _start_s3_run_worker(
                 label, consume, module.redrive_stale_runs, scan_env)

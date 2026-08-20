@@ -9,6 +9,82 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-20 — firmographics off state.json: the last ceiling in the pipeline
+
+Asked directly whether firmographics could handle 500k like gmaps and relationship. It could
+not, and the honest answer was that only the PROVIDER had been migrated: the storage model
+was untouched, so `update_row_state` still rewrote the whole `state.json` per row under a
+per-upload lock. Bytes written grew with the SQUARE of the row count — ~7.6GB at the
+documented 2.7k ceiling, **~262TB at 500k**. Not a slowdown, a wall.
+
+### D60. Copy gmaps, do not invent
+
+`s3_run_driver` already owns the generic half — one message per run, the bounded task window,
+stop gating, the single-flight guard, the stale-run re-drive, the consumer, the
+Supabase/Slack terminal write. So the new runner is ~380 lines of pipeline-specific work and
+nothing else, and the endpoint/status/stop/retry paths needed a segment added rather than a
+new branch (`_find_s3_run` resolves all three namespaces; `stop_upload` already routed
+through it, so stop worked with zero new code).
+
+### D61. Four object kinds, and why `pending_llm/` earns its place
+
+`raw/` = the SERP verbatim, `rows/` = our result + cost (the phase-1 done marker, written
+second so a crash re-scrapes), `cleaned/` = the six fields when a BATCH produced them.
+
+First cut had only those three, and phase 2 computed its pending set by opening **every**
+`rows/` object to ask "was this row deferred?". The test log is what exposed it — an inline
+run printed `LLM phase: 3 candidate row(s)` for a phase with nothing to do, which is 500k
+GETs at scale to discover there is no work. `pending_llm/` is a tiny marker written only when
+batching defers a row, so the pending set is ONE paginated list and inline mode pays for a
+single list call. `test_firmographics_runner` pins it by counting per-row reads.
+
+Rejected: a `rows_deferred` counter in status.json. Counters are documented as a CACHE that a
+re-drive rebuilds from the objects — deriving control flow from one would make a lost
+status.json lose work.
+
+### D62. The LLM phase is not branched around by the mode flag
+
+`run_llm_phase` runs on every drive, inline or not, and costs one list when there is nothing
+to do. Gating it on `llm_batch.batch_enabled(...)` would mean a run that batched last week
+gets skipped after someone flips the toggle, stranding paid-for shards. Which mode a run used
+has to be recoverable from the OBJECTS, and it is: `is_batch` in the summary comes from
+`rows_cleaned`, not from current env.
+
+### D63. `enriched.csv` / `notEnriched.csv`, not found/notFound
+
+Every other pipeline splits on "did we discover a website". This one is HANDED the website, so
+reusing those names would publish a discovery result it never computed — the same reasoning
+that keeps it out of `REPORTING_PIPELINES` and reports `confidence_mode: null`. The retry
+membership rule is still the SHARED `reporting.retry_row`, so the three rerun lists cannot
+drift in vocabulary.
+
+Consequence accepted and surfaced: `/uploads/{id}/output?format=csv` — the export built on
+2026-08-18 — now 404s for this pipeline, because there is no state.json to build it from.
+`enriched.csv` supersedes it and is strictly better (streamed, carries the input columns).
+`run_detail.js` learned `NO_STATE_PIPELINES` so it stops advertising a link that cannot work.
+
+### D64. The test suite was not hermetic against `.env`, and it made a real API call
+
+Found mid-migration: four failures came from `AI_DEEP_BATCH_SIZE=2` in a developer `.env`
+leaking into the test process, and one from `LLM_BATCH=true` doing the same — that one flipped
+AI Mode's cleanup into the Gemini BATCH path during an "offline" test, which then made a real
+HTTPS call to `generativelanguage.googleapis.com` and failed with HTTP 400.
+
+`tests/__init__.py` blanked credentials but not behaviour toggles. It now blanks both. A
+credential blank stops a leak; a toggle blank stops the suite's RESULT from depending on whose
+machine it runs on — and stops an offline test from spending money.
+
+Two tests had to say what they meant rather than inherit it: one now sets
+`GSEARCH_LLM_BATCH=true` explicitly, and one asserted a model against
+`os.getenv(key, default)` — which returns `""` for a blank-but-present var — and now asserts
+against `llm_batch.batch_model()`, the single source of truth.
+
+### D65. Measured, not asserted
+
+`writes/row` converges to **2.01** and `bytes/row` to **881** across 10 → 800 row runs, i.e.
+flat. That is the whole claim of the migration, so it was measured against the real runner and
+the real store rather than reasoned about.
+
 ## 2026-08-19 (b) — one resolver for all Gemini batch config
 
 Pushback, fairly: adding firmographics batch mode I made `FIRMOGRAPHICS_LLM_BATCH` fall back to

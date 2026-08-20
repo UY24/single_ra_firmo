@@ -47,6 +47,34 @@ _EMPTY_MAPPED_COLUMNS: dict[str, Any] = {
 }
 
 
+def row_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """The inputs a firmographics row needs, out of an arbitrary input.csv row.
+
+    Header resolution goes through ``csv_input.firmographics_columns`` -- the SAME alias
+    table the upload validates against -- so a header accepted at upload can never be one
+    the worker fails to find. The row index is the CSV position injected by
+    ``s3_run_store.iter_input_rows``, not a sequence number that skips blanks: it is the
+    row's identity in raw/, rows/ and cleaned/, so it has to survive a row with no website.
+    """
+    from app.services.serpwow.csv_input import firmographics_columns
+
+    columns = firmographics_columns(list(row.keys()))
+
+    def pick(canonical: str) -> str:
+        key = columns.get(canonical)
+        return str(row.get(key) or "").strip() if key else ""
+
+    return {
+        "row_index": row.get("row_index"),
+        "official_website": _normalize_website_input(pick("website_url")),
+        "company_name": pick("company_name"),
+        "country": pick("country"),
+        "firm_id": pick("firm_id"),
+        "industry": pick("industry"),
+        "full_address": pick("full_address"),
+    }
+
+
 def _cost_breakdown(scrapedo: dict[str, Any], gemini_cost_usd: float) -> dict[str, Any]:
     """Credit accounting for one row, in the shape the run summary routes on: the presence
     of ``scrapedo_requests``/``scrapedo_credits`` is what makes ``build_summary`` account

@@ -21,7 +21,13 @@ import {
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
-const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship"]);
+// Pipelines that write result files at the end of a run. firmographics joined on
+// 2026-08-20 with its S3-only migration.
+const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship",
+                                     "firmographics"]);
+// The S3-only pipelines keep NO state.json, so /uploads/{id}/output (and its CSV form)
+// 404 for them — their per-row data is in the result files instead.
+const NO_STATE_PIPELINES = new Set(["relationship", "firmographics"]);
 const BATCH_TERMINAL_STATUSES = new Set([
   "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
 ]);
@@ -924,17 +930,24 @@ function renderLegacyStatus(root, ref, s) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
     // retry.csv is the rerun/refund list, written only by the two S3-only pipelines —
     // gsearch shares this branch and never produces one, so don't advertise it there.
-    const retryFile = ["gmaps", "relationship"].includes(s.pipeline) ? ["retry.csv"] : [];
+    // retry.csv is the rerun/refund list, written only by the S3-only pipelines — gsearch
+    // shares this branch and never produces one, so don't advertise it there.
+    const retryFile = ["gmaps", "relationship", "firmographics"].includes(s.pipeline)
+      ? ["retry.csv"] : [];
+    // enriched/notEnriched for firmographics: it is HANDED the website, so a found/notFound
+    // split would name a discovery result it never computed.
+    const PAIRS = {
+      relationship: ["confirmed_relation.csv", "notconfirmed_relation.csv"],
+      firmographics: ["enriched.csv", "notEnriched.csv"],
+    };
     const resultFiles = (runState.reporting && runState.batchTerminal)
-      ? (s.pipeline === "relationship"
-          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", ...retryFile,
-             "report.json", "run.log"]
-          : ["found.csv", "notFound.csv", ...retryFile, "report.json", "run.log"])
+      ? [...(PAIRS[s.pipeline] ?? ["found.csv", "notFound.csv"]), ...retryFile,
+         "report.json", "run.log"]
       : [];
-    // Relationship runs are counter-driven: there is no state.json to build output.json
-    // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two
-    // relationship CSVs above — don't advertise two links that cannot work.
-    const extras = s.pipeline === "relationship" ? [] : [
+    // The S3-only pipelines are counter-driven: there is no state.json to build
+    // output.json (or its CSV) from, so both endpoints 404. Their per-row detail lives in
+    // the result CSVs above — don't advertise two links that cannot work.
+    const extras = NO_STATE_PIPELINES.has(s.pipeline) ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
       // CSV, not XLSX: it opens in Excel just the same (the bytes carry a UTF-8 BOM) and
       // is the format the per-row output is actually loaded from. ?format=xlsx still works

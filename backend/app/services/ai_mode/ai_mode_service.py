@@ -224,10 +224,11 @@ def build_ai_mode_llm_config() -> LLMConfig:
     Defaults to the Gemini provider. Reads process env directly; does NOT load a
     scrape.do .env file.
     """
-    # Batch cleanup is Gemini-only, so AI_MODE_LLM_BATCH forces the Gemini provider
-    # regardless of AI_MODE_LLM_PROVIDER (which governs only the normal/sync path).
-    # ai_bulk and ai_deep share ONE override key (AI_MODE_LLM_BATCH), so either
-    # name resolves identically -- this function does not know which mode it is for.
+    # Batch cleanup is Gemini-only, so LLM_BATCH forces the Gemini provider regardless of
+    # AI_MODE_LLM_PROVIDER (which governs only the normal/sync path). Since 2026-08-20 that
+    # is the ONE global toggle, so turning batching on anywhere turns it on here too.
+    # ai_bulk and ai_deep resolve identically -- this function does not know which mode it
+    # is for, and does not need to.
     batch_mode = llm_batch.batch_enabled("ai_bulk")
     if batch_mode:
         provider = "gemini"
@@ -994,7 +995,7 @@ def run_ai_mode_finish(
 
         if batch_mode:
             if not _str_env("GEMINI_API_KEY"):
-                raise RuntimeError("GEMINI_API_KEY not configured (required for AI_MODE_LLM_BATCH)")
+                raise RuntimeError("GEMINI_API_KEY not configured (required for LLM_BATCH)")
             shard_size = llm_batch.shard_size()
             max_inflight = llm_batch.max_inflight()
             poll_sec = llm_batch.poll_sec()

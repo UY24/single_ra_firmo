@@ -443,7 +443,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                     prompt_tokens += int(usage.get("promptTokenCount", 0) or 0)
                     completion_tokens += int(usage.get("candidatesTokenCount", 0) or 0)
     # is_batch: the gemini_batch block is only seeded when batch post-processing is
-    # enabled for this upload (GSEARCH_LLM_BATCH), so its presence is the reliable signal.
+    # enabled for this upload (LLM_BATCH), so its presence is the reliable signal.
     is_batch = bool(state.get("gemini_batch"))
     # SerpWow gsearch is per-request billed (unlike scrape.do's flat fee), so
     # surface a USD figure. Rate unset -> 0 (no crash).

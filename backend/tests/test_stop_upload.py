@@ -92,7 +92,7 @@ class TestStopGuards(unittest.TestCase):
     def test_maybe_start_skips_stopped_uploads(self):
         state = {"pipeline": "gsearch", "status": "completed_with_errors",
                  "stopped_by_user_at": "t", "rows": []}
-        with patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}), \
+        with patch.dict("os.environ", {"LLM_BATCH": "true"}), \
              patch.object(engine, "persist_upload_state", AsyncMock()) as persist:
             asyncio.run(engine.maybe_start_gemini_batch_for_upload("u-stop", state))
         persist.assert_not_awaited()

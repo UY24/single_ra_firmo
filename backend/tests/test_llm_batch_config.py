@@ -2,6 +2,10 @@
 
 One value must move all four pipelines. Before this module existed, the shard size lived under
 two key names with identical defaults and the model resolved differently per pipeline.
+
+Since 2026-08-20 that applies to the TOGGLE too: ``LLM_BATCH`` is the only one, and the three
+per-pipeline overrides are deleted rather than deprecated — see
+``test_deleted_per_pipeline_toggles_have_no_effect``.
 """
 import os
 import unittest
@@ -13,7 +17,7 @@ from app.services.serpwow import engine, relationship_runner
 # Every key the resolver reads, blanked, so a stray value in the developer's environment
 # cannot make a test pass or fail by accident.
 _CLEAN = {k: "" for k in (
-    "LLM_BATCH", "AI_MODE_LLM_BATCH", "GSEARCH_LLM_BATCH", "FIRMOGRAPHICS_LLM_BATCH",
+    "LLM_BATCH",
     "GEMINI_BATCH_MODEL", "GEMINI_MODEL", "GEMINI_BATCH_SHARD_SIZE",
     "GEMINI_BATCH_MAX_INFLIGHT", "GEMINI_BATCH_TIMEOUT_SEC", "GEMINI_BATCH_POLL_SEC")}
 
@@ -33,20 +37,15 @@ class ToggleTests(unittest.TestCase):
             for pipe in ("ai_bulk", "ai_deep", "gsearch", "firmographics"):
                 self.assertTrue(lb.batch_enabled(pipe), pipe)
 
-    def test_blank_override_does_not_defeat_the_global(self) -> None:
-        """.env.example ships every key as `NAME=`, and get_bool_env only falls back on an
-        ABSENT variable — so blank has to mean "unset" or the global silently stops working."""
-        with _env(LLM_BATCH="true", GSEARCH_LLM_BATCH="", FIRMOGRAPHICS_LLM_BATCH="   "):
-            self.assertTrue(lb.batch_enabled("gsearch"))
-            self.assertTrue(lb.batch_enabled("firmographics"))
-
-    def test_a_set_override_wins_both_ways(self) -> None:
-        with _env(LLM_BATCH="true", FIRMOGRAPHICS_LLM_BATCH="false"):
-            self.assertFalse(lb.batch_enabled("firmographics"))
-            self.assertTrue(lb.batch_enabled("gsearch"))
-        with _env(LLM_BATCH="false", FIRMOGRAPHICS_LLM_BATCH="true"):
-            self.assertTrue(lb.batch_enabled("firmographics"))
-            self.assertFalse(lb.batch_enabled("gsearch"))
+    def test_blank_reads_as_unset_not_as_off(self) -> None:
+        """.env.example ships the key as `NAME=`, and get_bool_env only falls back on an
+        ABSENT variable — so blank has to mean "unset", which is what _flag's tri-state is
+        for. With one toggle left, blank and false happen to agree; the distinction stays
+        because a caller that treats "not configured" differently must still be able to."""
+        with _env(LLM_BATCH="   "):
+            for pipe in ("ai_bulk", "ai_deep", "gsearch", "firmographics"):
+                self.assertFalse(lb.batch_enabled(pipe), pipe)
+        self.assertIsNone(lb._flag("LLM_BATCH_DEFINITELY_UNSET_KEY"))
 
     def test_relationship_is_always_batch(self) -> None:
         """Its Gemini call IS the verdict; there is no inline path to switch to, so a toggle
@@ -139,6 +138,19 @@ class MechanicalKnobTests(unittest.TestCase):
             self.assertEqual(lb.shard_size(), 5000)
             self.assertEqual(lb.max_inflight(), 5)
             self.assertEqual(lb.timeout_sec(), 172800)
+
+    def test_deleted_per_pipeline_toggles_have_no_effect(self) -> None:
+        """The three overrides were deleted 2026-08-20. A leftover line in someone's .env
+        must be INERT, not a ghost key that still quietly wins over the global — that is the
+        exact failure the collapse to one toggle was meant to end."""
+        with _env(LLM_BATCH="false", AI_MODE_LLM_BATCH="true",
+                  GSEARCH_LLM_BATCH="true", FIRMOGRAPHICS_LLM_BATCH="true"):
+            for pipe in ("ai_bulk", "ai_deep", "gsearch", "firmographics"):
+                self.assertFalse(lb.batch_enabled(pipe), pipe)
+        with _env(LLM_BATCH="true", AI_MODE_LLM_BATCH="false",
+                  GSEARCH_LLM_BATCH="false", FIRMOGRAPHICS_LLM_BATCH="false"):
+            for pipe in ("ai_bulk", "ai_deep", "gsearch", "firmographics"):
+                self.assertTrue(lb.batch_enabled(pipe), pipe)
 
 
 if __name__ == "__main__":

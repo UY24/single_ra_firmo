@@ -29,7 +29,7 @@ class TestGsearchWorker(unittest.TestCase):
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini",
                                return_value=(confidence_raw, None, "gemini-2.5-flash-lite",
                                              {"promptTokenCount": 50, "candidatesTokenCount": 10})), \
-             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false",
+             mock.patch.dict("os.environ", {"LLM_BATCH": "false",
                                             "ENABLE_FINAL_URL_GEMINI": "true",
                                             "GEMINI_API_KEY": "k"}):
             resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
@@ -52,7 +52,7 @@ class TestGsearchWorker(unittest.TestCase):
         with mock.patch.object(gsearch_mode, "run_serpwow_search", failed_search), \
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
              mock.patch.dict("os.environ", {
-                 "GSEARCH_LLM_BATCH": "false",
+                 "LLM_BATCH": "false",
                  "SERPWOW_USD_PER_SEARCH": "0.00035",
              }):
             resp, _ = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
@@ -75,7 +75,7 @@ class TestGsearchWorker(unittest.TestCase):
 
         with mock.patch.object(gsearch_mode, "run_serpwow_search", no_result), \
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
-             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false"}):
+             mock.patch.dict("os.environ", {"LLM_BATCH": "false"}):
             resp, _ = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
                 company_name="Acme Motors", country="us", phase="phase1"))
 
@@ -97,7 +97,7 @@ class TestGsearchWorker(unittest.TestCase):
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini",
                                return_value=(None, "Gemini HTTPError: 429",
                                              "gemini-2.5-flash-lite", None)), \
-             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "false",
+             mock.patch.dict("os.environ", {"LLM_BATCH": "false",
                                             "ENABLE_FINAL_URL_GEMINI": "true",
                                             "GEMINI_API_KEY": "k"}):
             resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
@@ -114,7 +114,7 @@ class TestGsearchWorker(unittest.TestCase):
     def test_batch_mode_skips_per_row_llm(self):
         with mock.patch.object(gsearch_mode, "run_serpwow_search", _fake_serpwow), \
              mock.patch.object(gsearch_mode, "choose_final_website_with_gemini") as chooser, \
-             mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}):
+             mock.patch.dict("os.environ", {"LLM_BATCH": "true"}):
             resp, raw = asyncio.run(legacy_app.execute_gsearch_lookup_for_worker(
                 company_name="Acme Motors", country="us", phase="phase1"))
         chooser.assert_not_called()

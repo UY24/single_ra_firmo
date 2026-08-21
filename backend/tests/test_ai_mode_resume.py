@@ -1,7 +1,7 @@
 # backend/tests/test_ai_mode_resume.py
 """Offline test: broker resume reuses cleaned batches and never re-scrapes.
 
-Drives the Gemini-batch cleanup path (AI_MODE_LLM_BATCH=true) with the
+Drives the Gemini-batch cleanup path (LLM_BATCH=true) with the
 gemini_batch seams mocked. Pre-seeds raw_responses/ (so the resume republish
 skips every batch -> no scrape.do calls) and one cleaned/ batch (so the finish
 task re-submits only the rest to Gemini).
@@ -23,7 +23,7 @@ CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in ran
 FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
-    "AI_MODE_LLM_BATCH": "1",          # force the Gemini-batch cleanup path
+    "LLM_BATCH": "1",          # force the Gemini-batch cleanup path
     "AI_MODE_LLM_PROVIDER": "gemini",
     "SCRAPEDO_CONCURRENCY": "2",
     "S3_BUCKET": "",                    # keep the S3 mirror a no-op (offline)

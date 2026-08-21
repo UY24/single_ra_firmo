@@ -49,7 +49,7 @@ class ExecutorSkipsInlineCallTests(unittest.TestCase):
             return (dict(FIELDS), None, "m", {})
 
         with mock.patch.dict(os.environ, {"SCRAPEDO_TOKEN": "t",
-                                          "FIRMOGRAPHICS_LLM_BATCH": "true"}), \
+                                          "LLM_BATCH": "true"}), \
                 mock.patch.object(fm, "standardize_ai_overview_with_gemini", spy):
             resp, _ = self._row({"state": "complete", "text_blocks": [{"snippet": "x"}]})
         self.assertEqual(called, [], "inline Gemini ran despite batch mode")
@@ -69,8 +69,7 @@ class ExecutorSkipsInlineCallTests(unittest.TestCase):
                                               "candidatesTokenCount": 5})
 
         with mock.patch.dict(os.environ, {"SCRAPEDO_TOKEN": "t",
-                                          "GSEARCH_LLM_BATCH": "false",
-                                          "FIRMOGRAPHICS_LLM_BATCH": "false"}), \
+                                          "LLM_BATCH": "false"}), \
                 mock.patch.object(fm, "standardize_ai_overview_with_gemini", spy):
             resp, _ = self._row({"state": "complete", "text_blocks": [{"snippet": "x"}]})
         self.assertEqual(called, [1])
@@ -132,7 +131,7 @@ class BatchRunTests(unittest.IsolatedAsyncioTestCase):
             return out
 
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k",
-                                          "FIRMOGRAPHICS_LLM_BATCH": "true"}), \
+                                          "LLM_BATCH": "true"}), \
                 mock.patch.object(app, "read_upload_artifact",
                                   new=mock.AsyncMock(side_effect=lambda u, k: persisted["state"])), \
                 mock.patch.object(app, "persist_upload_state", new=fake_persist), \
@@ -177,7 +176,7 @@ class BatchRunTests(unittest.IsolatedAsyncioTestCase):
             persisted["state"] = st
 
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k",
-                                          "FIRMOGRAPHICS_LLM_BATCH": "true"}), \
+                                          "LLM_BATCH": "true"}), \
                 mock.patch.object(app, "read_upload_artifact",
                                   new=mock.AsyncMock(side_effect=lambda u, k: persisted["state"])), \
                 mock.patch.object(app, "persist_upload_state", new=fake_persist), \

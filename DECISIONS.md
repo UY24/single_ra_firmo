@@ -9,6 +9,47 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-20 — one batch toggle, not four
+
+Asked why `LLM_BATCH=true` did or did not apply to firmographics. It did — but only because
+all three per-pipeline overrides happened to be blank, which is a bad reason for a setting to
+work. D53 kept them as overrides on the grounds that batching one pipeline and not another was
+worth a tri-state; nobody has ever done that, and the tri-state is what made the question
+un-answerable without reading four `.env` lines and the resolver.
+
+### D67. Delete the three overrides; `LLM_BATCH` is the only toggle
+
+`AI_MODE_LLM_BATCH` / `GSEARCH_LLM_BATCH` / `FIRMOGRAPHICS_LLM_BATCH` are **gone**, and
+`_OVERRIDE_KEYS` with them — `batch_enabled` is now "always-batch pipeline? → yes; toggleable
+pipeline? → `LLM_BATCH`; otherwise no". This reverses D53's second half while keeping its
+first: the *mechanical* knobs (shard/inflight/timeout/poll/model) stay one key each.
+
+**Deleted, not deprecated.** A key that still quietly wins over the global is exactly the
+failure being removed, so a leftover `FIRMOGRAPHICS_LLM_BATCH=true` in someone's `.env` must
+be inert. `test_deleted_per_pipeline_toggles_have_no_effect` asserts both directions — the
+ghost key can neither turn batching on nor off — alongside the existing guard for the deleted
+`GSEARCH_GEMINI_*` names.
+
+**The consequence was stated and accepted, not discovered.** `AI_MODE_LLM_BATCH` carried a
+second meaning: it forces `provider="gemini"` over `AI_MODE_LLM_PROVIDER`, because batch
+cleanup is Gemini-only. That side effect now rides the global, so `LLM_BATCH=true` moves AI
+Mode's provider too. Decoupling it is a separate change (D53 already flagged it as not done);
+hiding it behind a key that exists only for that purpose is not a decoupling, it is a place to
+forget.
+
+**What did NOT change**: `uses_shared_row_batch` stays a separate question from
+`batch_enabled` — relationship batches through its own driver and `engine`'s gate must still
+say no, or a duplicate job is seeded. `_flag`'s blank-counts-as-unset tri-state stays too,
+even though with one key blank and false now agree: `.env.example` ships `NAME=`, and the
+distinction between "off" and "not configured" is the resolver's to keep, not each caller's.
+
+**Deliberately not done, same session** (asked, declined): re-adding the `output_json` column
+to firmographics' CSVs — the SERP is one S3 GET away via `raw_response_s3_key` and inlining it
+is ~10GB of CSV at 500k rows — and filling `enrichment_note` on partially-enriched rows, since
+the six field columns already show what is missing.
+
+---
+
 ## 2026-08-20 — firmographics off state.json: the last ceiling in the pipeline
 
 Asked directly whether firmographics could handle 500k like gmaps and relationship. It could
@@ -49,6 +90,33 @@ to do. Gating it on `llm_batch.batch_enabled(...)` would mean a run that batched
 gets skipped after someone flips the toggle, stranding paid-for shards. Which mode a run used
 has to be recoverable from the OBJECTS, and it is: `is_batch` in the summary comes from
 `rows_cleaned`, not from current env.
+
+### D66. The output CSV carries per-ROW facts only — and the first cut lost seven of them
+
+Reported: "in serpwow one we had a lot more columns, why are those missing?" Three of the
+four groups were dropped on purpose, one was a mistake.
+
+Correctly gone: the **nine run-level values** the old export repeated identically on every
+row (upload_id, file_status, batch_status, created_at, updated_at, total_rows,
+processed_rows, success_rows, failed_rows) — `report.json` states them once; and the five
+that were always blank for this pipeline (confidence_score, confidence, both
+`website_company_descirption_ai`, massive_proxy_cost_usd).
+
+Correctly REPLACED: the six `input_*` columns. The uploaded header now goes out verbatim,
+which is strictly more — every column the user sent, under their own names, not six renamed
+ones.
+
+The mistake: seven genuine per-row facts (`row_index`, outcome, `summary`,
+`gemini_cost_usd`, `total_cost_usd`, `processing_seconds`, `raw_response_s3_key`). Restored.
+
+Dropped on request: `llm_model` and `scrapedo_credits`. Both were per-RUN facts wearing a
+per-row column, and `llm_model` was worse than redundant — it was filled from a run-level
+accumulator, so it reported `gemini-2.5-flash-lite` on a row whose LLM never ran. Their real
+homes are `report.json`, `run.log` and the billing card.
+
+`raw_response_s3_key` is blank unless a `raw/` object can actually exist: a row with no
+website made no call, and one that died before returning a body has no SERP. Emitting the key
+anyway sends a reader hunting for an object that was never written.
 
 ### D63. `enriched.csv` / `notEnriched.csv`, not found/notFound
 
@@ -103,6 +171,11 @@ to be silently ignored, and a setting that cannot be honoured is worse than no s
 `ai_mode_service.build_ai_mode_llm_config` makes its toggle **force `provider="gemini"`** over
 `AI_MODE_LLM_PROVIDER`, so a shared flag would quietly move AI Mode off an OpenAI gateway — a
 billing change disguised as a transport change. AI Mode therefore keeps its own key.
+
+**Superseded in part by D67 (2026-08-20): the three overrides are deleted.** The first blocker
+never applied to them (relationship is handled by `_ALWAYS_BATCH`, not by an override); the
+second was real and is now an accepted, documented consequence of the global rather than a
+reason for a fourth key. The mechanical-knob half of D53 stands unchanged.
 
 ### D54. "Is it batched?" and "is it batched BY ENGINE?" are different questions
 

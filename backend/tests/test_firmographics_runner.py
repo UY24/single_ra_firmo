@@ -51,6 +51,9 @@ def _response(*, fields=None, overview=True, error=None, credits=10, deferred=Fa
     }
     context = {
         "pipeline": "firmographics",
+        # The executor records the phase split per row; the CSV's processing_seconds is
+        # their sum. Present in the fixture so that column is actually covered.
+        "timing": {"search_seconds": 1.25, "llm_seconds": 0.5 if fields else 0.0},
         "scrapedo": scrapedo,
         "mapping_ai": {"provider": "google-gemini",
                        "model": "gemini-2.5-flash-lite" if fields else None,
@@ -95,7 +98,7 @@ def _csv_rows(fake: FakeS3, name: str) -> list[dict[str, str]]:
 
 def _drive(fake: FakeS3, executor, *, batch=False, batch_results=None):
     """Run all three phases with the provider (and optionally Gemini) faked."""
-    env = {"FIRMOGRAPHICS_LLM_BATCH": "true" if batch else "false",
+    env = {"LLM_BATCH": "true" if batch else "false",
            "SCRAPEDO_CONCURRENCY": "2"}
 
     def fake_gemini(prefix, items, counters=None):
@@ -145,13 +148,26 @@ class InlineModeTests(unittest.TestCase):
         # The input header goes out verbatim, then our columns.
         self.assertEqual(rows[0]["website_url"], "https://acme.com")
         self.assertEqual(rows[0]["company_name"], "Acme Motors")
+        # Per-row facts the old 37-column export carried and the first cut of this one lost.
+        self.assertEqual(rows[0]["outcome"], "found")
+        self.assertEqual(rows[0]["row_index"], "0")
+        self.assertTrue(rows[0]["summary"])
+        self.assertTrue(float(rows[0]["total_cost_usd"]) > 0)
+        self.assertIn("/raw/", rows[0]["raw_response_s3_key"])
+        self.assertEqual(rows[0]["processing_seconds"], "1.75")   # 1.25 scrape + 0.5 llm
+        # Dropped on request: both were per-run facts masquerading as per-row ones, and
+        # llm_model even reported a model for rows whose LLM never ran.
+        self.assertNotIn("llm_model", rows[0])
+        self.assertNotIn("scrapedo_credits", rows[0])
 
     def test_row_without_a_website_is_not_found_and_costs_nothing(self) -> None:
         summary = _drive(self.fake, self._executor)
         rows = _csv_rows(self.fake, "notEnriched.csv")
         self.assertEqual(len(rows), 1)
         self.assertIn("no website_url", rows[0]["enrichment_note"])
-        self.assertEqual(rows[0]["scrapedo_credits"], "0")
+        # Spent nothing: no provider call, so no per-row cost and no SERP to point at.
+        self.assertEqual(rows[0]["total_cost_usd"], "")
+        self.assertEqual(rows[0]["raw_response_s3_key"], "")
         # Not an error: nothing failed, there was nothing to look up.
         self.assertEqual(summary["outcome_breakdown"]["errored"], 0)
         self.assertEqual(summary["outcome_breakdown"]["not_found"], 1)
@@ -187,7 +203,7 @@ class InlineModeTests(unittest.TestCase):
 
         async def go():
             with _patched(self.fake), \
-                    mock.patch.dict(os.environ, {"FIRMOGRAPHICS_LLM_BATCH": "false"}), \
+                    mock.patch.dict(os.environ, {"LLM_BATCH": "false"}), \
                     mock.patch.object(store, "get_object", counting_get):
                 await runner.run_llm_phase(PREFIX, store.Counters(PREFIX, rows_total=3))
         asyncio.run(go())
@@ -254,7 +270,7 @@ class BatchModeTests(unittest.TestCase):
 
         async def go():
             with _patched(self.fake), \
-                    mock.patch.dict(os.environ, {"FIRMOGRAPHICS_LLM_BATCH": "true"}), \
+                    mock.patch.dict(os.environ, {"LLM_BATCH": "true"}), \
                     mock.patch.object(runner, "execute_firmographic_extraction", counting), \
                     mock.patch.object(runner, "_run_gemini_batch", counting_batch):
                 await runner._phases(PREFIX, store.Counters(PREFIX, rows_total=3), {})

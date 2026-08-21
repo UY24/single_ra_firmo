@@ -90,7 +90,7 @@ def _make_state(upload_id: str, rows: list) -> dict:
         "rows": rows,
         # Pre-seed the batch block so _batch_postprocess_pending returns True
         # from the first persist call, deferring Slack until the batch is done.
-        # This matches _create_upload_with_rows when GSEARCH_LLM_BATCH=true.
+        # This matches _create_upload_with_rows when LLM_BATCH=true.
         "gemini_batch": {
             "status": "waiting_for_rows",
             "queued_at": None,
@@ -144,7 +144,7 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
 
         # Environment: batch mode ON, small chunk size for ≥2 chunks, no real cloud.
         self.env = {
-            "GSEARCH_LLM_BATCH": "true",
+            "LLM_BATCH": "true",
             "GEMINI_BATCH_SHARD_SIZE": "2",   # 6 rows → 3 chunks
             "GEMINI_BATCH_MAX_INFLIGHT": "10",
             "ENABLE_FINAL_URL_GEMINI": "false",  # skip per-row LLM

@@ -31,11 +31,22 @@ from app.services.serpwow.reporting import (
     s3_passthrough,
 )
 
-# What this pipeline works out per row. `enrichment_note` carries the reason a row has no
-# fields, so a reader never has to guess between "no overview", "provider failed" and
-# "nothing to look up".
-RESULT_COLUMNS = ["address", "phone", "email", "industry", "products", "services",
-                  "llm_model", "scrapedo_credits", "enrichment_note"]
+# What this pipeline works out per row, appended after the uploaded header verbatim.
+#
+# Deliberately per-ROW only. The old 37-column export also repeated nine RUN-level values
+# (upload_id, file_status, created_at, total_rows, processed_rows, success_rows,
+# failed_rows, batch_status, updated_at) on every single row — those live in report.json,
+# where they are stated once. Its six input_* columns are replaced by the uploaded header
+# itself, which is strictly more: every column the user sent, under their own names.
+# Its confidence/description/massive_proxy columns were always blank for this pipeline.
+#
+# `enrichment_note` is empty on an enriched row by design — there is nothing to explain
+# when it worked. It carries the reason in notEnriched.csv, which is the file it is for.
+RESULT_COLUMNS = ["row_index", "outcome",
+                  "address", "phone", "email", "industry", "products", "services",
+                  "summary", "enrichment_note",
+                  "gemini_cost_usd", "total_cost_usd", "processing_seconds",
+                  "raw_response_s3_key"]
 
 _FIELD_KEYS = ("address", "phone", "email", "industry", "products", "services")
 
@@ -188,13 +199,39 @@ def _write_outputs(prefix: str, counters: store.Counters,
                     no_overview += 1
 
         outcomes[outcome] += 1
-        cost_now = ((stored or {}).get("context") or {}).get("cost_breakdown") or {}
+        context_now = (stored or {}).get("context") or {}
+        cost_now = context_now.get("cost_breakdown") or {}
+        timing = context_now.get("timing") if isinstance(
+            context_now.get("timing"), dict) else {}
+        # Per-row wall clock, split as the row itself recorded it. Summed rather than taking
+        # total_seconds, which the old state-driven worker stamped and this pipeline has no
+        # equivalent of — there is no per-row task wrapper here.
+        seconds = round(float(timing.get("search_seconds") or 0.0)
+                        + float(timing.get("llm_seconds") or 0.0), 3)
+        row_gemini_usd = float((stored or {}).get("gemini_cost_usd") or 0.0)
         csv_row = {
             **passthrough_row(original, passthrough),
+            "row_index": idx,
+            # found / not_found / errored — the repo's own vocabulary, and the same value
+            # report.json counts in outcome_breakdown, so the two always reconcile.
+            "outcome": outcome,
             **{key: _joined(result.get(key)) for key in _FIELD_KEYS},
-            "llm_model": model or "",
-            "scrapedo_credits": int(cost_now.get("scrapedo_credits") or 0),
+            "summary": str((stored or {}).get("summary") or ""),
             "enrichment_note": note,
+            "gemini_cost_usd": f"{row_gemini_usd:.8f}" if row_gemini_usd else "",
+            # Credits are not dollars, so a firmographics row's total USD IS its LLM cost.
+            "total_cost_usd": f"{row_gemini_usd:.8f}" if row_gemini_usd else "",
+            "processing_seconds": seconds or "",
+            # Where this row's provider SERP is. Our computed result for the same row sits
+            # at the matching rows/ path, so one column locates both.
+            #
+            # Emitted only when a raw/ object can actually exist: `context` is None for a
+            # row with no website (no call was ever made) and formatted_results means the
+            # call died before returning a body. Pointing at a key that isn't there is
+            # worse than an empty cell — it sends a reader looking for a missing object.
+            "raw_response_s3_key": (
+                store.raw_key(prefix, idx)
+                if context_now and not context_now.get("formatted_results") else ""),
         }
         name = "enriched.csv" if outcome == "found" else "notEnriched.csv"
         writers[name].writerow(csv_row)

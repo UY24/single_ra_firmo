@@ -25,7 +25,7 @@ CSV_SIX = "company_name,country\n" + "".join(f"Company {i},Japan\n" for i in ran
 FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
-    "AI_MODE_LLM_BATCH": "",
+    "LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
     "AI_MODE_STATUS_FLUSH_SEC": "0",
     # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated

@@ -145,7 +145,7 @@ class TestProcessUploadJobUsesUploadCompany(unittest.TestCase):
              mock.patch.object(app, "persist_upload_state",
                                side_effect=_fake_persist), \
              mock.patch.dict("os.environ", {
-                 "GSEARCH_LLM_BATCH": "false",
+                 "LLM_BATCH": "false",
                  "ENABLE_FINAL_URL_GEMINI": "false",
              }):
             asyncio.run(app.process_upload_job(job))

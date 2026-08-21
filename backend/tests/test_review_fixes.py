@@ -24,7 +24,7 @@ CSV_OK = b"company_name,country\nAcme,Japan\nBeta,Japan\n"
 NO_KEY_ENV = {
     "GEMINI_API_KEY": "",
     "OPENAI_API_KEY": "",
-    "AI_MODE_LLM_BATCH": "",
+    "LLM_BATCH": "",
     "AI_MODE_LLM_PROVIDER": "gemini",
 }
 

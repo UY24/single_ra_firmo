@@ -10,10 +10,15 @@ Lives in ``common/`` because it must be importable from both ``serpwow/`` and ``
 without a cycle, alongside the other cross-provider helpers (``text``, ``env``,
 ``provider_limits``).
 
-**Blank counts as unset, everywhere.** ``env.get_bool_env`` falls back only when a variable
-is ABSENT, while ``.env.example`` ships every key as ``NAME=`` — so a blank line would
-otherwise read as an explicit "off" and silently defeat the global default. That check is
-made once, here, rather than at each call site.
+**ONE toggle: ``LLM_BATCH``.** The per-pipeline overrides (``AI_MODE_LLM_BATCH``,
+``GSEARCH_LLM_BATCH``, ``FIRMOGRAPHICS_LLM_BATCH``) were deleted 2026-08-20. They bought
+granularity nobody used and cost a second place to look when a run came out in the wrong
+mode: the global only appeared to work because all three happened to be blank, and one
+non-blank value silently exempted that pipeline from it.
+
+**Blank counts as unset.** ``env.get_bool_env`` falls back only when a variable is ABSENT,
+while ``.env.example`` ships every key as ``NAME=`` — so a blank line would otherwise read
+as an explicit "off". That check is made once, here, rather than at each call site.
 """
 from __future__ import annotations
 
@@ -31,16 +36,15 @@ DEFAULT_MAX_INFLIGHT = 5
 DEFAULT_TIMEOUT_SEC = 172800
 DEFAULT_POLL_SEC = 15
 
-# Pipelines that genuinely have a choice, mapped to their override key. A pipeline absent
+# Pipelines that genuinely have a choice, i.e. the ones LLM_BATCH moves. A pipeline absent
 # here has no toggle, and inventing one would mean a setting that cannot be honoured:
 #   relationship -- its Gemini call IS the verdict; there is no inline path to switch to.
 #   gmaps        -- no LLM at all since it moved to the S3-only runner.
-_OVERRIDE_KEYS = {
-    "ai_bulk": "AI_MODE_LLM_BATCH",
-    "ai_deep": "AI_MODE_LLM_BATCH",
-    "gsearch": "GSEARCH_LLM_BATCH",
-    "firmographics": "FIRMOGRAPHICS_LLM_BATCH",
-}
+#
+# Spelled out rather than derived from _SHARED_ROW_BATCH below: AI Mode is toggleable but
+# does NOT run through engine's shared row-batch driver, and conflating those two sets is
+# the exact bug this module exists to prevent.
+_TOGGLEABLE = {"ai_bulk", "ai_deep", "gsearch", "firmographics"}
 
 # Pipelines whose LLM work is ALWAYS a batch job, toggle or no toggle.
 _ALWAYS_BATCH = {"relationship"}
@@ -51,8 +55,8 @@ _TRUE = {"1", "true", "yes", "on"}
 def _flag(name: str) -> bool | None:
     """Tri-state read: True / False / None for absent-or-blank.
 
-    The None is the whole point — it is what lets an override fall through to the global
-    default instead of asserting "off".
+    The None keeps a blank ``LLM_BATCH=`` line (what ``.env.example`` ships) from reading as
+    an explicit "off" that a caller might treat differently from "not configured".
     """
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -81,24 +85,20 @@ def uses_shared_row_batch(pipeline: str) -> bool:
 def batch_enabled(pipeline: str) -> bool:
     """True when this pipeline's Gemini work should run as a Batch job instead of inline.
 
-    ``LLM_BATCH`` is the one knob you normally set. A per-pipeline key
-    (``AI_MODE_LLM_BATCH`` / ``GSEARCH_LLM_BATCH`` / ``FIRMOGRAPHICS_LLM_BATCH``) overrides it
-    only when actually set, so you can batch one pipeline and not another without inventing a
-    second global.
+    ``LLM_BATCH`` is the only knob, and it moves every pipeline that has a choice at once
+    (2026-08-20). Per-pipeline granularity is gone on purpose — see the module docstring.
 
-    Note for AI Mode: its override ALSO forces the Gemini provider over
-    ``AI_MODE_LLM_PROVIDER`` (see ``ai_mode_service.build_ai_mode_llm_config``). That side
-    effect is deliberate and out of scope here — this function only answers batch-vs-inline.
+    Note for AI Mode: turning this on ALSO forces the Gemini provider over
+    ``AI_MODE_LLM_PROVIDER``, because batch cleanup is Gemini-only (see
+    ``ai_mode_service.build_ai_mode_llm_config``). That side effect used to ride the
+    AI-Mode-specific key and now rides the global; this function still only answers
+    batch-vs-inline.
     """
     pipe = str(pipeline or "")
     if pipe in _ALWAYS_BATCH:
         return True
-    key = _OVERRIDE_KEYS.get(pipe)
-    if key is None:
+    if pipe not in _TOGGLEABLE:
         return False
-    override = _flag(key)
-    if override is not None:
-        return override
     return _flag("LLM_BATCH") or False
 
 

@@ -59,7 +59,7 @@ class TestChunkedStatusReconcileGuard(unittest.IsolatedAsyncioTestCase):
             "done": True,
             "state": {"name": "JOB_STATE_CANCELLED"},
         })
-        with mock.patch.dict("os.environ", {"GSEARCH_LLM_BATCH": "true"}, clear=False), \
+        with mock.patch.dict("os.environ", {"LLM_BATCH": "true"}, clear=False), \
              mock.patch.object(app, "_gemini_batch_get_sync", get_batch), \
              mock.patch.object(app, "read_upload_artifact",
                                new=mock.AsyncMock(return_value=state)), \
@@ -89,7 +89,7 @@ class TestChunkedStatusReconcileGuard(unittest.IsolatedAsyncioTestCase):
         persist_mock = mock.AsyncMock()
         with mock.patch.dict(
             "os.environ",
-            {"GSEARCH_LLM_BATCH": "true", "GEMINI_API_KEY": "k"},
+            {"LLM_BATCH": "true", "GEMINI_API_KEY": "k"},
             clear=False,
         ), mock.patch.object(
             app, "read_upload_artifact", new=mock.AsyncMock(return_value=state)
@@ -121,7 +121,7 @@ class TestChunkedStatusReconcileGuard(unittest.IsolatedAsyncioTestCase):
         }
         with mock.patch.dict(
             "os.environ",
-            {"GSEARCH_LLM_BATCH": "true", "GEMINI_API_KEY": "k"},
+            {"LLM_BATCH": "true", "GEMINI_API_KEY": "k"},
             clear=False,
         ):
             result = await app.maybe_reconcile_gemini_batch_status("u-legacy", state)

@@ -3316,6 +3316,17 @@ async def init_rabbitmq() -> None:
     await rabbitmq_queue.bind(rabbitmq_exchange, routing_key=routing_key)
     rabbitmq_last_error = None
 
+    # The three S3-only run queues, declared by the PUBLISHER as well as the worker. A
+    # direct exchange drops an unroutable message on the floor, so publishing a run before
+    # the worker had ever bound its queue lost the message entirely and the run stalled at
+    # phase="queued" until the stale-run scan found it. See declare_run_queues.
+    try:
+        from app.services.serpwow import s3_run_driver
+
+        await s3_run_driver.declare_run_queues(rabbitmq_channel, rabbitmq_exchange)
+    except Exception as exc:
+        print(f"[s3-run-queues] declare failed (runs will wait for the re-drive scan): {exc}")
+
     # AI Mode rides the same connection with its OWN channel/queue (independent
     # QoS — scrape.do concurrency must not share SerpWow's prefetch). Best-effort:
     # a failure here 503s AI-Mode uploads (broker.is_ready() False) but must not

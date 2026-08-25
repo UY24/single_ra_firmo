@@ -50,7 +50,7 @@ Run lifecycle:
 
 **Reconciler** (`worker.reconcile_ai_mode_runs`, worker startup + folded into `periodic_batch_reconciler`): (a) publishing/scraping runs with missing batches and no activity for `AI_MODE_BATCH_STALE_TIMEOUT_SEC` (900s) get missing batches republished (safe — workers skip existing files) up to `AI_MODE_BATCH_MAX_REQUEUE` (1) times, then terminalized via error markers so the barrier ALWAYS resolves (gated on a drained queue); (b) `cleaning` runs with no live finish task are re-dispatched (resumable via `cleaned/`); (c) **phantom fix**: legacy (`engine != "broker"`) runs stuck `queued/running` past `AI_MODE_LEGACY_STALE_SEC` (3600s) are flipped to `failed` so the UI's "Rerun failed" button appears.
 
-`status.json` is polled by the UI as before (fields additive: `engine`, `phase`, `requeue_attempts`…). Modes in `mode_config.py` (`ai_bulk`=batch 10 / `ai_bulk_search.txt`; `ai_deep`=batch 3 / `ai_deep_search.txt`; both share `ai_cleanup.txt`). Provider/keys: `build_ai_mode_llm_config` reads `AI_MODE_LLM_PROVIDER` (`gemini`|`openai`, `OPENAI_BASE_URL` for gateways); validated at **upload time** (`prepare_ai_mode_run`, 400 on missing key) and again in the worker (`SCRAPEDO_TOKEN` required) — so the worker's env needs the scrape.do/LLM/S3/Supabase/Slack vars too.
+`status.json` is polled by the UI as before (fields additive: `engine`, `phase`, `requeue_attempts`…). Modes in `mode_config.py` (`ai_bulk`=batch 10 / `ai_bulk_search.txt`; `ai_deep`=batch 3 / `ai_deep_search.txt`; both share `ai_cleanup.txt`). Provider/keys: `build_ai_mode_llm_config` is **Gemini-only** — `GEMINI_API_KEY` + `GEMINI_MODEL` (or `llm_batch.batch_model()` in batch mode); validated at **upload time** (`prepare_ai_mode_run`, 400 on missing key) and again in the worker (`SCRAPEDO_TOKEN` required) — so the worker's env needs the scrape.do/LLM/S3/Supabase/Slack vars too.
 
 **One retry action** (`POST …/{run_id}/resume`, labelled "Rerun failed"): allowed only for `failed`/`completed_with_errors` (409 otherwise), 503 when the broker is down. It deletes `*.error.json` markers (best-effort deleting their S3 mirrors too), clears `gemini_batch_jobs`/`requeue_attempts`, then republishes **only** batches without a parseable raw file (`publish_run_batches(only_missing=True)`) — no scrape.do re-spend on successes; the finish task reuses `cleaned/` so only failed LLM work is redone. Updates the existing Supabase row (no new row). If the local run dir is gone (ephemeral host), it first **rehydrates from S3** (`s3_sync.rehydrate_run_from_s3`). This is also the migration path for legacy pre-broker failed runs (same file layout). **Genuinely not-found rows are not retried** — those go through AI Mode Deep (`ai_deep`). **Offline tests** drive this whole engine without RabbitMQ via `tests/ai_mode_drive.py` (captures publishes, feeds them through `process_scrape_job`, awaits the finish task).
 
@@ -160,7 +160,7 @@ Two **kinds** of dial, deliberately not one — but in practice you set only the
 
 **Per-row latency fixes (2026-08-04, from a 100-row live run):** a shared pooled `httpx.AsyncClient` in `scrapedo_maps_client` — a fresh client per row cost ~400ms of DNS/TCP/TLS setup per call (636ms → 233ms measured) and forfeited keep-alive, i.e. ~55 hours across 500k rows; keepalive is sized to `SCRAPEDO_CONCURRENCY` so every slot holds a warm connection, and it's closed in `shutdown_event`. The `state.json` S3 mirror is **throttled** to `SERPWOW_S3_STATE_FLUSH_SEC` (5s) because it was re-PUT to the SAME key twice per row and grows with the run (~84MB of near-identical copies per 100-row run, saturating uplink and hot-spotting one key — the documented `SlowDown` cause); local disk is still written every time and **terminal snapshots always mirror**, so a cold-start resume never reads a stale run. boto3 retries are `adaptive` (AWS's client-side rate limiter, their documented answer to `SlowDown`) in both S3 clients.
 
-**What that run proved about the provider:** with `WORKER_CONCURRENCY=100`, 100 rows took 134s at ~28.6s median per row (vs 3.5s isolated), peak 60 in flight, **1 attempt per row, zero 429s** — scrape.do *queues* rather than rejecting, so client concurrency above its real capacity converts into latency, not throughput. Observed delivered rate: **~0.88 calls/s**. Raising concurrency further risks crossing `SCRAPEDO_TIMEOUT_SECONDS=90` and turning slow rows into failed ones.
+**What that run proved about the provider — and what re-measurement changed (2026-08-25):** on 2026-08-04, `WORKER_CONCURRENCY=100` put 100 rows at 134s / ~0.75 rows/s while 25 did 70.5s / 1.42 — scrape.do *queues* rather than 429ing, so client concurrency above its real capacity became latency. **That number is obsolete.** Three completed 100-row runs at concurrency 100 (`8ffe96d9` 44s, `1a46cba0` 36s, `64b81c68` **34s / 2.94 rows/s**) are 4x the old 100 figure and 2x the best 25 ever measured; the A/B predated the pooled `httpx.AsyncClient`, which is the likeliest cause. 500k ≈ 47 hours at today's rate. Every run still shows **1 attempt per row, zero 429s**. What has NOT been re-measured is 25 — all three fast runs are at 100 — so "100 beats 25 today" is unproven; only "100 got much faster" is. `SCRAPEDO_TIMEOUT_SECONDS=90` is still the ceiling that turns a slow row into a failed one.
 
 `scrapedo_slot()` is **one gate shared by gmaps AND AI Mode** — scrape.do's cap is per *account* and both run in the same worker process, so two separate caps could sum past it. It stays even when you intend to run one pipeline at a time, because that isn't fully manual: AI Mode's periodic reconciler re-dispatches finish tasks and republishes missing batches on its own, and the resume endpoint can start work you didn't. The cap turns "only run one at a time" from a rule someone has to remember into an enforced invariant. Note the provider cap deliberately does **not** track `WORKER_CONCURRENCY` — if it did, raising slots would silently raise the vendor limit and defeat the point. gmaps wraps its HTTP call; AI Mode wraps its `to_thread(scrape_batch_sync)`. It's a concurrency cap only: if scrape.do also enforces requests/second, a token bucket goes **inside** that helper and no call site changes.
 
@@ -334,9 +334,9 @@ so `common/llm_batch.py` now owns every batch setting and each call site reads i
   inert (`test_deleted_per_pipeline_toggles_have_no_effect`). They were dropped because the
   granularity was unused while the tri-state cost a second place to look when a run came out
   in the wrong mode — the global only *appeared* to work because all three shipped blank.
-  **Consequence, accepted:** `LLM_BATCH=true` now also forces AI Mode onto the Gemini provider
-  over `AI_MODE_LLM_PROVIDER` (batch cleanup is Gemini-only), a side effect that used to ride
-  the AI-Mode-specific key. `_flag`'s blank-counts-as-unset tri-state stays — `.env.example`
+  (The consequence that `LLM_BATCH=true` forced AI Mode's provider is **moot as of
+  2026-08-20**: Gemini is the only provider — see below.) `_flag`'s blank-counts-as-unset
+  tri-state stays — `.env.example`
   ships `NAME=` and `env.get_bool_env` falls back only on an ABSENT variable.
 - **`batch_enabled(pipeline)` and `uses_shared_row_batch(pipeline)` are different questions.**
   relationship batches (its Gemini call IS the verdict — no inline path exists, so it has no
@@ -362,9 +362,20 @@ so `common/llm_batch.py` now owns every batch setting and each call site reads i
   from one thread, while `relationship_runner._poll_to_terminal` blocks a pool thread per
   in-flight shard for hours. Headroom matters because that executor is shared with every S3
   write and CSV parse in the worker.
-- **Not done**: AI Mode's override still forces `provider="gemini"` over
-  `AI_MODE_LLM_PROVIDER` (batch cleanup is Gemini-only). That is why AI Mode keeps a separate
-  key instead of one shared meaning; decoupling it is its own change.
+- **Gemini is the only LLM provider, and there is no `provider` field anywhere** (2026-08-20).
+  Deleted: `AI_MODE_LLM_PROVIDER`, the whole `OPENAI_*` family (key/model/base_url/both
+  pricing rates), `llm_client.OpenAICompatibleClient` + `parse_usage`, the dead
+  `settings.load_llm_config` and its `LLM_PROVIDER`/`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`
+  keys, `cost.calculate_llm_cost_usd`'s `provider` argument, **`LLMConfig.provider`** and the
+  `llm_provider` key it wrote into `status.json` (nothing read it — not `run_detail.js`, not
+  the DOM contracts). `DEFAULT_LLM_BASE_URLS` collapsed to the constant
+  `settings.GEMINI_BASE_URL`, which is now `LLMConfig.base_url`'s default.
+  **`LLMConfig` is `{api_key, model, base_url=GEMINI_BASE_URL, max_retries, timeout_seconds}`
+  and the ONLY thing env chooses is the model** — `llm_batch.batch_model()` in batch mode
+  (`GEMINI_BATCH_MODEL` → `GEMINI_MODEL` → default), `GEMINI_MODEL` inline. `final_report.json`'s
+  `llm` block is now `{base_url, model}`. `make_llm_client` stays despite having no branch
+  left: it adapts `LLMConfig` to the client kwargs and is the seam every offline AI-Mode test
+  patches. `LLM_MAX_RETRIES` / `LLM_TIMEOUT_SECONDS` are transport settings and stay.
 
 ### Shared layers
 - **Canonical CSV input** (`models/entities.py`, `parse_entities_csv`): requires a company-name column (aliases `company_name|company|name|entity_name|entity|organization|organisation|legal_name`) **and** a country column (`country|country_name|nation`); optional `company_local_name|address|firm_id|industry`. Headerless 2+-col files parse positionally. The **old `Company Name ENG`/`Country Code`/`ISIC` format is rejected with 400** (no auto-detect). `InvalidCSVError` → 400.

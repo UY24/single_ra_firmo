@@ -26,7 +26,6 @@ FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
     "LLM_BATCH": "",
-    "AI_MODE_LLM_PROVIDER": "gemini",
     "AI_MODE_STATUS_FLUSH_SEC": "0",
     # Keep the smoke test offline: unset so the S3 mirror no-ops (a populated
     # .env would otherwise attempt a live S3 upload).

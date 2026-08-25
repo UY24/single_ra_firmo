@@ -54,7 +54,7 @@ from app.services.ai_mode.run_reporting import (  # noqa: F401 (classify_one_res
     write_outputs,
 )
 from app.services.ai_mode.scrapedo_client import ScrapeDoClient
-from app.services.ai_mode.settings import DEFAULT_LLM_BASE_URLS, LLMConfig, Settings
+from app.services.ai_mode.settings import LLMConfig, Settings
 from app.services.serpwow.outcomes import (
     SRC_GEMINI,
     SRC_SCRAPEDO,
@@ -221,37 +221,19 @@ def build_ai_mode_settings() -> Settings:
 def build_ai_mode_llm_config() -> LLMConfig:
     """Build (and validate) the LLM config from the process environment.
 
-    Defaults to the Gemini provider. Reads process env directly; does NOT load a
-    scrape.do .env file.
-    """
-    # Batch cleanup is Gemini-only, so LLM_BATCH forces the Gemini provider regardless of
-    # AI_MODE_LLM_PROVIDER (which governs only the normal/sync path). Since 2026-08-20 that
-    # is the ONE global toggle, so turning batching on anywhere turns it on here too.
-    # ai_bulk and ai_deep resolve identically -- this function does not know which mode it
-    # is for, and does not need to.
-    batch_mode = llm_batch.batch_enabled("ai_bulk")
-    if batch_mode:
-        provider = "gemini"
-    else:
-        provider = (_str_env("AI_MODE_LLM_PROVIDER", "gemini").lower()) or "gemini"
-    if provider == "openai":
-        api_key = _str_env("OPENAI_API_KEY")
-        model = _str_env("OPENAI_MODEL") or "gpt-4o-mini"
-        base_url = _str_env("OPENAI_BASE_URL") or DEFAULT_LLM_BASE_URLS["openai"]
-    else:
-        provider = "gemini"
-        api_key = _str_env("GEMINI_API_KEY")
-        if batch_mode:
-            model = llm_batch.batch_model()
-        else:
-            model = _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"
-        base_url = DEFAULT_LLM_BASE_URLS["gemini"]
+    Gemini only. Reads process env directly; does NOT load a scrape.do .env file.
 
+    The batch and inline paths differ in ONE thing, the model: a Batch job resolves through
+    ``llm_batch.batch_model()`` (GEMINI_BATCH_MODEL -> GEMINI_MODEL -> default) so a run can
+    be batched on a different model than it is inlined on. ``ai_bulk`` and ``ai_deep``
+    resolve identically — this function does not know which mode it is for, and does not
+    need to.
+    """
+    batch_mode = llm_batch.batch_enabled("ai_bulk")
     config = LLMConfig(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        provider=provider,
+        api_key=_str_env("GEMINI_API_KEY"),
+        model=(llm_batch.batch_model() if batch_mode
+               else _str_env("GEMINI_MODEL") or "gemini-2.5-flash-lite"),
         max_retries=_int_env("LLM_MAX_RETRIES", 2),
         timeout_seconds=_float_env("LLM_TIMEOUT_SECONDS", 120.0),
     )
@@ -565,7 +547,7 @@ def prepare_ai_mode_run(
     parsed = parse_entities_csv(raw_csv)
     total_rows = len(parsed.entities)
 
-    # Build the LLM config only to surface provider/model labels (no API call).
+    # Build the LLM config only to surface the model label (no API call).
     # Validated BEFORE any files are written so a misconfigured server (e.g.
     # missing API key -> ValueError) never leaves an orphan run dir behind.
     llm_config = build_ai_mode_llm_config()
@@ -590,7 +572,7 @@ def prepare_ai_mode_run(
         run_dir,
         f"AI Mode run prepared filename={filename or '-'} mode={mode.key} "
         f"company={company_name} total_rows={total_rows} batch_size={batch_size} "
-        f"llm_provider={llm_config.provider} llm_model={llm_config.model}",
+        f"llm_model={llm_config.model}",
     )
 
     return {
@@ -602,7 +584,6 @@ def prepare_ai_mode_run(
         "company_name": company_name,
         "columns_detected": parsed.columns_detected,
         "warnings": parsed.warnings,
-        "llm_provider": llm_config.provider,
         "llm_model": llm_config.model,
         "batch_size": batch_size,
         "created_at": now,
@@ -633,7 +614,6 @@ def _initial_status(
         "warnings": parsed.warnings,
         "total_rows": len(parsed.entities),
         "batch_size": batch_size,
-        "llm_provider": llm_config.provider,
         "llm_model": llm_config.model,
         "batches_total": 0,
         "batches_done": 0,
@@ -1284,7 +1264,6 @@ def run_ai_mode_finish(
         # Per-run cost (Task 15): LLM tokens priced via env rates + scrape.do
         # per-request credits from response headers (env-rate estimate fallback).
         llm_usd = calculate_llm_cost_usd(
-            provider=cfg.provider,
             prompt_tokens=usage_total.prompt_tokens,
             completion_tokens=usage_total.completion_tokens,
             batch_mode=batch_mode,
@@ -1302,7 +1281,7 @@ def run_ai_mode_finish(
             "company_id": status.get("company_id"),
             "company_name": status.get("company_name"),
             "generated_at": completed_at,
-            "llm": {"provider": cfg.provider, "base_url": cfg.base_url, "model": cfg.model},
+            "llm": {"base_url": cfg.base_url, "model": cfg.model},
             "batch_size": batch_size,
             "total_input_entities": len(entities),
             "entities_processed": entities_processed,

@@ -45,15 +45,16 @@ any `static/js` file.
    `relationship_runner.py:289` defaults to 172800 but reads the *shared* SerpWow key, and
    `.env:212` sets `1800`. A Gemini verdict shard that outlives 30 min raises and the run's rows
    keep no `cleaned/` object. Either give relationship its own key or raise the shared one.
-2. **`retry-failed-rows` can't complete at scale.** LISTs all of `raw/` then issues one *serial*
-   `to_thread` DELETE per dead row in a single HTTP request — 50k dead rows is 20+ minutes and a
-   client timeout. It also ignores its `limit` param, and `s3_run_store.delete_object`
-   swallows failures, so a row can count as retried and never be rescraped. Fix: `delete_objects`
-   in 1000-key batches + honour `limit`.
-3. **`phase="failed"` is terminal for the re-drive scan.** Any transient error over a multi-day
-   run parks it permanently; recovery is hand-typing the run id into Operations. Fix: attempts
-   counter in `status.json` (AI Mode's `requeue_attempts` pattern) and let the scan pick `failed`
-   up N times — a re-drive is free.
+2. ~~**`retry-failed-rows` can't complete at scale.**~~ **DONE** — verified in code 2026-08-20:
+   `engine.retry_failed_rows` LISTs `errors/`, honours `limit`, and calls
+   `s3_run_store.delete_objects` in 1000-key batches returning a CONFIRMED count. Original note:
+   one serial DELETE per dead row (50k = 20+ min and a client timeout), `limit` ignored,
+   failures swallowed.
+3. ~~**`phase="failed"` is terminal for the re-drive scan.**~~ **DONE** — verified in code
+   2026-08-20: `s3_run_driver.redrivable` re-drives a `failed` run while
+   `drive_attempts < max_attempts` (`{GMAPS,FIRMOGRAPHICS,RELATIONSHIP}_MAX_DRIVE_ATTEMPTS`, 3),
+   and the staleness gate applies to failed runs too so an instantly-dying run cannot spin.
+   Original note: any transient error over a multi-day run parked it permanently.
 4. ~~**`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.**~~ **DONE 2026-08-19.** The worker
    sizes its default executor to `max(32, max_inflight + 16)` in `start_worker_consumers`.
    Note the blocker was **relationship-only**: engine's chunk driver awaits `asyncio.sleep`
@@ -69,11 +70,16 @@ any `static/js` file.
 6. ~~**firmographics cannot reach 500k.**~~ **DONE 2026-08-20** — S3-only, three phases,
    `firmographics_runs` queue. Its LLM phase finds its work with one LIST (`pending_llm/`
    markers) rather than a GET per row.
-7. **API-process memory — partly fixed.** `parse_relationship_csv` (2026-08-05) and
-   `parse_entities_csv` (2026-08-10, via `sample_limit`) now validate every row while retaining
-   none, so a 500k-row upload no longer materialises its rows in the API process. Still open:
-   `/uploads/{id}/result` reads a whole several-hundred-MB CSV into memory instead of streaming
-   the boto3 body.
+7. **API-process memory — partly fixed, and this is the LAST real blocker.**
+   `parse_relationship_csv` (2026-08-05) and `parse_entities_csv` (2026-08-10, via
+   `sample_limit`) now validate every row while retaining none, so a 500k-row upload no longer
+   materialises its rows in the API process. **Still open, re-confirmed 2026-08-20:**
+   `engine.upload_result_file` calls `s3_run_store.get_bytes` and returns `Response(content=…)`
+   — the WHOLE output CSV in API-process RAM, per concurrent download. It now hits all three
+   S3-only pipelines (`enriched.csv`, `found.csv`, `confirmed_relation.csv`), which at 500k rows
+   are several hundred MB each. Fix: `StreamingResponse` over the boto3 body. While there: that
+   branch also serves `.csv` as `text/plain` and ignores `download`, so a 500MB file opens in
+   the browser instead of downloading.
 
 ## gmaps billing display — done 2026-08-11 (commit `15167f3`)
 
@@ -231,10 +237,22 @@ follow gsearch out, so neither is worth touching either.
 
 ## Unproven numbers
 
-- **`SCRAPEDO_CONCURRENCY=100` is a target, not a measurement.** On the *Maps* endpoint, 100
-  measured **1.9x slower** than 25 — scrape.do queues instead of 429ing. Whether the *AI Mode*
-  endpoint behaves the same is unverified. It's the shared per-account cap, so tuning it moves
-  gmaps and AI Mode too. Do not raise anything here without re-measuring.
+- ~~**`SCRAPEDO_CONCURRENCY=100` measured 1.9x slower than 25.**~~ **OBSOLETE — re-measured
+  2026-08-25.** Three completed 100-row gmaps runs at concurrency **100**, from S3 counters:
+
+  | run | date | scrape_s | rows/s |
+  |---|---|---|---|
+  | `64b81c68` | 2026-08-25 | **34** | **2.94** |
+  | `1a46cba0` | 2026-08-18 | 36 | 2.78 |
+  | `8ffe96d9` | 2026-08-11 | 44 | 2.27 |
+
+  The 2026-08-04 table (100 → 134s/0.75 rows/s, 25 → 70.5s/1.42 rows/s) no longer describes
+  this system: **100 is now ~4x faster than 100 was, and ~2x faster than the best 25 ever
+  measured.** The A/B predates the pooled `httpx.AsyncClient` landing, so the old "keep 25, do
+  not raise" guidance is withdrawn. 500k at 2.94 rows/s ≈ **47 hours**, not 98.
+  **Still owed:** a fresh run at 25 — all three above are at 100, so we know 100 improved, not
+  that it beats 25 today. Whether the *AI Mode* endpoint behaves the same is still unverified,
+  and it is the shared per-account cap, so tuning it moves gmaps and AI Mode together.
 - **Gemini Batch wave count at 500k.** At the defaults (shard 5000, inflight 5) that's 100 shards
   in 20 sequential waves, and Google's "within 24h" SLA is per job. Inferred, not measured — this
   phase, not scraping, is the likely wall-clock wall.

@@ -303,6 +303,48 @@ async function gmapsBillingBreakdown() {
   assert(root.textContent.includes("870"), "credits missing from the cost card");
 }
 
+async function inFlightScrapedoRunIsNotLabelledSerpWow() {
+  // A gmaps run that has not billed a call yet: every scrapedo_* counter is 0, which is
+  // ALSO what a SerpWow run carries, so the truthiness check alone fell through to the
+  // default "SerpWow" provider label. Seen live on run 7a03eaa0, which stalled at
+  // phase="queued" and rendered a SerpWow cost card for a pipeline that cannot use it.
+  const { root } = await renderStatus("gmaps-inflight", {
+    pipeline: "gmaps", status: "processing", total_rows: 100,
+    processed_rows: 0, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 100,
+      websites_found: 0, websites_not_found: 100,
+      outcome_breakdown: { found: 0, not_found: 0, errored: 0 },
+      available_files: [],
+      cost: { scrapedo_requests: 0, scrapedo_credits: 0, scrapedo_failed_requests: 0,
+              llm_usd: 0.0, total_usd: 0.0 },
+    },
+  });
+  assert(!root.textContent.includes("SerpWow"),
+    "in-flight gmaps run labelled its provider SerpWow");
+  assert(root.textContent.includes("Scrape.do"),
+    "in-flight gmaps run missing the Scrape.do cost card");
+}
+
+async function preMigrationGmapsKeepsSerpWowCard() {
+  // The other half of the same rule: a gmaps run from BEFORE the scrape.do migration has
+  // real serpwow_searches, and must keep rendering them rather than being relabelled by
+  // its pipeline key.
+  const { root } = await renderStatus("gmaps-legacy", {
+    pipeline: "gmaps", status: "completed", total_rows: 10,
+    processed_rows: 10, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 10,
+      websites_found: 8, websites_not_found: 2,
+      outcome_breakdown: { found: 8, not_found: 2, errored: 0 },
+      available_files: [],
+      cost: { serpwow_searches: 21, serpwow_usd: 0.21, llm_usd: 0.0, total_usd: 0.21 },
+    },
+  });
+  assert(root.textContent.includes("SerpWow"),
+    "pre-migration gmaps run lost its SerpWow cost card");
+}
+
 async function failedRowsViewer() {
   const ref = "failed rows/&";
   const { root } = await renderStatus(ref, {
@@ -864,6 +906,8 @@ await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
 await gmapsBillingBreakdown();
+await inFlightScrapedoRunIsNotLabelledSerpWow();
+await preMigrationGmapsKeepsSerpWowCard();
 await failedRowsViewer();
 await completedRelationship();
 await counterDrivenRelationshipTerminal();

@@ -21,7 +21,6 @@ FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
     "LLM_BATCH": "",           # sync-LLM cleanup path
-    "AI_MODE_LLM_PROVIDER": "gemini",
     "SCRAPEDO_CONCURRENCY": "2",
     "S3_BUCKET": "",
     "SLACK_WEBHOOK_URL": "",

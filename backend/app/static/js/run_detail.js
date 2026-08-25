@@ -25,6 +25,11 @@ const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "fa
 // 2026-08-20 with its S3-only migration.
 const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship",
                                      "firmographics"]);
+// Pipelines whose ONLY provider is scrape.do, billed in credits. Used to label the cost
+// card before any call has been billed — at zero, the numbers cannot say who the provider
+// was. gsearch is absent: it is the last one still on SerpWow.
+const SCRAPEDO_PIPELINES = new Set(["gmaps", "relationship", "firmographics"]);
+
 // The S3-only pipelines keep NO state.json, so /uploads/{id}/output (and its CSV form)
 // 404 for them — their per-row data is in the result files instead.
 const NO_STATE_PIPELINES = new Set(["relationship", "firmographics"]);
@@ -862,13 +867,17 @@ function renderLegacyStatus(root, ref, s) {
     parts.push(el("div", { class: "callout callout-red" },
       el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  // Branch on the DATA, not the pipeline key: a gmaps run predating the scrape.do
-  // migration still carries serpwow_searches/serpwow_usd and keeps its old cost card.
+  // Data first, pipeline as the tie-break. Truthy, not != null: the cost block carries
+  // these keys as 0 for SerpWow pipelines too, and checking failed/credits as well keeps
+  // an all-failed run on the Scrape.do card. But zero is also what every scrape.do run
+  // reads BEFORE its first billed call lands, which labelled an in-flight gmaps run
+  // "SerpWow" — so a pipeline that only ever talks to scrape.do says so even at zero.
+  // The data check still comes first, so a gmaps run predating the migration keeps
+  // rendering its real serpwow_searches/serpwow_usd card.
   if (g) {
-    // Truthy, not != null: the cost block carries these keys as 0 for SerpWow pipelines
-    // too. Checking failed/credits as well keeps an all-failed run on the Scrape.do card.
     const isScrapedo = !!(g.cost?.scrapedo_requests || g.cost?.scrapedo_credits
-                          || g.cost?.scrapedo_failed_requests);
+                          || g.cost?.scrapedo_failed_requests)
+      || (SCRAPEDO_PIPELINES.has(s.pipeline) && !g.cost?.serpwow_searches);
     parts.push(isScrapedo
       ? costSection(g, {
           providerLabel: "Scrape.do",

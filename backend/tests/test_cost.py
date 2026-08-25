@@ -39,38 +39,16 @@ class TestCalculateLlmCostUsd(unittest.TestCase):
     def test_gemini_sync_pricing(self):
         with mock.patch.dict(os.environ, self.GEMINI_PRICING):
             cost = calculate_llm_cost_usd(
-                provider="gemini", prompt_tokens=1_000_000,
-                completion_tokens=1_000_000, batch_mode=False,
+                prompt_tokens=1_000_000, completion_tokens=1_000_000, batch_mode=False,
             )
         self.assertAlmostEqual(cost, 0.50)
 
     def test_gemini_batch_pricing_uses_batch_rates(self):
         with mock.patch.dict(os.environ, self.GEMINI_PRICING):
             cost = calculate_llm_cost_usd(
-                provider="gemini", prompt_tokens=1_000_000,
-                completion_tokens=1_000_000, batch_mode=True,
+                prompt_tokens=1_000_000, completion_tokens=1_000_000, batch_mode=True,
             )
         self.assertAlmostEqual(cost, 0.25)
-
-    def test_openai_pricing_from_env(self):
-        with mock.patch.dict(os.environ, {
-            "OPENAI_INPUT_USD_PER_1M_TOKENS": "0.15",
-            "OPENAI_OUTPUT_USD_PER_1M_TOKENS": "0.60",
-        }):
-            cost = calculate_llm_cost_usd(
-                provider="openai", prompt_tokens=1_000_000, completion_tokens=500_000,
-            )
-        self.assertAlmostEqual(cost, 0.15 + 0.30)
-
-    def test_openai_defaults_to_zero_without_env(self):
-        with mock.patch.dict(os.environ, {
-            "OPENAI_INPUT_USD_PER_1M_TOKENS": "",
-            "OPENAI_OUTPUT_USD_PER_1M_TOKENS": "",
-        }):
-            cost = calculate_llm_cost_usd(
-                provider="openai", prompt_tokens=1_000_000, completion_tokens=1_000_000,
-            )
-        self.assertEqual(cost, 0.0)
 
 
 class TestScrapeDoClientReturnsPayload(unittest.TestCase):

@@ -9,6 +9,72 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ---
 
+## 2026-08-25 — a run published into a void, and a stale throughput number
+
+Run `7a03eaa0` (gmaps, 100 rows) never started: no worker log line, `status.json` frozen at
+`phase="queued"` with `updated_at == created_at`, zero objects under `raw/`, and Stop appeared
+to do nothing. A run uploaded minutes later worked perfectly.
+
+### D69. The publisher must declare the run queues, not only the worker
+
+RabbitMQ told the truth by saying nothing. The `*_runs` queues were declared **and bound**
+only inside `s3_run_driver.consume_runs` — which runs in the **worker**. The exchange is
+DIRECT, so a run published before the worker had ever bound its queue against that broker
+produced an unroutable message, and an unroutable message on a direct exchange with no
+`mandatory` flag and no alternate-exchange is **silently discarded**: no error at the
+publisher, no log, nothing sitting in any queue. Confirmed live — the mgmt API showed
+`gmaps_runs` with 0 messages and a healthy consumer while the run sat queued.
+
+`engine.startup_event` already does exactly the right thing for `singleRA_search_jobs`
+(declare + bind at API start); the three run queues had simply never been added. Now
+`declare_run_queues(channel, exchange)` does it for all three, called from BOTH startup paths.
+Declaring is idempotent (same name, same durability), so either process may win the race.
+
+**Not a new failure — it had happened before and nobody noticed.** `8ebbd930` (2026-08-18)
+shows the identical signature: 100 rows, 0 scraped, 1369s of wall clock, `stopped`. Two
+occurrences in a week, in the only window that matters (upload right after starting
+everything), is what makes this a bug rather than an operational quirk.
+
+**Why Stop "didn't work", and why it is not separately broken.** For an S3-only run, Stop
+writes a marker and nothing else — the runner polls it between rows. With nothing driving the
+run, nothing polls, so the marker sits there and the UI keeps showing `queued`. The marker is
+durable and IS honoured: `run_row_phase` seeds `last_stop_check = -inf` specifically so a stop
+set before the phase starts halts it on the first pass. So the run terminalises correctly —
+just whenever the stale-run scan gets to it, up to `GMAPS_STALE_SEC` (900s) later. Deliberately
+NOT fixed by having the stop endpoint terminalise the run itself: that would put status writes
+and output writing back in the API process, which is the exact thing these pipelines moved
+away from. D69 closes the window that made the delay visible.
+
+### D70. An in-flight scrape.do run must not be labelled "SerpWow"
+
+Second symptom of the same run, and a real bug on its own. The cost card picked its provider
+from the DATA — `!!(cost.scrapedo_requests || scrapedo_credits || scrapedo_failed_requests)` —
+deliberately, so a pre-migration gmaps run with real `serpwow_searches` keeps its old card.
+But **zero is also what every scrape.do run reads before its first billed call lands**, so any
+in-flight (or stalled) gmaps/relationship/firmographics run fell through to the default
+`providerLabel = "SerpWow"`. Presence (`!= null`) cannot discriminate either: SerpWow runs
+carry the `scrapedo_*` keys as 0 too.
+
+Fix keeps the data check FIRST and adds the pipeline only as the tie-break at zero:
+`SCRAPEDO_PIPELINES.has(s.pipeline) && !cost.serpwow_searches`. Both halves are pinned —
+`inFlightScrapedoRunIsNotLabelledSerpWow` and `preMigrationGmapsKeepsSerpWowCard`.
+
+### D71. The "keep concurrency at 25" guidance is withdrawn
+
+The 2026-08-04 A/B (100 → 134s, 25 → 70.5s, "1.9x faster, do not raise") was the basis for
+every throughput estimate in these docs. Re-measured from S3 counters across three completed
+100-row gmaps runs, all at concurrency **100**: 44s → 36s → **34s (2.94 rows/s)**. That is 4x
+the old 100 figure and 2x the best 25 ever recorded. The A/B predates the pooled
+`httpx.AsyncClient` landing, which is the likeliest cause; scrape.do's own capacity changing is
+the other. 500k drops from ~98h to **~47h**.
+
+Stated precisely, because the temptation is to over-claim: this proves **100 got much faster**,
+NOT that **100 beats 25 today** — there is no fresh 25 run to compare against. HANDOFF now
+carries that as the owed measurement. The 429/502 attribution the docs already made stands and
+is confirmed again here: 133 attempts for 100 rows, zero 429s, every failure free.
+
+---
+
 ## 2026-08-20 — one batch toggle, not four
 
 Asked why `LLM_BATCH=true` did or did not apply to firmographics. It did — but only because
@@ -16,6 +82,41 @@ all three per-pipeline overrides happened to be blank, which is a bad reason for
 work. D53 kept them as overrides on the grounds that batching one pipeline and not another was
 worth a tri-state; nobody has ever done that, and the tri-state is what made the question
 un-answerable without reading four `.env` lines and the resolver.
+
+### D68. Gemini is the only LLM provider; the OpenAI transport is deleted
+
+Asked for directly, and the code agreed. `AI_MODE_LLM_PROVIDER=openai` reached one client
+class with no tuned prompts of its own, `OPENAI_*_USD_PER_1M_TOKENS` defaulting to **0** (so a
+run on it reported a $0.00 LLM bill), and `LLM_BATCH=true` already forced Gemini past it —
+which D67 had just widened to every pipeline. A switch that is off in every deployment, priced
+at zero when on, and overridden by the toggle you are most likely to set is not optionality,
+it is an untested code path.
+
+Deleted: `AI_MODE_LLM_PROVIDER`, the `OPENAI_*` env family (key, model, base_url, both pricing
+rates), `llm_client.OpenAICompatibleClient` and its `parse_usage`, and
+`calculate_llm_cost_usd`'s now-constant `provider` argument. `DEFAULT_LLM_BASE_URLS` was a
+two-entry dict behind a one-provider decision, so it became the constant
+`settings.GEMINI_BASE_URL`.
+
+**Found while doing it: `settings.load_llm_config` had no callers at all** — a whole second
+config path (`LLM_PROVIDER`/`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`, defaulting to openai)
+left over from the standalone-script era, shadowing the real one in `ai_mode_service`. Deleted
+too; it would have been the next person's wrong answer to "where does the provider come from".
+
+**`LLMConfig.provider` went too.** First cut kept it as a *record* — it lands in
+`status.json` and `final_report.json` — but that argument does not survive contact: nothing
+reads it (not `run_detail.js`, not the DOM contracts, no test), and a field that can only ever
+hold `"gemini"` is not a record, it is a constant shaped like a choice, which is exactly how
+the next person reads it as "so I can switch it". `LLMConfig` is now
+`{api_key, model, base_url=GEMINI_BASE_URL, max_retries, timeout_seconds}`, and **the only
+thing env picks is the model**: `llm_batch.batch_model()` in batch mode, `GEMINI_MODEL`
+inline. `validate()` is back to checking that the required values are non-empty, since there
+is no longer an enum to police. `final_report.json`'s `llm` block is `{base_url, model}`.
+
+**Kept**: `make_llm_client`, despite having no branch left — it adapts `LLMConfig` to the
+client kwargs and is the seam all four offline AI-Mode tests patch, so deleting it would move
+that construction into every caller and every test. `LLM_MAX_RETRIES` / `LLM_TIMEOUT_SECONDS`
+are transport settings, not provider ones, and stay.
 
 ### D67. Delete the three overrides; `LLM_BATCH` is the only toggle
 

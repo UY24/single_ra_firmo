@@ -279,6 +279,85 @@ class BatchModeTests(unittest.TestCase):
         self.assertEqual(submitted, [], "re-drive resubmitted rows that already had fields")
 
 
+class DeadGeminiShardTests(unittest.TestCase):
+    """The scrape succeeded and was billed; the Gemini shard never delivered.
+
+    Everything here is about telling that apart from "Google had no AI Overview", which
+    looks identical in the objects but is FINAL — rerunning it re-buys the same silence,
+    while rerunning this costs Gemini tokens only.
+    """
+
+    def setUp(self) -> None:
+        self.fake = FakeS3()
+        _seed(self.fake)
+
+        async def executor(**kwargs):
+            return _response(fields=None)          # overview captured, deferred to batch
+
+        def dead_shard(prefix, items, counters=None):
+            raise RuntimeError("Gemini batch batches/abc ended JOB_STATE_EXPIRED")
+
+        async def go():
+            with _patched(self.fake), \
+                    mock.patch.dict(os.environ, {"LLM_BATCH": "true",
+                                                 "SCRAPEDO_CONCURRENCY": "2"}), \
+                    mock.patch.object(runner, "execute_firmographic_extraction", executor), \
+                    mock.patch.object(runner, "_run_gemini_batch", dead_shard):
+                return await runner._phases(PREFIX, store.Counters(PREFIX, rows_total=3), {})
+
+        self.summary = asyncio.run(go())
+
+    def test_the_run_reports_the_failure_instead_of_a_clean_finish(self) -> None:
+        self.assertEqual(self.summary["status"], "completed_with_errors")
+        self.assertGreater(self.summary["error_breakdown"]["task_errors"], 0,
+                           "a dead shard left no trace in the summary")
+
+    def test_unjudged_rows_get_their_own_bucket_not_no_ai_overview(self) -> None:
+        """These rows HAD an overview — that is why they were deferred. Counting them as
+        no_ai_overview both overstated what Google failed to give us and hid the only
+        outcome in that card a rerun can fix."""
+        eb = self.summary["empty_response_breakdown"]
+        self.assertEqual(eb["llm_incomplete"], 2)
+        self.assertEqual(eb["no_ai_overview"], 0)
+
+    def test_the_note_says_it_is_retryable_and_free_on_the_provider(self) -> None:
+        rows = {r["website_url"]: r for r in _csv_rows(self.fake, "notEnriched.csv")}
+        note = rows["https://acme.com"]["enrichment_note"]
+        self.assertIn("LLM never completed", note)
+        self.assertIn("no scrape.do re-spend", note)
+        self.assertNotEqual(note, "No firmographics extracted.")
+
+    def test_they_land_in_retry_csv(self) -> None:
+        retry = _csv_rows(self.fake, "retry.csv")
+        self.assertEqual(len(retry), 2, "unjudged rows missing from the rerun list")
+        self.assertIn("llm_incomplete", retry[0]["retry_reason"])
+
+    def test_a_row_gemini_ANSWERED_emptily_is_final_not_retryable(self) -> None:
+        """The other side of the line: a cleaned/ object exists with no fields, meaning
+        Gemini read the overview and found nothing. Rerunning re-buys that silence, so it
+        must NOT be marked retryable."""
+        fake = FakeS3()
+        _seed(fake)
+
+        async def executor(**kwargs):
+            return _response(fields=None)
+
+        def empty_answer(prefix, items, counters=None):
+            return {key: {"parsed": {}, "usage": {}, "model": "m"} for key, _b in items}
+
+        async def go():
+            with _patched(fake), \
+                    mock.patch.dict(os.environ, {"LLM_BATCH": "true"}), \
+                    mock.patch.object(runner, "execute_firmographic_extraction", executor), \
+                    mock.patch.object(runner, "_run_gemini_batch", empty_answer):
+                return await runner._phases(PREFIX, store.Counters(PREFIX, rows_total=3), {})
+
+        summary = asyncio.run(go())
+        self.assertEqual(summary["empty_response_breakdown"]["llm_incomplete"], 0)
+        self.assertEqual(_csv_rows(fake, "retry.csv"), [],
+                         "a row Gemini answered was offered for rerun")
+
+
 class ProviderErrorTests(unittest.TestCase):
     def test_a_dead_row_is_an_error_and_lands_in_retry_csv(self) -> None:
         fake = FakeS3()

@@ -102,6 +102,24 @@ def batch_enabled(pipeline: str) -> bool:
     return _flag("LLM_BATCH") or False
 
 
+def shard_failure(gb, obj: dict) -> str | None:
+    """The terminal state of a shard Google produced NOTHING for, else None.
+
+    ``is_terminal()`` is true for SUCCEEDED, FAILED, CANCELLED and EXPIRED alike — it
+    answers "stop polling", not "there are results". A caller that checks only terminality
+    treats a dead job as an answered one, and both runners then write an empty ``cleaned/``
+    object for every key in the shard. That object IS the row's done-marker, so the rows are
+    permanently blank: no retry, no error, and the scrape.do spend behind them wasted.
+
+    ``gb`` is ``ai_mode.gemini_batch``, passed in rather than imported: it is imported lazily
+    at the call sites to keep this module free of the ai_mode dependency.
+    """
+    state = gb.state_name(obj)
+    if gb.is_success(state, bool(obj.get("done")), obj):
+        return None
+    return str(state or "unknown")
+
+
 def batch_model() -> str:
     """The model for Batch jobs: ``GEMINI_BATCH_MODEL`` -> ``GEMINI_MODEL`` -> default.
 

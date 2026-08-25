@@ -11,6 +11,97 @@ Companion files: `CLAUDE.md` (architecture), `FLOW.md` (call graph), `HANDOFF.md
 
 ## 2026-08-25 — a run published into a void, and a stale throughput number
 
+### D73. Retry stays manual — so the button has to be findable and the rows nameable
+
+Asked whether the re-drive scan should auto-retry a run left with unjudged rows. **No —
+user's call: a rerun only ever happens when someone clicks.** Automatic retry spends Gemini
+tokens unattended, and a permanently-poisoned shard would burn `drive_attempts` worth of
+them with nobody watching. `redrivable()` is unchanged; `completed` stays terminal to the
+scan.
+
+That decision only holds if the manual path actually works, and it did not. A run whose
+scrape succeeded and whose Gemini shard died reported `completed_with_errors` while **every
+visible count read zero**: `failed_rows` is `counters.rows_failed`, which only bumps on a
+SCRAPE failure; "View failed rows" is gated on `errors > 0`; the rows were `outcome=not_found`
+carrying `"No firmographics extracted."` — byte-identical to a row Google had no AI Overview
+for, which is FINAL; they were counted in `no_ai_overview` **despite having had an overview**;
+they were absent from `retry.csv`; the run detail page had no Rerun button at all (that
+section posts to the AI-Mode `/resume` endpoint); and `retry-failed-rows`, reached by
+hand-typing the id into Operations, answered **"Enqueued 0 failed rows"** while correctly
+republishing and redoing exactly that work.
+
+Fixed as four small things, all naming the same distinction — *did the LLM ever run for this
+row*:
+
+- **`reporting.retry_row` grew an `llm_incomplete` reason**, last in precedence because it is
+  the only one whose rerun costs nothing from the provider. Shared, so firmographics and
+  relationship say it the same way.
+- **The signal is object presence, not a flag.** `cleaned/` MISSING means the shard died and
+  the row is retryable; `cleaned/` present with a null result means Gemini read the overview
+  and had nothing to say — final, and rerunning re-buys that silence. `_row_result` now
+  attaches `_cleaned` whenever the object exists rather than only when it carries fields,
+  which is what makes the two distinguishable at all.
+- **Its own bucket**, `empty_response_breakdown.llm_incomplete`, in both pipelines' summaries
+  and as a chip on the billing card. Rolling it into `no_ai_overview` was doubly wrong: it
+  overstated what Google failed to deliver and hid the one number on that card a rerun fixes.
+- **A Rerun button on the run itself** for all three S3-only pipelines, plus a callout that
+  renders `task_errors` — so `completed_with_errors` has a visible cause. The button's copy
+  distinguishes the two costs: dead rows are re-scraped at full price, unjudged rows are not.
+  Gated on `SCRAPEDO_PIPELINES`, not `NO_STATE_PIPELINES` — the question is "will
+  `_find_s3_run` resolve this id", and that set omits gmaps because it answers a different
+  one (which `/output` links to advertise).
+- **`retry-failed-rows` counts unjudged rows too**, asking each pipeline in its own terms:
+  firmographics has `pending_llm/` markers (only deferred rows owe an LLM), relationship owes
+  one for every scraped row (its verdict IS the LLM, no inline path), gmaps has no LLM.
+
+### D72. A dead Gemini shard leaves its rows retryable — no JSONL needed
+
+Asked whether a timed-out batch should dump a JSONL to S3 so the LLM half could be retried
+without re-paying scrape.do. **The scrape spend was never at risk**, and every input the
+retry needs is already stored:
+
+| what a retry needs | where it already lives |
+|---|---|
+| the SERP | `raw/<shard>/row_N.json` |
+| our row result + cost | `rows/…` — also the phase-1 DONE marker, so a re-drive skips the row and buys nothing |
+| which rows await an LLM | `pending_llm/…` markers, found with ONE list |
+| the prompt | rebuilt from `rows/` by `_batch_item()`, deterministic |
+| an in-flight job's name | `batches/<first>-<last>.json` |
+
+A JSONL would be a fourth copy of the same bytes — multi-GB at 500k, and a second source of
+truth to drift. Rejected.
+
+**But the question was pointing at a real bug, in the layer below.** `is_terminal()` is true
+for SUCCEEDED, FAILED, CANCELLED and EXPIRED alike — it answers "stop polling", not "there
+are results". `is_success()` was supposed to draw that line and did not: for a non-SUCCEEDED
+state it fell through to `done_flag and not batch_obj.get("error")`, and an expired or
+cancelled job comes back `done: true` with no error body. So a dead shard read as a
+successful one, `_write_fields` / `_write_verdicts` wrote a `cleaned/` object for **every key
+in the shard**, and that object is the row's done-marker: the rows were blank forever, no
+error raised, no retry possible, and the scrape.do credits behind them wasted. Note this is
+the *likely* path — the 48h `TimeoutError` everyone worries about is the rarer one.
+
+`engine`'s gsearch chunk driver had survived this all along by keeping a **private
+`_failed_states` set** and checking it before trusting `is_success`. The two S3-only runners
+were written later and never inherited the workaround. So the fix went where all three
+callers route: `gemini_batch.FAILED_STATES` + `is_success` short-circuiting on it, and
+engine's private copy deleted.
+
+On top of that, `_abort_if_shard_died` in both runners: drop the job record (or the next
+drive re-polls a corpse instead of buying a fresh shard) and **raise before anything is
+written**, so the rows keep their `pending_llm/` marker. The raise lands in `driver.drain` →
+`task_errors` → `completed_with_errors`, and `write_outputs` still runs, so the run is
+honest rather than silently short. "Rerun failed" then re-publishes, the scrape phase skips
+every row that has an object (0 credits), and only the pending rows are resubmitted to
+Gemini. That IS the retry the JSONL was for.
+
+**Still not done**, and it is the same shape as before: a run that ends
+`completed_with_errors` this way is `completed` to the re-drive *scan*, so recovery is a
+deliberate "Rerun failed", not automatic. Explicit re-drive works because `drive()` does not
+check `TERMINAL_PHASES` — only `redrivable()` does.
+
+
+
 Run `7a03eaa0` (gmaps, 100 rows) never started: no worker log line, `status.json` frozen at
 `phase="queued"` with `updated_at == created_at`, zero objects under `raw/`, and Stop appeared
 to do nothing. A run uploaded minutes later worked perfectly.

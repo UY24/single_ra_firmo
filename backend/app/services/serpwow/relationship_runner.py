@@ -169,6 +169,28 @@ def _poll_to_terminal(gb, name: str, counters: store.Counters | None) -> dict:
         _time.sleep(llm_batch.poll_sec())
 
 
+def _abort_if_shard_died(gb, obj: dict, record_key: str, name: str) -> None:
+    """Raise (and forget the job) when Google answered nothing for this shard.
+
+    Deliberately does NOT write cleaned/: those rows keep their pending marker, so the next
+    drive resubmits ONLY them. And it drops the job record first, or the next drive would
+    re-attach to a job that can never answer instead of submitting a fresh one.
+
+    The scrape is untouched by any of this — raw/ and rows/ already exist, and every phase
+    skips a row that has an object, so retrying the LLM half re-buys nothing from scrape.do.
+    """
+    reason = llm_batch.shard_failure(gb, obj)
+    if reason is None:
+        return
+    try:
+        store.delete_object(record_key)
+    except Exception:                       # best-effort: the raise below matters more
+        pass
+    raise RuntimeError(
+        f"Gemini batch {name} ended {reason} with no results; "
+        f"its rows stay pending for the next drive")
+
+
 def _collect(gb, obj: dict, model: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for record in gb.collect_results(obj):
@@ -219,7 +241,9 @@ def _run_gemini_batch(prefix: str, items: list[tuple[str, dict]],
         _LOGGER.warning("relationship %s: could not record batch %s (%s: %s) — "
                         "a restart before it resolves will resubmit these rows",
                         prefix, name, type(exc).__name__, exc)
-    return _collect(gb, _poll_to_terminal(gb, name, counters), model)
+    obj = _poll_to_terminal(gb, name, counters)
+    _abort_if_shard_died(gb, obj, store.batch_record_key(prefix, indices), name)
+    return _collect(gb, obj, model)
 
 
 async def _iter_scraped_rows(prefix: str, wanted: set[int]):
@@ -293,6 +317,8 @@ async def _reattach_batches(prefix: str, counters: store.Counters) -> None:
                        f"({len(pending)} row(s) still without a verdict)",
                        upload_id=prefix.rsplit("/", 1)[-1])
         obj = await asyncio.to_thread(_poll_to_terminal, gb, name, counters)
+        await asyncio.to_thread(
+            _abort_if_shard_died, gb, obj, record["record_key"], name)
         results = await asyncio.to_thread(_collect, gb, obj, model)
         await _write_verdicts(prefix, [str(i) for i in pending], results, counters,
                               meta=meta)

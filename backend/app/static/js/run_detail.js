@@ -445,6 +445,10 @@ function emptyResponsesSection(g) {
         chip("Deferred rows", fmtNum(eb.deferred ?? 0), (eb.deferred ?? 0) ? "info" : "muted"),
         chip("Billed but no overview", fmtNum(paidForNothing),
           paidForNothing ? "danger" : "muted"),
+        // The one bucket here a rerun can fix: scraped and billed, overview captured,
+        // but the Gemini shard never returned. Rerunning redoes the LLM only.
+        chip("LLM never completed", fmtNum(eb.llm_incomplete ?? 0),
+          (eb.llm_incomplete ?? 0) ? "warn" : "muted"),
         chip("Failed after retries", fmtNum(failed), failed ? "warn" : "muted"),
         chip("Unbilled attempts", fmtNum(unbilled), "muted"),
       ),
@@ -483,7 +487,9 @@ function emptyResponsesSection(g) {
   }
   const aiMode = eb.no_ai_text != null;
   const chips = aiMode
-    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
+    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted"),
+       chip("LLM never completed", fmtNum(eb.llm_incomplete ?? 0),
+         (eb.llm_incomplete ?? 0) ? "warn" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
@@ -677,6 +683,53 @@ function rerunFailedSection(ref) {
         + "only batches that failed to scrape, Phase 2 (LLM cleanup) re-does only batches "
         + "that failed to clean. Successful scrapes and cleaned results are reused — no "
         + "scrape.do or LLM re-spend on them. (Not-found rows are final; use AI Mode Deep for those.)"),
+      el("div", { class: "mt-3" }, btn), msg,
+    ),
+  );
+}
+
+// The S3-only pipelines' rerun. NOT the AI-Mode one above: different endpoint, and
+// different semantics — there are no batches here, only per-row objects, so "redo what
+// failed" means "delete the error markers and re-drive". Until this existed the only way
+// to retry a gmaps/relationship/firmographics run was to hand-type its id into the
+// Operations page, which is exactly the friction that let a dead Gemini shard sit
+// unnoticed: nothing on the run itself offered the one action that fixes it.
+function rerunRunSection(ref, { llmIncomplete = 0, errors = 0 } = {}) {
+  const msg = el("div", { class: "mt-3 hidden" });
+  const btn = el("button", {
+    class: "btn-primary disabled:opacity-50",
+    onclick: async () => {
+      btn.disabled = true;
+      msg.className = "mt-3";
+      msg.replaceChildren(el("p", { class: "section-copy" }, "Rerunning failed work..."));
+      try {
+        const data = await api(
+          `/uploads/${encodeURIComponent(ref)}/retry-failed-rows`, { method: "POST" });
+        msg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
+          `Rerun started for ${fmtNum(data.enqueued_rows ?? 0)} row(s). Reloading...`));
+        _scheduleReload();
+      } catch (e) {
+        btn.disabled = false;
+        msg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+      }
+    },
+  }, "Rerun failed");
+  // Say what this run will actually redo, because the two cases cost very different
+  // things: a dead row is re-scraped at full provider price, an unjudged row is not.
+  const detail = [];
+  if (errors) detail.push(`${fmtNum(errors)} failed row(s) will be re-scraped`);
+  if (llmIncomplete) {
+    detail.push(`${fmtNum(llmIncomplete)} scraped row(s) will be re-sent to the LLM `
+      + `(no provider re-spend — their scrape is already stored)`);
+  }
+  return el("section", { class: "detail-section detail-action" },
+    sectionHeading("Rerun failed"),
+    el("div", { class: "detail-section-body" },
+      el("p", { class: "text-xs text-slate-400" },
+        detail.length
+          ? `${detail.join("; ")}. Rows that already have a result are skipped entirely.`
+          : "Re-drives this run. Every row that already has a result is skipped, so "
+            + "answered rows cost nothing to leave in place."),
       el("div", { class: "mt-3" }, btn), msg,
     ),
   );
@@ -896,6 +949,29 @@ function renderLegacyStatus(root, ref, s) {
   if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
+  }
+  // task_errors are shard/row TASKS that raised — a whole Gemini shard dying is the
+  // common one, and it strands rows without making any of them an "error" row. Without
+  // this the run said completed_with_errors while every visible count read zero.
+  const taskErrors = safeCount(g?.error_breakdown?.task_errors);
+  const llmIncomplete = safeCount(g?.empty_response_breakdown?.llm_incomplete);
+  if (runState.pollTerminal && taskErrors > 0) {
+    parts.push(el("div", { class: "callout callout-amber" },
+      el("p", { class: "text-xs" },
+        `${fmtNum(taskErrors)} background task(s) failed during this run`
+        + (llmIncomplete
+            ? ` — ${fmtNum(llmIncomplete)} row(s) were scraped but never got an LLM result.`
+              + " Rerun below redoes only the LLM half; the scrape is already paid for."
+            : ". See report.json error_breakdown for detail."))));
+  }
+  // Offered on any terminal run of these pipelines: a re-drive skips every row that has a
+  // result, so the button is safe even when there is nothing to redo.
+  // SCRAPEDO_PIPELINES, not NO_STATE_PIPELINES: the question is "does
+  // /uploads/{id}/retry-failed-rows find an S3 run for this id", and that is exactly the
+  // three run-per-message pipelines. (NO_STATE_PIPELINES omits gmaps — it is about which
+  // /output links to advertise, a different question.)
+  if (runState.pollTerminal && SCRAPEDO_PIPELINES.has(s.pipeline)) {
+    parts.push(rerunRunSection(ref, { llmIncomplete, errors }));
   }
 
   // Stop button while the run is still doing work (rows in flight, or the

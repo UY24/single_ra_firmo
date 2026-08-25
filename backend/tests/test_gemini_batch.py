@@ -92,6 +92,20 @@ class StateHelperTests(unittest.TestCase):
         self.assertFalse(gemini_batch.is_success(state, done, obj))
 
 
+    def test_a_dead_state_is_never_a_success_even_with_done_true(self) -> None:
+        """An expired/cancelled job can report done=true with NO error body, which the
+        `not batch_obj.get("error")` fallback read as success — so both S3-only runners
+        persisted an empty `cleaned/` object for every row in the shard and marked them
+        permanently done. engine's chunk driver had a private copy of this set; now the
+        rule lives here, once."""
+        for state in sorted(gemini_batch.FAILED_STATES):
+            with self.subTest(state=state):
+                obj = {"state": state, "done": True}
+                self.assertTrue(gemini_batch.is_terminal(state, True))
+                self.assertFalse(gemini_batch.is_success(state, True, obj),
+                                 f"{state} reported as a successful shard")
+
+
 class CollectResultsInlineTests(unittest.TestCase):
     def test_inline_response_yields_single_record(self) -> None:
         batch_obj = {

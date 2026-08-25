@@ -70,9 +70,14 @@ def _row_result(prefix: str, idx: int) -> tuple[dict[str, Any] | None, dict[str,
     result = stored.get("result")
     if not isinstance(result, dict) or not any(result.get(k) for k in _FIELD_KEYS):
         cleaned = store.get_object(store.cleaned_key(prefix, idx))
-        if cleaned is not None and isinstance(cleaned.get("result"), dict):
-            result = cleaned["result"]
+        if cleaned is not None:
+            # Attached whenever the object EXISTS, not only when it carries fields: its
+            # presence is how the caller tells "Gemini answered nothing for this row"
+            # (final — rerunning re-buys the same silence) from "the shard never returned"
+            # (retryable). It also carries usage/model even on an empty answer.
             stored["_cleaned"] = cleaned
+            if isinstance(cleaned.get("result"), dict):
+                result = cleaned["result"]
     return stored, result if isinstance(result, dict) else {}
 
 
@@ -131,7 +136,7 @@ def _write_outputs(prefix: str, counters: store.Counters,
     prompt_tokens = completion_tokens = 0
     llm_usd = 0.0
     model: str | None = None
-    no_overview = never_processed = no_website = 0
+    no_overview = never_processed = no_website = llm_incomplete = 0
 
     for original in store.iter_input_rows(prefix):
         total_rows += 1
@@ -189,6 +194,14 @@ def _write_outputs(prefix: str, counters: store.Counters,
                 by_category[category] = by_category.get(category, 0) + 1
             elif any(result.get(k) for k in _FIELD_KEYS):
                 outcome = "found"
+            elif stored.get("awaiting_batch") and stored.get("_cleaned") is None:
+                # Scraped, billed, an AI overview WAS captured (that is why it was
+                # deferred) — and the Gemini shard never came back. Its own note and its
+                # own bucket: rolling it into no_ai_overview both overstated "Google gave
+                # us nothing" and hid the one outcome here that a rerun actually fixes.
+                note = ("LLM never completed — rerun to retry "
+                        "(no scrape.do re-spend).")
+                llm_incomplete += 1
             else:
                 note = str(stored.get("row_error")
                            or context.get("row_error")
@@ -247,7 +260,11 @@ def _write_outputs(prefix: str, counters: store.Counters,
             credits=int(cost_now.get("scrapedo_credits") or 0),
             error=note if outcome == "errored" else "",
             billed_empty=(outcome == "not_found"
-                          and bool(cost_now.get("scrapedo_billed_empty"))))
+                          and bool(cost_now.get("scrapedo_billed_empty"))),
+            # The scrape is already paid for and already in S3, so this row's rerun costs
+            # Gemini tokens and nothing else.
+            llm_incomplete=bool(stored and stored.get("awaiting_batch")
+                                and stored.get("_cleaned") is None))
         if retry:
             retry_writer.writerow(retry)
 
@@ -298,6 +315,9 @@ def _write_outputs(prefix: str, counters: store.Counters,
         "empty_response_breakdown": {"no_ai_overview": no_overview,
                                      "deferred": deferred,
                                      "no_website": no_website,
+                                     # Had an overview; the Gemini shard never delivered.
+                                     # The ONLY bucket here a rerun can fix.
+                                     "llm_incomplete": llm_incomplete,
                                      "never_processed": never_processed},
         "cost": _build_cost(
             llm_usd, 0, 0, requests, credits, successes, failed_requests,

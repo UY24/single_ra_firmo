@@ -163,6 +163,7 @@ def _write_outputs(prefix: str, counters: store.Counters,
     # the gate URLs to pick from but nothing to verify a relationship against, so a run
     # with a high count here will read not_confirmed almost everywhere.
     no_ai_text = 0
+    llm_incomplete = 0
     total_rows = found = 0
     prompt_tokens = completion_tokens = 0
     llm_usd = 0.0
@@ -205,16 +206,27 @@ def _write_outputs(prefix: str, counters: store.Counters,
         # (confirmed or not) is a real answer — rerunning it re-buys it. Rows with
         # references but no prose (no_ai_text) are deliberately NOT here: the gate had
         # something to work with and produced a verdict.
+        # Read BEFORE the retry rule, which needs to know whether the verdict phase ever
+        # produced anything for this row. `None` (not `{}`) means no object at all: the
+        # Gemini shard died and nothing was written, so the row is scraped-but-unjudged
+        # and a rerun redoes the LLM alone. An object with a null `parsed` is different —
+        # Gemini answered and had nothing to say, which rerunning only re-buys.
+        cleaned_obj = store.get_object(store.cleaned_key(prefix, idx))
+        row_unjudged = cleaned_obj is None and not envelope.get("error")
+        if row_unjudged:
+            llm_incomplete += 1
+
         retry = retry_row(
             original, header, reason_column,
             attempts=int(envelope.get("request_count") or 0),
             credits=int(envelope.get("credits") or 0),
             error=str(envelope.get("error") or ""),
-            billed_empty=not envelope.get("error") and not blocks and not refs)
+            billed_empty=not envelope.get("error") and not blocks and not refs,
+            llm_incomplete=row_unjudged)
         if retry:
             retry_writer.writerow(retry)
 
-        cleaned = store.get_object(store.cleaned_key(prefix, idx)) or {}
+        cleaned = cleaned_obj or {}
         parsed = cleaned.get("parsed")
         # LLM accounting, aggregated per row so nothing scales with run size. The UI has
         # had Model / Input tokens / Output tokens / LLM-cost tiles all along; they were
@@ -293,7 +305,10 @@ def _write_outputs(prefix: str, counters: store.Counters,
         # empty) because that is the broader signal: references with no prose still
         # leaves the gate nothing to verify a relationship against. The stricter
         # "spent credits for literally nothing" number is cost.scrapedo_billed_empty.
-        "empty_response_breakdown": {"no_ai_text": no_ai_text},
+        # no_ai_text: a billed 200 with citations but no prose — the gate still produced a
+        # verdict, so it is final. llm_incomplete: scraped fine, never judged, retryable.
+        "empty_response_breakdown": {"no_ai_text": no_ai_text,
+                                     "llm_incomplete": llm_incomplete},
         "confidence_mode": "llm",
         # Hardcoded, not derived: this pipeline has no per-row LLM path at all — phase 2 is
         # always the Gemini Batch verdict pass. Leaving it unset made run_detail.js read

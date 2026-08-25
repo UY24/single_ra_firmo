@@ -67,8 +67,8 @@ def retry_column(header: list[str]) -> str:
 
 def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *,
               attempts: int, credits: int, error: str = "",
-              billed_empty: bool = False, no_listing: bool = False
-              ) -> Optional[dict[str, str]]:
+              billed_empty: bool = False, no_listing: bool = False,
+              llm_incomplete: bool = False) -> Optional[dict[str, str]]:
     """One retry.csv row, or None when the row got a real answer.
 
     retry.csv exists to be RE-UPLOADED, so it carries the original input cells verbatim
@@ -81,8 +81,14 @@ def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *
       only reason that costs money.
     - ``no_listing`` — every attempt came back 502 "no results" (gmaps). Not billed.
     - ``error``      — died after every retry, or never ran at all.
+    - ``llm_incomplete`` — the provider answered and we were billed, but the Gemini shard
+      that had to read that answer never delivered (job FAILED/EXPIRED, or our poll gave
+      up). The row has a scrape and no verdict. Listed LAST because it is the only reason
+      whose rerun costs nothing from the provider: the scrape objects already exist, so a
+      re-drive skips the row and redoes the LLM half alone.
 
-    Shared by gmaps and relationship so one vocabulary describes both runs' rerun lists.
+    Shared by gmaps, relationship and firmographics so one vocabulary describes every
+    run's rerun list.
     """
     if billed_empty:
         reason = "billed_empty: HTTP 200 returned no data — refundable"
@@ -93,6 +99,9 @@ def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *
         # the error — charged for nothing, exactly like billed_empty. A row that died
         # before any 200 cost nothing, so it must not claim to be refundable.
         reason = f"error: {error}" + (" — billed, refundable" if credits else "")
+    elif llm_incomplete:
+        reason = ("llm_incomplete: scraped and billed, but the Gemini batch never returned "
+                  "a result for this row — rerun redoes the LLM only, no provider re-spend")
     else:
         return None
     row = passthrough_row(original, s3_passthrough(header, ()))

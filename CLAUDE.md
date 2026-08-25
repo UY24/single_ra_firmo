@@ -351,6 +351,34 @@ so `common/llm_batch.py` now owns every batch setting and each call site reads i
   (**172800 = 48h, Gemini's job expiry** — a Batch job runs and bills on Google's side whether
   or not we poll, so the old 1800 abandoned work already paid for), `AI_MODE_BATCH_POLL_SEC` →
   `GEMINI_BATCH_POLL_SEC`. Closes HANDOFF blocker #1.
+- **Retry is MANUAL, button-only** (user's call, 2026-08-25) — `redrivable()` is unchanged,
+  so `completed` stays terminal to the re-drive scan and no run ever re-spends Gemini tokens
+  unattended. What that requires in exchange: a row whose scrape succeeded but whose Gemini
+  shard died is named `llm_incomplete` everywhere — its own `empty_response_breakdown` bucket
+  and billing chip (NOT folded into `no_ai_overview`, which it is not), its own
+  `enrichment_note` ("LLM never completed — rerun to retry (no scrape.do re-spend)."), its own
+  `reporting.retry_row` reason so it reaches `retry.csv`, and a **Rerun button on the run
+  detail page** for all three S3-only pipelines instead of hand-typing the id into Operations.
+  The discriminator is object presence: `cleaned/` **missing** = the shard died, retryable;
+  `cleaned/` present with a null result = Gemini answered and had nothing, final. A callout
+  renders `task_errors`, so `completed_with_errors` always has a visible cause.
+- **A shard Google never answered leaves its rows RETRYABLE** (2026-08-25). `is_terminal()`
+  is true for SUCCEEDED/FAILED/CANCELLED/EXPIRED alike — it means "stop polling", not "there
+  are results". `is_success()` now short-circuits on `gemini_batch.FAILED_STATES` instead of
+  falling through to `done_flag and not error`, which an expired job satisfies. Both S3-only
+  runners then call `_abort_if_shard_died`: drop the `batches/` record (else the next drive
+  re-polls a corpse rather than buying a fresh shard) and **raise before writing anything**,
+  so the rows keep their `pending_llm/` marker and only they are resubmitted. Recovery is
+  "Rerun failed" → scrape phase skips every row with an object (**0 scrape.do credits**) →
+  LLM phase resubmits the pending rows. No extra artifact is needed for this: `raw/`,
+  `rows/`, `pending_llm/` and `batches/` already hold everything a retry reads. `engine`'s
+  private `_failed_states` copy is deleted — one rule, three callers.
+- **`GEMINI_BATCH_TIMEOUT_SEC` bounds ONE SHARD's poll, not the run and not the LLM phase.**
+  The deadline is built inside `_poll_to_terminal`, which runs in phase 2 — so a scrape phase
+  of any length (hours, days) cannot consume it, and 20 sequential waves of shards can far
+  exceed 48h in total because each wave starts its own clock. Asked twice, so it is pinned by
+  `test_batch_timeout_scope.py` (including the companion that a shard which genuinely overruns
+  still raises, or the first test passes vacuously). Never hoist that deadline to run start.
 - **Model: `GEMINI_BATCH_MODEL` → `GEMINI_MODEL` → `gemini-2.5-flash-lite`.** The second step
   is load-bearing: `relationship_runner` read only `GEMINI_BATCH_MODEL`, so setting just
   `GEMINI_MODEL` moved three pipelines and left relationship on the hardcoded default.

@@ -1955,9 +1955,10 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
                 raise TimeoutError(f"chunk {chunk_id} batch timeout after {poll_timeout}s")
             await asyncio.sleep(poll_interval)
         sname = gb.state_name(final_obj); done = bool(final_obj.get("done"))
-        _failed_states = {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
-                          "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED"}
-        if sname in _failed_states or not gb.is_success(sname, done, final_obj):
+        # The private _failed_states set that used to sit here is now inside
+        # gb.is_success (gemini_batch.FAILED_STATES) — same rule, one copy, and the two
+        # S3-only runners get the defence this driver had all along.
+        if not gb.is_success(sname, done, final_obj):
             raise RuntimeError(f"chunk {chunk_id} ended state={sname} error={final_obj.get('error')}")
         records = await asyncio.to_thread(gb.collect_results, final_obj)
         row_index_by_key = {k: int(k.split("-")[1]) for k, _ in items}
@@ -4680,13 +4681,39 @@ async def retry_failed_rows(
         # this time out on any run with a lot of dead rows.
         removed = await asyncio.to_thread(
             lambda: rel_store.delete_objects(_dead_markers()))
+
+        # Rows that scraped fine but never got a verdict, because their Gemini shard died.
+        # They have NO error marker, so `removed` cannot see them — and a run whose only
+        # problem was a dead shard therefore reported "Enqueued 0 failed rows" while
+        # correctly republishing and redoing exactly this work. Counted, not deleted:
+        # their pending_llm/ marker is what the LLM phase reads to find them, and their
+        # scrape objects are what make the rerun free on the provider side.
+        def _unjudged() -> int:
+            # Which rows OWE an LLM result differs by pipeline, so ask each in its own
+            # terms rather than assuming one marker:
+            #   firmographics — only DEFERRED rows do (inline mode marks none), so it is
+            #                   the pending_llm/ markers. Cheap: one LIST, and empty in
+            #                   inline mode.
+            #   relationship  — every scraped row does; its Gemini verdict IS the answer
+            #                   and it has no inline path, so there are no markers to read.
+            #   gmaps         — has no LLM at all.
+            if segment == "gmaps":
+                return 0
+            owed = (rel_store.list_pending_llm_rows(prefix) if segment == "firmographics"
+                    else rel_store.list_done_rows(prefix))
+            return len(owed - rel_store.list_cleaned_rows(prefix))
+
+        pending_llm = await asyncio.to_thread(_unjudged)
         await asyncio.to_thread(rel_store.clear_stop, prefix)
         publishers = {"gmaps": publish_gmaps_run,
                       "firmographics": publish_firmographics_run}
         await publishers.get(segment, publish_relationship_run)(upload_id)
         return {"upload_id": upload_id, "retried_rows": removed,
-                # operations.js reads enqueued_rows for its status line.
-                "enqueued_rows": removed,
+                "pending_llm_rows": pending_llm,
+                # operations.js reads enqueued_rows for its status line. Both kinds of
+                # work count: a dead row to re-scrape and an unjudged row to re-send to
+                # Gemini are both things this request just put back in flight.
+                "enqueued_rows": removed + pending_llm,
                 "status_url": f"/uploads/{upload_id}/status"}
 
     if rabbitmq_exchange is None:

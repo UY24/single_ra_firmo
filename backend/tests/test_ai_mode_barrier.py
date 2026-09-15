@@ -17,7 +17,7 @@ from app.services.ai_mode import worker as ai_worker
 FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
-    "AI_MODE_LLM_BATCH": "",           # sync-LLM cleanup path (offline)
+    "LLM_BATCH": "",           # sync-LLM cleanup path (offline)
     "AI_MODE_STATUS_FLUSH_SEC": "0",
     "S3_BUCKET": "",
     "SLACK_WEBHOOK_URL": "",

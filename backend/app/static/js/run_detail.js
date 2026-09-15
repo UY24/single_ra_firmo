@@ -21,7 +21,18 @@ import {
 
 const RESULT_FILES = ["final_report.json", "found.csv", "notFound.csv", "run.log", "input.csv"];
 const ROW_TERMINAL_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
-const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship"]);
+// Pipelines that write result files at the end of a run. firmographics joined on
+// 2026-08-20 with its S3-only migration.
+const REPORTING_PIPELINES = new Set(["gsearch", "gmaps", "relationship",
+                                     "firmographics"]);
+// Pipelines whose ONLY provider is scrape.do, billed in credits. Used to label the cost
+// card before any call has been billed — at zero, the numbers cannot say who the provider
+// was. gsearch is absent: it is the last one still on SerpWow.
+const SCRAPEDO_PIPELINES = new Set(["gmaps", "relationship", "firmographics"]);
+
+// The S3-only pipelines keep NO state.json, so /uploads/{id}/output (and its CSV form)
+// 404 for them — their per-row data is in the result files instead.
+const NO_STATE_PIPELINES = new Set(["relationship", "firmographics"]);
 const BATCH_TERMINAL_STATUSES = new Set([
   "succeeded", "completed_with_errors", "failed", "cancelled", "skipped", "not_started",
 ]);
@@ -403,6 +414,46 @@ function verdictSection(rb) {
 function emptyResponsesSection(g) {
   const eb = g.empty_response_breakdown || {};
   const cost = g.cost || {};
+  // firmographics buys TWO differently-priced calls: a Google Search (10 credits per
+  // HTTP 200) and, only when Google defers the AI Overview, a follow-up fetch (5
+  // credits). The totals alone cannot explain the bill, so split by endpoint.
+  if (eb.no_ai_overview != null) {
+    const rows = safeCount(g.total_rows);
+    const searchBilled = safeCount(cost.scrapedo_search_successful);
+    const aioBilled = safeCount(cost.scrapedo_ai_overview_successful);
+    const searchCredits = searchBilled * 10;
+    const aioCredits = aioBilled * 5;
+    const unbilled = Math.max(0, safeCount(cost.scrapedo_requests)
+                                 - safeCount(cost.scrapedo_successful_requests));
+    // Billed and answered, but no overview to extract from — Google had none, or the
+    // deferred fetch failed. Credits spent for nothing: the refund claim.
+    const paidForNothing = safeCount(eb.no_ai_overview);
+    const failed = safeCount(cost.scrapedo_error_requests);
+    return el("section", { class: "detail-section" },
+      sectionHeading(
+        "Scrape.do billing (10 credits per search, 5 per deferred AI Overview)",
+        "Credits are charged on HTTP 200s only, so failed attempts and retries are free. "
+        + "A deferred overview means Google had not finished generating it when the SERP "
+        + "was served, so a second call was needed for that row."),
+      el("div", { class: "detail-section-body relationship-verdict" },
+        chip("Search calls billed",
+          rows ? `${fmtNum(searchBilled)} of ${fmtNum(rows)} rows` : fmtNum(searchBilled),
+          "good"),
+        chip("Search credits", fmtNum(searchCredits), "muted"),
+        chip("AI Overview follow-ups", fmtNum(aioBilled), aioBilled ? "info" : "muted"),
+        chip("AI Overview credits", fmtNum(aioCredits), "muted"),
+        chip("Deferred rows", fmtNum(eb.deferred ?? 0), (eb.deferred ?? 0) ? "info" : "muted"),
+        chip("Billed but no overview", fmtNum(paidForNothing),
+          paidForNothing ? "danger" : "muted"),
+        // The one bucket here a rerun can fix: scraped and billed, overview captured,
+        // but the Gemini shard never returned. Rerunning redoes the LLM only.
+        chip("LLM never completed", fmtNum(eb.llm_incomplete ?? 0),
+          (eb.llm_incomplete ?? 0) ? "warn" : "muted"),
+        chip("Failed after retries", fmtNum(failed), failed ? "warn" : "muted"),
+        chip("Unbilled attempts", fmtNum(unbilled), "muted"),
+      ),
+    );
+  }
   if (eb.no_listing != null) {
     const billed = safeCount(cost.scrapedo_successful_requests);
     const rows = safeCount(g.total_rows);
@@ -436,7 +487,9 @@ function emptyResponsesSection(g) {
   }
   const aiMode = eb.no_ai_text != null;
   const chips = aiMode
-    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted")]
+    ? [chip("No AI Mode text", fmtNum(eb.no_ai_text), eb.no_ai_text ? "danger" : "muted"),
+       chip("LLM never completed", fmtNum(eb.llm_incomplete ?? 0),
+         (eb.llm_incomplete ?? 0) ? "warn" : "muted")]
     : [
         chip("All phases", fmtNum(eb.all_phases ?? 0), (eb.all_phases ?? 0) ? "danger" : "muted"),
         chip("Some phases", fmtNum(eb.some_phases ?? 0), (eb.some_phases ?? 0) ? "warn" : "muted"),
@@ -635,6 +688,53 @@ function rerunFailedSection(ref) {
   );
 }
 
+// The S3-only pipelines' rerun. NOT the AI-Mode one above: different endpoint, and
+// different semantics — there are no batches here, only per-row objects, so "redo what
+// failed" means "delete the error markers and re-drive". Until this existed the only way
+// to retry a gmaps/relationship/firmographics run was to hand-type its id into the
+// Operations page, which is exactly the friction that let a dead Gemini shard sit
+// unnoticed: nothing on the run itself offered the one action that fixes it.
+function rerunRunSection(ref, { llmIncomplete = 0, errors = 0 } = {}) {
+  const msg = el("div", { class: "mt-3 hidden" });
+  const btn = el("button", {
+    class: "btn-primary disabled:opacity-50",
+    onclick: async () => {
+      btn.disabled = true;
+      msg.className = "mt-3";
+      msg.replaceChildren(el("p", { class: "section-copy" }, "Rerunning failed work..."));
+      try {
+        const data = await api(
+          `/uploads/${encodeURIComponent(ref)}/retry-failed-rows`, { method: "POST" });
+        msg.replaceChildren(el("p", { class: "text-sm font-semibold text-emerald-600" },
+          `Rerun started for ${fmtNum(data.enqueued_rows ?? 0)} row(s). Reloading...`));
+        _scheduleReload();
+      } catch (e) {
+        btn.disabled = false;
+        msg.replaceChildren(el("p", { class: "text-sm text-red-600" }, e.message));
+      }
+    },
+  }, "Rerun failed");
+  // Say what this run will actually redo, because the two cases cost very different
+  // things: a dead row is re-scraped at full provider price, an unjudged row is not.
+  const detail = [];
+  if (errors) detail.push(`${fmtNum(errors)} failed row(s) will be re-scraped`);
+  if (llmIncomplete) {
+    detail.push(`${fmtNum(llmIncomplete)} scraped row(s) will be re-sent to the LLM `
+      + `(no provider re-spend — their scrape is already stored)`);
+  }
+  return el("section", { class: "detail-section detail-action" },
+    sectionHeading("Rerun failed"),
+    el("div", { class: "detail-section-body" },
+      el("p", { class: "text-xs text-slate-400" },
+        detail.length
+          ? `${detail.join("; ")}. Rows that already have a result are skipped entirely.`
+          : "Re-drives this run. Every row that already has a result is skipped, so "
+            + "answered rows cost nothing to leave in place."),
+      el("div", { class: "mt-3" }, btn), msg,
+    ),
+  );
+}
+
 function warningsNote(warnings) {
   return el("div", { class: "callout callout-amber" },
     ...warnings.map((w) => el("p", { class: "text-xs" }, w)));
@@ -723,6 +823,14 @@ function renderLegacyStatus(root, ref, s) {
       chips.push(chip("Batch", g.is_batch ? "On" : "Off", g.is_batch ? "good" : "muted"));
       if (g.model) chips.push(chip("Model", g.model, "muted"));
     }
+  } else if (g?.llm_mode) {
+    // A pipeline that uses an LLM for something OTHER than confidence — firmographics
+    // normalises the AI Overview into its six fields. It reports confidence_mode: null
+    // (it is handed the website, so there is nothing to be confident about), which used to
+    // hide the fact that a paid model ran at all, and whether batched or not.
+    chips.push(chip("LLM", g.llm_mode === "batch" ? "Batch" : "Inline",
+      g.llm_mode === "batch" ? "good" : "info"));
+    if (g.model) chips.push(chip("Model", g.model, "muted"));
   }
   // Which provider is actually working right now. `phase` is served by the
   // counter-driven status endpoint; without this the run looked identical whether
@@ -744,6 +852,14 @@ function renderLegacyStatus(root, ref, s) {
   if (phaseSecs && (phaseSecs.scraping || phaseSecs.cleaning)) {
     chips.push(chip("scrape.do", fmtDuration(phaseSecs.scraping ?? 0), "muted"));
     chips.push(chip("LLM", fmtDuration(phaseSecs.cleaning ?? 0), "muted"));
+  }
+  // Row-parallel pipelines have no run-level phase split, so their time is reported as a
+  // per-row AVERAGE. Labelled "/row" so it is not read as wall clock: summing it across
+  // rows at high concurrency would exceed the run's own duration.
+  const avgSecs = g?.phase_seconds_avg;
+  if (avgSecs && (avgSecs.provider || avgSecs.llm)) {
+    chips.push(chip("scrape.do/row", fmtDuration(avgSecs.provider ?? 0), "muted"));
+    chips.push(chip("LLM/row", fmtDuration(avgSecs.llm ?? 0), "muted"));
   }
 
   const isRel = s.pipeline === "relationship";
@@ -804,13 +920,17 @@ function renderLegacyStatus(root, ref, s) {
     parts.push(el("div", { class: "callout callout-red" },
       el("p", { class: "detail-error text-sm" }, s.error)));
   }
-  // Branch on the DATA, not the pipeline key: a gmaps run predating the scrape.do
-  // migration still carries serpwow_searches/serpwow_usd and keeps its old cost card.
+  // Data first, pipeline as the tie-break. Truthy, not != null: the cost block carries
+  // these keys as 0 for SerpWow pipelines too, and checking failed/credits as well keeps
+  // an all-failed run on the Scrape.do card. But zero is also what every scrape.do run
+  // reads BEFORE its first billed call lands, which labelled an in-flight gmaps run
+  // "SerpWow" — so a pipeline that only ever talks to scrape.do says so even at zero.
+  // The data check still comes first, so a gmaps run predating the migration keeps
+  // rendering its real serpwow_searches/serpwow_usd card.
   if (g) {
-    // Truthy, not != null: the cost block carries these keys as 0 for SerpWow pipelines
-    // too. Checking failed/credits as well keeps an all-failed run on the Scrape.do card.
     const isScrapedo = !!(g.cost?.scrapedo_requests || g.cost?.scrapedo_credits
-                          || g.cost?.scrapedo_failed_requests);
+                          || g.cost?.scrapedo_failed_requests)
+      || (SCRAPEDO_PIPELINES.has(s.pipeline) && !g.cost?.serpwow_searches);
     parts.push(isScrapedo
       ? costSection(g, {
           providerLabel: "Scrape.do",
@@ -829,6 +949,29 @@ function renderLegacyStatus(root, ref, s) {
   if (g?.empty_response_breakdown) parts.push(emptyResponsesSection(g));
   if (runState.pollTerminal && errors > 0) {
     parts.push(failedRowsSection(ref, errors, isRel ? "Company Y" : "Company"));
+  }
+  // task_errors are shard/row TASKS that raised — a whole Gemini shard dying is the
+  // common one, and it strands rows without making any of them an "error" row. Without
+  // this the run said completed_with_errors while every visible count read zero.
+  const taskErrors = safeCount(g?.error_breakdown?.task_errors);
+  const llmIncomplete = safeCount(g?.empty_response_breakdown?.llm_incomplete);
+  if (runState.pollTerminal && taskErrors > 0) {
+    parts.push(el("div", { class: "callout callout-amber" },
+      el("p", { class: "text-xs" },
+        `${fmtNum(taskErrors)} background task(s) failed during this run`
+        + (llmIncomplete
+            ? ` — ${fmtNum(llmIncomplete)} row(s) were scraped but never got an LLM result.`
+              + " Rerun below redoes only the LLM half; the scrape is already paid for."
+            : ". See report.json error_breakdown for detail."))));
+  }
+  // Offered on any terminal run of these pipelines: a re-drive skips every row that has a
+  // result, so the button is safe even when there is nothing to redo.
+  // SCRAPEDO_PIPELINES, not NO_STATE_PIPELINES: the question is "does
+  // /uploads/{id}/retry-failed-rows find an S3 run for this id", and that is exactly the
+  // three run-per-message pipelines. (NO_STATE_PIPELINES omits gmaps — it is about which
+  // /output links to advertise, a different question.)
+  if (runState.pollTerminal && SCRAPEDO_PIPELINES.has(s.pipeline)) {
+    parts.push(rerunRunSection(ref, { llmIncomplete, errors }));
   }
 
   // Stop button while the run is still doing work (rows in flight, or the
@@ -872,19 +1015,29 @@ function renderLegacyStatus(root, ref, s) {
     const resultUrl = (name) => `/uploads/${encodeURIComponent(ref)}/result?file=${encodeURIComponent(name)}`;
     // retry.csv is the rerun/refund list, written only by the two S3-only pipelines —
     // gsearch shares this branch and never produces one, so don't advertise it there.
-    const retryFile = ["gmaps", "relationship"].includes(s.pipeline) ? ["retry.csv"] : [];
+    // retry.csv is the rerun/refund list, written only by the S3-only pipelines — gsearch
+    // shares this branch and never produces one, so don't advertise it there.
+    const retryFile = ["gmaps", "relationship", "firmographics"].includes(s.pipeline)
+      ? ["retry.csv"] : [];
+    // enriched/notEnriched for firmographics: it is HANDED the website, so a found/notFound
+    // split would name a discovery result it never computed.
+    const PAIRS = {
+      relationship: ["confirmed_relation.csv", "notconfirmed_relation.csv"],
+      firmographics: ["enriched.csv", "notEnriched.csv"],
+    };
     const resultFiles = (runState.reporting && runState.batchTerminal)
-      ? (s.pipeline === "relationship"
-          ? ["confirmed_relation.csv", "notconfirmed_relation.csv", ...retryFile,
-             "report.json", "run.log"]
-          : ["found.csv", "notFound.csv", ...retryFile, "report.json", "run.log"])
+      ? [...(PAIRS[s.pipeline] ?? ["found.csv", "notFound.csv"]), ...retryFile,
+         "report.json", "run.log"]
       : [];
-    // Relationship runs are counter-driven: there is no state.json to build output.json
-    // (or its XLSX) from, so both endpoints 404. The per-row detail lives in the two
-    // relationship CSVs above — don't advertise two links that cannot work.
-    const extras = s.pipeline === "relationship" ? [] : [
+    // The S3-only pipelines are counter-driven: there is no state.json to build
+    // output.json (or its CSV) from, so both endpoints 404. Their per-row detail lives in
+    // the result CSVs above — don't advertise two links that cannot work.
+    const extras = NO_STATE_PIPELINES.has(s.pipeline) ? [] : [
       { name: "output.json", href: `/uploads/${encodeURIComponent(ref)}/output?download=true` },
-      { name: "output.xlsx", href: `/uploads/${encodeURIComponent(ref)}/output?format=xlsx&download=true` },
+      // CSV, not XLSX: it opens in Excel just the same (the bytes carry a UTF-8 BOM) and
+      // is the format the per-row output is actually loaded from. ?format=xlsx still works
+      // for anyone with the old link, it just isn't advertised.
+      { name: "output.csv", href: `/uploads/${encodeURIComponent(ref)}/output?format=csv&download=true` },
     ];
     parts.push(filesSection(resultFiles, resultUrl, g?.available_files, extras));
   }

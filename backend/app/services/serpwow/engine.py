@@ -10,14 +10,14 @@ extracted into focused sibling modules (all re-imported below for backward-compa
   geo / cost / url_utils / address     — leaf helpers (locale, pricing, URLs, addresses)
   query_builders / gmaps_scoring       — search-query construction, Maps scoring
   serpwow_client / gemini_llm          — SerpWow HTTP + Gemini confidence/selection
-  csv_input / xlsx_export / serpwow_reporting — I/O + reporting
+  csv_input / output_export / reporting — I/O + reporting
   modes/{gsearch,gmaps,firmographics,full,common} — per-mode row executors
   scrapedo_maps_client                 — scrape.do Google Maps search (gmaps pipeline)
-  codetails                            — standalone SerpWow codetails API script
 
 Shared, provider-agnostic helpers live in ``app/services/common/`` (text, env).
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
@@ -47,7 +47,8 @@ from app.core.config import PROJECT_ROOT
 from app.services.common.env import get_float_env, get_int_env, get_bool_env
 from app.services.common.text import slugify_company
 from app.services.serpwow import serpwow_client
-from app.services.serpwow import serpwow_reporting
+from app.services.common import llm_batch
+from app.services.serpwow import reporting
 from app.services.serpwow.cost import (
     calculate_gemini_cost_usd,
     calculate_gemini_batch_cost_usd,
@@ -65,10 +66,11 @@ from app.services.serpwow.url_utils import (
     _domain_from_url,
     _normalize_website_input,
 )
-from app.services.serpwow.xlsx_export import (
+from app.services.serpwow.output_export import (
     _sanitize_excel_text,
     _excel_col_name,
     _xlsx_cell_xml,
+    build_upload_output_csv_bytes,
     build_upload_output_xlsx_bytes,
 )
 from app.services.serpwow.csv_input import (
@@ -125,7 +127,8 @@ from app.services.serpwow.gemini_llm import (
     _parse_json_from_text,
     _gemini_generate_content_json,
     analyze_with_gemini,
-    standardize_serpwow_ai_overview_with_gemini,
+    build_ai_overview_prompt,
+    standardize_ai_overview_with_gemini,
     parse_city_state_from_full_address_with_gemini,
     transliterate_inputs_with_gemini,
     classify_address_with_gemini,
@@ -136,6 +139,7 @@ from app.services.serpwow.constants import (
     PIPELINE_GMAPS,
     PIPELINE_GSEARCH,
     PIPELINE_RELATIONSHIP,
+    COST_SUMMARY_PIPELINES,
     REPORTING_PIPELINES,
 )
 from app.services.serpwow.schemas import FirmographicsRequest, CrawlResponse
@@ -146,7 +150,7 @@ from app.services.serpwow.row_logging import (
     _log_row_stage,
 )
 from app.services.serpwow.modes.common import (
-    run_serpwow_from_codetails,
+    run_scrapedo_search_for_firmographics,
     run_gmaps_from_module,
 )
 from app.services.serpwow.modes.gsearch import execute_gsearch_lookup_for_worker
@@ -289,18 +293,13 @@ _get_bool_env = get_bool_env
 
 
 def _batch_postprocess_enabled_for(pipeline: str) -> bool:
-    """True when Gemini batch confidence scoring applies to this pipeline.
+    """Does THIS module's chunked row-batch driver handle the pipeline?
 
-    gsearch -> GSEARCH_LLM_BATCH (independent toggle)
-
-    gsearch is the ONLY pipeline here. relationship owns its own Gemini Batch driver in
-    relationship_runner, and gmaps has no LLM mode at all since it moved to the S3-only
-    runner — its confidence is heuristic and computed inside the row task.
+    Deliberately ``uses_shared_row_batch``, not ``batch_enabled``: relationship batches too,
+    but through its own driver in relationship_runner, and answering "yes" here would seed a
+    second duplicate job for it.
     """
-    pipe = str(pipeline or "")
-    if pipe == PIPELINE_GSEARCH:
-        return _get_bool_env("GSEARCH_LLM_BATCH", False)
-    return False
+    return llm_batch.uses_shared_row_batch(pipeline)
 
 
 def _batch_postprocess_pending(state: dict[str, Any]) -> bool:
@@ -1212,18 +1211,35 @@ async def write_upload_text_artifact(upload_id: str, name: str, text: str, conte
     local_path.write_text(text, encoding="utf-8")
 
 
-def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> str:
+# Per-row raw-response artifact naming, by pipeline. The folder and filename suffix say
+# WHICH PROVIDER produced the bytes, so a stored object is self-describing — a
+# firmographics row holds a scrape.do SERP, not a SerpWow response. gsearch is the only
+# pipeline still on SerpWow and keeps its existing names, so its old and new runs stay in
+# one folder.
+_RAW_ARTIFACT_NAMES: dict[str, tuple[str, str]] = {
+    PIPELINE_FIRMOGRAPHICS: ("search_response", "search"),
+}
+_DEFAULT_RAW_ARTIFACT_NAMES = ("serpwow_response", "serpwow")
+
+
+def _raw_artifact_names(pipeline: str) -> tuple[str, str]:
+    """(folder, filename suffix) for one pipeline's per-row raw provider response."""
+    return _RAW_ARTIFACT_NAMES.get(str(pipeline or ""), _DEFAULT_RAW_ARTIFACT_NAMES)
+
+
+def _upload_raw_response_sync(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> str:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         raise RuntimeError("S3_BUCKET not configured")
 
     # Folder uses the UPLOAD company (one folder per run); the per-row filename
     # uses the ROW company so each response is identifiable. Per-row raw responses
-    # live under a serpwow_response/ subfolder, apart from the run aggregates.
+    # live in a provider-named subfolder, apart from the run aggregates.
     safe_name = _safe_name(row_company_name or upload_company_name)
     prefix = _resolved_upload_s3_prefix(
         upload_id, upload_company_name, pipeline)
-    key = f"{prefix}/serpwow_response/{row_index:06d}_{safe_name}_serpwow.json"
+    folder, suffix = _raw_artifact_names(pipeline)
+    key = f"{prefix}/{folder}/{row_index:06d}_{safe_name}_{suffix}.json"
     get_s3_client().put_object(
         Bucket=bucket,
         Key=key,
@@ -1233,12 +1249,12 @@ def _upload_serpwow_json_sync(upload_id: str, row_index: int, raw_json: str, pip
     return key
 
 
-async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> tuple[Optional[str], Optional[str]]:
+async def upload_raw_response_to_s3(upload_id: str, row_index: int, raw_json: str, pipeline: str = "", upload_company_name: str = "", row_company_name: str = "") -> tuple[Optional[str], Optional[str]]:
     if not raw_json:
-        return None, "No SerpWow raw JSON available to upload"
+        return None, "No raw provider response available to upload"
     try:
         key = await asyncio.to_thread(
-            _upload_serpwow_json_sync,
+            _upload_raw_response_sync,
             upload_id,
             row_index,
             raw_json,
@@ -1249,6 +1265,22 @@ async def upload_serpwow_json_to_s3(upload_id: str, row_index: int, raw_json: st
         return key, None
     except Exception as exc:
         return None, str(exc)
+
+
+def _raw_response_key(row: dict[str, Any]) -> Optional[str]:
+    """The row's raw-provider-response S3 key.
+
+    Reads the current field, then the two legacy names. Both legacy keys always held the
+    SAME value -- ``s3_html_key`` never contained HTML, and ``s3_serpwow_json_key`` was
+    SerpWow-named while carrying a scrape.do payload for every migrated pipeline -- so they
+    collapsed into one honestly-named field on 2026-08-19. The fallback is what keeps runs
+    written before that readable.
+    """
+    for key in ("raw_response_s3_key", "s3_serpwow_json_key", "s3_html_key"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
@@ -1285,8 +1317,7 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
                 },
                 "status": row["status"],
                 "error": row.get("error"),
-                "s3_html_key": row.get("s3_html_key"),
-                "s3_serpwow_json_key": row.get("s3_serpwow_json_key"),
+                "raw_response_s3_key": _raw_response_key(row),
                 "output": row.get("result"),
             }
             for row in state.get("rows", [])
@@ -1295,10 +1326,24 @@ def build_upload_output_payload(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # XLSX export (_sanitize_excel_text/_excel_col_name/_xlsx_cell_xml/
-# build_upload_output_xlsx_bytes) lives in xlsx_export.py; re-imported at the top.
+# build_upload_output_xlsx_bytes) lives in output_export.py; re-imported at the top.
 
 
 def _build_batch_prompt_for_row(row: dict[str, Any]) -> str:
+    ctx_probe = ((row.get("result") or {}).get("context")
+                 if isinstance((row.get("result") or {}).get("context"), dict) else {})
+    if ctx_probe.get("pipeline") == PIPELINE_FIRMOGRAPHICS:
+        # A different question entirely: normalise this row's AI Overview into the six
+        # firmographic fields. Byte-identical to the inline prompt (one builder in
+        # gemini_llm), so a batched run cannot answer a row differently from an inline one.
+        scrapedo = ctx_probe.get("scrapedo") if isinstance(ctx_probe.get("scrapedo"), dict) else {}
+        overview = scrapedo.get("ai_overview")
+        return build_ai_overview_prompt(
+            str(row.get("company_name") or ""),
+            str(row.get("country") or ""),
+            str((row.get("result") or {}).get("official_website") or ""),
+            overview if isinstance(overview, dict) else {},
+        )
     input_obj = {
         "company_name": row.get("company_name"),
         "country": row.get("country"),
@@ -1732,6 +1777,12 @@ def _build_batch_items_for_state(state: dict[str, Any]) -> tuple[list[tuple[str,
         if ctx.get("skip_llm"):
             # Worker-decided short-circuit rows were already finalized.
             continue
+        if ctx.get("pipeline") == PIPELINE_FIRMOGRAPHICS:
+            # No AI overview means there is nothing to normalise; a request would be paid
+            # for and come back empty. The row is already terminal as not_found.
+            _sd = ctx.get("scrapedo") if isinstance(ctx.get("scrapedo"), dict) else {}
+            if not isinstance(_sd.get("ai_overview"), dict) or not _sd.get("ai_overview"):
+                continue
         if ctx.get("pipeline") == PIPELINE_GSEARCH and not ctx.get("candidates"):
             # Defense for legacy/in-flight rows created before gsearch persisted
             # skip_llm: Gemini cannot select a URL from an empty candidate set.
@@ -1784,6 +1835,20 @@ def _apply_batch_parsed_to_row(row: dict[str, Any], parsed: dict[str, Any],
                                   "raw": parsed, "error": None}
     result["context"] = context
     row["result"] = result
+    if context.get("pipeline") == PIPELINE_FIRMOGRAPHICS:
+        # official_website is this pipeline's INPUT, so it cannot decide the outcome (D43).
+        # What the batch produced decides it: fields extracted -> found, nothing -> a
+        # business not_found.
+        row["status"] = "completed"
+        row["error_source"] = None
+        row["error_category"] = None
+        if reporting.row_produced_a_result(result, PIPELINE_FIRMOGRAPHICS):
+            row["error"] = None
+            row["outcome"] = _outcomes.OUTCOME_FOUND
+        else:
+            row["error"] = _outcomes.BATCH_NOT_FOUND
+            row["outcome"] = _outcomes.OUTCOME_NOT_FOUND
+        return "completed"
     finalized = str(result.get("official_website") or "").strip()
     if finalized:
         if not _official_website_looks_plausible(finalized, str(row.get("company_name") or ""),
@@ -1841,8 +1906,8 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
     {chunk_id, job_name, status, error, parsed_by_row, usage}. Never raises — a failed
     chunk returns status='failed' with its rows unmapped (-> not found)."""
     from app.services.ai_mode import gemini_batch as gb
-    poll_interval = max(5, _get_int_env("GEMINI_BATCH_POLL_SEC", 15))
-    poll_timeout = max(60, _get_int_env("GEMINI_BATCH_TIMEOUT_SEC", 1800))
+    poll_interval = llm_batch.poll_sec()
+    poll_timeout = llm_batch.timeout_sec()
     result = {"chunk_id": chunk_id, "job_name": existing_job_name or None,
               "status": "failed", "error": None, "parsed_by_row": {}, "usage": {}}
     try:
@@ -1890,9 +1955,10 @@ async def _run_one_gemini_chunk(upload_id: str, chunk_id: int,
                 raise TimeoutError(f"chunk {chunk_id} batch timeout after {poll_timeout}s")
             await asyncio.sleep(poll_interval)
         sname = gb.state_name(final_obj); done = bool(final_obj.get("done"))
-        _failed_states = {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
-                          "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED"}
-        if sname in _failed_states or not gb.is_success(sname, done, final_obj):
+        # The private _failed_states set that used to sit here is now inside
+        # gb.is_success (gemini_batch.FAILED_STATES) — same rule, one copy, and the two
+        # S3-only runners get the defence this driver had all along.
+        if not gb.is_success(sname, done, final_obj):
             raise RuntimeError(f"chunk {chunk_id} ended state={sname} error={final_obj.get('error')}")
         records = await asyncio.to_thread(gb.collect_results, final_obj)
         row_index_by_key = {k: int(k.split("-")[1]) for k, _ in items}
@@ -1944,9 +2010,11 @@ async def run_gemini_batch_for_upload(upload_id: str) -> None:
                 await persist_upload_state(upload_id, state)
             return
 
-        batch_model = os.getenv("GEMINI_BATCH_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-        chunk_size = max(1, _get_int_env("GSEARCH_GEMINI_CHUNK_SIZE", 5000))
-        max_inflight = max(1, _get_int_env("GSEARCH_GEMINI_MAX_INFLIGHT", 5))
+        # GSEARCH_GEMINI_CHUNK_SIZE / GSEARCH_GEMINI_MAX_INFLIGHT are gone: they were a
+        # second name for GEMINI_BATCH_SHARD_SIZE / _MAX_INFLIGHT with identical defaults.
+        batch_model = llm_batch.batch_model()
+        chunk_size = llm_batch.shard_size()
+        max_inflight = llm_batch.max_inflight()
         chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
         # Row -> owning chunk id, so a chunk failure can be traced back to its rows below.
         chunk_id_by_ridx: dict[int, int] = {}
@@ -2323,15 +2391,21 @@ def summarize_upload_state(state: dict[str, Any]) -> dict[str, Any]:
     state["success_rows"] = success
     state["failed_rows"] = failed
 
+    pipeline_name = str(state.get("pipeline") or "")
+
     def _outcome_of(r: dict[str, Any]) -> Optional[str]:
         oc = r.get("outcome")
         if oc:
             return oc
         # Derive for rows without an explicit outcome (out-of-scope pipelines,
         # or peripheral status="failed" paths like user-stop/redelivery-drop).
+        # The "did it produce a result" test lives in reporting and is SHARED
+        # with its _derive_outcome twin: firmographics answers it differently (its
+        # official_website is the input echoed back), and two copies would drift.
         if r.get("status") == "completed":
-            result_obj = r.get("result") if isinstance(r.get("result"), dict) else {}
-            return _outcomes.OUTCOME_FOUND if result_obj.get("official_website") else _outcomes.OUTCOME_NOT_FOUND
+            return (_outcomes.OUTCOME_FOUND
+                    if reporting.row_produced_a_result(r.get("result"), pipeline_name)
+                    else _outcomes.OUTCOME_NOT_FOUND)
         if r.get("status") == "failed":
             return _outcomes.OUTCOME_ERROR
         return None
@@ -2574,6 +2648,7 @@ def update_summary_cache(upload_id: str, state: dict[str, Any]) -> None:
             "file_links": file_links,
             "status_url": f"/uploads/{upload_id}/status",
             "output_url": f"/uploads/{upload_id}/output",
+            "output_csv_url": f"/uploads/{upload_id}/output?format=csv",
             "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
         }
     except Exception:
@@ -2602,9 +2677,9 @@ def _update_supabase_run(state: dict[str, Any]) -> bool:
         extra: dict[str, Any] = {}
         success_count = state.get("success_rows")
         failed_count = state.get("failed_rows")
-        if str(state.get("pipeline") or "") in REPORTING_PIPELINES:
-            results = serpwow_reporting.state_to_entity_results(state)
-            summ = serpwow_reporting.build_summary(state, results)
+        if str(state.get("pipeline") or "") in COST_SUMMARY_PIPELINES:
+            results = reporting.state_to_entity_results(state)
+            summ = reporting.build_summary(state, results)
             extra = {
                 "websites_found": summ["websites_found"],
                 "websites_not_found": summ["websites_not_found"],
@@ -2716,14 +2791,14 @@ def _notify_slack_terminal(state: dict[str, Any]) -> None:
             notify.notify_run_failed(error=state.get("error") or "run failed", **common)
         else:  # completed | completed_with_errors
             # gsearch and gmaps both track SerpWow searches + Gemini tokens/cost via
-            # the same serpwow_reporting.build_summary — surface them in the ping like
+            # the same reporting.build_summary — surface them in the ping like
             # AI Mode does. Other SerpWow pipelines have none, so omit.
             extra: dict[str, Any] = {}
-            is_reporting = str(state.get("pipeline") or "") in REPORTING_PIPELINES
+            is_reporting = str(state.get("pipeline") or "") in COST_SUMMARY_PIPELINES
             if is_reporting:
                 try:
-                    gs = serpwow_reporting.build_summary(
-                        state, serpwow_reporting.state_to_entity_results(state))
+                    gs = reporting.build_summary(
+                        state, reporting.state_to_entity_results(state))
                     tu = gs.get("token_usage") or {}
                     ob = gs.get("outcome_breakdown") or {}
                     eb = gs.get("error_breakdown") or {}
@@ -2783,7 +2858,7 @@ async def _finalize_serpwow_outputs(upload_id: str, state: dict[str, Any]) -> No
     to S3. Best-effort: logs + swallows everything, never raises."""
     try:
         upload_dir = _find_upload_dir(upload_id)
-        paths = await asyncio.to_thread(serpwow_reporting.write_outputs, upload_dir, state)
+        paths = await asyncio.to_thread(reporting.write_outputs, upload_dir, state)
     except Exception as exc:
         print(f"[serpwow] reporting failed for {upload_id}: {type(exc).__name__}: {exc}")
         return
@@ -2940,8 +3015,7 @@ async def update_row_state(
     status: Optional[str] = None,
     error: Optional[str] = None,
     result: Optional[dict[str, Any]] = None,
-    s3_html_key: Optional[str] = None,
-    s3_serpwow_json_key: Optional[str] = None,
+    raw_response_s3_key: Optional[str] = None,
     outcome: Optional[str] = None,
     error_source: Optional[str] = None,
     error_category: Optional[str] = None,
@@ -2975,10 +3049,8 @@ async def update_row_state(
             row["error"] = error
         if result is not None:
             row["result"] = result
-        if s3_html_key is not None:
-            row["s3_html_key"] = s3_html_key
-        if s3_serpwow_json_key is not None:
-            row["s3_serpwow_json_key"] = s3_serpwow_json_key
+        if raw_response_s3_key is not None:
+            row["raw_response_s3_key"] = raw_response_s3_key
         if outcome is not None:
             row["outcome"] = outcome
         if error_source is not None:
@@ -3245,6 +3317,17 @@ async def init_rabbitmq() -> None:
     await rabbitmq_queue.bind(rabbitmq_exchange, routing_key=routing_key)
     rabbitmq_last_error = None
 
+    # The three S3-only run queues, declared by the PUBLISHER as well as the worker. A
+    # direct exchange drops an unroutable message on the floor, so publishing a run before
+    # the worker had ever bound its queue lost the message entirely and the run stalled at
+    # phase="queued" until the stale-run scan found it. See declare_run_queues.
+    try:
+        from app.services.serpwow import s3_run_driver
+
+        await s3_run_driver.declare_run_queues(rabbitmq_channel, rabbitmq_exchange)
+    except Exception as exc:
+        print(f"[s3-run-queues] declare failed (runs will wait for the re-drive scan): {exc}")
+
     # AI Mode rides the same connection with its OWN channel/queue (independent
     # QoS — scrape.do concurrency must not share SerpWow's prefetch). Best-effort:
     # a failure here 503s AI-Mode uploads (broker.is_ready() False) but must not
@@ -3377,6 +3460,37 @@ async def publish_gmaps_run(run_id: str) -> None:
               f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
 
 
+async def publish_firmographics_run(run_id: str) -> None:
+    """Publish the ONE message that drives a whole firmographics run.
+
+    Same contract as publish_gmaps_run, including that failure is tolerated HERE rather
+    than at the call site: the run already exists in S3 by this point, so letting an AMQP
+    error propagate would 500 the request with no upload_id while the run exists. The
+    worker's stale-run scan picks it up, so a broker hiccup delays a run, never loses one.
+    """
+    from app.services.serpwow.firmographics_runner import FIRMOGRAPHICS_ROUTING_KEY
+
+    if rabbitmq_exchange is None:
+        print(f"[firmographics] run {run_id} queued without a broker; "
+              f"the re-drive scan will start it")
+        return
+    try:
+        await asyncio.wait_for(
+            rabbitmq_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"run_id": run_id}).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    content_type="application/json",
+                ),
+                routing_key=FIRMOGRAPHICS_ROUTING_KEY,
+            ),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        print(f"[firmographics] publish failed for run {run_id} "
+              f"({type(exc).__name__}: {exc}); the re-drive scan will start it")
+
+
 def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postprocess_enabled: bool):
     """Return (OutcomeInfo, row_status). For out-of-scope pipelines, preserve the
     legacy binary: found->completed, everything-else->failed (no not_found remap)."""
@@ -3385,7 +3499,10 @@ def _finalize_row_outcome(result: dict[str, Any], *, pipeline: str, batch_postpr
         result, pipeline=pipeline,
         ctx_row_error=(str(ctx.get("row_error")).strip() or None) if ctx.get("row_error") else None,
         skip_llm=bool(ctx.get("skip_llm")))
-    if pipeline in REPORTING_PIPELINES:
+    if pipeline in COST_SUMMARY_PIPELINES:
+        # firmographics joined this set in 2026-08-19: a row whose website simply has no
+        # AI overview is a business not-found, and the legacy binary below turned that
+        # into a "failed" row that "Rerun failed" would re-buy at 10 credits a go.
         return info, info.row_status
     # Out of scope: legacy behavior — only 'found' is completed.
     return info, ("completed" if info.outcome == _outcomes.OUTCOME_FOUND else "failed")
@@ -3468,7 +3585,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             # arriving here is a bug this correctly rejects.
             raise ValueError(f"unknown pipeline {pipeline!r}")
 
-        s3_serpwow_json_key, s3_error = await upload_serpwow_json_to_s3(
+        raw_response_key, s3_error = await upload_raw_response_to_s3(
             upload_id=upload_id,
             row_index=row_index,
             raw_json=serpwow_raw_json,
@@ -3478,17 +3595,20 @@ async def process_upload_job(job: dict[str, Any]) -> None:
         )
 
         result = crawl_response.model_dump()
-        result["s3_serpwow_json_key"] = s3_serpwow_json_key
-        result["s3_serpwow_json_error"] = s3_error
-        # Backward compatibility for clients still reading old keys.
-        result["s3_html_key"] = s3_serpwow_json_key
-        result["s3_html_error"] = s3_error
+        result["raw_response_s3_key"] = raw_response_key
+        result["raw_response_s3_error"] = s3_error
         # Record total per-row processing time so each pipeline's flow duration is visible
         # in the output/XLSX (parallels the AI-mode per-batch timing).
         if isinstance(result.get("context"), dict):
-            result["context"]["timing"] = {
-                "total_seconds": round(asyncio.get_event_loop().time() - started_monotonic, 3)
-            }
+            # MERGE, don't replace: an executor may already have recorded its own phase
+            # split in here (firmographics writes search_seconds/llm_seconds), and
+            # assigning a fresh dict silently dropped it.
+            timing = result["context"].get("timing")
+            if not isinstance(timing, dict):
+                timing = {}
+            timing["total_seconds"] = round(
+                asyncio.get_event_loop().time() - started_monotonic, 3)
+            result["context"]["timing"] = timing
 
         official_website = (result.get("official_website") or "").strip()
         is_successful = bool(official_website)
@@ -3513,8 +3633,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             status=row_status,
             error=row_error,
             result=result,
-            s3_html_key=s3_serpwow_json_key,
-            s3_serpwow_json_key=s3_serpwow_json_key,
+            raw_response_s3_key=raw_response_key,
             outcome=info.outcome,
             error_source=info.error_source,
             error_category=info.error_category,
@@ -3526,7 +3645,7 @@ async def process_upload_job(job: dict[str, Any]) -> None:
             (
                 f"status={row_status} "
                 f"official={_short_text(official_website, 160)!r} "
-                f"s3_key={_short_text(s3_serpwow_json_key, 140)!r} "
+                f"s3_key={_short_text(raw_response_key, 140)!r} "
                 f"s3_error={_short_text(s3_error, 180)!r} "
                 f"elapsed_sec={elapsed_sec:.2f}"
             ),
@@ -3882,6 +4001,26 @@ async def start_worker_consumers(worker_count: Optional[int] = None) -> None:
         return
 
     rabbitmq_stop_event = asyncio.Event()
+
+    # HANDOFF blocker #4. relationship_runner._poll_to_terminal does a BLOCKING sleep inside
+    # asyncio.to_thread, so each in-flight Gemini shard holds one default-executor thread for
+    # the job's whole (multi-hour) life. The default pool is min(32, cpu+4) -- SIX on a 2-vCPU
+    # box -- so GEMINI_BATCH_MAX_INFLIGHT above that created nothing. Its own docstring
+    # prescribes exactly this fix.
+    #
+    # Sized off max_inflight PLUS headroom, never max_inflight alone: this executor is shared
+    # with every S3 write, CSV parse and _write_json in the worker, and starving those to make
+    # room for pollers would trade one bottleneck for a worse one. Consumers-only path, since
+    # the API process makes no provider calls.
+    #
+    # engine's own chunk driver and AI Mode do NOT need this (they await asyncio.sleep, and
+    # poll all shards from a single thread, respectively) -- it is relationship that pays.
+    executor_size = max(32, llm_batch.max_inflight() + 16)
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=executor_size, thread_name_prefix="worker"))
+    print(f"[worker] default executor sized to {executor_size} threads "
+          f"(GEMINI_BATCH_MAX_INFLIGHT={llm_batch.max_inflight()})")
+
     count = worker_count if worker_count is not None else _get_int_env("WORKER_CONCURRENCY", 4)
     count = max(1, int(count))
     rabbitmq_consumer_tasks = [
@@ -3982,11 +4121,13 @@ async def shutdown_event() -> None:
     if gemini_batch_tasks:
         await asyncio.gather(*gemini_batch_tasks.values(), return_exceptions=True)
         gemini_batch_tasks.clear()
-    # Release the gmaps pipeline's pooled scrape.do connections.
+    # Release the pooled scrape.do connections (gmaps' Maps client and firmographics'
+    # Search client each hold their own pool).
     try:
-        from app.services.serpwow import scrapedo_maps_client
+        from app.services.serpwow import scrapedo_maps_client, scrapedo_search_client
 
         await scrapedo_maps_client.close_shared_client()
+        await scrapedo_search_client.close_shared_client()
     except Exception:
         pass
     await close_rabbitmq()
@@ -4117,8 +4258,7 @@ async def _create_upload_with_rows(
                 "status_updated_at": now_iso,
                 "processing_started_at": None,
                 "error": None,
-                "s3_html_key": None,
-                "s3_serpwow_json_key": None,
+                "raw_response_s3_key": None,
                 "result": None,
             }
             for row in parsed_rows
@@ -4187,6 +4327,7 @@ async def _create_upload_with_rows(
         "enqueue_errors": enqueue_errors,
         "status_url": f"/uploads/{upload_id}/status",
         "output_url": f"/uploads/{upload_id}/output",
+        "output_csv_url": f"/uploads/{upload_id}/output?format=csv",
         "output_xlsx_url": f"/uploads/{upload_id}/output?format=xlsx",
     }
 
@@ -4197,14 +4338,74 @@ async def create_firmographics_upload(
     company_id: str = Form(...),
     company_name: str = Form(""),
 ) -> dict[str, Any]:
+    """Create an S3-only firmographics run: validate, park input.csv in S3, publish ONE
+    message.
+
+    No state.json and no local disk (2026-08-20). The rows are never materialised here —
+    the worker streams input.csv back out of S3 — which is what makes a 500k-row upload
+    cost the API process a fixed amount of memory, and what removes the ~2.7k-row ceiling
+    the old per-row state.json rewrite imposed.
+    """
+    import uuid
+
+    from app.core import s3 as core_s3
+    from app.services.serpwow import s3_run_store as run_store
+    from app.services.serpwow.csv_input import count_firmographics_csv_rows
+    from app.services.serpwow.firmographics_runner import (
+        PIPELINE_SEGMENT as FIRMO_SEGMENT,
+    )
+
     raw = await file.read()
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv file is supported.")
+    # CSV first: a bad CSV must report the CSV problem, not a config problem. Validates
+    # every row and retains none — the count is all this endpoint needs.
     try:
-        parsed_rows = parse_firmographics_csv_rows(raw)
+        total = await asyncio.to_thread(count_firmographics_csv_rows, raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _create_upload_with_rows(
-        file, parsed_rows, PIPELINE_FIRMOGRAPHICS, company_id=company_id, company_name=company_name
-    )
+
+    if not os.getenv("SCRAPEDO_TOKEN", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="SCRAPEDO_TOKEN is not configured — required for the firmographics "
+                   "pipeline.")
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="GEMINI_API_KEY is not configured — required to normalise the AI "
+                   "overview into firmographic fields.")
+    # S3 is not optional the way it is for the state-driven pipelines: this run has no
+    # local disk and no state.json, so an unset bucket means the very next put_bytes
+    # raises RuntimeError and the user gets an opaque 500 instead of this 400.
+    if not core_s3.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="S3_BUCKET is not configured — required for the firmographics pipeline.")
+
+    run_id = uuid.uuid4().hex
+    prefix = run_store.run_prefix(company_name or company_id, run_id, FIRMO_SEGMENT)
+
+    from app.services.companies import get_company_service
+
+    svc = get_company_service()
+    run_db_id = await asyncio.to_thread(
+        svc.create_run, company_id=company_id, pipeline=PIPELINE_FIRMOGRAPHICS,
+        run_ref=run_id, total_rows=total) if svc is not None else None
+
+    await asyncio.to_thread(run_store.put_bytes, run_store.input_key(prefix), raw)
+    # run_db_id rides in the pointer: there is no state dict to read it from later.
+    await asyncio.to_thread(run_store.write_run_pointer, run_id, prefix,
+                            company_name or company_id, run_db_id, FIRMO_SEGMENT)
+    # The API writes status.json exactly once, before publishing; from the first scrape on
+    # the worker is the only writer. created_at is stamped ONCE here and carried by every
+    # later drive, so total wall clock survives a worker restart mid-run.
+    counters = run_store.Counters(prefix, rows_total=total, phase="queued")
+    await asyncio.to_thread(counters.flush, True)
+
+    await publish_firmographics_run(run_id)
+    return {"upload_id": run_id, "pipeline": PIPELINE_FIRMOGRAPHICS,
+            "total_rows": total, "company_id": company_id}
 
 
 @app.post("/uploads/gmaps")
@@ -4437,7 +4638,7 @@ async def create_relationship_upload(
 def _find_s3_run(run_id: str) -> tuple[Optional[dict[str, Any]], str]:
     """(pointer, segment) for an S3-only run, or (None, "") if this id is not one.
 
-    Two pipelines now keep their runs entirely in S3 with no state.json, each in its own
+    THREE pipelines now keep their runs entirely in S3 with no state.json, each in its own
     pointer namespace. Endpoints that serve both — status, stop, retry, failure-analysis,
     result files — resolve the id here rather than each guessing a namespace. Two small
     GETs at most, and the miss is what tells the caller to fall through to the
@@ -4445,8 +4646,11 @@ def _find_s3_run(run_id: str) -> tuple[Optional[dict[str, Any]], str]:
     """
     from app.services.serpwow import s3_run_store as run_store
     from app.services.serpwow.gmaps_runner import PIPELINE_SEGMENT as GMAPS_SEGMENT
+    from app.services.serpwow.firmographics_runner import (
+        PIPELINE_SEGMENT as FIRMO_SEGMENT,
+    )
 
-    for segment in (run_store.PIPELINE_SEGMENT, GMAPS_SEGMENT):
+    for segment in (run_store.PIPELINE_SEGMENT, GMAPS_SEGMENT, FIRMO_SEGMENT):
         pointer = run_store.read_run_pointer(run_id, segment)
         if pointer:
             return pointer, segment
@@ -4477,12 +4681,39 @@ async def retry_failed_rows(
         # this time out on any run with a lot of dead rows.
         removed = await asyncio.to_thread(
             lambda: rel_store.delete_objects(_dead_markers()))
+
+        # Rows that scraped fine but never got a verdict, because their Gemini shard died.
+        # They have NO error marker, so `removed` cannot see them — and a run whose only
+        # problem was a dead shard therefore reported "Enqueued 0 failed rows" while
+        # correctly republishing and redoing exactly this work. Counted, not deleted:
+        # their pending_llm/ marker is what the LLM phase reads to find them, and their
+        # scrape objects are what make the rerun free on the provider side.
+        def _unjudged() -> int:
+            # Which rows OWE an LLM result differs by pipeline, so ask each in its own
+            # terms rather than assuming one marker:
+            #   firmographics — only DEFERRED rows do (inline mode marks none), so it is
+            #                   the pending_llm/ markers. Cheap: one LIST, and empty in
+            #                   inline mode.
+            #   relationship  — every scraped row does; its Gemini verdict IS the answer
+            #                   and it has no inline path, so there are no markers to read.
+            #   gmaps         — has no LLM at all.
+            if segment == "gmaps":
+                return 0
+            owed = (rel_store.list_pending_llm_rows(prefix) if segment == "firmographics"
+                    else rel_store.list_done_rows(prefix))
+            return len(owed - rel_store.list_cleaned_rows(prefix))
+
+        pending_llm = await asyncio.to_thread(_unjudged)
         await asyncio.to_thread(rel_store.clear_stop, prefix)
-        await (publish_gmaps_run(upload_id) if segment == "gmaps"
-               else publish_relationship_run(upload_id))
+        publishers = {"gmaps": publish_gmaps_run,
+                      "firmographics": publish_firmographics_run}
+        await publishers.get(segment, publish_relationship_run)(upload_id)
         return {"upload_id": upload_id, "retried_rows": removed,
-                # operations.js reads enqueued_rows for its status line.
-                "enqueued_rows": removed,
+                "pending_llm_rows": pending_llm,
+                # operations.js reads enqueued_rows for its status line. Both kinds of
+                # work count: a dead row to re-scrape and an unjudged row to re-send to
+                # Gemini are both things this request just put back in flight.
+                "enqueued_rows": removed + pending_llm,
                 "status_url": f"/uploads/{upload_id}/status"}
 
     if rabbitmq_exchange is None:
@@ -4553,8 +4784,7 @@ async def retry_failed_rows(
             row["processing_started_at"] = None
             row["error"] = None
             row["result"] = None
-            row["s3_html_key"] = None
-            row["s3_serpwow_json_key"] = None
+            row["raw_response_s3_key"] = None
             retried_row_indexes.append(row_index)
             jobs_to_retry.append(
                 {
@@ -5188,6 +5418,11 @@ _RELATIONSHIP_TERMINAL_STATUSES = {"completed", "completed_with_errors", "failed
 
 _GMAPS_FILES = ("found.csv", "notFound.csv", "retry.csv", "report.json", "run.log")
 
+# enriched/notEnriched, not found/notFound: this pipeline is HANDED the website, so the
+# split that means something is "did we enrich it", not "did we discover it".
+_FIRMOGRAPHICS_FILES = ("enriched.csv", "notEnriched.csv", "retry.csv",
+                        "report.json", "run.log")
+
 
 def _s3_run_available_files(prefix: str, names: tuple[str, ...]) -> list[str]:
     """Which of the run's output files actually exist.
@@ -5298,7 +5533,7 @@ def _relationship_fallback_summary(counters: dict[str, Any], total: int, scraped
         # Mid-run the LLM hasn't reported usage yet (it arrives with the batch results), so
         # these are honest zeros rather than absent keys — the tiles render 0, not blank,
         # and fill in for real once report.json exists.
-        "model": os.getenv("GEMINI_BATCH_MODEL", "gemini-2.5-flash-lite"),
+        "model": llm_batch.batch_model(),
         "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "processing_seconds_total": _s3_run_elapsed(counters),
         "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
@@ -5351,6 +5586,47 @@ def _gmaps_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
     }
 
 
+def _firmographics_fallback_summary(counters: dict[str, Any], total: int, scraped: int,
+                                    failed: int) -> dict[str, Any]:
+    """The summary shown while a firmographics run is still in flight.
+
+    Credits are two rates here, so billed-call counts cannot be derived from the credit
+    total the way gmaps derives them (10 per call). Mid-run the split is unknown, so the
+    per-endpoint keys stay 0 and report.json fills them in with the real per-row sums —
+    honest zeros rather than a guess that would contradict the final card.
+    """
+    requests = int(counters.get("requests") or 0)
+    credits = int(counters.get("credits") or 0)
+    return {
+        "total_rows": total,
+        "websites_found": int(counters.get("rows_cleaned") or 0) or scraped,
+        "websites_not_found": max(0, total - scraped),
+        # No confidence concept — the website is an input. None makes the UI skip the chip.
+        "confidence_mode": None,
+        "is_batch": bool(counters.get("rows_cleaned")),
+        "llm_mode": None,
+        "model": llm_batch.batch_model(),
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "processing_seconds_total": _s3_run_elapsed(counters),
+        "phase_seconds": {"scraping": int(counters.get("scrape_seconds") or 0),
+                          "cleaning": int(counters.get("llm_seconds") or 0)},
+        "outcome_breakdown": {"found": 0, "not_found": 0, "errored": failed},
+        "empty_response_breakdown": {"no_ai_overview": 0, "deferred": 0,
+                                     "no_website": 0, "never_processed": 0},
+        "cost": reporting._build_cost(0.0, 0, 0, requests, credits, 0, 0),
+    }
+
+
+async def _firmographics_status(run_id: str) -> Optional[dict[str, Any]]:
+    from app.services.serpwow.firmographics_runner import (
+        PIPELINE_SEGMENT as FIRMO_SEGMENT,
+    )
+
+    return await _s3_run_status(
+        run_id, segment=FIRMO_SEGMENT, pipeline=PIPELINE_FIRMOGRAPHICS,
+        files=_FIRMOGRAPHICS_FILES, fallback=_firmographics_fallback_summary)
+
+
 async def _relationship_status(run_id: str) -> Optional[dict[str, Any]]:
     """Build the /status response for a relationship run. None if it is not one."""
     from app.services.serpwow import s3_run_store as rel_store
@@ -5373,7 +5649,7 @@ async def _gmaps_status(run_id: str) -> Optional[dict[str, Any]]:
 async def upload_status(upload_id: str) -> dict[str, Any]:
     # The S3-only pipelines have no state.json — they are counter-driven. Check their
     # pointers first; the response shape is identical so the UI needs no change.
-    for build in (_relationship_status, _gmaps_status):
+    for build in (_relationship_status, _gmaps_status, _firmographics_status):
         s3_status = await build(upload_id)
         if s3_status is not None:
             return s3_status
@@ -5396,10 +5672,10 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
     # batch mode, found counts, cost, tokens) so the run-detail UI can show the
     # same tiles AI Mode does. gmaps has no LLM -> model=None, tokens=0.
     serpwow_summary = None
-    if (summary.get("pipeline") or "") in REPORTING_PIPELINES:
+    if (summary.get("pipeline") or "") in COST_SUMMARY_PIPELINES:
         try:
-            gs = serpwow_reporting.build_summary(
-                summary, serpwow_reporting.state_to_entity_results(summary))
+            gs = reporting.build_summary(
+                summary, reporting.state_to_entity_results(summary))
             upload_terminal = summary.get("status") in {
                 "completed", "completed_with_errors", "failed",
             }
@@ -5462,8 +5738,7 @@ async def upload_status(upload_id: str) -> dict[str, Any]:
                 "official_website": row.get("official_website"),
                 "status": row["status"],
                 "error": row.get("error"),
-                "s3_html_key": row.get("s3_html_key"),
-                "s3_serpwow_json_key": row.get("s3_serpwow_json_key"),
+                "raw_response_s3_key": _raw_response_key(row),
             }
             for row in summary.get("rows", [])
         ],
@@ -5581,7 +5856,7 @@ async def upload_failure_analysis(
 async def upload_output(
     upload_id: str,
     download: bool = Query(False),
-    format: Literal["json", "xlsx"] = Query("json"),
+    format: Literal["json", "csv", "xlsx"] = Query("json"),
 ) -> Response:
     try:
         output_data = await read_upload_artifact(upload_id, "output")
@@ -5603,6 +5878,19 @@ async def upload_output(
 
     if isinstance(output_data, dict):
         output_data.update(build_processing_timing_summary(output_data.get("results") or []))
+
+    if format == "csv":
+        # charset=utf-8 must be declared: the bytes carry a BOM for Excel, but a browser
+        # previewing them inline honours the header, not the BOM.
+        body = build_upload_output_csv_bytes(output_data)
+        headers = {}
+        if download:
+            headers["Content-Disposition"] = f'attachment; filename="{upload_id}.csv"'
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
+        )
 
     if format == "xlsx":
         body = build_upload_output_xlsx_bytes(output_data)
@@ -5634,9 +5922,13 @@ async def upload_result_file(
 
     pointer, segment = await asyncio.to_thread(_find_s3_run, upload_id)
     if pointer:
-        allowed = ({"found.csv", "notFound.csv"} if segment == "gmaps"
-                   else {"confirmed_relation.csv", "notconfirmed_relation.csv"}) | {
-            "report.json", "run.log", "input.csv", "status.json"}
+        per_segment = {
+            "gmaps": {"found.csv", "notFound.csv"},
+            "firmographics": {"enriched.csv", "notEnriched.csv"},
+        }
+        allowed = per_segment.get(
+            segment, {"confirmed_relation.csv", "notconfirmed_relation.csv"}) | {
+            "retry.csv", "report.json", "run.log", "input.csv", "status.json"}
         if file not in allowed:
             raise HTTPException(status_code=400, detail=f"Unknown file {file!r}")
         data = await asyncio.to_thread(

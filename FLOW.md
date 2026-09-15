@@ -165,14 +165,14 @@ after every retry — the only real errors), remainder (attempts on a no-listing
   `errors/…`), rebuilds a state-shaped row via `_state_row`, and sums the per-row
   `cost_breakdown` into run totals: `requests / successes / failed / credits /
   billed_empty / no_results / recovered / error_requests`.
-- `serpwow_reporting.row_to_entity_result` → `found.csv` / `notFound.csv`, written as
+- `reporting.row_to_entity_result` → `found.csv` / `notFound.csv`, written as
   **the input file plus what we worked out** ▲ CHANGED: `common.text.passthrough_row` emits
   the original cells under the input's own header (via `s3_passthrough`, which is
   collision-safe and undoes `iter_input_rows`' injected `row_index`), then
-  `serpwow_reporting.result_cells` appends `website_url, confidence, flags, attempt_log`
+  `reporting.result_cells` appends `website_url, confidence, flags, attempt_log`
   (+ `error` on notFound). gsearch keeps the old fixed `CSV_COLUMNS` — it never persists
   the upload, so it has no input columns to pass through.
-- `serpwow_reporting.retry_row(...)` → **`retry.csv`** ▲ CHANGED — the rerun / refund list.
+- `reporting.retry_row(...)` → **`retry.csv`** ▲ CHANGED — the rerun / refund list.
   Written in the same pass, from the same `original` input row, so it costs no extra read.
   A row is in it only when it has nothing to show for itself:
   `billed_empty` (charged, no data — the refund claim) → `no_listing` (unbilled) →
@@ -184,7 +184,7 @@ after every retry — the only real errors), remainder (attempts on a no-listing
 - Emits `summary` → `report.json` (**summary only**; a per-row array would be gigabytes at
   500k) with:
   - `empty_response_breakdown = {no_listing, billed_empty}`
-  - `cost = serpwow_reporting._build_cost(...)` — the full scrape.do key set.
+  - `cost = reporting._build_cost(...)` — the full scrape.do key set.
 - `run.log` header via `_cost_log_line`:
   `scrapedo_requests=139 (ok=87 recovered=0 no_listing=52 errors=0) scrapedo_credits=870 rows_no_listing=13`
   (`no_listing=52` counts **attempts**; `rows_no_listing=13` counts **rows**.)
@@ -259,18 +259,18 @@ Never joins on `EntityResult.sno` — that field takes the LLM's echoed value wh
 | File | Function | Change |
 |---|---|---|
 | `static/js/run_detail.js:403` | `emptyResponsesSection(g)` | Took `g` (the whole summary) instead of just `empty_response_breakdown`, and added a **gmaps branch**, keyed on `eb.no_listing != null`: "Scrape.do billing (10 credits per HTTP 200)" with four chips split by what was PAID — *Billed calls · Billed but no result (empty **or** error body → refund claim) · Failed after retries (every attempt 502/429/timeout, free) · Unbilled attempts*. gsearch (`all_phases`/`some_phases`) and relationship (`no_ai_text`) branches are untouched. |
-| `serpwow_reporting.py` | `_build_cost` | New `scrapedo_billed_errors` (rows that errored *with* a billed 200). `Billed but no result = billed_empty + billed_errors`; `Failed after retries = no_listing + (errored − billed_errors)` — the subtraction is what keeps a paid error row out of both chips. Defaults to 0, so other pipelines are unchanged. |
+| `reporting.py` | `_build_cost` | New `scrapedo_billed_errors` (rows that errored *with* a billed 200). `Billed but no result = billed_empty + billed_errors`; `Failed after retries = no_listing + (errored − billed_errors)` — the subtraction is what keeps a paid error row out of both chips. Defaults to 0, so other pipelines are unchanged. |
 | `static/js/run_detail.js:821` | `renderLegacyStatus` | Call site now passes `g`. |
 | `s3_run_store.py:458` | `Counters._FIELDS` | Added `rows_no_listing`. |
 | `s3_run_store.py:473` | `Counters.bump` | Raises `KeyError` on an unknown counter instead of silently dropping it. |
 | `engine.py:5279` | `_gmaps_fallback_summary` | Mid-run `cost` now carries `scrapedo_successful_requests` (= `credits // CREDITS_PER_CALL`) and `scrapedo_failed_requests`, so the billing card is populated before `report.json` exists. |
-| `serpwow_reporting.py:26` | `retry_column` / `retry_row` | **New.** The shared rerun/refund-row builder: membership rule, reason vocabulary, and input-column passthrough, in one place for both pipelines. |
+| `reporting.py:26` | `retry_column` / `retry_row` | **New.** The shared rerun/refund-row builder: membership rule, reason vocabulary, and input-column passthrough, in one place for both pipelines. |
 | `gmaps_outputs.py` | `_write_outputs` | Third spooled temp file → `retry.csv`. `error=` is passed only when `_derive_outcome(row) == "error"`, so a no-listing row and a "Row has no company name" row are not mislabelled as failures. |
 | `relationship_outputs.py` | `_write_outputs` | Same, with `billed_empty` derived from the stored response (`not blocks and not refs`, only when the row has no error). |
 | `engine.py:220 / 5134 / 5151` | `_GSEARCH_RESULT_FILES`, `_RELATIONSHIP_FILES`, `_GMAPS_FILES` | `retry.csv` added to the `/result` allowlist and to both pipelines' advertised file sets. |
 | `run_detail.js:865` | `renderLegacyStatus` | Files card offers `retry.csv` for gmaps + relationship only (gsearch shares that branch and writes none). |
-| `common/text.py` | `passthrough_fieldnames` / `passthrough_row` | **New.** The input-columns-first rule, shared by all three pipelines. Here and not in `serpwow_reporting` because `ai_mode/run_reporting.py` is standalone-by-contract and `serpwow_reporting` drags in `httpx`. `source_overrides` exists because the S3 readers inject `row_index` and AI Mode's doesn't. |
-| `serpwow_reporting.py` | `CSV_COLUMNS` split | `RESULT_COLUMNS` (the computed four) + the three echoed fields = today's `CSV_COLUMNS`, byte-identical, so the gsearch writer is untouched. Adds `result_cells` and `s3_passthrough`. |
+| `common/text.py` | `passthrough_fieldnames` / `passthrough_row` | **New.** The input-columns-first rule, shared by all three pipelines. Here and not in `reporting` because `ai_mode/run_reporting.py` is standalone-by-contract and `reporting` drags in `httpx`. `source_overrides` exists because the S3 readers inject `row_index` and AI Mode's doesn't. |
+| `reporting.py` | `CSV_COLUMNS` split | `RESULT_COLUMNS` (the computed four) + the three echoed fields = today's `CSV_COLUMNS`, byte-identical, so the gsearch writer is untouched. Adds `result_cells` and `s3_passthrough`. |
 | `relationship_outputs.py:58` | `_passthrough_fieldnames` | Now a one-line wrapper over the shared helper; its collision test passed unchanged. |
 | `gmaps_outputs.py` | `_write_outputs` | found/notFound built from `input header + RESULT_COLUMNS` instead of `CSV_COLUMNS`. |
 | `ai_mode/run_reporting.py` | `StreamingRunReport` | New optional `company_column`; owns the input.csv cursor (`_open_input` / `_close_input`), `extrasaction="ignore"` on both writers, desync canary in `close()`. |
@@ -285,7 +285,7 @@ billed-empty row), `tests/test_s3_run_store.py` (`bump` rejects an unknown count
 
 **Not touched, on purpose:** `scrapedo_maps_client` (the credit arithmetic was already
 correct — verified against the provider dashboard, section 7),
-`serpwow_reporting._build_cost`, and the Slack payload.
+`reporting._build_cost`, and the Slack payload.
 
 ---
 

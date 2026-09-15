@@ -254,9 +254,22 @@ def is_terminal(state: str, done_flag: bool) -> bool:
     return state in terminal or bool(done_flag)
 
 
+# Google said the job is over AND produced nothing. Checked before `done`, because an
+# expired or cancelled job can come back with done=true and no error body -- which the
+# `not batch_obj.get("error")` fallback below read as SUCCESS. engine's gsearch chunk
+# driver carried a private copy of this set to defend against exactly that; the two S3-only
+# runners did not, and silently persisted empty results for a whole shard.
+FAILED_STATES = {
+    "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
+    "BATCH_STATE_FAILED", "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED",
+}
+
+
 def is_success(state: str, done_flag: bool, batch_obj: dict[str, Any]) -> bool:
     if state in {"JOB_STATE_SUCCEEDED", "BATCH_STATE_SUCCEEDED"}:
         return True
+    if state in FAILED_STATES:
+        return False
     if not done_flag:
         return False
     return not bool(batch_obj.get("error"))

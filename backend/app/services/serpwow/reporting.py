@@ -1,12 +1,21 @@
-# backend/app/services/serpwow/serpwow_reporting.py
-"""found.csv / notFound.csv / report.json / run.log for SerpWow pipelines.
+# backend/app/services/serpwow/reporting.py
+"""found.csv / notFound.csv / report.json / run.log + the run summary, for the
+state-driven upload pipelines.
 
-Pipeline-agnostic: converts a terminal SerpWow upload ``state["rows"]`` (each row
-carries a CrawlResponse dict under ``result``) into the shared EntityResult
-schema, then writes the same file set AI Mode produces so the Runs UI can view
-them uniformly. Used by both ``gsearch`` (LLM confidence) and ``gmaps``
-(heuristic confidence) — the confidence block is read from whichever context key
-the pipeline populated.
+**Provider-agnostic** — it was ``serpwow_reporting.py`` until 2026-08-19, by which point
+three of the four pipelines it serves had migrated to scrape.do and the name was simply
+wrong. It converts a terminal upload's ``state["rows"]`` (each row carrying a
+CrawlResponse dict under ``result``) into the shared EntityResult schema, then writes the
+same file set AI Mode produces so the Runs UI can view them uniformly.
+
+Consumers: ``gsearch`` (SerpWow, LLM confidence), ``relationship`` and ``firmographics``
+(scrape.do) for their summaries, and ``gmaps_outputs``/``relationship_outputs`` for the
+shared per-row conversion. Cost accounting routes on the DATA — the presence of
+``scrapedo_*`` keys in a row's ``cost_breakdown`` — not on the pipeline name, which is why
+adding a migrated pipeline needed no branch here.
+
+Deliberately standalone-ish: it imports only ``models/results.py`` plus siblings, to avoid
+a circular import back into ``engine``.
 """
 from __future__ import annotations
 
@@ -58,8 +67,8 @@ def retry_column(header: list[str]) -> str:
 
 def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *,
               attempts: int, credits: int, error: str = "",
-              billed_empty: bool = False, no_listing: bool = False
-              ) -> Optional[dict[str, str]]:
+              billed_empty: bool = False, no_listing: bool = False,
+              llm_incomplete: bool = False) -> Optional[dict[str, str]]:
     """One retry.csv row, or None when the row got a real answer.
 
     retry.csv exists to be RE-UPLOADED, so it carries the original input cells verbatim
@@ -72,8 +81,14 @@ def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *
       only reason that costs money.
     - ``no_listing`` — every attempt came back 502 "no results" (gmaps). Not billed.
     - ``error``      — died after every retry, or never ran at all.
+    - ``llm_incomplete`` — the provider answered and we were billed, but the Gemini shard
+      that had to read that answer never delivered (job FAILED/EXPIRED, or our poll gave
+      up). The row has a scrape and no verdict. Listed LAST because it is the only reason
+      whose rerun costs nothing from the provider: the scrape objects already exist, so a
+      re-drive skips the row and redoes the LLM half alone.
 
-    Shared by gmaps and relationship so one vocabulary describes both runs' rerun lists.
+    Shared by gmaps, relationship and firmographics so one vocabulary describes every
+    run's rerun list.
     """
     if billed_empty:
         reason = "billed_empty: HTTP 200 returned no data — refundable"
@@ -84,6 +99,9 @@ def retry_row(original: dict[str, Any], header: list[str], reason_column: str, *
         # the error — charged for nothing, exactly like billed_empty. A row that died
         # before any 200 cost nothing, so it must not claim to be refundable.
         reason = f"error: {error}" + (" — billed, refundable" if credits else "")
+    elif llm_incomplete:
+        reason = ("llm_incomplete: scraped and billed, but the Gemini batch never returned "
+                  "a result for this row — rerun redoes the LLM only, no provider re-spend")
     else:
         return None
     row = passthrough_row(original, s3_passthrough(header, ()))
@@ -180,7 +198,12 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
                 scrapedo_no_results: int = 0,
                 scrapedo_recovered_requests: int = 0,
                 scrapedo_error_requests: int = 0,
-                scrapedo_billed_errors: int = 0) -> dict[str, Any]:
+                scrapedo_billed_errors: int = 0,
+                scrapedo_search_requests: int = 0,
+                scrapedo_search_successful: int = 0,
+                scrapedo_ai_overview_requests: int = 0,
+                scrapedo_ai_overview_successful: int = 0,
+                scrapedo_ai_overview_deferred: int = 0) -> dict[str, Any]:
     """SerpWow is per-search USD; scrape.do is credits (10 per successful call) with no
     USD figure. Both key sets are always present so a run whose pipeline has migrated
     and a pre-migration run of the same pipeline each render from their own fields.
@@ -216,6 +239,16 @@ def _build_cost(llm_usd: float, serpwow_searches: int, billable_searches: int,
         # Rows whose HTTP 200 came back with an ERROR body. Billed all the same, so they
         # sit with billed_empty as "credits spent for nothing", not with the free 502s.
         "scrapedo_billed_errors": scrapedo_billed_errors,
+        # Per-ENDPOINT split, because scrape.do prices them differently: a Google Search
+        # 200 is 10 credits, a deferred AI-Overview follow-up is 5. Without this the
+        # firmographics bill (rows x 10, plus 5 for each deferred row) is unexplainable
+        # from the totals alone. Zero for every other pipeline.
+        "scrapedo_search_requests": scrapedo_search_requests,
+        "scrapedo_search_successful": scrapedo_search_successful,
+        "scrapedo_ai_overview_requests": scrapedo_ai_overview_requests,
+        "scrapedo_ai_overview_successful": scrapedo_ai_overview_successful,
+        # Rows where Google deferred the overview, i.e. that needed the 5-credit call.
+        "scrapedo_ai_overview_deferred": scrapedo_ai_overview_deferred,
         "scrapedo_credits": scrapedo_credits,
         "total_usd": round(llm_usd + serpwow_usd, 6),
     }
@@ -247,18 +280,40 @@ def _cost_log_line(summary: dict[str, Any]) -> str:
     return line
 
 
-def _derive_outcome(row: dict[str, Any]) -> Any:
+# Fields a firmographics row must have gained for the row to count as "found". Its
+# official_website is the INPUT echoed back, so unlike every other pipeline it proves
+# nothing — see row_produced_a_result.
+FIRMOGRAPHICS_OUTPUT_FIELDS = ("address", "phone", "email", "industry",
+                               "products", "services")
+
+
+def row_produced_a_result(result: dict[str, Any], pipeline: str) -> bool:
+    """Did this row actually produce an answer? The fallback for rows with no explicit
+    ``outcome`` (legacy rows, user-stop, redelivery-drop).
+
+    Shared by ``_derive_outcome`` here and ``engine.summarize_upload_state._outcome_of``,
+    which must agree or report.json and /status disagree about the same run. Split out
+    because firmographics needs the opposite answer from everyone else: it is HANDED the
+    website, so ``official_website`` being set is just the input coming back.
+    """
+    result = result if isinstance(result, dict) else {}
+    if str(pipeline or "") == "firmographics":
+        return any(result.get(field) for field in FIRMOGRAPHICS_OUTPUT_FIELDS)
+    return bool(result.get("official_website"))
+
+
+def _derive_outcome(row: dict[str, Any], pipeline: str = "") -> Any:
     """Outcome for one row, mirroring engine.summarize_upload_state._outcome_of so the
     report.json / Supabase / Slack breakdown reconciles with the state summary:
-    explicit ``outcome`` wins; else completed -> found if official_website else not_found;
-    else failed -> error (covers user-stop / redelivery-drop / stale rows that carry no
-    explicit outcome); else uncounted."""
+    explicit ``outcome`` wins; else completed -> found if the row produced a result else
+    not_found; else failed -> error (covers user-stop / redelivery-drop / stale rows that
+    carry no explicit outcome); else uncounted."""
     oc = row.get("outcome")
     if oc:
         return oc
     if row.get("status") == "completed":
-        result_obj = row.get("result") if isinstance(row.get("result"), dict) else {}
-        return "found" if result_obj.get("official_website") else "not_found"
+        return ("found" if row_produced_a_result(row.get("result"), pipeline)
+                else "not_found")
     if row.get("status") == "failed":
         return "error"
     return None
@@ -278,12 +333,27 @@ def _phase_is_empty(item: dict[str, Any]) -> Optional[bool]:
 
 
 def empty_response_breakdown(state: dict[str, Any]) -> Optional[dict[str, int]]:
-    """Count gsearch rows whose SerpWow phases came back empty despite HTTP 200.
+    """Per-pipeline count of rows the provider answered with nothing usable.
 
     relationship moved to scrape.do in 2026-08 and reports its own
     {"empty": N} from relationship_outputs, so it no longer routes through here.
     """
-    if str(state.get("pipeline") or "") != "gsearch":
+    pipeline = str(state.get("pipeline") or "")
+    if pipeline == "firmographics":
+        # firmographics buys ONE search per row and extracts from ai_overview alone, so
+        # the only "answered but useless" case is a billed 200 with no overview -- either
+        # Google produced none, or the deferred 5-credit follow-up failed. Reported apart
+        # from real errors: the row cost credits and did not fail.
+        out = {"no_ai_overview": 0, "deferred": 0}
+        for row in state.get("rows", []):
+            ctx = ((row or {}).get("result") or {}).get("context") or {}
+            sd = ctx.get("scrapedo") if isinstance(ctx.get("scrapedo"), dict) else {}
+            if sd.get("billed_no_overview"):
+                out["no_ai_overview"] += 1
+            if sd.get("deferred"):
+                out["deferred"] += 1
+        return out
+    if pipeline != "gsearch":
         return None
     out = {"all_phases": 0, "some_phases": 0}
     for row in state.get("rows", []):
@@ -315,6 +385,16 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     scrapedo_no_results = 0
     scrapedo_recovered = 0
     scrapedo_errors = 0
+    scrapedo_billed_errors = 0
+    scrapedo_search_requests = 0
+    scrapedo_search_ok = 0
+    scrapedo_aio_requests = 0
+    scrapedo_aio_ok = 0
+    scrapedo_aio_deferred = 0
+
+    search_seconds = 0.0
+    llm_seconds = 0.0
+    timed_rows = 0
     llm_usd = 0.0
     prompt_tokens = 0
     completion_tokens = 0
@@ -338,6 +418,12 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
             scrapedo_no_results += int(cb.get("scrapedo_no_results") or 0)
             scrapedo_recovered += int(cb.get("scrapedo_recovered_requests") or 0)
             scrapedo_errors += int(cb.get("scrapedo_error_requests") or 0)
+            scrapedo_billed_errors += int(cb.get("scrapedo_billed_errors") or 0)
+            scrapedo_search_requests += int(cb.get("scrapedo_search_requests") or 0)
+            scrapedo_search_ok += int(cb.get("scrapedo_search_successful") or 0)
+            scrapedo_aio_requests += int(cb.get("scrapedo_ai_overview_requests") or 0)
+            scrapedo_aio_ok += int(cb.get("scrapedo_ai_overview_successful") or 0)
+            scrapedo_aio_deferred += int(cb.get("scrapedo_ai_overview_deferred") or 0)
         else:
             request_count = int(cb.get("serpwow_request_count") or 0)
             serpwow_searches += request_count
@@ -350,8 +436,13 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                         if isinstance(item, dict) and item.get("success"))
                     if isinstance(formatted, list) and formatted else request_count
                 )
+        timing = ctx.get("timing")
+        if isinstance(timing, dict) and "search_seconds" in timing:
+            search_seconds += float(timing.get("search_seconds") or 0.0)
+            llm_seconds += float(timing.get("llm_seconds") or 0.0)
+            timed_rows += 1
         llm_usd += float(result.get("gemini_cost_usd") or 0.0)
-        for key in ("final_url_selection_ai", "gemini_batch_ai"):
+        for key in ("final_url_selection_ai", "gemini_batch_ai", "mapping_ai"):
             obj = ctx.get(key)
             if isinstance(obj, dict):
                 if model is None and obj.get("model"):
@@ -361,7 +452,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                     prompt_tokens += int(usage.get("promptTokenCount", 0) or 0)
                     completion_tokens += int(usage.get("candidatesTokenCount", 0) or 0)
     # is_batch: the gemini_batch block is only seeded when batch post-processing is
-    # enabled for this upload (GSEARCH_LLM_BATCH), so its presence is the reliable signal.
+    # enabled for this upload (LLM_BATCH), so its presence is the reliable signal.
     is_batch = bool(state.get("gemini_batch"))
     # SerpWow gsearch is per-request billed (unlike scrape.do's flat fee), so
     # surface a USD figure. Rate unset -> 0 (no crash).
@@ -376,14 +467,26 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
         "model": model,
         # "llm" when a confidence model actually ran (gsearch always), else "heuristic".
         # Lets the UI show the confidence chip without guessing from model presence.
-        "confidence_mode": "llm" if model else "heuristic",
+        # None for firmographics: it is GIVEN the website, so there is nothing to be
+        # confident about, and the UI skips the chip on a null. Its Gemini call is an
+        # extraction step, not a confidence step -- `model` is still set, so the cost
+        # card keeps its LLM line.
+        "confidence_mode": (
+            None if str(state.get("pipeline") or "") == "firmographics"
+            else ("llm" if model else "heuristic")),
         "is_batch": is_batch,
         "token_usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens},
         "cost": _build_cost(llm_usd, serpwow_searches, billable_searches,
                             scrapedo_requests, scrapedo_credits,
                             scrapedo_ok, scrapedo_failed, scrapedo_billed_empty,
-                            scrapedo_no_results, scrapedo_recovered, scrapedo_errors),
+                            scrapedo_no_results, scrapedo_recovered, scrapedo_errors,
+                            scrapedo_billed_errors=scrapedo_billed_errors,
+                            scrapedo_search_requests=scrapedo_search_requests,
+                            scrapedo_search_successful=scrapedo_search_ok,
+                            scrapedo_ai_overview_requests=scrapedo_aio_requests,
+                            scrapedo_ai_overview_successful=scrapedo_aio_ok,
+                            scrapedo_ai_overview_deferred=scrapedo_aio_deferred),
         "processing_seconds_total": state.get("processing_seconds_total"),
     }
     # Outcome/error breakdown is original-row-level; each state row represents one
@@ -392,7 +495,7 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
     by_source: dict[str, int] = {}
     by_category: dict[str, int] = {}
     for row in state.get("rows", []):
-        oc = _derive_outcome(row or {})
+        oc = _derive_outcome(row or {}, str(state.get("pipeline") or ""))
         if oc == "found":
             outcome_breakdown["found"] += 1
         elif oc == "not_found":
@@ -405,6 +508,20 @@ def build_summary(state: dict[str, Any], results: list[EntityResult]) -> dict[st
                 by_category[row["error_category"]] = by_category.get(row["error_category"], 0) + 1
     summary["outcome_breakdown"] = outcome_breakdown
     summary["error_breakdown"] = {"by_source": by_source, "by_category": by_category}
+
+    # Per-row AVERAGES, not sums: this pipeline interleaves provider and LLM work per row
+    # under many concurrent workers, so a sum would read as many times the run's wall clock
+    # and mean nothing. Emitted only when rows actually carried the split, so no other
+    # pipeline's summary grows a key.
+    if timed_rows:
+        summary["phase_seconds_avg"] = {
+            "provider": round(search_seconds / timed_rows, 2),
+            "llm": round(llm_seconds / timed_rows, 2),
+        }
+    # How the LLM ran, so the UI can say so instead of leaving the user to guess. Batch is
+    # gsearch-only machinery; firmographics calls Gemini inline, once per row.
+    if model:
+        summary["llm_mode"] = "batch" if is_batch else "inline"
 
     ebd = empty_response_breakdown(state)
     if ebd is not None:

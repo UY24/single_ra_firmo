@@ -167,12 +167,22 @@ def firmographics_columns(fieldnames) -> dict[str, str]:
     return resolved
 
 
-def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
+def parse_firmographics_csv_rows(raw: bytes,
+                                 sample_limit: int | None = None) -> list[dict[str, str]]:
+    """Validate every row; keep at most ``sample_limit`` of them.
+
+    ``sample_limit=0`` validates and counts without retaining anything -- what the S3-only
+    upload path wants, since it ships the raw bytes to S3 and the worker streams them back.
+    Materialising 500k row dicts in the API process was ~100MB per upload that no caller
+    read. Same convention as ``parse_entities_csv``; use ``count_firmographics_csv_rows``
+    when only the number is wanted.
+    """
     text = raw.decode("utf-8-sig", errors="replace")
     stream = io.StringIO(text)
     reader = csv.DictReader(stream)
 
     rows: list[dict[str, str]] = []
+    total_valid = 0
     if not reader.fieldnames:
         raise ValueError(
             "CSV must include headers for firmographics upload. "
@@ -199,6 +209,9 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
             continue
         # Whatever the file has, nothing more: a name derived from the domain reads
         # like real data in the output and isn't.
+        total_valid += 1
+        if sample_limit is not None and len(rows) >= sample_limit:
+            continue
         company_name = (row.get(company_key) or "").strip() if company_key else ""
         country = (row.get(country_key) or "").strip() if country_key else ""
         rows.append(
@@ -213,6 +226,32 @@ def parse_firmographics_csv_rows(raw: bytes) -> list[dict[str, str]]:
             }
         )
 
-    if not rows:
+    if not total_valid:
         raise ValueError("Firmographics CSV has no valid rows with a website_url.")
     return rows
+
+
+def count_firmographics_csv_rows(raw: bytes) -> int:
+    """How many rows the worker will process. Validates every row, retains none.
+
+    The S3-only upload path needs the count for status.json and the Supabase run row, and
+    nothing else -- the worker streams input.csv straight back out of S3.
+    """
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError(
+            "CSV must include headers for firmographics upload. "
+            "Required: website_url (or official_website/website/url/domain)."
+        )
+    website_key = firmographics_columns(reader.fieldnames).get("website_url")
+    if not website_key:
+        raise ValueError(
+            "Firmographics CSV must include a website_url "
+            "(or official_website/website/url/domain) column."
+        )
+    total = sum(1 for row in reader
+                if _normalize_website_input(str(row.get(website_key) or "")))
+    if not total:
+        raise ValueError("Firmographics CSV has no valid rows with a website_url.")
+    return total

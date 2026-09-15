@@ -10,16 +10,6 @@ from .models import TokenUsage
 from .settings import LLMConfig
 
 
-def parse_usage(usage: dict[str, Any] | None) -> TokenUsage:
-    """Parse an OpenAI-style usage object."""
-    usage = usage or {}
-    return TokenUsage(
-        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
-        completion_tokens=int(usage.get("completion_tokens", 0) or 0),
-        total_tokens=int(usage.get("total_tokens", 0) or 0),
-    )
-
-
 def parse_gemini_usage(usage: dict[str, Any] | None) -> TokenUsage:
     """Parse a native Gemini usageMetadata object into the shared TokenUsage shape."""
     usage = usage or {}
@@ -53,48 +43,11 @@ def _post_json_with_retries(
     raise RuntimeError(f"LLM request failed: {last_error}") from last_error
 
 
-class OpenAICompatibleClient:
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str,
-        model: str,
-        max_retries: int = 2,
-        timeout_seconds: float = 120.0,
-        transport: httpx.BaseTransport | None = None,
-    ) -> None:
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.max_retries = max_retries
-        self.timeout_seconds = timeout_seconds
-        self._transport = transport
-
-    def complete_json(self, messages: list[dict[str, str]]) -> tuple[dict[str, Any], TokenUsage]:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-        }
-        data = _post_json_with_retries(
-            url=f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            payload=payload,
-            timeout_seconds=self.timeout_seconds,
-            max_retries=self.max_retries,
-            transport=self._transport,
-        )
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content), parse_usage(data.get("usage"))
-
-
 class GeminiClient:
     """Native Google Gemini API client (generativelanguage.googleapis.com).
 
-    Accepts the same OpenAI-style ``messages`` list as OpenAICompatibleClient and
-    translates it into Gemini's contents / systemInstruction format, so the runner
-    can use either client interchangeably.
+    Takes a chat-style ``messages`` list (``{"role", "content"}``, the shape the prompt
+    builders emit) and translates it into Gemini's contents / systemInstruction format.
     """
 
     def __init__(
@@ -145,14 +98,13 @@ class GeminiClient:
         return json.loads(text), parse_gemini_usage(data.get("usageMetadata"))
 
 
-def make_llm_client(config: LLMConfig) -> OpenAICompatibleClient | GeminiClient:
-    kwargs = {
-        "api_key": config.api_key,
-        "base_url": config.base_url,
-        "model": config.model,
-        "max_retries": config.max_retries,
-        "timeout_seconds": config.timeout_seconds,
-    }
-    if config.provider == "gemini":
-        return GeminiClient(**kwargs)
-    return OpenAICompatibleClient(**kwargs)
+def make_llm_client(config: LLMConfig) -> GeminiClient:
+    """Gemini is the only provider (2026-08-20). Kept as a function because it adapts
+    LLMConfig to the client's kwargs and is the seam every offline test patches."""
+    return GeminiClient(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        model=config.model,
+        max_retries=config.max_retries,
+        timeout_seconds=config.timeout_seconds,
+    )

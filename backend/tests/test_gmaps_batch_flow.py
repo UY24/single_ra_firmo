@@ -1,14 +1,14 @@
 """FIX 3 hardening test: gmaps reuses the SHARED gsearch batch machinery with no
 new engine. Drives _build_batch_items_for_state / _apply_batch_parsed_to_row
 directly (no network) against a gmaps row and asserts the result lands in
-context["gemini_batch_ai"], which serpwow_reporting reads ahead of
+context["gemini_batch_ai"], which reporting reads ahead of
 context["gmaps_confidence"] (see _confidence_raw's key order) -- locking in
 that a gmaps batch row is reported exactly like a gsearch batch row.
 """
 import unittest
 
 from app.services.serpwow import engine as legacy_app
-from app.services.serpwow import serpwow_reporting
+from app.services.serpwow import reporting
 
 
 def _terminal_gmaps_state():
@@ -61,7 +61,7 @@ class TestGmapsBatchItemsBuild(unittest.TestCase):
 
 class TestGmapsBatchApplyParsed(unittest.TestCase):
     """_apply_batch_parsed_to_row writes context["gemini_batch_ai"] for a gmaps
-    row the same way it does for gsearch, and serpwow_reporting picks it up
+    row the same way it does for gsearch, and reporting picks it up
     ahead of the heuristic gmaps_confidence block."""
 
     def _sample_parsed(self):
@@ -96,7 +96,7 @@ class TestGmapsBatchApplyParsed(unittest.TestCase):
 
     def test_summary_and_entity_results_reflect_batch_confidence(self):
         """End-to-end (offline): after applying the batch result, the shared
-        serpwow_reporting layer must read the BATCH confidence (95), not the
+        reporting layer must read the BATCH confidence (95), not the
         stale heuristic confidence (60) -- proving no separate gmaps reporting
         path exists."""
         state = _terminal_gmaps_state()
@@ -105,13 +105,13 @@ class TestGmapsBatchApplyParsed(unittest.TestCase):
         legacy_app._apply_batch_parsed_to_row(
             row, self._sample_parsed(), usage, "gemini-1.5-flash")
 
-        results = serpwow_reporting.state_to_entity_results(state)
+        results = reporting.state_to_entity_results(state)
         self.assertEqual(len(results), 1)
         entity = results[0]
         self.assertEqual(entity.website_url, "https://acme-motors.com")
         self.assertEqual(entity.confidence, 95)  # batch confidence, not heuristic's 60
 
-        summary = serpwow_reporting.build_summary(state, results)
+        summary = reporting.build_summary(state, results)
         self.assertEqual(summary["websites_found"], 1)
         self.assertEqual(summary["websites_not_found"], 0)
         self.assertEqual(summary["model"], "gemini-1.5-flash")

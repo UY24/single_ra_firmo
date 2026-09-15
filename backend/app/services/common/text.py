@@ -38,7 +38,7 @@ def passthrough_fieldnames(
       ``source_overrides``. Readers that inject nothing (AI Mode's plain DictReader)
       pass none.
 
-    Lives here, not in serpwow_reporting, because ai_mode/run_reporting.py is
+    Lives here, not in reporting, because ai_mode/run_reporting.py is
     deliberately standalone (stdlib + models only) and that module pulls in httpx.
     """
     overrides = source_overrides or {}

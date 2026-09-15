@@ -303,6 +303,109 @@ async function gmapsBillingBreakdown() {
   assert(root.textContent.includes("870"), "credits missing from the cost card");
 }
 
+async function inFlightScrapedoRunIsNotLabelledSerpWow() {
+  // A gmaps run that has not billed a call yet: every scrapedo_* counter is 0, which is
+  // ALSO what a SerpWow run carries, so the truthiness check alone fell through to the
+  // default "SerpWow" provider label. Seen live on run 7a03eaa0, which stalled at
+  // phase="queued" and rendered a SerpWow cost card for a pipeline that cannot use it.
+  const { root } = await renderStatus("gmaps-inflight", {
+    pipeline: "gmaps", status: "processing", total_rows: 100,
+    processed_rows: 0, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 100,
+      websites_found: 0, websites_not_found: 100,
+      outcome_breakdown: { found: 0, not_found: 0, errored: 0 },
+      available_files: [],
+      cost: { scrapedo_requests: 0, scrapedo_credits: 0, scrapedo_failed_requests: 0,
+              llm_usd: 0.0, total_usd: 0.0 },
+    },
+  });
+  assert(!root.textContent.includes("SerpWow"),
+    "in-flight gmaps run labelled its provider SerpWow");
+  assert(root.textContent.includes("Scrape.do"),
+    "in-flight gmaps run missing the Scrape.do cost card");
+}
+
+async function preMigrationGmapsKeepsSerpWowCard() {
+  // The other half of the same rule: a gmaps run from BEFORE the scrape.do migration has
+  // real serpwow_searches, and must keep rendering them rather than being relabelled by
+  // its pipeline key.
+  const { root } = await renderStatus("gmaps-legacy", {
+    pipeline: "gmaps", status: "completed", total_rows: 10,
+    processed_rows: 10, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 10,
+      websites_found: 8, websites_not_found: 2,
+      outcome_breakdown: { found: 8, not_found: 2, errored: 0 },
+      available_files: [],
+      cost: { serpwow_searches: 21, serpwow_usd: 0.21, llm_usd: 0.0, total_usd: 0.21 },
+    },
+  });
+  assert(root.textContent.includes("SerpWow"),
+    "pre-migration gmaps run lost its SerpWow cost card");
+}
+
+async function deadGeminiShardIsVisibleAndRerunnable() {
+  // scrape.do did its job and was billed; the Gemini shard that had to read the answer
+  // died. Before this the run said "completed_with_errors" while every visible count read
+  // zero, the rows were indistinguishable from "Google had no overview" (which is FINAL),
+  // and the only retry surface was hand-typing the run id into the Operations page.
+  const { root } = await renderStatus("firmo-dead-shard", {
+    pipeline: "firmographics", status: "completed_with_errors",
+    total_rows: 100, processed_rows: 100, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: null, model: "gemini-2.5-flash-lite", llm_mode: "batch",
+      total_rows: 100, websites_found: 60, websites_not_found: 40,
+      outcome_breakdown: { found: 60, not_found: 40, errored: 0 },
+      error_breakdown: { by_source: {}, by_category: {}, task_errors: 2 },
+      empty_response_breakdown: {
+        no_ai_overview: 5, deferred: 12, no_website: 0,
+        llm_incomplete: 35, never_processed: 0,
+      },
+      available_files: [],
+      cost: {
+        scrapedo_requests: 100, scrapedo_successful_requests: 100,
+        scrapedo_search_successful: 100, scrapedo_ai_overview_successful: 12,
+        scrapedo_credits: 1060, scrapedo_error_requests: 0,
+        llm_usd: 0.01, total_usd: 0.01,
+      },
+    },
+  });
+  const pillValue = (label) => byClass(root, "pill")
+    .find((pill) => pill.children[0]?.textContent === label)?.children[1]?.textContent;
+  assert(pillValue("LLM never completed") === "35",
+    "unjudged rows not broken out from Billed-but-no-overview");
+  assert(pillValue("Billed but no overview") === "5",
+    "no_ai_overview must not absorb the rows that DID have an overview");
+  assert(/2 background task\(s\) failed/.test(root.textContent),
+    "task_errors never surfaced — completed_with_errors had no visible cause");
+  assert(root.textContent.includes("no provider re-spend"),
+    "rerun copy must say the scrape is not re-bought");
+  const btn = byText(root, "button", "Rerun failed");
+  assert(btn?.listeners.click, "no Rerun button on an S3-only run");
+}
+
+async function rerunButtonShowsOnACleanS3Run() {
+  // Offered on any terminal run of these pipelines: a re-drive skips every row that has a
+  // result, so the button is safe with nothing to redo — and a user looking for it should
+  // not have to first produce a failure to find out where it lives.
+  const { root } = await renderStatus("gmaps-clean", {
+    pipeline: "gmaps", status: "completed", total_rows: 10,
+    processed_rows: 10, failed_rows: 0,
+    serpwow_summary: {
+      confidence_mode: "heuristic", total_rows: 10,
+      websites_found: 10, websites_not_found: 0,
+      outcome_breakdown: { found: 10, not_found: 0, errored: 0 },
+      available_files: [],
+      cost: { scrapedo_requests: 10, scrapedo_successful_requests: 10,
+              scrapedo_credits: 100, llm_usd: 0, total_usd: 0 },
+    },
+  });
+  assert(byText(root, "button", "Rerun failed"), "gmaps run has no Rerun button");
+  assert(!/background task\(s\) failed/.test(root.textContent),
+    "clean run showed a task-error callout");
+}
+
 async function failedRowsViewer() {
   const ref = "failed rows/&";
   const { root } = await renderStatus(ref, {
@@ -409,10 +512,10 @@ async function counterDrivenRelationshipTerminal() {
   assert(!byText(root, "span", "found.csv"), "relationship run advertised gsearch files");
   assert(!byTag(files, "button").some((button) => button.disabled),
     "terminal relationship files rendered disabled");
-  // A relationship run has no state.json, so /output (json and xlsx) 404s — the Files
+  // A relationship run has no state.json, so /output (json and csv) 404s — the Files
   // card must not offer them. gsearch keeps them (see failedReportingRunShowsFiles).
   assert(!files.textContent.includes("output.json")
-    && !files.textContent.includes("output.xlsx"),
+    && !files.textContent.includes("output.csv"),
   "relationship Files card advertised the state-driven output endpoints");
 }
 
@@ -517,14 +620,45 @@ async function completedWithErrorsBatchIsTerminal() {
     "SerpWow failed attempts were not visible beside cost");
 }
 
-async function nonReportingPipelineIgnoresBatchState() {
-  const { root } = await renderStatus("firmo-batch", {
+async function firmographicsIsS3OnlyAndCarriesNoBatchState() {
+  // firmographics moved to the S3-only runner on 2026-08-20, so it has no state.json and
+  // therefore no gemini_batch field at all — the case this used to cover (a non-reporting
+  // pipeline handed batch state) can no longer be produced by the server.
+  //
+  // What must hold instead: it is terminal on its own status, it advertises its OWN result
+  // files, and it does NOT offer output.json / output.csv — both 404 without a state.json.
+  const { root } = await renderStatus("firmo-s3", {
     pipeline: "firmographics", status: "completed", total_rows: 2, processed_rows: 2,
-    success_rows: 2, failed_rows: 0, gemini_batch: { status: "running" },
+    success_rows: 2, failed_rows: 0,
+    serpwow_summary: {
+      total_rows: 2, websites_found: 2, websites_not_found: 0,
+      confidence_mode: null, model: "gemini-2.5-flash-lite", llm_mode: "inline",
+      available_files: ["enriched.csv", "notEnriched.csv", "retry.csv",
+                        "report.json", "run.log"],
+      cost: { llm_usd: 0.0004, scrapedo_requests: 2, scrapedo_credits: 20,
+              scrapedo_search_successful: 2, scrapedo_ai_overview_successful: 0,
+              total_usd: 0.0004 },
+      outcome_breakdown: { found: 2, not_found: 0, errored: 0 },
+      empty_response_breakdown: { no_ai_overview: 0, deferred: 0 },
+      token_usage: { prompt_tokens: 200, completion_tokens: 100, total_tokens: 300 },
+    },
   });
-  assert(timers.length === 0, "non-reporting pipeline silently kept polling irrelevant batch state");
-  assert(!root.textContent.includes("finalizing"), "non-reporting pipeline showed reporting finalizing state");
-  assert(byClass(root, "files-section").length === 1, "terminal non-reporting pipeline files missing");
+  assert(timers.length === 0, "terminal S3-only run kept polling");
+  const files = byClass(root, "files-section")[0];
+  assert(files, "terminal firmographics run hid its Files surface");
+  assert(files.textContent.includes("enriched.csv")
+    && files.textContent.includes("notEnriched.csv"),
+  "firmographics did not advertise its own result files");
+  assert(!files.textContent.includes("found.csv"),
+    "firmographics advertised gsearch's file names");
+  assert(!files.textContent.includes("output.json")
+    && !files.textContent.includes("output.csv"),
+  "firmographics advertised state-driven output endpoints it has no state for");
+  // No Confidence chip: the website is an input, so there is nothing to be confident
+  // about. The LLM chip is what says a paid model ran, and in which mode.
+  assert(!root.textContent.includes("Heuristic"),
+    "firmographics showed a confidence mode it does not have");
+  assert(root.textContent.includes("Inline"), "firmographics hid its LLM mode");
 }
 
 async function failedReportingRunShowsFiles() {
@@ -545,7 +679,7 @@ async function failedReportingRunShowsFiles() {
   assert(!log?.children[1]?.children[0]?.disabled, "available failed-run log was disabled");
   const found = byClass(files, "file-row").find((row) => row.textContent.includes("found.csv"));
   assert(found?.children[1]?.children[0]?.disabled, "absent failed-run result was enabled");
-  assert(files.textContent.includes("output.json") && files.textContent.includes("output.xlsx"),
+  assert(files.textContent.includes("output.json") && files.textContent.includes("output.csv"),
     "failed run lost output endpoint fallbacks");
 }
 
@@ -833,6 +967,10 @@ await customPollTerminalPredicate();
 await completedGsearchLlm();
 await completedGmapsHeuristic();
 await gmapsBillingBreakdown();
+await deadGeminiShardIsVisibleAndRerunnable();
+await rerunButtonShowsOnACleanS3Run();
+await inFlightScrapedoRunIsNotLabelledSerpWow();
+await preMigrationGmapsKeepsSerpWowCard();
 await failedRowsViewer();
 await completedRelationship();
 await counterDrivenRelationshipTerminal();
@@ -840,7 +978,7 @@ await counterDrivenRelationshipRunning();
 await counterDrivenRelationshipFailedMidScrape();
 await finalizingBatch();
 await completedWithErrorsBatchIsTerminal();
-await nonReportingPipelineIgnoresBatchState();
+await firmographicsIsS3OnlyAndCarriesNoBatchState();
 await failedReportingRunShowsFiles();
 await cancelledBatchTerminalizes();
 await legacyCompatibility();

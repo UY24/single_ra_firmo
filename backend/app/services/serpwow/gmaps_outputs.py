@@ -6,7 +6,7 @@ assembly uses spooled temp files rather than in-memory buffers. Nothing here sca
 row count — which is the whole point of the move off state.json, where the old reporting
 path materialised every EntityResult and embedded every row in report.json.
 
-The per-row conversion is the SHARED serpwow_reporting.row_to_entity_result, unchanged:
+The per-row conversion is the SHARED reporting.row_to_entity_result, unchanged:
 this module streams the same rows the old path held in a list, so found.csv and
 notFound.csv keep byte-identical columns.
 """
@@ -23,7 +23,7 @@ from typing import Any
 from app.services.serpwow import s3_run_store as store
 from app.services.serpwow.modes.gmaps import row_fields
 from app.services.common.text import passthrough_row
-from app.services.serpwow.serpwow_reporting import (
+from app.services.serpwow.reporting import (
     RESULT_COLUMNS,
     _build_cost,
     _cost_log_line,
@@ -38,7 +38,7 @@ from app.services.serpwow.serpwow_reporting import (
 
 def _state_row(idx: int, fields: dict[str, Any],
                stored: dict[str, Any] | None) -> dict[str, Any]:
-    """The row shape serpwow_reporting expects, rebuilt from one rows/ object.
+    """The row shape reporting expects, rebuilt from one rows/ object.
 
     row_to_entity_result and _derive_outcome read a state row — {result: {context, ...},
     company_name, country, outcome, ...}. Rebuilding it here is what lets both stay

@@ -8,9 +8,14 @@ archived newest-first in `docs/HISTORY.md`. This file is only current state + wh
 
 - Branch **`relationship-scrapedo`**, **5 commits ahead of `origin/relationship-scrapedo`** (pushed branch exists; these are not on it) — newest `ced718c` (output CSVs carry the input columns). Only the firmographics column rename below is uncommitted.
 - **778/778** offline tests + **6/6** `.mjs` DOM contracts passing.
-- Two pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03) and
-  **relationship** (Google AI Mode, 2026-08-04). **gsearch** and **firmographics** still call
-  `api.serpwow.com`. AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
+- **Three** pipelines are off SerpWow onto scrape.do: **gmaps** (Google Maps, 2026-08-03),
+  **relationship** (Google AI Mode, 2026-08-04) and **firmographics** (Google Search,
+  2026-08-19). **gsearch alone** still calls `api.serpwow.com`.
+  AI Mode (`ai_bulk`/`ai_deep`) is broker-driven.
+- **All three scrape.do pipelines are now S3-only** (no state.json, no local disk, one message
+  per run). firmographics migrated 2026-08-20 — measured at **2.01 S3 writes / ~881 bytes per
+  row, flat at any run size**. **gsearch is the last state-driven pipeline**, and the ~2.7k-row
+  ceiling now applies to it alone.
 - gmaps is live-verified (3 real 100-row runs). relationship has had real runs — the last three
   commits are fixes they surfaced — but the checklist below is not finished.
 
@@ -31,20 +36,30 @@ any `static/js` file.
 
 ## Blockers before 500k
 
-1. **`GEMINI_BATCH_TIMEOUT_SEC` is 30 min in the live `.env`, not the 48h relationship wants.**
+1. ~~**`GEMINI_BATCH_TIMEOUT_SEC` is 30 min in the live `.env`.**~~ **CODE FIXED 2026-08-19** —
+   one `GEMINI_BATCH_TIMEOUT_SEC`, default **172800 (48h)**, shared by all four pipelines via
+   `common/llm_batch.py`; `RELATIONSHIP_BATCH_TIMEOUT_SEC` and `AI_MODE_BATCH_TIMEOUT_SEC` are
+   deleted. **Still owed from YOU:** the live `.env` pins `1800` on line 227 — edit it or the
+   old deadline stands. Original note below for context.
+   **`GEMINI_BATCH_TIMEOUT_SEC` was 30 min in the live `.env`, not the 48h relationship wants.**
    `relationship_runner.py:289` defaults to 172800 but reads the *shared* SerpWow key, and
    `.env:212` sets `1800`. A Gemini verdict shard that outlives 30 min raises and the run's rows
    keep no `cleaned/` object. Either give relationship its own key or raise the shared one.
-2. **`retry-failed-rows` can't complete at scale.** LISTs all of `raw/` then issues one *serial*
-   `to_thread` DELETE per dead row in a single HTTP request — 50k dead rows is 20+ minutes and a
-   client timeout. It also ignores its `limit` param, and `s3_run_store.delete_object`
-   swallows failures, so a row can count as retried and never be rescraped. Fix: `delete_objects`
-   in 1000-key batches + honour `limit`.
-3. **`phase="failed"` is terminal for the re-drive scan.** Any transient error over a multi-day
-   run parks it permanently; recovery is hand-typing the run id into Operations. Fix: attempts
-   counter in `status.json` (AI Mode's `requeue_attempts` pattern) and let the scan pick `failed`
-   up N times — a re-drive is free.
-4. **`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.** Each shard holds a thread for its whole
+2. ~~**`retry-failed-rows` can't complete at scale.**~~ **DONE** — verified in code 2026-08-20:
+   `engine.retry_failed_rows` LISTs `errors/`, honours `limit`, and calls
+   `s3_run_store.delete_objects` in 1000-key batches returning a CONFIRMED count. Original note:
+   one serial DELETE per dead row (50k = 20+ min and a client timeout), `limit` ignored,
+   failures swallowed.
+3. ~~**`phase="failed"` is terminal for the re-drive scan.**~~ **DONE** — verified in code
+   2026-08-20: `s3_run_driver.redrivable` re-drives a `failed` run while
+   `drive_attempts < max_attempts` (`{GMAPS,FIRMOGRAPHICS,RELATIONSHIP}_MAX_DRIVE_ATTEMPTS`, 3),
+   and the staleness gate applies to failed runs too so an instantly-dying run cannot spin.
+   Original note: any transient error over a multi-day run parked it permanently.
+4. ~~**`GEMINI_BATCH_MAX_INFLIGHT` is silently capped.**~~ **DONE 2026-08-19.** The worker
+   sizes its default executor to `max(32, max_inflight + 16)` in `start_worker_consumers`.
+   Note the blocker was **relationship-only**: engine's chunk driver awaits `asyncio.sleep`
+   between polls and AI Mode polls all shards from one thread, so neither ever held a thread
+   per shard. Original note: **`GEMINI_BATCH_MAX_INFLIGHT` was silently capped.** Each shard holds a thread for its whole
    multi-hour poll, so raising it past the default `ThreadPoolExecutor`'s `min(32, cpu+4)`
    (**6 on a 2-vCPU box**) creates nothing. Needs a sized executor.
 5. ~~**gmaps state store.**~~ **DONE 2026-08-10.** gmaps is S3-only: no `state.json`, object
@@ -52,11 +67,19 @@ any `static/js` file.
    It reuses *relationship's* primitives (`s3_run_store` + the new `s3_run_driver`), not AI Mode's,
    and is two phases rather than three — its LLM confidence modes were deleted, so there is no
    batch pass. Old state-driven gmaps runs are not migrated (hard cutover; their S3 data remains).
-6. **API-process memory — partly fixed.** `parse_relationship_csv` (2026-08-05) and
-   `parse_entities_csv` (2026-08-10, via `sample_limit`) now validate every row while retaining
-   none, so a 500k-row upload no longer materialises its rows in the API process. Still open:
-   `/uploads/{id}/result` reads a whole several-hundred-MB CSV into memory instead of streaming
-   the boto3 body.
+6. ~~**firmographics cannot reach 500k.**~~ **DONE 2026-08-20** — S3-only, three phases,
+   `firmographics_runs` queue. Its LLM phase finds its work with one LIST (`pending_llm/`
+   markers) rather than a GET per row.
+7. **API-process memory — partly fixed, and this is the LAST real blocker.**
+   `parse_relationship_csv` (2026-08-05) and `parse_entities_csv` (2026-08-10, via
+   `sample_limit`) now validate every row while retaining none, so a 500k-row upload no longer
+   materialises its rows in the API process. **Still open, re-confirmed 2026-08-20:**
+   `engine.upload_result_file` calls `s3_run_store.get_bytes` and returns `Response(content=…)`
+   — the WHOLE output CSV in API-process RAM, per concurrent download. It now hits all three
+   S3-only pipelines (`enriched.csv`, `found.csv`, `confirmed_relation.csv`), which at 500k rows
+   are several hundred MB each. Fix: `StreamingResponse` over the boto3 body. While there: that
+   branch also serves `.csv` as `text/plain` and ignores `download`, so a 500MB file opens in
+   the browser instead of downloading.
 
 ## gmaps billing display — done 2026-08-11 (commit `15167f3`)
 
@@ -79,7 +102,7 @@ What changed (reasoning in `DECISIONS.md`, call graph in `FLOW.md` §6):
   502 "no results" and a 502 "request failed" are the same billing event: four attempts,
   nothing charged. `report.json` still reports `no_listing` separately. gsearch and
   relationship branches untouched.
-- `serpwow_reporting._build_cost` — new `scrapedo_billed_errors` (rows that errored with a
+- `reporting._build_cost` — new `scrapedo_billed_errors` (rows that errored with a
   billed 200). Subtracting it from `errored` is what stops a paid error row appearing in
   two chips at once. Defaults to 0, so gsearch/relationship reports are unchanged.
 - `s3_run_store.Counters` — `rows_no_listing` was **never in `_FIELDS`**, so
@@ -113,7 +136,7 @@ no prose — the gate still produced a verdict); the count stays in `report.json
 
 A billed error (HTTP 200 whose body carried the error) is marked `— billed, refundable`
 too; a row that died before any 200 is not, because it cost nothing. Membership rule +
-reason strings live in ONE shared helper, `serpwow_reporting.retry_row()`, so the two
+reason strings live in ONE shared helper, `reporting.retry_row()`, so the two
 pipelines can't drift.
 
 **S3 layout, for the record:** `raw/` = the call and everything that came back (query,
@@ -172,10 +195,10 @@ Verified against real run `8ffe96d9` — its 10 columns
 (`entity_name … firm_id`) come out first, in order.
 
 - The rule lives once, in `common/text.passthrough_fieldnames` / `passthrough_row` —
-  **there, not in `serpwow_reporting`**, because `ai_mode/run_reporting.py` is
-  standalone-by-contract and `serpwow_reporting` pulls in `httpx`.
+  **there, not in `reporting`**, because `ai_mode/run_reporting.py` is
+  standalone-by-contract and `reporting` pulls in `httpx`.
   `relationship_outputs._passthrough_fieldnames` is now a one-line wrapper over it.
-- `serpwow_reporting.CSV_COLUMNS` is split into `RESULT_COLUMNS` + the three echoed fields
+- `reporting.CSV_COLUMNS` is split into `RESULT_COLUMNS` + the three echoed fields
   and is byte-identical, so the **gsearch** writer is untouched.
 - **AI Mode: the writer owns the input.csv cursor.** `StreamingRunReport(run_dir,
   company_column)` pulls one input row per `EntityResult`, so alignment is an invariant of
@@ -214,10 +237,22 @@ follow gsearch out, so neither is worth touching either.
 
 ## Unproven numbers
 
-- **`SCRAPEDO_CONCURRENCY=100` is a target, not a measurement.** On the *Maps* endpoint, 100
-  measured **1.9x slower** than 25 — scrape.do queues instead of 429ing. Whether the *AI Mode*
-  endpoint behaves the same is unverified. It's the shared per-account cap, so tuning it moves
-  gmaps and AI Mode too. Do not raise anything here without re-measuring.
+- ~~**`SCRAPEDO_CONCURRENCY=100` measured 1.9x slower than 25.**~~ **OBSOLETE — re-measured
+  2026-08-25.** Three completed 100-row gmaps runs at concurrency **100**, from S3 counters:
+
+  | run | date | scrape_s | rows/s |
+  |---|---|---|---|
+  | `64b81c68` | 2026-08-25 | **34** | **2.94** |
+  | `1a46cba0` | 2026-08-18 | 36 | 2.78 |
+  | `8ffe96d9` | 2026-08-11 | 44 | 2.27 |
+
+  The 2026-08-04 table (100 → 134s/0.75 rows/s, 25 → 70.5s/1.42 rows/s) no longer describes
+  this system: **100 is now ~4x faster than 100 was, and ~2x faster than the best 25 ever
+  measured.** The A/B predates the pooled `httpx.AsyncClient` landing, so the old "keep 25, do
+  not raise" guidance is withdrawn. 500k at 2.94 rows/s ≈ **47 hours**, not 98.
+  **Still owed:** a fresh run at 25 — all three above are at 100, so we know 100 improved, not
+  that it beats 25 today. Whether the *AI Mode* endpoint behaves the same is still unverified,
+  and it is the shared per-account cap, so tuning it moves gmaps and AI Mode together.
 - **Gemini Batch wave count at 500k.** At the defaults (shard 5000, inflight 5) that's 100 shards
   in 20 sequential waves, and Google's "within 24h" SLA is per job. Inferred, not measured — this
   phase, not scraping, is the likely wall-clock wall.
@@ -246,9 +281,10 @@ gmaps on AI Mode's primitives — checklist in `docs/HISTORY.md` (2026-07-14).
 
 - **`errorTaxonomy` branch is NOT merged — user's call.** `found`/`not_found`/`error` taxonomy,
   reviewed, offline-green, not live-verified. Details in `docs/HISTORY.md` (2026-07-10).
-- **Decide gsearch / firmographics.** User intends to retire them; retiring before the gmaps state
-  rework is cheaper than preserving behaviour for pipelines about to be deleted. Rename
-  `serpwow_*` → `scrapedo_*` per pipeline as it migrates, package rename last.
+- **Decide gsearch.** It is the ONLY pipeline left on SerpWow and the only one still
+  state-driven, so the ~2.7k-row ceiling and `serpwow_client` exist for it alone. Retiring it
+  would let the `services/serpwow/` package rename (and `CrawlResponse.serpwow_cost_usd`)
+  finally happen. firmographics is no longer part of this decision — it migrated 2026-08-19/20.
 - **AI Mode's empty-response spend** (`scrapedo_empty_requests/` at the repo root) — the real money
   leak, never investigated. gmaps measured `scrapedo_billed_empty=0`, so it isn't leaking.
 
@@ -262,3 +298,20 @@ gmaps on AI Mode's primitives — checklist in `docs/HISTORY.md` (2026-07-14).
 - **Log decisions in `DECISIONS.md`** (newest first, including what was deliberately not
   done) and keep `FLOW.md` honest about what calls what — update its §6 table whenever the
   part of the path you touched moves.
+
+## Owed verification — firmographics S3-only (2026-08-20)
+
+Offline-green (12 dedicated tests drive the real runner + real store against a fake S3) but
+**never run live**. Checklist, mirroring what gmaps and relationship went through:
+
+1. Upload a 100-row CSV to `/uploads/firmographics`; confirm `enriched.csv` /
+   `notEnriched.csv` / `retry.csv` / `report.json` / `run.log` all appear in the Files card,
+   and that `output.json` / `output.csv` are NOT offered (they 404 by design now).
+2. Reconcile `report.json`'s `scrapedo_credits` against scrape.do's dashboard:
+   `10 x search 200s + 5 x ai-overview 200s`. The deferred count is the number to watch —
+   it has never been observed on a real run.
+3. `kill -9` the worker mid-scrape, restart, confirm the re-drive resumes with zero
+   re-scraped rows and zero re-spend (the offline test asserts this; live proves it).
+4. Run once with `LLM_BATCH=true` and once `false`; the six fields must match. Both paths send
+   a byte-identical prompt, so a difference means the batch mapping is wrong.
+5. Slack ping + the Supabase row on a terminal run.

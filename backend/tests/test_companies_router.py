@@ -382,9 +382,15 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
         self.assertIn("RabbitMQ", res.json()["detail"])
 
     def test_firmographics_keeps_own_parser_no_gate(self):
-        # A website-only CSV fails the canonical validator but is the valid
-        # firmographics format: it must get past validation (503 on RabbitMQ),
-        # proving the canonical gate is NOT applied to /uploads/firmographics.
+        """A website-only CSV fails the canonical validator but IS the valid firmographics
+        format, so it must get past CSV validation.
+
+        Since the 2026-08-20 S3-only migration this endpoint no longer needs the broker to
+        accept an upload (the re-drive scan starts a run published without one), so "got
+        past the parser" is now proven by the NEXT gate it hits: the config check for
+        SCRAPEDO_TOKEN. A canonical-validator rejection would have been a 400 naming the
+        company_name/country columns instead.
+        """
         firmo_csv = ("sites.csv", b"official_website\nhttps://acme.com\n", "text/csv")
         with mock.patch(
             "app.services.companies.get_company_service", return_value=self._svc()
@@ -394,8 +400,10 @@ class TestSerpwowUploadCsvGate(unittest.TestCase):
                 files={"file": firmo_csv},
                 data={"company_id": "u1"},
             )
-        self.assertEqual(res.status_code, 503)
-        self.assertIn("RabbitMQ", res.json()["detail"])
+        self.assertEqual(res.status_code, 400)
+        detail = res.json()["detail"]
+        self.assertIn("SCRAPEDO_TOKEN", detail)
+        self.assertNotIn("company_name", detail)
 
 
 class TestRunningStateSync(unittest.TestCase):

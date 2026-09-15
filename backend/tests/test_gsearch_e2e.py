@@ -5,7 +5,7 @@ Flow exercised (no real cloud services):
   2. Call process_upload_job() for 5 rows (rows 1-5); leave row 6 stuck ("queued").
   3. Call reconcile_stuck_gsearch_rows() → row 6 force-failed via reconciler.
   4. After all rows are terminal, maybe_start_gemini_batch_for_upload triggers
-     run_gemini_batch_for_upload with GSEARCH_GEMINI_CHUNK_SIZE=2 → ≥2 chunks.
+     run_gemini_batch_for_upload with GEMINI_BATCH_SHARD_SIZE=2 → ≥2 chunks.
      Chunk 1 (the second chunk) is patched to JOB_STATE_FAILED.
   5. persist_upload_state fires _finalize_serpwow_outputs → found.csv / notFound.csv.
   6. Slack notify_run_complete is patched to capture calls.
@@ -90,7 +90,7 @@ def _make_state(upload_id: str, rows: list) -> dict:
         "rows": rows,
         # Pre-seed the batch block so _batch_postprocess_pending returns True
         # from the first persist call, deferring Slack until the batch is done.
-        # This matches _create_upload_with_rows when GSEARCH_LLM_BATCH=true.
+        # This matches _create_upload_with_rows when LLM_BATCH=true.
         "gemini_batch": {
             "status": "waiting_for_rows",
             "queued_at": None,
@@ -144,9 +144,9 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
 
         # Environment: batch mode ON, small chunk size for ≥2 chunks, no real cloud.
         self.env = {
-            "GSEARCH_LLM_BATCH": "true",
-            "GSEARCH_GEMINI_CHUNK_SIZE": "2",   # 6 rows → 3 chunks
-            "GSEARCH_GEMINI_MAX_INFLIGHT": "10",
+            "LLM_BATCH": "true",
+            "GEMINI_BATCH_SHARD_SIZE": "2",   # 6 rows → 3 chunks
+            "GEMINI_BATCH_MAX_INFLIGHT": "10",
             "ENABLE_FINAL_URL_GEMINI": "false",  # skip per-row LLM
             "GSEARCH_ROW_STALE_TIMEOUT_SEC": "60",
             "GSEARCH_ROW_MAX_REQUEUE": "0",      # force-fail immediately
@@ -185,9 +185,9 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(mark_running_patcher.stop)
         mark_running_patcher.start()
 
-        # Patch upload_serpwow_json_to_s3 to be a no-op (no real S3).
+        # Patch upload_raw_response_to_s3 to be a no-op (no real S3).
         s3_patcher = mock.patch.object(
-            app, "upload_serpwow_json_to_s3",
+            app, "upload_raw_response_to_s3",
             new=mock.AsyncMock(return_value=(None, None))
         )
         self.addCleanup(s3_patcher.stop)
@@ -443,9 +443,9 @@ class TestGsearchE2E(unittest.IsolatedAsyncioTestCase):
                                 "_update_supabase_run must have been called")
         # Take the last call (terminal one).
         last_supabase = self.supabase_calls[-1]
-        from app.services.serpwow import serpwow_reporting
-        results = serpwow_reporting.state_to_entity_results(last_supabase)
-        summary = serpwow_reporting.build_summary(last_supabase, results)
+        from app.services.serpwow import reporting
+        results = reporting.state_to_entity_results(last_supabase)
+        summary = reporting.build_summary(last_supabase, results)
         supabase_found = summary["websites_found"]
         supabase_not_found = summary["websites_not_found"]
 

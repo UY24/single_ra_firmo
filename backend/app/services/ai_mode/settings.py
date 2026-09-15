@@ -70,52 +70,37 @@ def load_settings(env_file: Path | None = None, batch_size: int | None = None) -
     return settings
 
 
-DEFAULT_LLM_BASE_URLS = {
-    "openai": "https://api.openai.com/v1",
-    "gemini": "https://generativelanguage.googleapis.com/v1beta",
-}
+# Gemini is the only LLM provider (2026-08-20). The OpenAI-compatible transport and its
+# AI_MODE_LLM_PROVIDER switch are deleted: nothing used it, batch cleanup was Gemini-only
+# anyway (so LLM_BATCH already forced this branch), and a second provider with untuned
+# prompts and no pricing defaults was a config path nobody would have noticed breaking.
+#
+# There is no `provider` field either. With one provider it could only ever hold one value,
+# and a field that cannot vary is not configuration -- it is a constant pretending to be a
+# choice, which is what the next person reads as "so I can switch it".
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 @dataclass
 class LLMConfig:
+    """Which Gemini model to call, and how patiently. The only thing chosen from env is
+    the MODEL -- the endpoint is fixed and the key has one name."""
+
     api_key: str
-    base_url: str
     model: str
-    provider: str = "openai"
+    base_url: str = GEMINI_BASE_URL
     max_retries: int = 2
     timeout_seconds: float = 120.0
 
     def validate(self) -> None:
-        if self.provider not in DEFAULT_LLM_BASE_URLS:
-            raise ValueError(
-                f"LLM_PROVIDER must be one of {sorted(DEFAULT_LLM_BASE_URLS)}; got '{self.provider}'"
-            )
         missing = [
             name
             for name, value in (
-                ("LLM_API_KEY", self.api_key),
-                ("LLM_BASE_URL", self.base_url),
-                ("LLM_MODEL", self.model),
+                ("GEMINI_API_KEY", self.api_key),
+                ("GEMINI_MODEL", self.model),
+                ("base_url", self.base_url),
             )
             if not value
         ]
         if missing:
             raise ValueError("Required: " + ", ".join(missing))
-
-
-def load_llm_config(env_file: Path | None = None) -> LLMConfig:
-    load_dotenv(env_file or PROJECT_ROOT / ".env")
-    provider = (os.getenv("LLM_PROVIDER", "openai").strip().lower()) or "openai"
-    base_url = os.getenv("LLM_BASE_URL", "").strip().rstrip("/")
-    if not base_url:
-        base_url = DEFAULT_LLM_BASE_URLS.get(provider, "")
-    config = LLMConfig(
-        api_key=os.getenv("LLM_API_KEY", "").strip(),
-        base_url=base_url,
-        model=os.getenv("LLM_MODEL", "").strip(),
-        provider=provider,
-        max_retries=_int_env("LLM_MAX_RETRIES", 2),
-        timeout_seconds=_float_env("LLM_TIMEOUT_SECONDS", 120.0),
-    )
-    config.validate()
-    return config

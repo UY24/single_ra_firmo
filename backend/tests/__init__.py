@@ -24,3 +24,22 @@ for _key in (
     "SCRAPEDO_TOKEN",
 ):
     os.environ[_key] = ""
+
+# BEHAVIOUR toggles, not credentials — but they belong here for the same reason, and one
+# of them bit: a developer .env with LLM_BATCH=true flipped AI Mode's cleanup into the
+# Gemini BATCH path during an "offline" test, which then made a real HTTPS call to
+# generativelanguage.googleapis.com and failed with HTTP 400. Blanking a credential stops
+# a leak; blanking these stops the suite's RESULT depending on whose machine it runs on.
+#
+# Blanked, not deleted, so llm_batch's blank-counts-as-unset rule reads it as unset: a test
+# that wants batching on sets LLM_BATCH explicitly, which is also what documents its intent.
+# Since 2026-08-20 that is the ONLY batch toggle, so the whole hazard rests on this one key
+# (the per-pipeline overrides that used to be blanked alongside it are deleted).
+# Batch SIZES are here too — AI_DEEP_BATCH_SIZE=2 in a .env silently changed how many
+# batches a fixture produced and broke four assertions that had nothing to do with it.
+for _key in (
+    "LLM_BATCH",
+    "AI_BULK_BATCH_SIZE", "AI_DEEP_BATCH_SIZE",
+    "GEMINI_BATCH_SHARD_SIZE", "GEMINI_BATCH_MAX_INFLIGHT", "GEMINI_BATCH_MODEL",
+):
+    os.environ[_key] = ""

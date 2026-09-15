@@ -63,7 +63,7 @@ class TestFinalizeGsearch(unittest.TestCase):
             name: Path(f"/tmp/{name}")
             for name in ("found.csv", "notFound.csv", "report.json", "run.log")
         }
-        with mock.patch.object(legacy_app.serpwow_reporting, "write_outputs",
+        with mock.patch.object(legacy_app.reporting, "write_outputs",
                                return_value=paths), \
              mock.patch.object(legacy_app, "_write_error_dumps", return_value={}), \
              mock.patch.object(legacy_app, "_find_upload_dir", return_value=Path("/tmp")), \

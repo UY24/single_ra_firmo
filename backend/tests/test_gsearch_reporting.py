@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.services.serpwow import serpwow_reporting
+from app.services.serpwow import reporting
 
 
 def _state():
@@ -40,11 +40,11 @@ def _state():
 class TestGsearchReporting(unittest.TestCase):
     def test_entity_results_and_summary(self):
         state = _state()
-        results = serpwow_reporting.state_to_entity_results(state)
+        results = reporting.state_to_entity_results(state)
         self.assertEqual(results[0].website_url, "https://acme-motors.com")
         self.assertEqual(results[0].confidence, 88)
         self.assertIsNone(results[1].website_url)
-        summary = serpwow_reporting.build_summary(state, results)
+        summary = reporting.build_summary(state, results)
         self.assertEqual(summary["websites_found"], 1)
         self.assertEqual(summary["websites_not_found"], 1)
         self.assertEqual(summary["cost"]["serpwow_searches"], 10)
@@ -70,11 +70,11 @@ class TestGsearchReporting(unittest.TestCase):
                                                  "domain_name_mismatch": True}}}}},
             ],
         }
-        results = serpwow_reporting.state_to_entity_results(state)
+        results = reporting.state_to_entity_results(state)
         self.assertIsNone(results[0].website_url)          # rejected -> not found
         self.assertEqual(results[1].website_url, "https://brand.com")
         self.assertTrue(any(f.flag == "domain_name_mismatch" for f in results[1].flags))
-        summary = serpwow_reporting.build_summary(state, results)
+        summary = reporting.build_summary(state, results)
         self.assertEqual(summary["websites_found"], 1)
         self.assertEqual(summary["websites_not_found"], 1)
 
@@ -82,26 +82,26 @@ class TestGsearchReporting(unittest.TestCase):
         # per-row mode: model comes from final_url_selection_ai, no gemini_batch block
         state = _state()
         state["rows"][0]["result"]["context"]["final_url_selection_ai"]["model"] = "gemini-2.5-flash-lite"
-        summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(state, reporting.state_to_entity_results(state))
         self.assertEqual(summary["model"], "gemini-2.5-flash-lite")
         self.assertFalse(summary["is_batch"])
         # a model ran -> confidence_mode is "llm"
         self.assertEqual(summary["confidence_mode"], "llm")
         # batch mode: presence of the gemini_batch block flips is_batch
         state["gemini_batch"] = {"status": "succeeded"}
-        summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(state, reporting.state_to_entity_results(state))
         self.assertTrue(summary["is_batch"])
 
     def test_summary_confidence_mode_heuristic(self):
         # no LLM model surfaced (e.g. gmaps heuristic) -> confidence_mode is "heuristic"
         state = _state()
-        summary = serpwow_reporting.build_summary(state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(state, reporting.state_to_entity_results(state))
         self.assertIsNone(summary["model"])
         self.assertEqual(summary["confidence_mode"], "heuristic")
 
     def test_write_outputs(self):
         with tempfile.TemporaryDirectory() as d:
-            paths = serpwow_reporting.write_outputs(Path(d), _state())
+            paths = reporting.write_outputs(Path(d), _state())
             self.assertTrue(paths["found.csv"].exists())
             self.assertTrue(paths["notFound.csv"].exists())
             self.assertTrue(paths["report.json"].exists())
@@ -119,7 +119,7 @@ class TestGsearchReporting(unittest.TestCase):
         """Assert run.log starts with a 4-line header (status, counts, cost, blank line)."""
         with tempfile.TemporaryDirectory() as d:
             state = _state()
-            paths = serpwow_reporting.write_outputs(Path(d), state)
+            paths = reporting.write_outputs(Path(d), state)
             log_text = paths["run.log"].read_text()
             lines = log_text.split("\n")
             # Header should be: status line, counts line, cost line, blank line

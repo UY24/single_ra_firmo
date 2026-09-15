@@ -407,6 +407,42 @@ async def redrive_stale(
     return driven
 
 
+def run_queues() -> list[tuple[str, str]]:
+    """(queue, routing_key) for every S3-only pipeline. Imported lazily — these modules
+    import this one."""
+    from app.services.serpwow import firmographics_runner, gmaps_runner, relationship_runner
+
+    return [
+        (gmaps_runner.GMAPS_QUEUE, gmaps_runner.GMAPS_ROUTING_KEY),
+        (relationship_runner.RELATIONSHIP_QUEUE, relationship_runner.RELATIONSHIP_ROUTING_KEY),
+        (firmographics_runner.FIRMOGRAPHICS_QUEUE,
+         firmographics_runner.FIRMOGRAPHICS_ROUTING_KEY),
+    ]
+
+
+async def declare_run_queues(channel, exchange) -> None:
+    """Declare + bind the three run queues, so the PUBLISHER can create them too.
+
+    Without this they existed only where ``consume_runs`` ran — the worker. The exchange is
+    DIRECT, so a run published before the worker had ever bound its queue was silently
+    DISCARDED by RabbitMQ: no error, no log, no message anywhere, and the run sat at
+    phase="queued" until the stale-run scan noticed it up to GMAPS_STALE_SEC (900s) later.
+    That window opens every time the broker's data volume is fresh, or the queues are
+    deleted, and it is exactly the "upload right after starting everything" case.
+
+    Declaring is idempotent with the worker's own declare (same name, same durability), so
+    both may run in any order. Best-effort per queue: one pipeline's failure must not stop
+    the others, and none of it may take the API down.
+    """
+    for queue_name, routing_key in run_queues():
+        try:
+            queue = await channel.declare_queue(queue_name, durable=True)
+            await queue.bind(exchange, routing_key=routing_key)
+        except Exception as exc:  # noqa: BLE001 - best-effort, mirrors the AI Mode init
+            _LOGGER.warning("could not declare/bind %s: %s: %s",
+                            queue_name, type(exc).__name__, exc)
+
+
 async def consume_runs(channel, *, queue_name: str, routing_key: str,
                        drive_fn: Callable[[str], Awaitable[None]],
                        label: str) -> None:

@@ -17,23 +17,19 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-def calculate_llm_cost_usd(*, provider: str, prompt_tokens: int, completion_tokens: int,
+def calculate_llm_cost_usd(*, prompt_tokens: int, completion_tokens: int,
                            batch_mode: bool = False) -> float:
     """USD cost of the cleanup LLM from aggregated token counts.
 
-    Mirrors the legacy serpwow pricing-env convention (same env names/defaults for
-    Gemini; batch jobs fall back to sync rates when batch rates are unset). OpenAI
-    rates default to 0 — set OPENAI_*_USD_PER_1M_TOKENS to price the openai provider.
+    Gemini only (2026-08-20 — the OpenAI provider is deleted). Mirrors the legacy serpwow
+    pricing-env convention: same env names and defaults, and a batch job falls back to the
+    sync rates when the batch rates are unset.
     """
-    if provider == "openai":
-        input_rate = _float_env("OPENAI_INPUT_USD_PER_1M_TOKENS", 0.0)
-        output_rate = _float_env("OPENAI_OUTPUT_USD_PER_1M_TOKENS", 0.0)
-    else:  # gemini (default provider)
-        input_rate = _float_env("GEMINI_INPUT_USD_PER_1M_TOKENS", 0.10)
-        output_rate = _float_env("GEMINI_OUTPUT_USD_PER_1M_TOKENS", 0.40)
-        if batch_mode:
-            input_rate = _float_env("GEMINI_BATCH_INPUT_USD_PER_1M_TOKENS", input_rate)
-            output_rate = _float_env("GEMINI_BATCH_OUTPUT_USD_PER_1M_TOKENS", output_rate)
+    input_rate = _float_env("GEMINI_INPUT_USD_PER_1M_TOKENS", 0.10)
+    output_rate = _float_env("GEMINI_OUTPUT_USD_PER_1M_TOKENS", 0.40)
+    if batch_mode:
+        input_rate = _float_env("GEMINI_BATCH_INPUT_USD_PER_1M_TOKENS", input_rate)
+        output_rate = _float_env("GEMINI_BATCH_OUTPUT_USD_PER_1M_TOKENS", output_rate)
     cost = ((prompt_tokens / 1_000_000) * input_rate) + (
         (completion_tokens / 1_000_000) * output_rate
     )

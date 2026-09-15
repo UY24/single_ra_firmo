@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from app.services.serpwow import serpwow_reporting
+from app.services.serpwow import reporting
 
 
 def _state_with(searches: int, gemini_cost: float, billable: int | None = None) -> dict:
@@ -25,8 +25,8 @@ class TestGsearchCost(unittest.TestCase):
     def test_serpwow_usd_computed_and_added(self):
         state = _state_with(searches=10, gemini_cost=0.002)
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}, clear=False):
-            results = serpwow_reporting.state_to_entity_results(state)
-            summary = serpwow_reporting.build_summary(state, results)
+            results = reporting.state_to_entity_results(state)
+            summary = reporting.build_summary(state, results)
         cost = summary["cost"]
         self.assertEqual(cost["serpwow_searches"], 10)
         self.assertAlmostEqual(cost["serpwow_usd"], 0.0035, places=6)
@@ -35,16 +35,16 @@ class TestGsearchCost(unittest.TestCase):
     def test_rate_unset_means_zero_serpwow_usd(self):
         state = _state_with(searches=10, gemini_cost=0.002)
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": ""}, clear=False):
-            results = serpwow_reporting.state_to_entity_results(state)
-            summary = serpwow_reporting.build_summary(state, results)
+            results = reporting.state_to_entity_results(state)
+            summary = reporting.build_summary(state, results)
         self.assertEqual(summary["cost"]["serpwow_usd"], 0.0)
         self.assertAlmostEqual(summary["cost"]["total_usd"], 0.002, places=6)
 
     def test_failed_attempts_are_visible_but_not_billed(self):
         state = _state_with(searches=10, billable=2, gemini_cost=0.0)
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            summary = serpwow_reporting.build_summary(
-                state, serpwow_reporting.state_to_entity_results(state))
+            summary = reporting.build_summary(
+                state, reporting.state_to_entity_results(state))
         self.assertEqual(summary["cost"]["serpwow_searches"], 10)
         self.assertEqual(summary["cost"]["serpwow_billable_searches"], 2)
         self.assertAlmostEqual(summary["cost"]["serpwow_usd"], 0.0007)
@@ -54,8 +54,8 @@ class TestGsearchCost(unittest.TestCase):
         state["rows"][0]["result"]["context"]["formatted_results"] = [
             {"success": False}, {"success": True}, {"success": False}]
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            summary = serpwow_reporting.build_summary(
-                state, serpwow_reporting.state_to_entity_results(state))
+            summary = reporting.build_summary(
+                state, reporting.state_to_entity_results(state))
         self.assertEqual(summary["cost"]["serpwow_searches"], 3)
         self.assertEqual(summary["cost"]["serpwow_billable_searches"], 1)
         self.assertAlmostEqual(summary["cost"]["serpwow_usd"], 0.00035)
@@ -87,8 +87,8 @@ class TestScrapedoCredits(unittest.TestCase):
                       "scrapedo_failed_requests": 1, "scrapedo_credits": 0,
                       "scrapedo_no_results": 1, "scrapedo_error_requests": 0}
         state = _gmaps_state([ok] * 88 + [no_listing] * 12)
-        summary = serpwow_reporting.build_summary(
-            state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(
+            state, reporting.state_to_entity_results(state))
         cost = summary["cost"]
         self.assertEqual(cost["scrapedo_requests"], 100)       # not 200
         self.assertEqual(cost["scrapedo_successful_requests"], 88)
@@ -96,7 +96,7 @@ class TestScrapedoCredits(unittest.TestCase):
         self.assertEqual(cost["scrapedo_credits"], 880)        # 10 x 88 only
         # Real errors = failed minus no-results => zero on a clean run.
         self.assertEqual(cost["scrapedo_failed_requests"] - cost["scrapedo_no_results"], 0)
-        line = serpwow_reporting._cost_log_line(summary)
+        line = reporting._cost_log_line(summary)
         self.assertIn("ok=88", line)
         self.assertIn("no_listing=12", line)
         self.assertIn("errors=0", line)
@@ -112,12 +112,12 @@ class TestScrapedoCredits(unittest.TestCase):
                 "scrapedo_failed_requests": 4, "scrapedo_credits": 0,
                 "scrapedo_recovered_requests": 0, "scrapedo_error_requests": 4}
         state = _gmaps_state([recovered] * 5 + [dead] * 2)
-        cost = serpwow_reporting.build_summary(
-            state, serpwow_reporting.state_to_entity_results(state))["cost"]
+        cost = reporting.build_summary(
+            state, reporting.state_to_entity_results(state))["cost"]
         self.assertEqual(cost["scrapedo_recovered_requests"], 10)  # 5 rows x 2 retries
         self.assertEqual(cost["scrapedo_error_requests"], 8)       # only the 2 dead rows
         self.assertEqual(cost["scrapedo_credits"], 50)             # 5 rows billed once each
-        line = serpwow_reporting._cost_log_line({"cost": cost})
+        line = reporting._cost_log_line({"cost": cost})
         self.assertIn("recovered=10", line)
         self.assertIn("errors=8", line)
 
@@ -127,8 +127,8 @@ class TestScrapedoCredits(unittest.TestCase):
                  "scrapedo_failed_requests": 0, "scrapedo_credits": 10,
                  "scrapedo_billed_empty": 1}
         state = _gmaps_state([ok] * 90 + [empty] * 10)
-        summary = serpwow_reporting.build_summary(
-            state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(
+            state, reporting.state_to_entity_results(state))
         cost = summary["cost"]
         self.assertEqual(cost["scrapedo_billed_empty"], 10)
         # 100 billed calls, 10 of which bought nothing => 100 credits wasted.
@@ -142,8 +142,8 @@ class TestScrapedoCredits(unittest.TestCase):
         bad = {"scrapedo_requests": 4, "scrapedo_successful_requests": 0,
                "scrapedo_failed_requests": 4, "scrapedo_credits": 0}
         state = _gmaps_state([ok] * 88 + [bad] * 12)
-        summary = serpwow_reporting.build_summary(
-            state, serpwow_reporting.state_to_entity_results(state))
+        summary = reporting.build_summary(
+            state, reporting.state_to_entity_results(state))
         cost = summary["cost"]
         self.assertEqual(cost["scrapedo_successful_requests"], 88)
         self.assertEqual(cost["scrapedo_failed_requests"], 48)
@@ -156,8 +156,8 @@ class TestScrapedoCredits(unittest.TestCase):
     def test_credits_are_summed_across_rows(self):
         state = _gmaps_state([self.SCRAPEDO_ROW] * 3)
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            summary = serpwow_reporting.build_summary(
-                state, serpwow_reporting.state_to_entity_results(state))
+            summary = reporting.build_summary(
+                state, reporting.state_to_entity_results(state))
         cost = summary["cost"]
         self.assertEqual(cost["scrapedo_requests"], 3)
         self.assertEqual(cost["scrapedo_credits"], 30)
@@ -176,8 +176,8 @@ class TestScrapedoCredits(unittest.TestCase):
             row["result"]["context"]["formatted_results"] = [
                 {"phase": "gmaps", "success": True, "error": None}]
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            summary = serpwow_reporting.build_summary(
-                state, serpwow_reporting.state_to_entity_results(state))
+            summary = reporting.build_summary(
+                state, reporting.state_to_entity_results(state))
         self.assertEqual(summary["cost"]["serpwow_billable_searches"], 0)
         self.assertEqual(summary["cost"]["serpwow_usd"], 0.0)
         self.assertEqual(summary["cost"]["scrapedo_credits"], 20)
@@ -186,22 +186,22 @@ class TestScrapedoCredits(unittest.TestCase):
         # Back-compat: a run recorded before the migration has no scrapedo_* keys.
         state = _gmaps_state([{"serpwow_request_count": 4}])
         with mock.patch.dict("os.environ", {"SERPWOW_USD_PER_SEARCH": "0.00035"}):
-            summary = serpwow_reporting.build_summary(
-                state, serpwow_reporting.state_to_entity_results(state))
+            summary = reporting.build_summary(
+                state, reporting.state_to_entity_results(state))
         cost = summary["cost"]
         self.assertEqual(cost["serpwow_searches"], 4)
         self.assertAlmostEqual(cost["serpwow_usd"], 0.0014)
         self.assertEqual(cost["scrapedo_credits"], 0)
 
     def test_run_log_shows_credits_only_for_scrapedo_runs(self):
-        scrapedo = serpwow_reporting._cost_log_line(
+        scrapedo = reporting._cost_log_line(
             {"cost": {"llm_usd": 0.0, "serpwow_usd": 0.0, "total_usd": 0.0,
                       "serpwow_searches": 0, "scrapedo_requests": 3,
                       "scrapedo_credits": 30}})
         self.assertIn("scrapedo_requests=3", scrapedo)
         self.assertIn("scrapedo_credits=30", scrapedo)
 
-        serpwow = serpwow_reporting._cost_log_line(
+        serpwow = reporting._cost_log_line(
             {"cost": {"llm_usd": 0.0, "serpwow_usd": 0.0035, "total_usd": 0.0035,
                       "serpwow_searches": 10, "scrapedo_requests": 0,
                       "scrapedo_credits": 0}})

@@ -20,8 +20,7 @@ from app.services.ai_mode.mode_config import get_mode
 FAKE_ENV = {
     "SCRAPEDO_TOKEN": "fake-token",
     "GEMINI_API_KEY": "fake-key",
-    "AI_MODE_LLM_BATCH": "",           # sync-LLM cleanup path
-    "AI_MODE_LLM_PROVIDER": "gemini",
+    "LLM_BATCH": "",           # sync-LLM cleanup path
     "SCRAPEDO_CONCURRENCY": "2",
     "S3_BUCKET": "",
     "SLACK_WEBHOOK_URL": "",

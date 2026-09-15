@@ -116,8 +116,8 @@ class TestBatchDriverDoesNotCorruptSkipLlmRows(unittest.IsolatedAsyncioTestCase)
                      "confidence_score": 90}), "usage": {}})
             return out
 
-        with mock.patch.dict("os.environ", {"GSEARCH_GEMINI_CHUNK_SIZE": "100",
-                                            "GSEARCH_GEMINI_MAX_INFLIGHT": "5",
+        with mock.patch.dict("os.environ", {"GEMINI_BATCH_SHARD_SIZE": "100",
+                                            "GEMINI_BATCH_MAX_INFLIGHT": "5",
                                             "GEMINI_API_KEY": "k"}, clear=False), \
              mock.patch.object(engine, "read_upload_artifact",
                                new=mock.AsyncMock(side_effect=lambda u, k: persisted["state"])), \
